@@ -21,14 +21,20 @@ from ashare_decision_support.signals.dipbuy import measure_dip
 from ashare_decision_support.state.watchlist import Watchlist
 
 
-def bars(closes: list[float], volumes: list[float] | None = None) -> list[dict]:
+def bars(
+    closes: list[float],
+    volumes: list[float] | None = None,
+    amplitude: float = 0.02,
+) -> list[dict]:
+    """构造日线。`amplitude` 是每根的日内振幅，用来控制 ATR ——
+    回调档位现在按「几个日常波动」判定，所以振幅必须能被测试指定。"""
     vols = volumes or [1000.0] * len(closes)
     return [
         {
             "date": f"2026-06-{index + 1:02d}",
             "open": close,
-            "high": close,
-            "low": close,
+            "high": close * (1 + amplitude / 2),
+            "low": close * (1 - amplitude / 2),
             "close": close,
             "volume": vol,
         }
@@ -45,28 +51,66 @@ def test_pullback_is_measured_from_the_20_day_high() -> None:
     features = measure_dip(bars(closes))
 
     assert features.pullback_pct is not None
-    assert abs(features.pullback_pct - (99.0 / 110.0 - 1.0)) < 1e-6
+    # 高点用的是 bar 的 high（110 × 1.01），不是收盘价。
+    assert -0.12 < features.pullback_pct < -0.09
     # 高点在倒数第 5 根，之后走了 4 天。
     assert features.down_days == 4
 
 
-def test_pullback_bands_separate_no_dip_from_a_broken_trend() -> None:
-    """三段划分要真的把「没调」「理想」「太深」分开——它是台账分层的第一刀。"""
+def test_pullback_bands_are_measured_in_the_stock_s_own_volatility() -> None:
+    """同样跌一截，低波票是深度回调，高波票只是日常噪声。
 
-    def band(last: float) -> str | None:
-        return measure_dip(bars([100.0] * 19 + [last])).pullback_band
+    这是 2026-08-02 实测出来的问题：用固定百分比分档，长江电力（日振幅 1.82%）
+    一年里 `ideal` 只占 8%、`deep` 一次没到过；而计算机题材股（日振幅 6.23%）
+    49% 的交易日待在 `deep`——那个本该报警的档位成了它的常态。
+    """
+    closes = [100.0] * 19 + [94.0]  # 名义上一律跌 6%
 
-    assert band(99.5) == "none"      # -0.5%，根本没回调
-    assert band(97.0) == "shallow"   # -3%
-    assert band(92.0) == "ideal"     # -8%，低吸目标窗口
-    assert band(80.0) == "deep"      # -20%，趋势是不是还在已经说不清
+    calm = measure_dip(bars(closes, amplitude=0.01))     # 日振幅 1%
+    wild = measure_dip(bars(closes, amplitude=0.15))     # 日振幅 15%
+
+    # 名义跌幅接近（夹具的 high 随振幅略有差异），但归一化深度差近 6 倍。
+    assert calm.pullback_atr > wild.pullback_atr * 4
+    # 低波票该报警，高波票这点回撤还没超出日常波动。
+    assert calm.pullback_band == "deep"
+    assert wild.pullback_band in ("none", "shallow")
+
+
+def test_bands_cover_the_full_range_as_normalised_depth_grows() -> None:
+    def band(drop: float) -> str | None:
+        return measure_dip(bars([100.0] * 19 + [100.0 * (1 - drop)], amplitude=0.02)).pullback_band
+
+    # 日振幅 2%，所以档位边界约在 1.6% / 4% / 8% 的回撤上。
+    assert band(0.005) == "none"
+    assert band(0.03) == "shallow"
+    assert band(0.06) == "ideal"
+    assert band(0.20) == "deep"
+
+
+def test_true_range_counts_gaps_not_just_the_intraday_span() -> None:
+    """一字板和跳空开盘时日内区间几乎为零，只看 high-low 会把大跳空读成没波动。"""
+    rows = [
+        {"date": "2026-06-01", "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+         "volume": 1000.0},
+    ]
+    # 每根都平走，但每天跳空 5%。
+    price = 100.0
+    for day in range(2, 22):
+        price *= 1.05
+        rows.append({"date": f"2026-06-{day:02d}", "open": price, "high": price,
+                     "low": price, "close": price, "volume": 1000.0})
+
+    features = measure_dip(rows)
+    assert features.atr_pct is not None
+    # 日内区间恒为 0，但真实波幅认出了跳空。
+    assert features.atr_pct > 0.03
 
 
 def test_a_rally_to_a_new_high_has_zero_pullback_not_a_positive_one() -> None:
     """创新高时回撤是 0，不能因为现价高于区间内某根高点而算出正数。"""
     features = measure_dip(bars([100.0, 101.0, 102.0, 103.0]))
-    assert features.pullback_pct == 0.0
-    assert features.pullback_band == "none"
+    assert features.pullback_pct <= 0.0
+    assert features.pullback_band in (None, "none")
 
 
 def test_volume_contraction_tells_a_healthy_dip_from_distribution() -> None:
@@ -90,6 +134,19 @@ def test_missing_data_yields_none_not_zero() -> None:
     assert features.above_ma20 is None
     # 且不抛异常——一只票算不出特征不该让整条盘前链路停下来。
     assert measure_dip([]).pullback_pct is None
+
+
+def test_a_flat_line_has_no_band_rather_than_a_fake_one() -> None:
+    """振幅为零时分母是零，不该拿绝对值凑一个档位出来。"""
+    rows = [
+        {"date": f"2026-06-{i + 1:02d}", "open": 100.0, "high": 100.0, "low": 100.0,
+         "close": 100.0, "volume": 1000.0}
+        for i in range(25)
+    ]
+    features = measure_dip(rows)
+    assert features.atr_pct in (None, 0.0)
+    assert features.pullback_atr is None
+    assert features.pullback_band is None
 
 
 def test_support_distance_only_counts_supports_below_the_price() -> None:

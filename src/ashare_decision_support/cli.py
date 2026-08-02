@@ -507,11 +507,15 @@ def main() -> None:
         return
 
     if args.command == "intraday-check":
-        # 付费档就查 TickFlow 那条路，免费档查新浪——盘中时效要测的是**实际在跑
-        # 的那条链路**，拿另一条的读数交差没有意义。
+        # 盘中时效要测的是**实际在跑的那条链路**，拿另一条的读数交差没有意义。
+        # `--source` 可以强制某一路，用来做两路的时效对比。
+        if args.source == "sina":
+            source = SinaIntradayAdapter()
+        else:
+            source = build_intraday_adapter(_tickflow(args)) or SinaIntradayAdapter()
         _dump_json(
             check_intraday_freshness(
-                build_intraday_adapter(_source_adapter(args)) or SinaIntradayAdapter(),
+                source,
                 symbols=args.symbols,
                 period=args.period,
                 gap_seconds=args.gap_seconds,

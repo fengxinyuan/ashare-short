@@ -20,12 +20,24 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-# 回调深度的三段划分。低于 SHALLOW 说明还没怎么调，追进去和打板无异；高于 DEEP
-# 时「回调」和「趋势走坏」已经难以区分，此时买入是接刀不是低吸。
-# 这两个数是**先验假设，不是实测结论**——它们的作用是给台账分层提供一个初始
-# 切分，等积累够样本后由数据修正。
-SHALLOW_PULLBACK = 0.02
-DEEP_PULLBACK = 0.12
+# 回调深度的档位，单位是**这只票自己的日均真实波幅（ATR%）**，不是绝对百分比。
+#
+# 用绝对百分比是错的，2026-08-02 实测八只票一年日线，「回撤 5%~12% 算理想」这套
+# 固定档位两头都坏：
+#
+#   长江电力（日振幅 1.82%）  ideal 只占  8% 的交易日，deep 一次都没到过
+#   计算机题材（日振幅 6.23%） deep 占了 49% —— 一个本该意味着「趋势可能已破坏」
+#                             的档位成了它的常态，等于没有告警能力
+#
+# 归一化之后同一档位在不同波动的票上含义才一致：建行一年最大回撤 -11.47%、长电
+# -7.85%，绝对值差 46%，除以各自日振幅后是 4.4 与 4.3 —— 几乎相同。
+#
+# 下面三个数是拿八只票（五只红利蓝筹 + 计算机/传媒/茅台）的档位分布标定出来的，
+# 目标是**每只票四个档位都填得满、且没有哪一档吞掉一半以上**。这是先验校准，
+# 不是收益验证——哪一档真的更值得买，要等台账样本回答。
+SHALLOW_ATR = 0.8
+IDEAL_ATR = 2.0
+DEEP_ATR = 4.0
 
 # 缩量判定。近 3 日均量掉到 20 日均量的这个比例以下，视作缩量回调。
 CONTRACTION_FULL = 0.75
@@ -50,9 +62,11 @@ class DipFeatures:
     dist_to_ma20_pct: float | None = None
 
     # L2 回调到位了吗
-    pullback_pct: float | None = None          # 距 20 日最高的回撤，≤0
-    pullback_band: str | None = None           # none | shallow | ideal | deep
-    down_days: int | None = None               # 从 20 日高点算起，连续下跌天数
+    pullback_pct: float | None = None          # 距 20 日最高的回撤，≤0。原始百分比，给人看
+    atr_pct: float | None = None               # 日均真实波幅占价格的比例，归一化的分母
+    pullback_atr: float | None = None          # 回撤 ÷ 日振幅：回调了「几个日常波动」
+    pullback_band: str | None = None           # none | shallow | ideal | deep，按 ATR 口径分
+    down_days: int | None = None               # 从 20 日高点算起，走了几天
     dist_to_support_pct: float | None = None   # 距最近支撑，正=支撑在下方
 
     # 回调质量：缩量回调是健康的，放量回调是出货
@@ -91,6 +105,8 @@ def measure_dip(bars: list[dict], snapshot: Any = None) -> DipFeatures:
 
     pullback, down_days = _pullback(highs[-MEDIUM_WINDOW:], closes[-MEDIUM_WINDOW:], last)
     contraction = _contraction(volumes)
+    atr_pct = _atr_pct(bars[-MEDIUM_WINDOW - 1:])
+    normalised = _normalise(pullback, atr_pct)
 
     return DipFeatures(
         ret_20d=ret_20d,
@@ -98,7 +114,9 @@ def measure_dip(bars: list[dict], snapshot: Any = None) -> DipFeatures:
         above_ma20=above_ma20,
         dist_to_ma20_pct=dist_to_ma20,
         pullback_pct=pullback,
-        pullback_band=_band(pullback),
+        atr_pct=atr_pct,
+        pullback_atr=normalised,
+        pullback_band=_band(normalised),
         down_days=down_days,
         dist_to_support_pct=_support_distance(snapshot, last),
         volume_contraction=contraction,
@@ -106,16 +124,56 @@ def measure_dip(bars: list[dict], snapshot: Any = None) -> DipFeatures:
     )
 
 
-def _band(pullback: float | None) -> str | None:
-    """把回调深度切成四段。`ideal` 是低吸的目标窗口，`deep` 要当成风险而非机会。"""
-    if pullback is None:
+def _normalise(pullback: float | None, atr_pct: float | None) -> float | None:
+    """回撤除以日振幅。分母缺失或为零时返回 None——宁可不分档，也不拿绝对值凑。"""
+    if pullback is None or not atr_pct:
         return None
-    depth = -pullback
-    if depth < SHALLOW_PULLBACK:
+    return round(-pullback / atr_pct, 4)
+
+
+def _atr_pct(bars: list[dict]) -> float | None:
+    """日均真实波幅占价格的比例。
+
+    用真实波幅（含跳空）而不是简单的 `high-low`：A 股一字板和跳空开盘时，当日
+    最高最低可以贴在一起，只看日内区间会把「跳空 5%」读成「几乎没波动」。
+    """
+    ranges: list[float] = []
+    previous_close: float | None = None
+    for bar in bars or []:
+        high, low, close = bar.get("high"), bar.get("low"), bar.get("close")
+        if high is None or low is None or close is None:
+            continue
+        try:
+            high, low, close = float(high), float(low), float(close)
+        except (TypeError, ValueError):
+            continue
+        true_range = high - low
+        if previous_close is not None:
+            true_range = max(
+                true_range, abs(high - previous_close), abs(low - previous_close)
+            )
+        if close > 0:
+            ranges.append(true_range / close)
+        previous_close = close
+
+    if len(ranges) < 5:
+        return None
+    return round(sum(ranges) / len(ranges), 6)
+
+
+def _band(normalised: float | None) -> str | None:
+    """按「回调了几个日常波动」分档。
+
+    `ideal` 是低吸的目标窗口：跌得够多、明显超出日常噪声，但还没到该怀疑趋势的
+    地步。`deep` 要当成风险读数而不是机会——那时「回调」和「趋势走坏」已经分不开。
+    """
+    if normalised is None:
+        return None
+    if normalised < SHALLOW_ATR:
         return "none"
-    if depth < 0.05:
+    if normalised < IDEAL_ATR:
         return "shallow"
-    if depth <= DEEP_PULLBACK:
+    if normalised <= DEEP_ATR:
         return "ideal"
     return "deep"
 

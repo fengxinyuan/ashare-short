@@ -43,6 +43,11 @@ DAILY_PROXY_MAX_ROWS = 60
 # ceiling here is request size rather than throughput.
 BATCH_CHUNK_SIZE = 100
 
+# 硬上限。调大批次**又慢又静默丢标的**，实测表见
+# `get_historical_bars_batch` 的 docstring。夹住而不是报错，是因为调用方传大值
+# 通常是想「快一点」，把它压回安全值就够了——为一个性能参数中断盘前链路不值。
+BATCH_MAX_CHUNK = 100
+
 
 class TickFlowAdapter(MarketDataAdapter):
     """Analysis-only adapter backed by the TickFlow Python SDK."""
@@ -145,6 +150,20 @@ class TickFlowAdapter(MarketDataAdapter):
         Sector work needs thousands of series at once, which the one-symbol-per-
         call path cannot deliver in a pre-open window. Falls back to that path
         when the SDK has no batch endpoint, so callers never have to branch.
+
+        **不要调大 `chunk_size`。** 直觉上「一次要更多只」应该更快，实测正相反——
+        2026-08-02 付费档全 A 5534 只、120 天日线：
+
+        | chunk | 有数据的标的 | 耗时 |
+        |---|---|---|
+        | **100（默认）** | **5534 / 5534** | **27.8s** |
+        | 500 | 4434 ← 静默少 1100 只 | 53.6s |
+        | 1000 | 4034 ← 静默少 1500 只 | 51.2s |
+        | 2000 | **0** | 36.2s |
+
+        大批次**又慢又丢数据，而且不报错**——丢掉的标的返回空列表，和「这只票
+        确实没有日线」无法区分。小样本（2000 只）测出来的结论是反的，别用小样本
+        复核这个参数。`BATCH_MAX_CHUNK` 会把传进来的值夹住，就是为了挡住这条路。
         """
         normalized_map = self._normalized_symbol_map(symbols)
         klines = getattr(self.client, "klines", None)
@@ -155,11 +174,12 @@ class TickFlowAdapter(MarketDataAdapter):
         start_time = int(datetime.combine(start, time.min, tzinfo=CN_TZ).timestamp() * 1000)
         end_time = int(datetime.combine(end + timedelta(days=1), time.min, tzinfo=CN_TZ).timestamp() * 1000) - 1
         count = min(max((end - start).days * 2 + 16, 64), 10000)
+        step = max(1, min(int(chunk_size), BATCH_MAX_CHUNK))
 
         by_normalized: dict[str, list[dict]] = {}
         unique = list(dict.fromkeys(normalized_map.values()))
-        for index in range(0, len(unique), max(chunk_size, 1)):
-            chunk = unique[index : index + max(chunk_size, 1)]
+        for index in range(0, len(unique), step):
+            chunk = unique[index : index + step]
             payload = self._try_call(
                 batch_fn,
                 ((chunk,), {"period": "1d", "start_time": start_time, "end_time": end_time, "count": count, "adjust": self.adjust}),
