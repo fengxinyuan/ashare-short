@@ -238,3 +238,72 @@ def test_tickflow_free_mode_publishes_no_auction_microstructure() -> None:
     assert auction.seal_ratio is None
     # A real reference price is still available and still useful.
     assert auction.indicative_match_price > 0
+
+
+# ---- 批次大小护栏 ---------------------------------------------------------
+#
+# 直觉上「一次要更多只」应该更快，实测正相反。2026-08-02 付费档全 A 5534 只、
+# 120 天日线：chunk=100 拿到 5534/5534 用 27.8s；chunk=500 只剩 4434 只、53.6s；
+# chunk=1000 剩 4034 只、51.2s；chunk=2000 **一只都没有**、36.2s。
+#
+# 丢掉的标的返回空列表，与「这只票确实没有日线」无法区分——又慢又静默丢数据。
+# 小样本（2000 只）测出来的结论是反的，所以这里用调用记录钉死批次上限。
+
+
+class ChunkRecordingKlines:
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    def batch(self, symbols, **kwargs):
+        self.batch_sizes.append(len(symbols))
+        return {
+            symbol: {
+                "timestamp": [datetime(2026, 7, 31, 15, 0)],
+                "open": [12.0],
+                "high": [12.5],
+                "low": [11.8],
+                "close": [12.2],
+                "volume": [100000],
+                "amount": [1220000],
+            }
+            for symbol in symbols
+        }
+
+
+class ChunkRecordingClient(FakeClient):
+    def __init__(self, api_key: str | None = None) -> None:
+        super().__init__(api_key)
+        self.klines = ChunkRecordingKlines()
+
+
+class ChunkRecordingModule:
+    TickFlow = ChunkRecordingClient
+
+
+def _batch_sizes(chunk_size: int, symbol_count: int = 250) -> list[int]:
+    adapter = TickFlowAdapter(api_key="k", tickflow_module=ChunkRecordingModule())
+    symbols = [f"{600000 + index}.SH" for index in range(symbol_count)]
+    adapter.get_historical_bars_batch(symbols, date(2026, 4, 1), date(2026, 7, 31), chunk_size=chunk_size)
+    return adapter.client.klines.batch_sizes
+
+
+def test_an_oversized_chunk_is_clamped_instead_of_silently_losing_symbols() -> None:
+    assert max(_batch_sizes(2000)) <= 100
+
+
+def test_the_default_chunk_is_the_measured_safe_size() -> None:
+    assert _batch_sizes(100) == [100, 100, 50]
+
+
+def test_a_zero_or_negative_chunk_does_not_hang() -> None:
+    """`range(0, n, 0)` 会抛 ValueError，夹到 1 至少还能跑完。"""
+    assert _batch_sizes(0, symbol_count=3) == [1, 1, 1]
+
+
+def test_every_symbol_comes_back_when_the_chunking_is_right() -> None:
+    adapter = TickFlowAdapter(api_key="k", tickflow_module=ChunkRecordingModule())
+    symbols = [f"{600000 + index}.SH" for index in range(250)]
+    bars = adapter.get_historical_bars_batch(symbols, date(2026, 4, 1), date(2026, 7, 31))
+
+    assert len(bars) == 250
+    assert all(rows for rows in bars.values())

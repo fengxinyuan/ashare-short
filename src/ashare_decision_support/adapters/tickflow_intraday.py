@@ -29,6 +29,21 @@
 茅台的 VWAP 会算成 135083 而不是 1351。同一根 K 线实测：新浪 `volume=37000`、
 TickFlow `volume=369`。所以本模块输出的 bar 一律换算成**股**，与新浪那路可以
 直接互换。
+
+## 两家的分钟线并不逐根相同
+
+换算对齐之后，两条路仍然不是同一份数据。2026-08-02 拿重叠的 1970 根 1 分钟线
+逐根对照：
+
+| 标的 | 完全相同 | 相对差中位 | 相对差最大 |
+|---|---|---|---|
+| 000858.SZ | 776 / 1970（39.4%） | 1.3e-4 | 0.149% |
+| 600519.SH | 993 / 1970（50.4%） | 0 | 0.312% |
+| 000001.SZ | 1205 / 1970（61.2%） | 0 | 0.185% |
+
+这是不同厂商对逐笔归并到分钟的边界处理差异，不是谁错了。但它意味着**换一条路
+会让价位漂移最多约 0.3%**——所以别把两条路的读数混在同一次计算里，也别拿一条路
+的历史去回测另一条路要跑的规则。
 """
 
 from __future__ import annotations
@@ -56,6 +71,21 @@ MAX_HISTORY_PAGES = 32
 # 手 → 股。见模块头「量纲」。
 LOTS_TO_SHARES = 100.0
 
+# 分钟线一律取**不复权**。
+#
+# SDK 默认是 `forward`（比例前复权），不是不复权——实测五粮液 21 天 1 分钟线窗口
+# 内有除权，最早一根前复权 71.1339、不复权 73.6200，**差 3.4%**。三个理由必须
+# 显式指定：
+#
+# 1. `advise` 把这些价格当**挂单价**发出去，挂单价只有原始价一种口径；
+# 2. 免费路径（新浪 `adjust=""`）给的就是原始价。两条路对同一件事给不同的数，
+#    是这类系统里最难查的一种错；
+# 3. 简报里那句「价格为**不复权**实际成交价」得是真的。
+#
+# 回测要跨除权比较收益率时应当另取复权序列，`fetch_minute_history` 因此把
+# `adjust` 开成了参数。
+ADJUST_RAW = "none"
+
 
 class TickFlowIntradayError(RuntimeError):
     """一只都取不到时才抛。个别标的失败只记 note。"""
@@ -66,10 +96,11 @@ class TickFlowIntradayAdapter:
 
     name = "tickflow-intraday"
 
-    def __init__(self, client: Any, default_bars: int = 1200) -> None:
+    def __init__(self, client: Any, default_bars: int = 1200, adjust: str = ADJUST_RAW) -> None:
         self.client = client
         # 新浪那路一次给 1970 根，取相近量级，好让两条路径的下游行为一致。
         self.default_bars = default_bars
+        self.adjust = adjust
 
     def get_minute_bars(
         self,
@@ -91,7 +122,10 @@ class TickFlowIntradayAdapter:
             chunk = symbols[start : start + SYMBOL_BATCH]
             try:
                 payload = self.client.klines.batch(
-                    symbols=chunk, period=f"{period}{PERIOD_SUFFIX}", count=count
+                    symbols=chunk,
+                    period=f"{period}{PERIOD_SUFFIX}",
+                    count=count,
+                    adjust=self.adjust,
                 )
             except Exception:
                 failed.extend(chunk)
@@ -143,6 +177,7 @@ def fetch_minute_history(
     start: date | None = None,
     end: date | None = None,
     max_pages: int = MAX_HISTORY_PAGES,
+    adjust: str = ADJUST_RAW,
 ) -> tuple[list[dict], list[str]]:
     """把 `symbol` 的分钟线尽量往前拉，直到够到 `start` 或者没有更早的数据。
 
@@ -154,6 +189,9 @@ def fetch_minute_history(
     底，再往前翻返回的还是同一批，所以「这一页没有新数据」是终止条件之一。
 
     返回的 bar 与 `get_minute_bars` 同构，按时间升序，跨页去重。
+
+    `adjust` 默认不复权（挂单价口径）。要跨除权比较收益率就传 `"forward"`——
+    实测五粮液这两种口径在 21 天窗口内差 3.4%，训练与推理必须用同一种。
     """
     if period not in SUPPORTED_PERIODS:
         raise ValueError(f"unsupported period {period!r}; expected one of {SUPPORTED_PERIODS}")
@@ -169,6 +207,7 @@ def fetch_minute_history(
             "symbols": [symbol],
             "period": f"{period}{PERIOD_SUFFIX}",
             "count": MAX_BARS_PER_REQUEST,
+            "adjust": adjust,
         }
         if cursor_ms is not None:
             kwargs["end_time"] = cursor_ms

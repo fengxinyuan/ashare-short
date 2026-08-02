@@ -42,7 +42,8 @@ ashare-ds state                                            # 当前状态一览
 cd /root/a-share-ultra-short-ai-system
 python3 -m pip install -e ".[tickflow,akshare]"
 
-export TICKFLOW_API_KEY=...      # 可选，免费档无需
+export TICKFLOW_API_KEY=...      # 可选。不设走免费档（无分钟线、60 次/分钟闸门、
+                                 #   分类冷启动 6 分钟）；设了自动切付费档，代码无需改动
 export DASHSCOPE_API_KEY=...     # 可选，仅 --writer llm / chat / 多空辩论
 export FEISHU_WEBHOOK_URL=...    # 可选，--feishu 推送
 export ASHARE_DS_HOME=...        # 可选，状态目录，默认 ~/.ashare-ds
@@ -79,5 +80,5 @@ python3 scripts/source_audit.py --watch 600        # 高频轮询压测（盘中
 docs/      SOLUTION.md 总览 · AUTOMATION.md 架构 · DATA_SOURCE_AUDIT.md 实测
 scripts/   source_audit.py 数据源审计
 src/       源码
-tests/     单元测试（303）
+tests/     单元测试（370）
 ```

@@ -253,7 +253,8 @@ curl hq.sinajs.cn/list=sh600519              → http=200   ✅
 
 ```bash
 python3 scripts/source_audit.py --watch 600 --interval 3
-ashare-ds intraday-check --symbols 600519.SH          # 走当前实际在跑的那条路
+ashare-ds intraday-check --symbols 600519.SH                    # 按档位自动选路
+ashare-ds intraday-check --symbols 600519.SH --source sina      # 强制走免费路，用于对比
 ```
 
 看两个数：

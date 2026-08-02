@@ -143,6 +143,35 @@ def test_minute_bars_are_fetched_for_all_symbols_in_one_request() -> None:
     assert notes == []
 
 
+def test_minute_bars_are_unadjusted_because_they_are_quoted_as_order_prices() -> None:
+    """SDK 默认是比例前复权，不是不复权——必须显式指定。
+
+    实测五粮液 21 天 1 分钟线窗口内有除权，最早一根前复权 71.1339、不复权
+    73.6200，差 3.4%。而免费路径（新浪 `adjust=""`）给的是原始价：两条路对同一
+    件事给不同的数，是这类系统里最难查的一种错。简报里那句「价格为不复权实际
+    成交价」也得是真的。
+    """
+    client = FakeClient()
+    TickFlowIntradayAdapter(client).get_minute_bars(["600519.SH"], period="1")
+
+    assert client.klines.calls[0]["adjust"] == "none"
+
+
+def test_history_can_opt_into_adjusted_prices_for_return_studies() -> None:
+    """跨除权比收益率要用复权序列，训练与推理必须同口径。"""
+    client = FakeClient(FakeKlines(pages=[_page(1785000000000, 3), {}]))
+    fetch_minute_history(client, "600519.SH", period="1", adjust="forward")
+
+    assert client.klines.calls[0]["adjust"] == "forward"
+
+
+def test_history_defaults_to_unadjusted_like_the_live_path() -> None:
+    client = FakeClient(FakeKlines(pages=[_page(1785000000000, 3), {}]))
+    fetch_minute_history(client, "600519.SH", period="1")
+
+    assert client.klines.calls[0]["adjust"] == "none"
+
+
 def test_count_is_capped_at_the_server_limit() -> None:
     """服务端单次 5000 根封顶，传更大只是自欺。"""
     client = FakeClient()
