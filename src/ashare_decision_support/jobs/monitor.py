@@ -11,7 +11,7 @@ from datetime import date, datetime
 from typing import Any
 
 from ashare_decision_support.adapters.freshness import in_session
-from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter
+from ashare_decision_support.adapters.tickflow_intraday import build_intraday_adapter
 from ashare_decision_support.monitor import DEFAULT_LEVELS, MonitorSession, run_monitor_loop
 from ashare_decision_support.monitor.session import MONITOR_PERIOD
 from ashare_decision_support.news import AkshareNewsSource, NewsCache
@@ -57,7 +57,7 @@ def run_monitor(
             "notes": ["自选股与候选池都为空，先用 `ashare-ds watchlist add <代码>` 加入标的"],
         }
 
-    source = intraday_adapter or SinaIntradayAdapter()
+    source = intraday_adapter or build_intraday_adapter(adapter)
     session = MonitorSession(
         adapter=adapter,
         intraday_adapter=source,

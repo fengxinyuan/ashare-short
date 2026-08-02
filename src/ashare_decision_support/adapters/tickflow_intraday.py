@@ -313,3 +313,27 @@ def _fmt(stamp_ms: int) -> str:
 
 def _fmt_dt(when: datetime) -> str:
     return when.strftime("%Y-%m-%d %H:%M")
+
+
+# ---- 选路 -----------------------------------------------------------------
+
+
+def build_intraday_adapter(data_adapter: Any = None) -> Any | None:
+    """付费档走 TickFlow 批量，否则退回新浪。取不到任何一路时返回 ``None``。
+
+    放在这里而不是各个 job 里，是因为「什么时候该用付费档」只应该有一个答案。
+    判据用 `supports_intraday` 而不是「有没有 key」——档位是服务端说了算的，
+    适配器连上之后自己知道，猜没有意义。
+    """
+    client = getattr(data_adapter, "client", None)
+    if client is not None and getattr(data_adapter, "supports_intraday", False):
+        return TickFlowIntradayAdapter(client)
+    try:
+        from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter
+    except Exception:
+        return None
+    try:
+        return SinaIntradayAdapter()
+    except Exception:
+        # akshare 没装。分钟线缺了链路仍然能跑（只出日线结构判断），所以不抛。
+        return None

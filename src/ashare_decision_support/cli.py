@@ -23,6 +23,7 @@ from ashare_decision_support.adapters.freshness import check_intraday_freshness
 from ashare_decision_support.adapters.mapping import get_profile, load_profile_from_path
 from ashare_decision_support.adapters.qmt_xtdata import QmtAdapterError, QmtXtDataAdapter
 from ashare_decision_support.adapters.sina_intraday import SUPPORTED_PERIODS, SinaIntradayAdapter
+from ashare_decision_support.adapters.tickflow_intraday import build_intraday_adapter
 from ashare_decision_support.adapters.tickflow_adapter import TickFlowAdapter
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.chat import run_chat
@@ -498,9 +499,11 @@ def main() -> None:
         return
 
     if args.command == "intraday-check":
+        # 付费档就查 TickFlow 那条路，免费档查新浪——盘中时效要测的是**实际在跑
+        # 的那条链路**，拿另一条的读数交差没有意义。
         _dump_json(
             check_intraday_freshness(
-                SinaIntradayAdapter(),
+                build_intraday_adapter(_source_adapter(args)) or SinaIntradayAdapter(),
                 symbols=args.symbols,
                 period=args.period,
                 gap_seconds=args.gap_seconds,

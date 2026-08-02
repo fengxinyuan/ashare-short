@@ -26,7 +26,12 @@ from ashare_decision_support.agents import (
 )
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.journal import Journal
-from ashare_decision_support.journal.records import Recommendation, facts_hash
+from ashare_decision_support.journal.records import (
+    KIND_CONTROL,
+    KIND_RECOMMENDATION,
+    Recommendation,
+    facts_hash,
+)
 from ashare_decision_support.adapters.limit_pool import LimitPoolAdapter
 from ashare_decision_support.adapters.market_scan import MarketScanAdapter
 from ashare_decision_support.adapters.tickflow_market import (
@@ -54,6 +59,7 @@ from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, 
 from ashare_decision_support.screens import AnnouncementScreen, LiquidityScreen, StScreen
 from ashare_decision_support.sectors import SectorPredictor, TickFlowSwTaxonomy
 from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
+from ashare_decision_support.signals.dipbuy import measure_dip
 from ashare_decision_support.state import SOURCE_SCAN, CandidatePool, WatchEntry
 from ashare_decision_support.writer import TemplateWriter, WriteRequest
 from ashare_decision_support.writer.base import BriefWriter
@@ -204,7 +210,7 @@ def run_morning(
     kept, screen_notes = _apply_screens(adapter, shortlist, announcements, market_scan)
     notes.extend(screen_notes)
 
-    candidates = _rank_candidates(
+    candidates, control = _rank_candidates(
         adapter=adapter,
         symbols=kept,
         sector_of={
@@ -241,9 +247,22 @@ def run_morning(
         today, selected, candidates, market, effective_factor, notes, news_as_of,
         limit_snapshot, sector_index,
     )
-    recorded = _record_journal(journal or Journal(), candidates, today, facts)
+    state = _market_state(market, effective_factor, limit_snapshot)
+    recorded = _record_journal(journal or Journal(), candidates, today, facts, state)
+    # 对照组和入选组走同一套记录与兑现流程，只是 kind 不同、不推送、不进候选池。
+    recorded_control = _record_journal(
+        journal or Journal(), control, today, facts, state, kind=KIND_CONTROL
+    )
     if recorded:
-        notes.append(f"{recorded} 条候选已落台账，将在 T+1..T+5 自动核对兑现情况")
+        notes.append(
+            f"{recorded} 条候选已落台账，将在 T+1..T+5 自动核对兑现情况"
+            + (
+                f"；另记 {recorded_control} 条对照组（紧邻落选，只记不推），"
+                "用于事后回答「这套筛选本身有没有用」"
+                if recorded_control
+                else ""
+            )
+        )
 
     # ---- 6. 多空辩论（可关）与发布 -----------------------------------------
     debate_block = ""
@@ -539,8 +558,8 @@ def _rank_candidates(
     news_source: Any | None = None,
     announcements: list[dict] | None = None,
     notes: list[str] | None = None,
-) -> list[dict]:
-    """两段打分：先量价粗排，再对入围票拉个股舆情精排。
+) -> tuple[list[dict], list[dict]]:
+    """两段打分：先量价粗排，再对入围票拉个股舆情精排。返回 (入选, 对照组)。
 
     个股新闻是**每标的一次 HTTP**，对几百只成分股全拉是几分钟的事，为了一个封顶
     ±6 分的读数不值得。所以先用量价把范围收到每个板块 `per_sector × 3` 只，只对
@@ -553,12 +572,12 @@ def _rank_candidates(
     """
     sink = notes if notes is not None else []
     if not symbols:
-        return []
+        return [], []
 
     bars = _fetch_bars(adapter, symbols, today - timedelta(days=CANDIDATE_LOOKBACK_DAYS), today)
     usable = {symbol: rows for symbol, rows in bars.items() if rows}
     if not usable:
-        return []
+        return [], []
 
     snapshots = DailyTechnicalAnalyzer().analyze_many(usable)
     wyckoff = {signal.symbol: signal for signal in WyckoffAnalyzer().analyze_many(usable)}
@@ -597,31 +616,40 @@ def _rank_candidates(
         )
 
     picked: list[dict] = []
+    control: list[dict] = []
     per_sector_count: dict[str, int] = {}
     for result in results:
         sector = sector_of.get(result.symbol, "未分类")
-        if per_sector_count.get(sector, 0) >= per_sector:
-            continue
-        per_sector_count[sector] = per_sector_count.get(sector, 0) + 1
+        over_quota = per_sector_count.get(sector, 0) >= per_sector
+        if not over_quota:
+            per_sector_count[sector] = per_sector_count.get(sector, 0) + 1
+
         snapshot = snapshots.get(result.symbol)
         reading = sentiment.get(result.symbol)
-        picked.append(
-            {
-                "symbol": result.symbol,
-                "name": names.get(result.symbol),
-                "sector": sector,
-                "score": result.score,
-                "reasons": result.reasons,
-                "warnings": result.warnings,
-                "last_close": snapshot.last_close if snapshot else None,
-                "trend_state": snapshot.trend_state.value if snapshot else None,
-                "stop_reference": snapshot.stop_reference if snapshot else None,
-                "target_reference": snapshot.target_reference if snapshot else None,
-                "wyckoff_bias": wyckoff[result.symbol].bias.value if result.symbol in wyckoff else None,
-                "news": reading.to_dict() if reading is not None else None,
-            }
-        )
-    return picked
+        row = {
+            "symbol": result.symbol,
+            "name": names.get(result.symbol),
+            "sector": sector,
+            "score": result.score,
+            "reasons": result.reasons,
+            "warnings": result.warnings,
+            "last_close": snapshot.last_close if snapshot else None,
+            "trend_state": snapshot.trend_state.value if snapshot else None,
+            "stop_reference": snapshot.stop_reference if snapshot else None,
+            "target_reference": snapshot.target_reference if snapshot else None,
+            "wyckoff_bias": wyckoff[result.symbol].bias.value if result.symbol in wyckoff else None,
+            "news": reading.to_dict() if reading is not None else None,
+            # 低吸画像。现在只落台账不参与打分——打分口径要等积累出样本再调，
+            # 但特征必须从第一天就开始记，否则将来无法回头分层。
+            "dip": measure_dip(usable.get(result.symbol) or [], snapshot).to_dict(),
+        }
+        (control if over_quota else picked).append(row)
+
+    # 对照组取和入选组等量的落选样本。等量是为了让两组的统计噪声量级可比；
+    # 取紧挨着的（分数最高的落选者）是因为这才是真正的边缘对照——拿全市场
+    # 垫底的票做对照，差出来的是「好票 vs 烂票」，不是「这套规则有没有用」。
+    control = control[: len(picked)]
+    return picked, control
 
 
 def _take_per_sector(results: list, sector_of: dict[str, str], quota: int) -> list[str]:
@@ -660,7 +688,41 @@ def _fetch_bars(adapter: Any, symbols: list[str], start: date, end: date) -> dic
     return adapter.get_historical_bars(symbols, start, end)
 
 
-def _record_journal(journal: Journal, candidates: list[dict], today: date, facts: dict) -> int:
+def _market_state(market: Any, position_factor: float | None, limit_pool: Any) -> dict[str, Any]:
+    """建议发出当时的大盘快照，原样存进每一条台账记录。
+
+    冗余存储是刻意的：台账是 JSONL，每条多带七八个数比事后按日期 join 便宜得多，
+    而且**记录自带分层维度**意味着任何一段区间的数据都能独立分析，不依赖别的文件
+    还在不在。
+
+    这里的每个字段都对应一个「超短线该不该出手」的判断维度，缺了就没法回答
+    「这套规则在退潮期到底管不管用」。
+    """
+    ok = limit_pool is not None and getattr(limit_pool, "ok", False)
+    return {
+        "direction": getattr(market, "direction", None),
+        "score": getattr(market, "score", None),
+        "breadth": getattr(market, "breadth", None),
+        "position_factor": position_factor,
+        # 情绪周期位置的三个读数。炸板率说今天封板质量，连板高度说有没有资金
+        # 愿意接力，跌停家数说恐慌程度。
+        "blowup_rate": getattr(limit_pool, "blowup_rate", None) if ok else None,
+        "max_streak": getattr(limit_pool, "max_streak", None) if ok else None,
+        "limit_up_count": getattr(limit_pool, "limit_up_count", None) if ok else None,
+        "limit_down_count": getattr(limit_pool, "limit_down_count", None) if ok else None,
+        # 涨停池的数据日期可能早于请求日期（服务端对非交易日返回最近交易日）。
+        "limit_pool_date": str(getattr(limit_pool, "trade_date", "")) or None if ok else None,
+    }
+
+
+def _record_journal(
+    journal: Journal,
+    candidates: list[dict],
+    today: date,
+    facts: dict,
+    market_state: dict[str, Any] | None = None,
+    kind: str = KIND_RECOMMENDATION,
+) -> int:
     """把候选落台账。
 
     参考价与止损/目标都取自**前复权日线**，所以三者同口径，相对百分比有效。
@@ -698,9 +760,12 @@ def _record_journal(journal: Journal, candidates: list[dict], today: date, facts
                 news_polarity=news.get("polarity"),
                 news_intensity=news.get("intensity"),
                 news_doc_count=news.get("doc_count"),
+                dip=item.get("dip") or {},
+                market_state=dict(market_state or {}),
                 reasons=item.get("reasons") or [],
                 warnings=item.get("warnings") or [],
                 facts_hash=digest,
+                kind=kind,
             )
         )
     return journal.record_many(list(records))

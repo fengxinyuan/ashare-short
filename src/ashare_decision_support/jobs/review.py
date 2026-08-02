@@ -67,19 +67,31 @@ def render_review(today: date, result: dict, stats: dict) -> str:
         lines.append(_stat_line(overall))
         lines.append("")
 
-    for title, key in (("按分数分桶", "by_score"), ("按趋势状态", "by_trend"), ("按板块", "by_sector")):
-        rows = [row for row in stats[key] if row["samples"]]
+    lines.extend(_selection_block(stats.get("selection_edge") or {}))
+
+    for title, key in (
+        ("入选 vs 对照", "by_group"),
+        ("按情绪周期（炸板率）", "by_regime"),
+        ("按回调深度", "by_pullback"),
+        ("按分数分桶", "by_score"),
+        ("按趋势状态", "by_trend"),
+        ("按板块", "by_sector"),
+    ):
+        rows = [row for row in stats.get(key) or [] if row["samples"]]
         if not rows:
             continue
         lines.append(f"## {title}")
-        lines.append("| 分组 | 样本 | 先到目标 | 先到止损 | MFE中位 | MAE中位 | 期末为正 |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append(
+            "| 分组 | 样本 | 先到目标 | 先到止损 | MFE中位 | MAE中位 | 次日收盘中位 | 期末为正 |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|")
         for row in sorted(rows, key=lambda item: -item["samples"])[:10]:
             flag = "" if row["trusted"] else " ⚠️"
             lines.append(
                 f"| {row['bucket']}{flag} | {row['samples']} | {_pct(row['target_first_rate'])} | "
                 f"{_pct(row['stop_first_rate'])} | {_pct(row['median_mfe_pct'])} | "
-                f"{_pct(row['median_mae_pct'])} | {_pct(row['positive_close_rate'])} |"
+                f"{_pct(row['median_mae_pct'])} | {_pct(row.get('median_next_close_pct'))} | "
+                f"{_pct(row['positive_close_rate'])} |"
             )
         lines.append("")
         # 小样本照列但标注——把它藏起来只会让人误读那个数字。
@@ -94,6 +106,37 @@ def render_review(today: date, result: dict, stats: dict) -> str:
 
     lines.append(DISCLAIMER)
     return "\n".join(lines)
+
+
+def _selection_block(edge: dict) -> list[str]:
+    """筛选价值：入选组减对照组。
+
+    这是整份报告里唯一直接回答「这套规则有没有用」的一段。单看入选组的绝对
+    收益说明不了任何事——普涨的日子里随便选都赚，差值才把市场本身消掉了。
+    """
+    if not edge.get("available"):
+        return [
+            "## 筛选价值",
+            f"- 暂时算不出：{edge.get('reason', '缺少对照组样本')}。"
+            "对照组是每天紧邻落选的那批票，只记不推，随盘前链路自动积累。",
+            "",
+        ]
+
+    def fmt(value: float | None) -> str:
+        return "—" if value is None else f"{value:+.2%}"
+
+    flag = "" if edge.get("trusted") else " ⚠️"
+    return [
+        f"## 筛选价值（入选 − 对照）{flag}",
+        f"- 入选 {edge['picked_samples']} 条　对照 {edge['control_samples']} 条",
+        f"- 隔夜跳空差 **{fmt(edge.get('next_open_gap'))}**　"
+        f"次日收盘差 **{fmt(edge.get('next_close_gap'))}**",
+        f"- 五日期末差 **{fmt(edge.get('close_gap'))}**　"
+        f"MFE 差 **{fmt(edge.get('mfe_gap'))}**",
+        "- 差值为负说明这套排序不如紧邻的落选样本——那是要改规则的信号，不是要加样本。",
+        "" if edge.get("trusted") else f"> ⚠️ 两组样本各不足 {MIN_BUCKET} 条，差值仅供观察。",
+        "",
+    ]
 
 
 def _stat_line(row: dict) -> str:

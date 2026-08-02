@@ -21,6 +21,7 @@ import pytest
 from ashare_decision_support.adapters.tickflow_intraday import (
     MAX_BARS_PER_REQUEST,
     TickFlowIntradayAdapter,
+    build_intraday_adapter,
     fetch_minute_history,
     to_bars,
 )
@@ -67,8 +68,17 @@ def test_columnar_payload_becomes_one_bar_per_timestamp() -> None:
     bars = to_bars(COMPACT, "600519.SH")
 
     assert len(bars) == 3
-    assert bars[0]["timestamp"] == datetime(2026, 7, 31, 14, 46)
+    assert bars[0]["timestamp"] == datetime(2026, 7, 31, 14, 56)
+    assert bars[-1]["timestamp"] == datetime(2026, 7, 31, 15, 0)
     assert bars[0]["close"] == 1351.54
+
+
+def test_timestamps_are_exchange_local_time() -> None:
+    """毫秒时间戳按 UTC 解会把 15:00 收盘读成 07:00，整条日内形态跟着错位。"""
+    bars = to_bars(COMPACT, "600519.SH")
+
+    assert bars[-1]["timestamp"].hour == 15
+    assert bars[-1]["timestamp"].tzinfo is None      # 与新浪那路同为 naive
 
 
 def test_a_row_shaped_payload_yields_nothing_rather_than_garbage() -> None:
@@ -247,3 +257,32 @@ def test_a_mid_page_failure_keeps_what_was_already_fetched() -> None:
 
     assert len(bars) == 3
     assert any("取数失败" in note for note in notes)
+
+
+# ---- 选路 -----------------------------------------------------------------
+
+
+class PaidAdapter:
+    supports_intraday = True
+
+    def __init__(self) -> None:
+        self.client = FakeClient()
+
+
+class FreeAdapter:
+    supports_intraday = False
+    client = None
+
+
+def test_a_paid_adapter_routes_to_the_batch_endpoint() -> None:
+    assert isinstance(build_intraday_adapter(PaidAdapter()), TickFlowIntradayAdapter)
+
+
+def test_a_free_adapter_does_not_route_to_the_paid_endpoint() -> None:
+    """档位是服务端说了算的，猜不得——`supports_intraday` 为假就必须退回免费路径。"""
+    assert not isinstance(build_intraday_adapter(FreeAdapter()), TickFlowIntradayAdapter)
+
+
+def test_no_adapter_at_all_still_returns_something_or_none_but_never_raises() -> None:
+    """分钟线缺了链路仍要能跑（退化成只出日线结构判断），所以这里不许抛。"""
+    build_intraday_adapter(None)

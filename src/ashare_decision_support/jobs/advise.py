@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ashare_decision_support.advice.engine import AdviceEngine, StockAdvice
-from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter
+from ashare_decision_support.adapters.tickflow_intraday import build_intraday_adapter
 from ashare_decision_support.agents import (
     AgentContext,
     SymbolDailyAgent,
@@ -57,7 +57,7 @@ def run_advise(
     provider = score_provider or RuleBasedScoreProvider()
 
     # ---- 并行采集：日线 || 分时 || 个股舆情 --------------------------------
-    source = intraday_adapter or _default_intraday()
+    source = intraday_adapter or _default_intraday(adapter)
     if source is None:
         notes.append("akshare 不可用，本次无分钟线，价位仅为前复权口径、不可直接挂单")
 
@@ -195,11 +195,10 @@ def run_advise(
     }
 
 
-def _default_intraday() -> Any | None:
-    try:
-        return SinaIntradayAdapter()
-    except Exception:
-        return None
+def _default_intraday(data_adapter: Any = None) -> Any | None:
+    # 付费档走 TickFlow 批量分钟线，免费档退回新浪。选路只有一处，见
+    # `adapters/tickflow_intraday.build_intraday_adapter`。
+    return build_intraday_adapter(data_adapter)
 
 
 def _default_news() -> Any | None:
