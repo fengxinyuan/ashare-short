@@ -1,0 +1,10 @@
+pydantic<3.0,>=2.5
+
+[akshare]
+akshare<2.0,>=1.18
+
+[dev]
+pytest>=9.0
+
+[tickflow]
+tickflow

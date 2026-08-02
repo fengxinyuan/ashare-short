@@ -1,0 +1,16 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+
+# 密钥：只有 .env.tickflow.example 进版本库
+.env
+.env.tickflow
+
+# 运行产物：每次跑都会重生成，进版本库只会制造噪声
+briefs/
+briefs_*/
+tickflow_charts/
+audit_*.json
+tickflow_daily_report.json
+tickflow_smoke.json

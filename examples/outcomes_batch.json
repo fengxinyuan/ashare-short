@@ -1,0 +1,16 @@
+[
+  {
+    "symbol": "300001.SZ",
+    "realized_return_bps": 126.0,
+    "max_favorable_excursion_bps": 188.0,
+    "max_adverse_excursion_bps": -42.0,
+    "note": "开盘后承接确认成功"
+  },
+  {
+    "symbol": "600001.SH",
+    "realized_return_bps": -96.0,
+    "max_favorable_excursion_bps": 12.0,
+    "max_adverse_excursion_bps": -144.0,
+    "note": "高开后承接不足"
+  }
+]

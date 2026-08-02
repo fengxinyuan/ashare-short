@@ -1,0 +1,35 @@
+[
+  {
+    "symbol": "300001.SZ",
+    "signal_mode": "AUC_FOCUS",
+    "route": "MAINLINE",
+    "confidence": 0.808,
+    "fill_difficulty": 0.4133,
+    "expected_edge_bps": 51.77,
+    "suggested_position_band": "10%-15%",
+    "risk_tags": [],
+    "entry_window": "09:24:56-09:24:58",
+    "fallback_window": "09:30:00-09:35:00",
+    "explanation": "竞价成交额、开盘预期与拥挤度处于可接受范围，可优先盯盘。",
+    "source_ts": "2026-07-31T09:24:58",
+    "strategy_version": "v1.0"
+  },
+  {
+    "symbol": "600001.SH",
+    "signal_mode": "AVOID_NOFILL",
+    "route": "PULSE",
+    "confidence": 0.287,
+    "fill_difficulty": 0.875,
+    "expected_edge_bps": -110.61,
+    "suggested_position_band": "0%",
+    "risk_tags": [
+      "LOW_AUCTION_AMOUNT",
+      "NO_FILL_RISK"
+    ],
+    "entry_window": "09:24:56-09:24:58",
+    "fallback_window": "09:30:00-09:35:00",
+    "explanation": "封单拥挤过重，竞价阶段大概率难以成交。",
+    "source_ts": "2026-07-31T09:24:58",
+    "strategy_version": "v1.0"
+  }
+]

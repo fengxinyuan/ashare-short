@@ -1,0 +1,58 @@
+"""Pluggable candidate scoring.
+
+The scoring layer is deliberately thin: it turns per-symbol daily research
+artifacts into a single comparable number plus human-readable reasons. The
+rule-based provider is the default so the pipeline runs without a trained
+model; an alpha-factor / LightGBM provider can be dropped in later by
+implementing the same `ScoreProvider` interface.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, WyckoffSignal
+from ashare_decision_support.news.base import SymbolSentiment
+
+
+@dataclass(frozen=True)
+class ScoreInput:
+    """Everything a provider may look at for one symbol.
+
+    `bars` is kept alongside the derived artifacts so a model-based provider can
+    compute its own features instead of being limited to the rule-based ones.
+
+    `news` is optional and defaults to None, which means "not collected" rather
+    than "collected and neutral" — the rule provider contributes nothing in that
+    case instead of reading absence as a negative.
+    """
+
+    symbol: str
+    bars: list[dict]
+    snapshot: DailyTechnicalSnapshot
+    wyckoff: WyckoffSignal | None = None
+    news: SymbolSentiment | None = None
+
+
+@dataclass(frozen=True)
+class ScoreResult:
+    symbol: str
+    score: float
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+class ScoreProvider(ABC):
+    """Scores a candidate on a 0-100 scale, higher is more attractive."""
+
+    name: str = "base"
+
+    @abstractmethod
+    def score(self, item: ScoreInput) -> ScoreResult:
+        """Score a single symbol."""
+
+    def score_many(self, items: list[ScoreInput]) -> list[ScoreResult]:
+        """Score every symbol, best first. Providers may override for batching."""
+        results = [self.score(item) for item in items]
+        return sorted(results, key=lambda result: result.score, reverse=True)

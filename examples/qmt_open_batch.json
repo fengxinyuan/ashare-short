@@ -1,0 +1,20 @@
+[
+  {
+    "symbol": "300001.SZ",
+    "minutesSinceOpen": 3,
+    "priceVsOpenPct": 0.65,
+    "priceVsVwapPct": 0.42,
+    "volumeRatio": 1.35,
+    "openGapPct": 3.8,
+    "sourceTs": "2026-07-31T09:33:00"
+  },
+  {
+    "symbol": "600001.SH",
+    "minutesSinceOpen": 4,
+    "priceVsOpenPct": -0.55,
+    "priceVsVwapPct": -0.3,
+    "volumeRatio": 0.72,
+    "openGapPct": 6.3,
+    "sourceTs": "2026-07-31T09:33:00"
+  }
+]
