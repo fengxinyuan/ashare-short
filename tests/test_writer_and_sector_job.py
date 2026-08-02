@@ -414,3 +414,71 @@ def test_morning_runs_without_any_news_input(tmp_path) -> None:
 
     assert summary["sectors_selected"] == ["电子"]
     assert any("禁用舆情" in note for note in summary["data_notes"])
+
+
+# ---- 舆情语料库接线 --------------------------------------------------------
+
+
+def test_morning_archives_the_news_it_collected(tmp_path) -> None:
+    """采到的舆情要真的进语料库——否则 `news/store.py` 就是又一个"已具备但没接入"。
+
+    盘前链路是语料库唯一的写入点；不接这里，first_seen 永远没有数据可记。
+    """
+    from ashare_decision_support.news.store import NewsStore
+
+    corpus = NewsStore(tmp_path / "corpus.sqlite3")
+    run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=FakeNewsSource(),
+        top_sectors=1,
+        candidates_per_sector=1,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+        news_store=corpus,
+    )
+
+    stored = corpus.recent(within_hours=24 * 365, by="last_seen")
+    assert [item.title for item in stored] == ["半导体行业订单超预期，芯片涨价"]
+
+
+def test_morning_keeps_first_seen_across_two_runs(tmp_path) -> None:
+    """同一个早上跑两次（改参数重跑很常见），first_seen 必须停在第一次。"""
+    from ashare_decision_support.news.store import NewsStore
+
+    corpus = NewsStore(tmp_path / "corpus.sqlite3")
+    kwargs = dict(
+        adapter=FakeSectorAdapter(), output_dir=tmp_path, news_source=FakeNewsSource(),
+        top_sectors=1, candidates_per_sector=1, notifiers=[], trade_date=date(2026, 8, 1),
+        use_limit_pool=False, use_sector_index=False, use_market_scan=False,
+        news_store=corpus,
+    )
+    run_morning(**kwargs)
+    first = corpus.recent(within_hours=24 * 365, by="last_seen")[0].first_seen_at
+    run_morning(**kwargs)
+    again = corpus.recent(within_hours=24 * 365, by="last_seen")[0]
+
+    assert again.first_seen_at == first
+    assert again.seen_count == 2
+
+
+def test_morning_without_news_touches_no_corpus(tmp_path) -> None:
+    """--no-news 时不该凭空建一个库文件。"""
+    summary = run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        top_sectors=1,
+        candidates_per_sector=1,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_news=False,
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+    )
+
+    assert summary["candidates"] >= 0
+    assert not (tmp_path / "corpus.sqlite3").exists()

@@ -44,6 +44,7 @@ from ashare_decision_support.news import (
     CompositeNewsSource,
     LexiconSentiment,
     NewsCache,
+    NewsStore,
     WallstreetNewsSource,
 )
 from ashare_decision_support.news.llm_classifier import (
@@ -100,6 +101,7 @@ def run_morning(
     use_sector_index: bool = True,
     market_scan_adapter: Any | None = None,
     use_market_scan: bool = True,
+    news_store: Any | None = None,
 ) -> dict[str, Any]:
     output_path = Path(output_dir)
     today = trade_date or date.today()
@@ -132,8 +134,14 @@ def run_morning(
         notes.append("已禁用舆情输入（--no-news），板块排序仅依据量价动量")
 
     ctx = AgentContext(trade_date=today, adapter=adapter, news_source=source)
+    # 语料库跨日累积，所以它归状态目录管，不归 `--output-dir`——后者常常按日期命名，
+    # 那样每天会建一个新库，`first_seen` 就永远等于「今天第一次见到」，这个字段
+    # 的全部意义都没了。
+    corpus = news_store if news_store is not None else (NewsStore() if use_news else None)
     findings = run_agents(
-        [NewsAgent(), SectorMetricsAgent(definitions, all_symbols)], ctx, max_workers=2
+        [NewsAgent(store=corpus), SectorMetricsAgent(definitions, all_symbols)],
+        ctx,
+        max_workers=2,
     )
     for finding in findings.values():
         notes.extend(finding.notes)
