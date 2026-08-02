@@ -38,11 +38,12 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 from ashare_decision_support.adapters.market_scan import MarketRow, MarketScan
 from ashare_decision_support.adapters.snapshot import OrderBookLevel, Snapshot
+from ashare_decision_support.adapters.validate import cross_check
 from ashare_decision_support.symbols import normalize_symbol
 
 # 全 A 标的池 id。TickFlow 的池名不是自解释的：`CN_Equity` / `CN_Equity_All`
@@ -385,7 +386,32 @@ class CompositeMarketScanAdapter:
             f"两路合并：{len(merged)} 只（主源 {len(scan.rows)}、兜底 {len(other.rows)}，"
             f"补齐 PE/PB {filled} 只）"
         )
+        # 合并有个盲区：**两路都有的字段从来没被比过**。主源某个字段悄悄换了量纲、
+        # 喂了昨天的数、或者标的映射错位，合并会照单全收，而兜底那一路就摆在旁边。
+        # 比对只出 note、不改数——合并策略是上面那一段的事，混在一起会让
+        # 「这个数用的是哪一路」变得不可追溯。
+        notes.extend(_cross_check_notes(scan.rows, other.rows))
         return MarketScan(rows=merged, notes=notes, ok=True)
+
+
+# 两路都提供、且量纲上最容易出事的字段。价格类放进来是因为它们是标的映射错位的
+# 最灵敏探针：映射一错，同一个 code 下两路的价格会差出数量级。
+CROSS_CHECKED_FIELDS = ("price", "prev_close", "change_pct", "amount", "volume", "float_cap")
+
+
+def _cross_check_notes(
+    primary: dict[str, MarketRow], fallback: dict[str, MarketRow]
+) -> list[str]:
+    """跨源逐字段比对，返回给简报的说明。任何异常都吞掉——校验挂了不该拖垮取数。"""
+    try:
+        result = cross_check(
+            {code: asdict(row) for code, row in primary.items()},
+            {code: asdict(row) for code, row in fallback.items()},
+            fields=CROSS_CHECKED_FIELDS,
+        )
+        return result.notes()
+    except Exception:
+        return []
 
 
 def _safe_fetch(source: Any) -> MarketScan | None:

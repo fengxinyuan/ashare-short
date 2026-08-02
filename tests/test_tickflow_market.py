@@ -349,3 +349,60 @@ def test_both_dead_is_reported_as_not_ok() -> None:
     ).fetch()
 
     assert merged.ok is False
+
+
+# ---- 跨源校验 -------------------------------------------------------------
+#
+# 合并有个盲区：**两路都有的字段从来没被比过**。主源某个字段悄悄换了量纲、喂了
+# 昨天的数、或者标的映射错位，合并会照单全收，而兜底那一路就摆在旁边。
+# docs/DATA_SOURCES.md 写着「两路逐字段吻合到新浪的取整精度，可以互为校验」——
+# 那是一次手工实测的结论，下面这几条让它变成代码在做的事。
+
+
+def test_a_hundred_fold_unit_gap_between_the_two_paths_is_flagged() -> None:
+    """volume 手/股搞混是记录在案的三处量纲陷阱之一，且**两路都有这个字段**。"""
+    primary = MarketScan(rows={"600519": _row("600519", volume=55128.0)})       # 手
+    fallback = MarketScan(rows={"600519": _row("600519", volume=5512800.0)})    # 股
+
+    merged = CompositeMarketScanAdapter(StubScan(primary), StubScan(fallback)).fetch()
+    notes = " / ".join(merged.notes)
+
+    assert "量纲" in notes
+    assert "bug 不是数据分歧" in notes
+
+
+def test_ordinary_vendor_drift_is_not_reported_as_a_unit_bug() -> None:
+    """两家对同一件事的测量本来就有差（实测相对差最大 0.31%），那不是 bug。"""
+    primary = MarketScan(rows={"600519": _row("600519", amount=7373462600.0)})
+    fallback = MarketScan(rows={"600519": _row("600519", amount=7373462600.0 * 1.002)})
+
+    merged = CompositeMarketScanAdapter(StubScan(primary), StubScan(fallback)).fetch()
+
+    assert not any("量纲" in note for note in merged.notes)
+
+
+def test_agreement_is_stated_so_it_differs_from_never_having_checked() -> None:
+    """只报异常的设计里，「比过了一致」和「根本没比」长得一模一样。"""
+    rows = {"600519": _row("600519", volume=55128.0, amount=7373462600.0)}
+    merged = CompositeMarketScanAdapter(
+        StubScan(MarketScan(rows=dict(rows))), StubScan(MarketScan(rows=dict(rows)))
+    ).fetch()
+
+    assert any("两路一致" in note for note in merged.notes)
+
+
+def test_cross_check_failure_never_breaks_the_fetch() -> None:
+    """校验挂了不该拖垮取数——它是旁证，不是关键路径。"""
+    import ashare_decision_support.adapters.tickflow_market as module
+
+    original = module.cross_check
+    try:
+        module.cross_check = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        merged = CompositeMarketScanAdapter(
+            StubScan(MarketScan(rows={"600519": _row("600519")})),
+            StubScan(MarketScan(rows={"600519": _row("600519")})),
+        ).fetch()
+    finally:
+        module.cross_check = original
+
+    assert merged.ok and len(merged) == 1
