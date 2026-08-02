@@ -28,7 +28,7 @@ SINA_MAX_BARS = 1970
 # measured 1.0 s/symbol serial, 0.19 s/symbol at 8 workers. The monitor loop
 # only closes at that speed, so concurrency here is a requirement rather than
 # an optimisation. Kept modest because sustained polling against Sina has not
-# been rate-limit tested — see docs/AUTOMATION.md §九.
+# been rate-limit tested — see docs/DATA_SOURCES.md §九.
 DEFAULT_WORKERS = 8
 
 SUPPORTED_PERIODS: tuple[str, ...] = ("1", "5", "15", "30", "60")

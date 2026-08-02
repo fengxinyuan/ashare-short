@@ -21,7 +21,7 @@ tickflow = [
 ]
 # Measured 2026-08-01: the free path to 五档盘口 and whole-market snapshots.
 # Optional because nothing in src/ imports them yet — scripts/source_audit.py
-# skips whichever is missing. See docs/DATA_SOURCE_AUDIT.md.
+# skips whichever is missing. See docs/DATA_SOURCES.md.
 quotes = [
   "easyquotation>=0.7",
 ]

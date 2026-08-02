@@ -339,7 +339,7 @@ LEVEL_BADGE = {"ACTION": "🔴", "WARN": "🟠", "INFO": "🔵"}
 
 
 def render_alerts(alerts: list, health) -> str:
-    """Compact alert card. Deliberately template-only — see docs/AUTOMATION.md §六.
+    """Compact alert card. Deliberately template-only — see docs/ARCHITECTURE.md §五.
 
     Every alert carries the as-of timestamp of the bar it was computed from.
     Without it a push is indistinguishable from one built on yesterday's close,

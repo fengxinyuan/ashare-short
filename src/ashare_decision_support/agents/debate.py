@@ -9,7 +9,7 @@
 fact bundle，输出要过 `writer/llm.py:unverified_numbers` 同一套闸门；越界的
 整段丢弃，简报退回模板体。
 
-辩论只在盘前与盘后跑（每天 3 次调用）。盘中告警不走这里——见 docs/AUTOMATION.md §六。
+辩论只在盘前与盘后跑（每天 3 次调用）。盘中告警不走这里——见 docs/ARCHITECTURE.md §五。
 """
 
 from __future__ import annotations

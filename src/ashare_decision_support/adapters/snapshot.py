@@ -13,7 +13,7 @@ impossible:
 - **Order-book depth.** `docs/SOLUTION.md` used to state that five-level depth
   needed the paid tier because 东财's `stock_bid_ask_em` (on the unreachable
   `push2` host) was the only known source. Sina's quote host is reachable and
-  carries bid1-5/ask1-5. See `docs/DATA_SOURCE_AUDIT.md`.
+  carries bid1-5/ask1-5. See `docs/DATA_SOURCES.md`.
 - **Real limit prices.** Tencent returns 涨停价/跌停价 directly, so limit-up
   detection no longer has to approximate with "rose ≥ 9.5%" — an approximation
   that cannot tell a 10% board from a 20% ChiNext/STAR board at all.

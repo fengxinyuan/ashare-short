@@ -497,7 +497,7 @@ class TickFlowAdapter(MarketDataAdapter):
         count = min(max((end - start).days * 2 + 16, 64), 10000)
         # `adjust` is passed explicitly: the SDK default is forward adjustment,
         # which rescales history and makes limit-up/limit-down and tick-size
-        # checks meaningless. See docs/TICKFLOW_LOCAL_SETUP.md.
+        # checks meaningless. See docs/DATA_SOURCES.md.
         return self._try_call(
             get_fn,
             ((symbol,), {"period": "1d", "start_time": start_time, "end_time": end_time, "count": count, "adjust": self.adjust}),
