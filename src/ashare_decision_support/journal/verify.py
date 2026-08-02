@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from ashare_decision_support.journal.records import Outcome
+from ashare_decision_support.journal.records import KIND_RECOMMENDATION, Outcome
 from ashare_decision_support.journal.store import Journal
 
 DEFAULT_HORIZON_SESSIONS = 5
@@ -128,6 +128,12 @@ def _resolve(row: dict, bars: list[dict], today: date, horizon: int) -> Outcome 
     last_close = next(
         (float(bar["close"]) for bar in reversed(forward) if bar.get("close")), None
     )
+
+    # T+1 口径。forward[0] 就是建议发出后的第一个交易日——「买入后第二天卖」
+    # 这条策略的全部收益都落在这一根 bar 里，而 5 日 MFE/MAE 会把它稀释掉。
+    # 开盘单独取：持仓过夜的收益里隔夜跳空常常比日内择时贡献更大，两者不拆开
+    # 就无法归因。
+    t1 = forward[0]
     return Outcome(
         symbol=row["symbol"],
         trade_date=str(trade_date),
@@ -141,11 +147,27 @@ def _resolve(row: dict, bars: list[dict], today: date, horizon: int) -> Outcome 
         mfe_pct=round(max(highs) / base - 1.0, 6),
         mae_pct=round(min(lows) / base - 1.0, 6),
         close_pct=None if last_close is None else round(last_close / base - 1.0, 6),
+        next_open_pct=_relative(t1.get("open"), base),
+        next_high_pct=_relative(t1.get("high"), base),
+        next_low_pct=_relative(t1.get("low"), base),
+        next_close_pct=_relative(t1.get("close"), base),
         score=row.get("score"),
         sector=row.get("sector"),
         trend_state=row.get("trend_state"),
         wyckoff_bias=row.get("wyckoff_bias"),
+        rec_kind=row.get("kind") or KIND_RECOMMENDATION,
+        dip=row.get("dip") or {},
+        market_state=row.get("market_state") or {},
     )
+
+
+def _relative(value: Any, base: float) -> float | None:
+    if value is None or not base:
+        return None
+    try:
+        return round(float(value) / base - 1.0, 6)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
 
 
 def _level(pct: Any, base: float) -> float | None:

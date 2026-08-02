@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from ashare_decision_support.journal.records import (
+    KIND_CONTROL,
     KIND_OUTCOME,
     KIND_RECOMMENDATION,
+    VERIFIABLE_KINDS,
     Outcome,
     Recommendation,
 )
@@ -59,11 +61,18 @@ class Journal:
     def recommendations(self, since: date | None = None, until: date | None = None) -> list[dict]:
         return [row for row in self.rows(since, until) if row.get("kind") == KIND_RECOMMENDATION]
 
+    def controls(self, since: date | None = None, until: date | None = None) -> list[dict]:
+        return [row for row in self.rows(since, until) if row.get("kind") == KIND_CONTROL]
+
     def outcomes(self, since: date | None = None, until: date | None = None) -> list[dict]:
         return [row for row in self.rows(since, until) if row.get("kind") == KIND_OUTCOME]
 
     def pending(self, today: date, min_age_days: int = 1, lookback_days: int = 60) -> list[dict]:
-        """待核对的建议：已过至少一个交易日，且还没有兑现记录。"""
+        """待核对的记录：已过至少一个交易日，且还没有兑现记录。
+
+        **对照组也在内。** 只核对推荐、不核对对照，等于把对照组记了个寂寞——
+        没有对照的兑现数据就算不出「入选 vs 落选」的收益差。
+        """
         rows = self.rows(since=today - timedelta(days=lookback_days), until=today)
         resolved = {
             f"{row.get('symbol')}|{row.get('trade_date')}|{row.get('source')}"
@@ -73,7 +82,7 @@ class Journal:
         pending: list[dict] = []
         seen: set[str] = set()
         for row in rows:
-            if row.get("kind") != KIND_RECOMMENDATION:
+            if row.get("kind") not in VERIFIABLE_KINDS:
                 continue
             key = f"{row.get('symbol')}|{row.get('trade_date')}|{row.get('source')}"
             day = _parse_date(row.get("trade_date"))

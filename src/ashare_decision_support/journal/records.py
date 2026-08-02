@@ -1,4 +1,12 @@
-"""台账记录的两种形态：建议（当时）与兑现（事后）。"""
+"""台账记录的两种形态：建议（当时）与兑现（事后）。
+
+**对照组。** 建议分两类：`recommendation` 是真的推给你的，`control` 是同一轮
+筛选里紧挨着落选的那些——不推送、不进候选池，**只记录**。没有它，台账里全是
+正样本，永远回答不了「筛选规则本身有没有用」：入选组次日平均涨 1.2% 听起来
+不错，但如果落选组涨 1.4%，这套规则就是负价值。两组都记，差值才有意义。
+
+对照组和建议走**完全相同的兑现流程**，`Outcome.rec_kind` 保留它来自哪一组。
+"""
 
 from __future__ import annotations
 
@@ -9,7 +17,11 @@ from datetime import date
 from typing import Any
 
 KIND_RECOMMENDATION = "recommendation"
+KIND_CONTROL = "control"
 KIND_OUTCOME = "outcome"
+
+# 会被兑现流程核对的两类记录。对照组必须在内，否则它记了也白记。
+VERIFIABLE_KINDS = (KIND_RECOMMENDATION, KIND_CONTROL)
 
 
 @dataclass
@@ -43,6 +55,14 @@ class Recommendation:
     news_polarity: float | None = None
     news_intensity: float | None = None
     news_doc_count: int | None = None
+    # 低吸画像（`signals/dipbuy.py`）。回撤深度、缩量程度、距支撑距离——这几个数
+    # 决定了「这是不是一个低吸位置」，而它们此前完全没有被记录过。
+    dip: dict[str, Any] = field(default_factory=dict)
+    # 建议发出当时的**大盘状态**。此前台账 24 个字段全是个股维度，一个都没记
+    # 当天市场什么样，后果是三个月后有了几百条记录却**无法按情绪周期分层**——
+    # 而这恰恰是超短最重要的分层维度。同一套规则在退潮期和启动期的期望值可以
+    # 是反号的，混在一起统计只会得到一个谁都不像的平均数。
+    market_state: dict[str, Any] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     facts_hash: str | None = None
@@ -100,7 +120,17 @@ class Recommendation:
 
 @dataclass
 class Outcome:
-    """建议发出后 N 个交易日里实际发生了什么。"""
+    """建议发出后 N 个交易日里实际发生了什么。
+
+    **两套口径并存，因为持有期本身还没有定论。** T+5 的 MFE/MAE 对应低吸的
+    自然持有期（等回调结束→反弹到前高，通常 2–5 日）；`next_*` 三个数对应
+    「次日就卖」。哪一种更适合这套规则，现在拍板都是猜——两个都记下来，等
+    样本够了让数据回答。
+
+    `next_open_pct` 单独拿出来是有原因的：持仓过夜的收益里，隔夜跳空往往比
+    日内择时贡献大得多。把跳空和日内分开记，才能归因到底是选股选对了，还是
+    单纯吃到了普涨。
+    """
 
     symbol: str
     trade_date: str
@@ -114,10 +144,21 @@ class Outcome:
     mfe_pct: float | None  # 最大有利偏移
     mae_pct: float | None  # 最大不利偏移
     close_pct: float | None  # 期末收益
+    # T+1 口径：隔夜跳空、次日最高（当天能卖到的最好价）、次日收盘
+    next_open_pct: float | None = None
+    next_high_pct: float | None = None
+    next_low_pct: float | None = None
+    next_close_pct: float | None = None
     score: float | None = None
     sector: str | None = None
     trend_state: str | None = None
     wyckoff_bias: str | None = None
+    # 来自建议还是对照组。少了这个字段，两组数据混在一起就再也分不开。
+    rec_kind: str = KIND_RECOMMENDATION
+    # 特征与市场状态原样带过来，让一条兑现记录自带全部分层维度，统计时不必回头
+    # 关联建议记录。台账是 JSONL，冗余几个字段远比 join 便宜。
+    dip: dict[str, Any] = field(default_factory=dict)
+    market_state: dict[str, Any] = field(default_factory=dict)
     note: str | None = None
     kind: str = KIND_OUTCOME
 
