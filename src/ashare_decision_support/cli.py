@@ -157,6 +157,18 @@ def build_parser() -> argparse.ArgumentParser:
     watch_sub.add_parser("list", help="列出自选与今日候选池")
     watch_sub.add_parser("clear", help="清空自选")
 
+    # 持仓状态：决定这只票该被盯买点还是盯卖点。系统只出建议，不下单——
+    # 这些字段全部手工维护。
+    watch_hold = watch_sub.add_parser("hold", help="标记为已持仓（盯卖点）")
+    watch_hold.add_argument("symbol")
+    watch_hold.add_argument("--cost", type=float, required=True, help="成本价")
+    watch_hold.add_argument("--shares", type=int, help="股数")
+    watch_hold.add_argument("--opened-on", help="建仓日 YYYY-MM-DD，默认今天")
+    watch_hold.add_argument("--stop", type=float, help="你自己定的止损，优先于系统值")
+    watch_hold.add_argument("--target", type=float, help="你自己定的目标")
+    watch_close = watch_sub.add_parser("close", help="清掉持仓状态，仍留在自选")
+    watch_close.add_argument("symbols", nargs="+")
+
     # ================= 台账与复盘 =================
 
     review = subparsers.add_parser("review", help="兑现核对：T+1..T+5 对照实际走势，并出统计")
@@ -522,9 +534,25 @@ def _watchlist_command(args) -> dict:
     if args.action == "clear":
         return {"cleared": book.clear(), "total": 0}
 
+    if args.action == "hold":
+        entry = book.set_position(
+            args.symbol,
+            cost_price=args.cost,
+            shares=args.shares,
+            opened_on=date.fromisoformat(args.opened_on) if args.opened_on else None,
+            plan_stop=args.stop,
+            plan_target=args.target,
+        )
+        return {"holding": entry.to_dict(), "total_holdings": len(book.holdings())}
+
+    if args.action == "close":
+        closed = [symbol for symbol in args.symbols if book.close_position(symbol)]
+        return {"closed": closed, "total_holdings": len(book.holdings())}
+
     pool = CandidatePool()
     return {
         "watchlist": [entry.to_dict() for entry in book.entries],
+        "holdings": [entry.symbol for entry in book.holdings()],
         "candidates": [entry.to_dict() for entry in pool.entries],
         "candidates_trade_date": pool.trade_date,
         "candidates_stale": pool.stale,

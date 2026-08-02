@@ -29,6 +29,16 @@ SOURCE_SCAN = "sector-scan"
 
 @dataclass
 class WatchEntry:
+    """自选股的一条。
+
+    **持仓状态决定这条记录该被怎么监控。** 同一只票，没持仓时要盯的是买点
+    （进入区间 → 止跌确认），已持仓时要盯的是卖点（止损、目标、结构破坏、
+    时间止损）——两套判断的输入、阈值和紧急程度都不同。没有 `cost_price`
+    就给不出「你已经浮盈 4%，跌破 X 该走」这类建议，只能报绝对价位。
+
+    系统只出建议，不下单、不接管账户，所以这些字段全部由人手工填写维护。
+    """
+
     symbol: str
     name: str | None = None
     sector: str | None = None
@@ -36,6 +46,13 @@ class WatchEntry:
     note: str | None = None
     added_on: str | None = None
     score: float | None = None
+    # ---- 持仓状态（人工维护）------------------------------------------------
+    holding: bool = False
+    cost_price: float | None = None
+    shares: int | None = None
+    opened_on: str | None = None      # 建仓日，时间止损从这天算起
+    plan_stop: float | None = None    # 你自己定的止损，优先于系统算出来的
+    plan_target: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -50,7 +67,30 @@ class WatchEntry:
             note=payload.get("note"),
             added_on=payload.get("added_on"),
             score=payload.get("score"),
+            # 老文件没有这些键，缺省即「未持仓」——读旧 watchlist.json 不会炸。
+            holding=bool(payload.get("holding")),
+            cost_price=payload.get("cost_price"),
+            shares=payload.get("shares"),
+            opened_on=payload.get("opened_on"),
+            plan_stop=payload.get("plan_stop"),
+            plan_target=payload.get("plan_target"),
         )
+
+    @property
+    def held_days(self) -> int | None:
+        """持仓自然日数。时间止损用它，不精确到交易日——差一两天不影响判断。"""
+        if not self.holding or not self.opened_on:
+            return None
+        try:
+            return (date.today() - date.fromisoformat(str(self.opened_on))).days
+        except (TypeError, ValueError):
+            return None
+
+    def unrealised_pct(self, price: float | None) -> float | None:
+        """浮动盈亏。没有成本价就返回 None，不猜。"""
+        if not self.holding or not self.cost_price or not price:
+            return None
+        return round(float(price) / float(self.cost_price) - 1.0, 6)
 
 
 @dataclass
@@ -130,6 +170,49 @@ class Watchlist(_EntryList):
         self.entries.remove(entry)
         self.save()
         return True
+
+    def set_position(
+        self,
+        symbol: str,
+        cost_price: float,
+        shares: int | None = None,
+        opened_on: date | None = None,
+        plan_stop: float | None = None,
+        plan_target: float | None = None,
+        today: date | None = None,
+    ) -> WatchEntry:
+        """标记为已持仓。标的不在自选股里就先加进去——你买了它，它当然该被盯着。"""
+        entry = self.get(symbol)
+        if entry is None:
+            entry, _ = self.add(symbol, today=today)
+        entry.holding = True
+        entry.cost_price = float(cost_price)
+        entry.shares = shares if shares is None else int(shares)
+        entry.opened_on = str(opened_on or today or date.today())
+        if plan_stop is not None:
+            entry.plan_stop = float(plan_stop)
+        if plan_target is not None:
+            entry.plan_target = float(plan_target)
+        self.save()
+        return entry
+
+    def close_position(self, symbol: str) -> bool:
+        """清掉持仓状态，但**保留在自选股里**——卖掉不等于不再关注。"""
+        entry = self.get(symbol)
+        if entry is None or not entry.holding:
+            return False
+        entry.holding = False
+        entry.cost_price = None
+        entry.shares = None
+        entry.opened_on = None
+        self.save()
+        return True
+
+    def holdings(self) -> list[WatchEntry]:
+        return [entry for entry in self.entries if entry.holding]
+
+    def unheld(self) -> list[WatchEntry]:
+        return [entry for entry in self.entries if not entry.holding]
 
     def clear(self) -> int:
         count = len(self.entries)

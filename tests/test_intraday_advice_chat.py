@@ -222,13 +222,18 @@ def test_stop_sits_below_the_session_low() -> None:
     assert advice.stop < advice.entry_low
 
 
-def test_daily_levels_are_converted_into_raw_price_space() -> None:
-    """Adjusted daily levels quoted as order prices are simply wrong."""
+def test_levels_are_rescaled_by_whatever_the_alignment_factor_says() -> None:
+    """比例乘法本身保留着，即便实盘上这个比值恒等于 1.0。
+
+    2026-08-02 实测 400 只，日线（比例前复权）最新一根与分钟线现价的比值偏离
+    1.0 超过 0.1% 的有 0 只——因为比例前复权锚定最新一根，两条序列本来就同尺度。
+    乘法留在这里是为了将来万一换成后复权口径时，改一个函数就够了。
+    """
     rows = minute_rows("2026-07-31", 48, start_price=100.0, step=0.1)
     intraday = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(rows))
     assert intraday is not None
 
-    # Daily series is adjusted to half the real price; resistance 60 -> 120.
+    # 日线序列被压到实际价格的一半，压力位 60 应当被还原成 120。
     daily = daily_snapshot(intraday.last_price / 2, supports=[45.0], resistances=[60.0])
     advice = AdviceEngine().build("600519.SH", daily, intraday)
 
@@ -236,7 +241,21 @@ def test_daily_levels_are_converted_into_raw_price_space() -> None:
     assert any(abs(target - 120.0) < 1.0 for target in advice.targets)
 
 
+def test_a_real_forward_adjusted_series_needs_no_conversion_at_all() -> None:
+    """实盘口径下比值就是 1.0，价位原样发出，不该被悄悄改动。"""
+    rows = minute_rows("2026-07-31", 48, start_price=100.0, step=0.1)
+    intraday = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(rows))
+    assert intraday is not None
+
+    # 比例前复权：最新一根 == 现价，历史位已在今天的尺度上。
+    daily = daily_snapshot(intraday.last_price, supports=[95.0], resistances=[108.0])
+    advice = AdviceEngine().build("600519.SH", daily, intraday)
+
+    assert any(abs(target - 108.0) < 1e-6 for target in advice.targets)
+
+
 def test_absurd_price_scale_disables_daily_levels_instead_of_lying() -> None:
+    """比值离谱 = 两份数据根本不是同一只票的同一天，此时一个价位都不该发。"""
     rows = minute_rows("2026-07-31", 48, start_price=100.0, step=0.1)
     intraday = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(rows))
     assert intraday is not None
@@ -244,7 +263,7 @@ def test_absurd_price_scale_disables_daily_levels_instead_of_lying() -> None:
     daily = daily_snapshot(0.5, supports=[0.4], resistances=[0.6])  # factor ~200x
     advice = AdviceEngine().build("600519.SH", daily, intraday)
 
-    assert any("无法对齐" in warning for warning in advice.warnings)
+    assert any("对不上" in warning for warning in advice.warnings)
 
 
 def test_advice_explains_why_there_is_no_target() -> None:
