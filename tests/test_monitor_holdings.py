@@ -245,3 +245,107 @@ def test_holding_alerts_sort_ahead_of_candidate_alerts() -> None:
     )
     assert text.index("建设银行") < text.index("候选票")
     assert "【持仓】" in text
+
+
+# ---- L3 止跌确认：进入区间不等于可以买 --------------------------------------
+
+
+def minutes(prices, volumes=None, span=0.004):
+    vols = volumes or [1000.0] * len(prices)
+    return [
+        {"high": p * (1 + span), "low": p * (1 - span), "close": p, "volume": v}
+        for p, v in zip(prices, vols)
+    ]
+
+
+def test_a_falling_tape_is_not_confirmed_however_deep_it_has_gone() -> None:
+    """下跌途中的任何一点都「回调到位过」。接刀和低吸的区别只在于跌势有没有停。"""
+    from ashare_decision_support.signals.stabilise import assess_stabilisation
+
+    falling = [100.0 - i * 0.3 for i in range(40)]
+    reading = assess_stabilisation(minutes(falling))
+
+    assert reading.confirmed is False
+    assert reading.insufficient is False
+    assert "创新低" in reading.reason
+
+
+def test_volume_drying_up_without_new_lows_counts_as_stabilising() -> None:
+    """卖压自然衰竭：没人急着出了。"""
+    from ashare_decision_support.signals.stabilise import (
+        PATTERN_CONTRACTION, assess_stabilisation,
+    )
+
+    prices = [100.0 - i * 0.4 for i in range(20)] + [92.2 + i * 0.01 for i in range(15)]
+    vols = [3000.0] * 20 + [600.0] * 15
+    reading = assess_stabilisation(minutes(prices, vols))
+
+    assert reading.confirmed is True
+    assert reading.pattern == PATTERN_CONTRACTION
+    assert reading.volume_contraction < 0.7
+
+
+def test_a_volume_reversal_bar_confirms_immediately() -> None:
+    """有资金主动买回来——比缩量止跌更硬的信号。"""
+    from ashare_decision_support.signals.stabilise import (
+        PATTERN_REVERSAL, assess_stabilisation,
+    )
+
+    prices = [100.0 - i * 0.2 for i in range(34)] + [98.0]
+    vols = [1000.0] * 34 + [5000.0]
+    reading = assess_stabilisation(minutes(prices, vols))
+
+    assert reading.confirmed is True
+    assert reading.pattern == PATTERN_REVERSAL
+
+
+def test_insufficient_data_is_not_reported_as_no_signal() -> None:
+    """把「不知道」当成「没有」，会在数据源出问题时静默地不再产生任何买点。"""
+    from ashare_decision_support.signals.stabilise import assess_stabilisation
+
+    reading = assess_stabilisation(minutes([100.0] * 5))
+    assert reading.insufficient is True
+    assert reading.confirmed is False
+    assert "不足" in reading.describe()
+
+    assert assess_stabilisation([]).insufficient is True
+
+
+def test_entering_the_band_without_stabilisation_is_downgraded() -> None:
+    """未止跌时按 ACTION 发，会在一路向下的过程中连着响，每次都像机会。"""
+    from ashare_decision_support.signals.stabilise import Stabilisation
+
+    engine, state = TriggerEngine(), AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[12.0], entry=(10.0, 10.6))
+    unconfirmed = Stabilisation(confirmed=False, reason="刚创新低")
+
+    fire(engine, state, advice, Intraday(11.0))  # 区间上方，建立基线
+    alerts = engine.evaluate(
+        advice=advice, intraday=Intraday(10.3), state=state, now=NOW,
+        stabilisation=unconfirmed,
+    )
+
+    assert [a.trigger for a in alerts] == ["entry_watch"]
+    assert alerts[0].level == "WARN"
+
+
+def test_stabilising_inside_the_band_is_the_actual_buy_signal() -> None:
+    """低吸最典型的顺序是先跌进来、再等企稳。只看「进入区间」那一刻会永远错过它。"""
+    from ashare_decision_support.signals.stabilise import Stabilisation
+
+    engine, state = TriggerEngine(), AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[12.0], entry=(10.0, 10.6))
+
+    # 进区间时还没止跌
+    fire(engine, state, advice, Intraday(11.0))
+    engine.evaluate(advice=advice, intraday=Intraday(10.3), state=state, now=NOW,
+                    stabilisation=Stabilisation(confirmed=False, reason="刚创新低"))
+    # 仍在区间内，随后出现止跌
+    alerts = engine.evaluate(
+        advice=advice, intraday=Intraday(10.35), state=state, now=NOW,
+        stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
+    )
+
+    triggers = [a.trigger for a in alerts]
+    assert "entry_confirmed" in triggers
+    assert next(a for a in alerts if a.trigger == "entry_confirmed").level == "ACTION"

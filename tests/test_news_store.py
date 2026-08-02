@@ -52,11 +52,31 @@ def test_a_story_carried_three_days_is_distinguishable_from_a_brand_new_one(tmp_
     corpus.ingest([old], TODAY, now=MORNING)
     corpus.ingest([doc("突发：某公司获大额订单")], TODAY, now=MORNING)
 
-    by_title = {item.title: item for item in corpus.recent(now=MORNING)}
+    # 「现在还在被说的是什么」——三天前那条今天又被转了一次，所以它在。
+    by_title = {item.title: item for item in corpus.recent(now=MORNING, by="last_seen")}
     assert by_title["某公司拟收购标的资产"].age_hours(MORNING) == 72.0
     assert by_title["突发：某公司获大额订单"].age_hours(MORNING) == 0.0
     assert by_title["突发：某公司获大额订单"].is_fresh(MORNING)
     assert not by_title["某公司拟收购标的资产"].is_fresh(MORNING)
+
+
+def test_the_two_recency_clocks_answer_different_questions(tmp_path) -> None:
+    """「有什么新消息」和「现在还在被说什么」不是同一个问题。
+
+    一个两天前爆出、至今仍在发酵的故事，正是现在推动板块的那个。按 first_seen
+    切窗口会把它滤掉，让「这个板块最近什么消息」答出一片空白。
+    """
+    corpus = store(tmp_path)
+    still_running = doc("两天前爆出、至今仍在发酵")
+    corpus.ingest([still_running], TODAY, now=MORNING - timedelta(days=2))
+    corpus.ingest([still_running], TODAY, now=MORNING)
+    corpus.ingest([doc("刚出现")], TODAY, now=MORNING)
+
+    fresh_only = [d.title for d in corpus.recent(now=MORNING, by="first_seen")]
+    circulating = [d.title for d in corpus.recent(now=MORNING, by="last_seen")]
+
+    assert fresh_only == ["刚出现"]
+    assert set(circulating) == {"刚出现", "两天前爆出、至今仍在发酵"}
 
 
 def test_dedup_key_matches_the_batch_layer(tmp_path) -> None:
@@ -219,3 +239,52 @@ def test_a_schema_bump_rebuilds_rather_than_mixing_old_rows(tmp_path) -> None:
         assert rebuilt.recent(now=MORNING) == []
     finally:
         store_module.SCHEMA_VERSION = original
+
+
+# ---- 接线：NewsAgent 采完就入库 --------------------------------------------
+
+
+class StubSource:
+    """只回固定几条，用来验证跨轮次的累积行为。"""
+
+    def __init__(self, titles: list[str]) -> None:
+        self.titles = titles
+
+    def fetch_market(self, trade_date, limit: int = 200):
+        return [doc(title, published=f"{trade_date} 09:30:00") for title in self.titles], []
+
+    def fetch_announcements(self, trade_date):
+        return [], []
+
+    def fetch_dragon_tiger(self, start, end):
+        return [], []
+
+
+def test_the_news_agent_archives_what_it_collects(tmp_path) -> None:
+    """08:00 采一轮、盘中再采一轮，语料库要能看出第二轮里哪些是新的。"""
+    from ashare_decision_support.agents.base import AgentContext
+    from ashare_decision_support.agents.collectors import NewsAgent
+
+    corpus = store(tmp_path)
+    ctx = AgentContext(trade_date=TODAY, news_source=StubSource(["消息甲", "消息乙"]))
+    first = NewsAgent(now=MORNING, store=corpus).run(ctx)
+    assert any("新增 2 条" in note for note in first[1])
+
+    ctx2 = AgentContext(trade_date=TODAY, news_source=StubSource(["消息甲", "消息丙"]))
+    _, notes = NewsAgent(now=MORNING + timedelta(hours=4), store=corpus).run(ctx2)
+
+    assert any("新增 1 条、重复 1 条" in note for note in notes)
+    assert corpus.first_seen(doc("消息甲")) == MORNING
+    assert corpus.first_seen(doc("消息丙")) == MORNING + timedelta(hours=4)
+
+
+def test_the_news_agent_runs_unchanged_without_a_store() -> None:
+    """默认关着：测试与一次性脚本不该因为多了语料库而要准备 SQLite 文件。"""
+    from ashare_decision_support.agents.base import AgentContext
+    from ashare_decision_support.agents.collectors import NewsAgent
+
+    ctx = AgentContext(trade_date=TODAY, news_source=StubSource(["消息甲"]))
+    data, notes = NewsAgent(now=MORNING).run(ctx)
+
+    assert len(data["docs"]) == 1
+    assert not any("入库" in note for note in notes)

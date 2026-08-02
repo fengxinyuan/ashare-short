@@ -282,15 +282,24 @@ class NewsStore:
         symbol: str | None = None,
         now: datetime | None = None,
         limit: int = 50,
+        by: str = "first_seen",
     ) -> list[StoredDoc]:
-        """按 `first_seen_at` 倒序取最近的文档。
+        """最近的文档，按 `first_seen_at` 倒序（新故事在最上面）。
 
-        按 first_seen 而不是 published 排序是刻意的：问「最近有什么新消息」时，
-        要的是**系统最近知道了什么**。一条三天前发布、刚被某个源翻出来转发的东西
-        排在前面是对的——它确实是刚进入视野的信息。
+        `by` 选的是**窗口按哪个时钟切**，两个问题不一样，都得答得了：
+
+        - `first_seen`（默认）——「有什么**新**消息」。三天前进来、今天还在转的
+          那条不算新，落在窗口外。
+        - `last_seen`——「现在还在被说的是什么」。上面那条会回来，而且它的
+          `age_hours` 会如实报出 72 小时，不会伪装成刚出现。
+
+        默认选 first_seen 是因为盘前盘中问得最多的是前者；但板块研判要的往往是
+        后者——一个两天前爆出、至今仍在发酵的故事，正是现在推动板块的那个，把它
+        滤掉会让「这个板块最近什么消息」答出一片空白。
         """
         if not self.ok:
             return []
+        column = "last_seen_at" if by == "last_seen" else "first_seen_at"
         stamp = now or datetime.now()
         floor = (stamp - timedelta(hours=within_hours)).isoformat(timespec="seconds")
 
@@ -302,7 +311,7 @@ class NewsStore:
         if symbol:
             sql.append("JOIN doc_symbols y ON y.key = d.key AND y.symbol = ?")
             params.append(symbol)
-        sql.append("WHERE d.first_seen_at >= ? ORDER BY d.first_seen_at DESC LIMIT ?")
+        sql.append(f"WHERE d.{column} >= ? ORDER BY d.first_seen_at DESC LIMIT ?")
         params.extend([floor, max(1, int(limit))])
 
         try:

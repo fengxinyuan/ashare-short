@@ -38,9 +38,17 @@ class NewsAgent:
 
     name = "news"
 
-    def __init__(self, now: datetime | None = None, half_life_hours: float = DEFAULT_HALF_LIFE_HOURS) -> None:
+    def __init__(
+        self,
+        now: datetime | None = None,
+        half_life_hours: float = DEFAULT_HALF_LIFE_HOURS,
+        store: Any = None,
+    ) -> None:
         self.now = now
         self.half_life_hours = half_life_hours
+        # 语料库。默认关着：`morning` 等长期跑的链路显式传一个进来，测试与
+        # 一次性脚本保持原样，不会因为多了这一层而需要准备 SQLite 文件。
+        self.store = store
 
     def run(self, ctx: AgentContext) -> tuple[dict, list[str]]:
         source = ctx.news_source
@@ -80,6 +88,11 @@ class NewsAgent:
         )
         notes.extend(weigh_notes)
 
+        # 入库在**去重之后**：批内重复的合并掉再入，库里的 seen_count 才是
+        # 「这条被采集到过几轮」，而不是「这一轮有几个源转了它」——后者由
+        # doc_sources 单独数。入库失败只记 note，不影响本轮任何读数。
+        notes.extend(self._archive(weighted, ctx))
+
         return (
             {
                 "docs": weighted,
@@ -90,6 +103,19 @@ class NewsAgent:
             },
             notes,
         )
+
+    def _archive(self, docs: list[NewsDoc], ctx: AgentContext) -> list[str]:
+        """写进持久语料库，并报告这批里有多少是真的新出现的。
+
+        `store=None` 时整段跳过——测试与一次性脚本不该因为多了一个语料库而
+        需要准备一个 SQLite 文件。
+        """
+        if self.store is None or not docs:
+            return []
+        stamp = self.now or datetime.now()
+        result = self.store.ingest(docs, ctx.trade_date, now=stamp)
+        _, fresh_notes = self.store.annotate_freshness(docs, now=stamp)
+        return result.notes + fresh_notes
 
 
 class SymbolNewsAgent:

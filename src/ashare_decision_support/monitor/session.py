@@ -21,6 +21,7 @@ from ashare_decision_support.monitor.triggers import DEFAULT_LEVELS, Alert, Trig
 from ashare_decision_support.screens import AnnouncementScreen
 from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
 from ashare_decision_support.signals.intraday import IntradayAnalyzer
+from ashare_decision_support.signals.stabilise import assess_stabilisation
 from ashare_decision_support.state.alerts import AlertState
 from ashare_decision_support.symbols import bare_code, normalize_symbol
 
@@ -195,6 +196,11 @@ class MonitorSession:
             )
             armed = self._apply_pinned_levels(advice, snapshot, now)
             holding = self.holdings.get(symbol)
+            # 止跌确认只对**未持仓**的票算：已持仓要回答的是什么时候卖，
+            # 「跌势停了没有」对它不是进场问题。顺带省掉一半计算。
+            stabilisation = (
+                assess_stabilisation(bars.get(symbol) or []) if holding is None else None
+            )
             alerts.extend(
                 self.engine.evaluate(
                     advice=advice,
@@ -205,6 +211,7 @@ class MonitorSession:
                     risk_note=self.risk_notes.get(bare_code(symbol)),
                     armed=armed,
                     holding=holding,
+                    stabilisation=stabilisation,
                     # 结构支撑取日线的止损参考位——它已经带了最小距离约束
                     # （`signals/daily_technical.py`），不会贴着现价。
                     daily_support=(

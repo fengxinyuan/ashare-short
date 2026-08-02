@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+from ashare_decision_support.screening.limit_order import LimitScan, scan_limit_rules
 from ashare_decision_support.screening.suitability import (
     ScreenConfig,
     SuitabilityCard,
@@ -39,6 +40,7 @@ class ScreenReport:
     funnel: dict[str, int] = field(default_factory=dict)
     passed: list[SuitabilityCard] = field(default_factory=list)
     unstable: list[SuitabilityCard] = field(default_factory=list)
+    limit_scans: list[LimitScan] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self, top: int = 30) -> dict[str, Any]:
@@ -49,6 +51,7 @@ class ScreenReport:
             "funnel": self.funnel,
             "passed": [card.to_dict() for card in self.passed[:top]],
             "unstable": [card.to_dict() for card in self.unstable[:top]],
+            "limit_scans": [scan.to_dict() for scan in self.limit_scans[:top]],
             "notes": self.notes,
         }
 
@@ -73,7 +76,39 @@ class ScreenReport:
                 f"择时溢价 {_pct(card.capture.timing_premium)}  "
                 f"可执行占比 {_ratio(card.capture.executable_ratio)}"
             )
+        lines.extend(self._limit_lines(top))
         lines.extend(self.notes)
+        return lines
+
+    def _limit_lines(self, top: int) -> list[str]:
+        """限价单扫描摘要。
+
+        只列 `pass` 和 `unstable`：`reject` 的含义是「样本内最优参数都覆盖不了成本」，
+        逐只列出来只会刷屏，它们的数量已经在下面那行汇总里。
+        """
+        if not self.limit_scans:
+            return []
+        survivors = [scan for scan in self.limit_scans if scan.verdict != "reject"]
+        lines = [
+            "",
+            f"限价单扫描：{len(self.limit_scans)} 只可交易标的，"
+            f"通过 {sum(1 for s in self.limit_scans if s.verdict == 'pass')} 只，"
+            f"样本外不稳 {sum(1 for s in self.limit_scans if s.verdict == 'unstable')} 只，"
+            f"样本内就没有正期望参数 {sum(1 for s in self.limit_scans if s.verdict == 'reject')} 只",
+        ]
+        for scan in survivors[:top]:
+            best = scan.best
+            if best is None:
+                continue
+            lines.append(
+                f"  [{scan.verdict}] {scan.symbol}  {best.rule.label()}  "
+                f"成交率 {_pct(best.fill_rate)}  止盈率 {_pct(best.hit_rate)}  "
+                f"样本内每次挂单 {_pct(best.per_attempt)}  "
+                f"样本外 {_pct(scan.holdout.per_attempt if scan.holdout else None)}  "
+                f"邻域 {_pct(scan.neighbourhood)}"
+            )
+            for note in scan.notes:
+                lines.append(f"      {note}")
         return lines
 
 
@@ -84,11 +119,16 @@ def run_screen(
     end: date | None = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     config: ScreenConfig | None = None,
+    limit_scan: bool = False,
 ) -> ScreenReport:
     """在 `symbols` 上跑一轮筛选。
 
     取不到日线的标的**不计入漏斗**，只记在 `fetched` 与 `universe` 的差里：
     「没数据」和「数据说它不行」是两件事，混在一起会让漏斗读数失真。
+
+    `limit_scan=True` 时对**所有通过 L0 的标的**（不只是五层全过的）额外扫一遍限价
+    单参数网格。范围放宽是刻意的：五层漏斗筛的是「无判断也能赚」，而限价规则问的
+    是「加上判断能不能赚」——只在前者的幸存者上问后者，等于预设了答案。
     """
     cfg = config or ScreenConfig()
     end_date = end or date.today()
@@ -108,6 +148,21 @@ def run_screen(
         unstable=[card for card in cards if card.verdict == "unstable"],
     )
 
+    if limit_scan:
+        tradable = [card.symbol for card in cards if card.tradability.passed]
+        scans = [scan_limit_rules(symbol, usable[symbol], cfg) for symbol in tradable]
+        # 排样本外每次挂单期望，没跑出样本外的排最后——和适配性卡片一个道理，
+        # 按样本内排出来的第一名通常只是过拟合最深的那只。
+        scans.sort(
+            key=lambda scan: (
+                scan.holdout.per_attempt
+                if scan.holdout and scan.holdout.per_attempt is not None
+                else -9.99
+            ),
+            reverse=True,
+        )
+        report.limit_scans = scans
+
     missing = len(symbols) - len(usable)
     if missing:
         report.notes.append(f"{missing} 只未取到日线，已排除在漏斗之外")
@@ -115,6 +170,12 @@ def run_screen(
         "口径提醒：`oracle` 列是事后视角（当日最低买、次日最高卖），不可执行，"
         "只作理论上限；决策看 `neutral`／`strict` 两列与样本外衰减。"
     )
+    if limit_scan:
+        report.notes.append(
+            "限价单口径提醒：挂单价只用决策时刻已收盘的数据算（滚动 ATR），"
+            "「样本内每次挂单」是 24 个参数点里挑出来的最优值，天生虚高——"
+            "只有「样本外」与「邻域」两列同时为正才说明规则可能真的存在。"
+        )
     return report
 
 

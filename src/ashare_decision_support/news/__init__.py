@@ -21,20 +21,24 @@ from ashare_decision_support.news.dedup import (
     weigh_docs,
 )
 from ashare_decision_support.news.sentiment import LexiconSentiment
+from ashare_decision_support.news.store import IngestResult, NewsStore, StoredDoc
 from ashare_decision_support.news.wallstreet_source import WallstreetNewsSource
 
 __all__ = [
     "AkshareNewsSource",
     "CompositeNewsSource",
     "DEFAULT_HALF_LIFE_HOURS",
+    "IngestResult",
     "LexiconSentiment",
     "MAX_AGE_HOURS",
     "NewsBundle",
     "NewsCache",
     "NewsDoc",
     "NewsSource",
+    "NewsStore",
     "SentimentAnalyzer",
     "SentimentScore",
+    "StoredDoc",
     "SymbolSentiment",
     "WallstreetNewsSource",
     "dedup_key",

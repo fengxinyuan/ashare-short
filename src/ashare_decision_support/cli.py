@@ -226,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--end", help="回看窗口终点，默认今天")
     screen.add_argument("--lookback-days", type=int, default=730)
     screen.add_argument("--top", type=int, default=15)
+    screen.add_argument(
+        "--limit-scan",
+        action="store_true",
+        help="额外扫限价单参数网格（跌 N 个 ATR 挂买、涨 M 个 ATR 止盈），"
+        "回答「加上择时判断能不能覆盖成本」",
+    )
     screen.add_argument("--output")
     screen.add_argument("--calendar-market", default="SH")
     screen.add_argument("--profile-file")
@@ -549,6 +555,7 @@ def main() -> None:
             symbols,
             end=_optional_date(args.end, date.today()),
             lookback_days=args.lookback_days,
+            limit_scan=args.limit_scan,
             config=ScreenConfig(
                 min_avg_amount=args.min_amount,
                 min_oracle_median=args.min_oracle,

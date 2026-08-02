@@ -27,6 +27,7 @@ from ashare_decision_support.monitor.holdings import (
     time_stop_due,
 )
 from ashare_decision_support.signals.intraday import IntradaySnapshot
+from ashare_decision_support.signals.stabilise import Stabilisation
 from ashare_decision_support.state.alerts import AlertState
 
 LEVEL_ACTION = "ACTION"
@@ -60,6 +61,11 @@ POLICIES: dict[str, TriggerPolicy] = {
         # a cooldown rather than a once-per-day. Half an hour is long enough
         # that oscillation around the band edge does not produce a stream.
         TriggerPolicy("entry_zone", LEVEL_ACTION, "进入买入区间", cooldown_minutes=30),
+        # 进了区间但跌势未止。降成 WARN 是刻意的：它是「盯着」不是「买」，
+        # 而下跌途中的每一点都会「进入区间」，按 ACTION 发会一路向下连着响。
+        TriggerPolicy("entry_watch", LEVEL_WARN, "进入买入区间（未止跌）", cooldown_minutes=30),
+        # 跌势停了。这才是低吸真正的进场信号。
+        TriggerPolicy("entry_confirmed", LEVEL_ACTION, "止跌确认", cooldown_minutes=30),
         # Once per session, deliberately. Price that chops across the stop
         # would otherwise send five identical alerts, and five identical
         # alerts is how a channel gets muted.
@@ -124,10 +130,11 @@ class TriggerEngine:
         armed: bool = True,
         holding: HoldingView | None = None,
         daily_support: float | None = None,
+        stabilisation: Stabilisation | None = None,
     ) -> list[Alert]:
         symbol = advice.symbol
         previous = state.state_of(symbol)
-        current = _derive_state(advice, intraday, armed, holding, daily_support)
+        current = _derive_state(advice, intraday, armed, holding, daily_support, stabilisation)
         state.set_state(symbol, current)
 
         # First sighting of the day establishes the baseline. Emitting on it
@@ -174,7 +181,33 @@ class TriggerEngine:
                 detail.append("目标 " + "、".join(f"{level:.2f}" for level in advice.targets))
             if advice.rrr is not None:
                 detail.append(f"盈亏比 {advice.rrr}")
-            emit("entry_zone", f"{label} 进入买入区间", detail)
+
+            # 低吸的第三层：**进入区间不等于可以买。** 下跌途中的任何一点都
+            # 「到位过」，接刀和低吸的区别只在于跌势有没有停。没有确认时降级
+            # 成观察，而不是照发一条看起来像机会的 ACTION。
+            if stabilisation is not None:
+                detail.append(stabilisation.describe())
+            if stabilisation is not None and not stabilisation.confirmed:
+                emit("entry_watch", f"{label} 进入买入区间（未见止跌）", detail)
+            else:
+                emit("entry_zone", f"{label} 进入买入区间", detail)
+
+        # 已经在区间里，随后才出现止跌——这是低吸最典型的进场顺序：先跌进来，
+        # 再等企稳。只看「进入区间」那一刻会永远错过它。
+        if (
+            current.get("stabilised")
+            and not previous.get("stabilised")
+            and current.get("vs_entry") == "inside"
+        ):
+            emit(
+                "entry_confirmed",
+                f"{label} 止跌确认，位于买入区间内",
+                [
+                    f"现价 {price}，区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}",
+                    stabilisation.describe() if stabilisation else "",
+                    "跌势停了才是低吸的进场点——进区间本身不是",
+                ],
+            )
 
         if current.get("stop_broken") and not previous.get("stop_broken"):
             # 报出来的必须是**实际生效的**那个止损。走 plan_stop 时 advice.stop
@@ -311,6 +344,7 @@ def _derive_state(
     armed: bool = True,
     holding: HoldingView | None = None,
     daily_support: float | None = None,
+    stabilisation: Stabilisation | None = None,
 ) -> dict:
     last = intraday.last_price
     # 你填的 plan_stop 优先于系统算的：手工值是决定，系统值是建议。
@@ -334,6 +368,7 @@ def _derive_state(
         "volume_spike": intraday.volume_ratio is not None and intraday.volume_ratio >= VOLUME_SPIKE_RATIO,
         "at_high": _at_high(intraday),
         # 下面两个只对持仓有意义，未持仓恒为 False。
+        "stabilised": bool(stabilisation is not None and stabilisation.confirmed),
         "structure_broken": holding is not None and structure_broken(last, daily_support),
         "time_stop_due": time_stop_due(holding, last),
     }
