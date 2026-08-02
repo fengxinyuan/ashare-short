@@ -40,10 +40,11 @@ def run_monitor(
     channels = notifiers if notifiers is not None else [ConsoleNotifier()]
 
     # 显式给了标的就只盯它；否则自选股 + 当日候选池。
+    book = Watchlist()
     if symbols:
         watch, candidates = list(symbols), []
     else:
-        watch = Watchlist().symbols()
+        watch = book.symbols()
         pool = CandidatePool(today=today)
         candidates = [item for item in pool.symbols() if item not in set(watch)]
 
@@ -66,6 +67,9 @@ def run_monitor(
         period=period,
     )
     notes = session.prime(watch + candidates)
+    # 持仓在 prime 之后加载：已持仓的票要盯的是卖点（止损/目标/结构破坏/时间止损），
+    # 未持仓的盯买点。两套判断的紧急程度不同，没有这一步 monitor 分不清。
+    notes.extend(session.load_positions(book))
 
     news = news_source if news_source is not None else _default_news_source(news_cache_dir)
     blocked, risk_notes = _refresh_risk(session, news, today)

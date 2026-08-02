@@ -346,11 +346,18 @@ def render_alerts(alerts: list, health) -> str:
     which is the single most dangerous thing an automated channel can send.
     """
     lines: list[str] = []
-    for alert in alerts:
+    # 持仓排在最前。同一批推送里，「你手上那只跌破止损了」和「候选池某只进买区」
+    # 不该按标的顺序混排——前者的漏读代价是真金白银。
+    for alert in sorted(alerts, key=lambda item: not getattr(item, "holding", False)):
         badge = LEVEL_BADGE.get(alert.level, "•")
         stamp = f"{alert.as_of:%H:%M}" if alert.as_of else "时间未知"
-        origin = "" if alert.watchlist else "（候选池）"
-        lines.append(f"{badge} **[{alert.level}] {alert.headline}**{origin}　as-of {stamp}")
+        if getattr(alert, "holding", False):
+            origin = "【持仓】"
+        elif alert.watchlist:
+            origin = ""
+        else:
+            origin = "（候选池）"
+        lines.append(f"{badge} **[{alert.level}] {origin}{alert.headline}**　as-of {stamp}")
         lines.extend(f"　{item}" for item in alert.detail)
         lines.append("")
 

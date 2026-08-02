@@ -3,7 +3,7 @@
 系统有两种用法，命令集也按这两种组织：
 
 **自动运行**（主体）——`daemon` 按时间表跑全天：舆情采集 → 盘前主链路 → 执行卡 →
-盘中监控 → 盘后复盘 → 兑现核对，结果推到控制台/文件/飞书。见 `docs/AUTOMATION.md`。
+盘中监控 → 盘后复盘 → 兑现核对，结果推到控制台/文件/飞书。见 `docs/ARCHITECTURE.md`。
 
 **手工插问**——`morning` / `advise` / `monitor` / `chat` / `review` 单独跑同一批任务，
 用于调试、补跑，或者你想立刻看一眼。
@@ -42,6 +42,7 @@ from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.feishu import FeishuNotifier
 from ashare_decision_support.research import ResearchPipeline, load_research_input
 from ashare_decision_support.schedule import TradingCalendar
+from ashare_decision_support.screening import CostModel, ScreenConfig, run_screen
 from ashare_decision_support.signals import WyckoffAnalyzer
 from ashare_decision_support.state import CandidatePool, Watchlist, state_home
 from ashare_decision_support.symbols import normalize_symbol
@@ -215,6 +216,25 @@ def build_parser() -> argparse.ArgumentParser:
     wyckoff_scan.add_argument("--profile-file")
     add_tickflow_args(wyckoff_scan)
 
+    screen = subparsers.add_parser(
+        "screen",
+        help="标的适配性筛选：哪些票的价格行为适合超短线（五层漏斗 + 样本外验证）",
+    )
+    screen.add_argument("--symbols", nargs="+", help="缺省读自选股；--all-a 覆盖此项")
+    screen.add_argument("--all-a", action="store_true", help="全 A 扫描（需付费档，耗时数分钟）")
+    screen.add_argument("--source", default="tickflow", choices=["tickflow", "akshare", "qmt"])
+    screen.add_argument("--end", help="回看窗口终点，默认今天")
+    screen.add_argument("--lookback-days", type=int, default=730)
+    screen.add_argument("--top", type=int, default=15)
+    screen.add_argument("--output")
+    screen.add_argument("--calendar-market", default="SH")
+    screen.add_argument("--profile-file")
+    # 阈值里最常需要按池子调的三个。其余的改 ScreenConfig，那里每个默认值都有注释。
+    screen.add_argument("--min-amount", type=float, default=1e8, help="日均成交额下限（元）")
+    screen.add_argument("--min-oracle", type=float, default=0.02, help="理论口径中位数下限")
+    screen.add_argument("--slippage", type=float, default=0.0005, help="单边滑点估计")
+    add_tickflow_args(screen)
+
     # ================= 诊断 =================
 
     tick_health = subparsers.add_parser("tick-health", help="诊断：TickFlow 连通性与能力边界")
@@ -316,6 +336,25 @@ def _resolve_symbols(args, include_candidates: bool = False) -> list[str]:
     if include_candidates:
         symbols = list(dict.fromkeys(symbols + CandidatePool().symbols()))
     return symbols
+
+
+def _screen_universe(args, adapter) -> list[str]:
+    """筛选池：`--all-a` 走申万成分股并集，否则同其余命令读 `--symbols`／自选股。
+
+    全 A 名单从板块成分推导而不是另找一个「全部代码」接口，是为了和盘前链路用
+    同一份 universe——两处名单不一致时，筛出来的票可能根本进不了后续流程。
+    """
+    if not getattr(args, "all_a", False):
+        return _resolve_symbols(args)
+
+    list_sectors = getattr(adapter, "list_universe_sectors", None)
+    if not callable(list_sectors):
+        raise SystemExit(f"--all-a 需要支持板块成分的数据源，{args.source} 不支持")
+    definitions = list_sectors() or {}
+    symbols = [symbol for members in definitions.values() for symbol in members]
+    if not symbols:
+        raise SystemExit("--all-a 未取到任何成分股（免费档通常拿不到，需付费档）")
+    return list(dict.fromkeys(normalize_symbol(item) for item in symbols))
 
 
 def _source_adapter(args):
@@ -500,6 +539,26 @@ def main() -> None:
         bars = adapter.get_historical_bars(args.symbols, start, end)
         signals = WyckoffAnalyzer().analyze_many(bars)
         _dump_json([signal.model_dump(mode="json") for signal in signals], args.output)
+        return
+
+    if args.command == "screen":
+        adapter = _source_adapter(args)
+        symbols = _screen_universe(args, adapter)
+        report = run_screen(
+            adapter,
+            symbols,
+            end=_optional_date(args.end, date.today()),
+            lookback_days=args.lookback_days,
+            config=ScreenConfig(
+                min_avg_amount=args.min_amount,
+                min_oracle_median=args.min_oracle,
+                cost=CostModel(slippage_side=args.slippage),
+            ),
+        )
+        for line in report.describe(top=args.top):
+            print(line)
+        if args.output:
+            _dump_json(report.to_dict(top=args.top), args.output)
         return
 
     if args.command == "tick-health":
