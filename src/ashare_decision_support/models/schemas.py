@@ -6,7 +6,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ashare_decision_support.models.enums import (
-    AgentStance,
     EffortResult,
     ResearchTargetType,
     RiskTag,
@@ -87,49 +86,6 @@ class CapitalFlowItem(BaseModel):
     tail_inflow_ratio: float | None = Field(default=None, ge=0)
     large_order_inflow: float | None = None
     note: str | None = None
-
-
-class AgentReview(BaseModel):
-    agent_name: str
-    target_type: ResearchTargetType
-    target_id: str
-    stance: AgentStance
-    score: float = Field(ge=-100, le=100)
-    confidence: float = Field(ge=0, le=1, default=0.5)
-    rationale: str
-    evidence: list[str] = Field(default_factory=list)
-
-
-class SectorResearchOverlay(BaseModel):
-    sector: str
-    hotness_score: float = Field(default=0.0, ge=0, le=100)
-    catalyst_score: float = Field(default=0.0, ge=0, le=100)
-    risk_score: float = Field(default=0.0, ge=0, le=100)
-    net_score: float
-    notes: list[str] = Field(default_factory=list)
-    reviews: list[AgentReview] = Field(default_factory=list)
-
-
-class CandidateResearchOverlay(BaseModel):
-    symbol: str
-    sector: str
-    conviction_score: float = Field(default=0.0, ge=0, le=100)
-    catalyst_score: float = Field(default=0.0, ge=0, le=100)
-    risk_score: float = Field(default=0.0, ge=0, le=100)
-    support_score: float = Field(default=0.0, ge=0, le=100)
-    net_score: float
-    warnings: list[str] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
-    reviews: list[AgentReview] = Field(default_factory=list)
-
-
-class ResearchSynthesis(BaseModel):
-    market_bias: AgentStance
-    market_score: float = Field(ge=-100, le=100)
-    market_notes: list[str] = Field(default_factory=list)
-    sector_overlays: list[SectorResearchOverlay] = Field(default_factory=list)
-    candidate_overlays: list[CandidateResearchOverlay] = Field(default_factory=list)
-    reviews: list[AgentReview] = Field(default_factory=list)
 
 
 class BlacklistEntry(BaseModel):
@@ -237,25 +193,6 @@ class OpenFeatures(BaseModel):
     source_ts: datetime
 
 
-class AuctionRiskConfig(BaseModel):
-    cancel_pre920_warn: float = Field(default=0.35, ge=0, le=1)
-    cancel_pre920_block: float = Field(default=0.45, ge=0, le=1)
-    imbalance_block: float = Field(default=0.65, ge=0, le=1)
-    auc_matched_amt_min_mainline: float = Field(default=30_000_000.0, ge=0)
-    auc_matched_amt_min_pulse: float = Field(default=40_000_000.0, ge=0)
-    nofill_seal_ratio: float = Field(default=10.0, ge=0)
-    mainline_open_gap_min: float = 2.0
-    mainline_open_gap_max: float = 5.5
-    pulse_open_gap_min: float = 5.0
-
-
-class OpenFollowConfig(BaseModel):
-    fail_volume_ratio: float = Field(default=0.8, ge=0)
-    favorable_volume_ratio: float = Field(default=1.0, ge=0)
-    vwap_exit_volume_ratio: float = Field(default=1.2, ge=0)
-    strong_price_vs_open_pct: float = 0.2
-
-
 class DecisionCard(BaseModel):
     model_config = ConfigDict(use_enum_values=False)
 
@@ -272,37 +209,6 @@ class DecisionCard(BaseModel):
     explanation: str
     source_ts: datetime
     strategy_version: str
-
-
-class OutcomeRecord(BaseModel):
-    symbol: str
-    realized_return_bps: float
-    max_favorable_excursion_bps: float | None = None
-    max_adverse_excursion_bps: float | None = None
-    note: str | None = None
-
-
-class ReplayRow(BaseModel):
-    symbol: str
-    signal_mode: SignalMode
-    confidence: float = Field(ge=0, le=1)
-    expected_edge_bps: float
-    realized_return_bps: float
-    alpha_gap_bps: float
-    risk_tags: list[RiskTag] = Field(default_factory=list)
-    note: str | None = None
-
-
-class ReplayReport(BaseModel):
-    generated_at: datetime
-    strategy_version: str
-    total_cards: int = Field(ge=0)
-    actionable_cards: int = Field(ge=0)
-    actionable_hit_rate: float = Field(ge=0, le=1)
-    actionable_avg_return_bps: float
-    false_positive_rate: float = Field(ge=0, le=1)
-    avg_alpha_gap_bps: float
-    rows: list[ReplayRow] = Field(default_factory=list)
 
 
 class WyckoffSignal(BaseModel):
