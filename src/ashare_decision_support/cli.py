@@ -222,11 +222,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     intraday_check = subparsers.add_parser(
         "intraday-check",
-        help="诊断：实测免费分钟线盘中时效（必须在交易时段跑，决定是否需要付费档）",
+        help="诊断：实测分钟线盘中时效（必须在交易时段跑）",
     )
     intraday_check.add_argument("--symbols", nargs="+", default=["600519.SH", "000001.SZ"])
     intraday_check.add_argument("--period", default="1", choices=list(SUPPORTED_PERIODS))
     intraday_check.add_argument("--gap-seconds", type=int, default=90)
+    # 要比的是两条路的**相对**时效：付费档与新浪相当，就说明买到的是分钟历史与
+    # 配额而不是实时性；付费档明显更新，实时这条线就该切过去。
+    intraday_check.add_argument(
+        "--source",
+        default="auto",
+        choices=["auto", "tickflow", "sina"],
+        help="auto=按档位自动选；tickflow/sina=强制走某一路，用于两路对比",
+    )
 
     subparsers.add_parser("qmt-health", help="诊断：本地 QMT / xtdata 是否就绪")
     subparsers.add_parser("state", help="诊断：状态目录、自选股、候选池、任务完成情况")
