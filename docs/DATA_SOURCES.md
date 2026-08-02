@@ -355,7 +355,7 @@ ashare-ds intraday-check --symbols 600519.SH --source sina      # 强制免费�
 | 5 | 接入付费档批量接口与分钟历史 | ✅ `adapters/tickflow_market.py` / `tickflow_intraday.py` |
 | 6 | 舆情持久语料库（记 first_seen） | ✅ `news/store.py` |
 | 7 | 跨源校验 + 量纲反推 + 浮点卫生 | ✅ `adapters/validate.py`，已接进 `CompositeMarketScanAdapter` |
-| 8 | **五档盘口进买卖点与监控** | 🚧 适配器已实测可用，接线中 |
+| 8 | **五档盘口进买卖点与监控** | ⬜ **未做**。`adapters/snapshot.py` 已实测可用且有测试，但**没有任何调用方** |
 | 9 | **真实涨跌停价替掉 `strong_count` 的 9.5% 近似** | ⬜ 数据已有，须连同阈值重标定 |
 | 10 | 验证盘中时效 | ⬜ 非交易时段测不了，见 §九 |
 | 11 | 回测 | ⬜ 分钟历史已能取，这是第一次具备前提 |
