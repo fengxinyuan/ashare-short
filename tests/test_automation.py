@@ -830,6 +830,19 @@ def _news(**overrides):
     return SymbolSentiment(**defaults)
 
 
+def _dip(**overrides):
+    from ashare_decision_support.signals.dipbuy import DipFeatures
+
+    defaults = dict(
+        ret_20d=0.08, ret_60d=0.2, above_ma20=True, dist_to_ma20_pct=0.03,
+        pullback_pct=-0.06, atr_pct=0.02, pullback_atr=3.0, pullback_band="ideal",
+        down_days=4, dist_to_support_pct=0.01,
+        volume_contraction=0.5, shrinking=True,
+    )
+    defaults.update(overrides)
+    return DipFeatures(**defaults)
+
+
 def test_scores_do_not_all_saturate_at_the_top_of_the_scale() -> None:
     """A ranking that ties every decent name at 100.0 cannot rank, and the
     candidate picked inside a sector becomes an artefact of iteration order."""
@@ -851,16 +864,26 @@ def test_scores_do_not_all_saturate_at_the_top_of_the_scale() -> None:
 
 
 def test_the_perfect_case_reaches_but_does_not_exceed_the_ceiling() -> None:
+    """满分样例现在描述的是**理想低吸形态**，不是放量突破。
+
+    口径转向低吸之后能拿满分的必须同时满足：趋势在（UPTREND）、处在吸筹末端
+    （ACCUMULATION 权重高于 MARKUP，主升段是追高位置）、回调到位且缩量。
+    放量突破拿不到满分是**设计意图**，不是回归。
+    """
+    from ashare_decision_support.models.enums import WyckoffBias
     from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput
     from ashare_decision_support.scoring.rule_based import MAX_COMPONENT_TOTAL
 
     provider = RuleBasedScoreProvider()
     result = provider.score(
-        ScoreInput(symbol="A", bars=[], snapshot=_snapshot(), wyckoff=_wyckoff(), news=_news())
+        ScoreInput(
+            symbol="A", bars=[], snapshot=_snapshot(volume_ratio_20d=0.5),
+            wyckoff=_wyckoff(bias=WyckoffBias.ACCUMULATION), news=_news(), dip=_dip(),
+        )
     )
 
     assert result.score == pytest.approx(100.0)
-    assert MAX_COMPONENT_TOTAL == pytest.approx(76.0)
+    assert MAX_COMPONENT_TOTAL == pytest.approx(85.0)
 
 
 def test_missing_news_is_not_read_as_bad_news() -> None:

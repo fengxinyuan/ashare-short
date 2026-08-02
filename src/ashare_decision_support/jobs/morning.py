@@ -69,6 +69,9 @@ CANDIDATE_LOOKBACK_DAYS = 240
 
 # 粗排配额倍数与全局上限，见 `_rank_candidates` 的说明。
 NEWS_SHORTLIST_MULTIPLIER = 3
+
+# 低吸门槛过滤后至少要剩这么多标的，否则说明全市场都在高位，此时放宽门槛并明说。
+MIN_DIP_CANDIDATES = 20
 NEWS_MAX_SYMBOLS = 40
 
 
@@ -582,6 +585,10 @@ def _rank_candidates(
     snapshots = DailyTechnicalAnalyzer().analyze_many(usable)
     wyckoff = {signal.symbol: signal for signal in WyckoffAnalyzer().analyze_many(usable)}
     names = _security_names(adapter, list(usable))
+    # 低吸画像算一次全程复用：既进打分（回调是否到位、缩量与否），也落台账。
+    dips = {
+        symbol: measure_dip(rows, snapshots.get(symbol)) for symbol, rows in usable.items()
+    }
 
     def build_inputs(scope: list[str], sentiment: dict[str, Any]) -> list[ScoreInput]:
         return [
@@ -591,12 +598,40 @@ def _rank_candidates(
                 snapshot=snapshots[symbol],
                 wyckoff=wyckoff.get(symbol),
                 news=sentiment.get(symbol),
+                dip=dips.get(symbol),
             )
             for symbol in scope
             if symbol in snapshots and symbol in usable
         ]
 
     scope = [symbol for symbol in usable if symbol in snapshots]
+
+    # 低吸门槛：**没有回调的票不是低吸候选，不管它分多高。**
+    #
+    # 这是门槛不是权重。dip 在打分里占 10/85，而 trend + wyckoff 占 50——靠加权
+    # 永远压不过「趋势强、位置高」的票。2026-08-02 实测：全市场随机 278 只里
+    # 27% 处在 none 档、29% 在 ideal 档，但打分选出的 15 只有 10 只是 none。
+    # 分布差这么远，说明问题出在「要不要它」而不是「给它几分」。
+    #
+    # 过滤后不足最低数量时**不回填**，宁可少给几只，也不把追高的票混进低吸清单。
+    dipped = [symbol for symbol in scope if _is_dip_candidate(dips.get(symbol))]
+    filtered_out = len(scope) - len(dipped)
+    if len(dipped) >= MIN_DIP_CANDIDATES:
+        if filtered_out:
+            sink.append(
+                f"低吸门槛：{filtered_out}/{len(scope)} 只处在 20 日高附近（未回调），"
+                "本次不作为低吸候选"
+            )
+        scope = dipped
+    elif dipped:
+        sink.append(
+            f"⚠️ 全市场普遍处于高位，仅 {len(dipped)}/{len(scope)} 只有回调，"
+            f"少于最低样本 {MIN_DIP_CANDIDATES}，本次放宽低吸门槛并按分数排序——"
+            "这些是次优时机，不是好机会"
+        )
+    else:
+        sink.append("⚠️ 入围标的全部处在 20 日高附近，今日没有低吸位置")
+
     coarse = provider.score_many(build_inputs(scope, {}))
 
     shortlist = _take_per_sector(coarse, sector_of, per_sector * NEWS_SHORTLIST_MULTIPLIER)
@@ -639,9 +674,8 @@ def _rank_candidates(
             "target_reference": snapshot.target_reference if snapshot else None,
             "wyckoff_bias": wyckoff[result.symbol].bias.value if result.symbol in wyckoff else None,
             "news": reading.to_dict() if reading is not None else None,
-            # 低吸画像。现在只落台账不参与打分——打分口径要等积累出样本再调，
-            # 但特征必须从第一天就开始记，否则将来无法回头分层。
-            "dip": measure_dip(usable.get(result.symbol) or [], snapshot).to_dict(),
+            # 低吸画像。已进打分（见 `scoring/rule_based.py`），这里落台账供事后分层。
+            "dip": (dips.get(result.symbol) or measure_dip([])).to_dict(),
         }
         (control if over_quota else picked).append(row)
 
@@ -650,6 +684,19 @@ def _rank_candidates(
     # 垫底的票做对照，差出来的是「好票 vs 烂票」，不是「这套规则有没有用」。
     control = control[: len(picked)]
     return picked, control
+
+
+def _is_dip_candidate(dip: Any) -> bool:
+    """回调档位在 shallow 及以上才算低吸候选。
+
+    `deep` 也放进来：那一档在打分里已经被扣分和告警覆盖，是否值得买交给分数决定，
+    而不是在门槛这里直接判死——深回调里确实有一部分是有效的反转位置。
+
+    档位算不出来（数据不足）时**放行**。门槛的作用是挡掉「明确没回调」的票，
+    不是挡掉「不知道」的票——后者该由样本不足的告警去管。
+    """
+    band = getattr(dip, "pullback_band", None)
+    return band != "none"
 
 
 def _take_per_sector(results: list, sector_of: dict[str, str], quota: int) -> list[str]:

@@ -15,6 +15,15 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(value, high))
 
 
+# 止损距离的上下限，单位是标的自身的 ATR。低于下限的止损是随机噪声（必被打掉），
+# 高于上限的止损保护不了任何东西。用 ATR 而非固定百分比，理由见 `_stop_reference`。
+MIN_STOP_ATR = 1.0
+MAX_STOP_ATR = 3.0
+
+# ATR 算不出来时的兜底波幅，取 A 股日均振幅的经验量级。
+DEFAULT_ATR_PCT = 0.02
+
+
 @dataclass
 class _Pivot:
     side: str
@@ -65,7 +74,7 @@ class DailyTechnicalAnalyzer:
         trend_state = self._trend_state(last["close"], ma20, ma60)
 
         supports, resistances = self._levels(rows, last["close"], atr14 or last["close"] * 0.02)
-        stop_reference = supports[0].price if supports else ma10 or ma20
+        stop_reference = self._stop_reference(last["close"], supports, ma10 or ma20, atr14)
         target_reference = resistances[0].price if resistances else None
         explanation = self._explanation(trend_state, supports, resistances, ma20, ma60, atr14)
         setups = self._setups(last["close"], trend_state, supports, resistances, ma20, ma60, volume_ratio_20d)
@@ -94,6 +103,39 @@ class DailyTechnicalAnalyzer:
             explanation=explanation,
             source_ts=last["timestamp"],
         )
+
+    def _stop_reference(
+        self,
+        close: float,
+        supports: list[PriceLevel],
+        fallback: float | None,
+        atr14: float | None,
+    ) -> float | None:
+        """止损参考位，带一个按标的自身波动定的最小距离。
+
+        直接取最近支撑是错的。2026-08-02 实测：603508.SH 现价 23.16、最近支撑
+        23.15，止损距离 **0.04%**——A 股日内正常振幅 3–5%，这种止损是随机噪声，
+        必然被打掉，而且它会让盈亏比算出 **172.84** 这种数直接拿满分。
+
+        所以止损必须至少落在**一个日均波幅之外**：低于这个距离的不是止损，是
+        在赌下一跳的方向。用 ATR 而不是固定百分比，理由和 `signals/dipbuy.py`
+        的档位一样——同一个百分比对低波和高波标的意义完全不同。
+
+        另一头也要管：超过 MAX_STOP_ATR 个波幅的「止损」已经保护不了任何东西，
+        此时收回到上限，让盈亏比反映真实的风险敞口而不是一个假的大分母。
+        """
+        if close <= 0:
+            return None
+
+        unit = atr14 if atr14 and atr14 > 0 else close * DEFAULT_ATR_PCT
+        floor = close - MAX_STOP_ATR * unit
+        ceiling = close - MIN_STOP_ATR * unit
+
+        candidate = supports[0].price if supports else fallback
+        if not candidate or candidate <= 0:
+            candidate = ceiling
+        # 支撑在现价上方时它不是支撑，退回到按波幅算的位置。
+        return round(_clamp(min(candidate, ceiling), floor, ceiling), 4)
 
     def _normalize_rows(self, bars: list[dict]) -> list[dict]:
         rows: list[dict] = []

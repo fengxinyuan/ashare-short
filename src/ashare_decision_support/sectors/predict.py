@@ -24,6 +24,14 @@ from ashare_decision_support.sectors.keywords import MARKET_LEVEL_KEYWORDS, sect
 # [0, 100], and no single reading may carry the score on its own — that is the
 # point of fusing three of them.
 MOMENTUM_CAP = 30.0
+
+# 板块回调窗口的档位，单位与个股层一致：成分股「距 20 日高回撤 ÷ 自身日波幅」的
+# 中位数。板块整体的回撤幅度小于单只股票（成分股的低点不同时发生），所以档位比
+# `signals/dipbuy.py` 的个股档位收窄。
+PULLBACK_NONE = 0.6
+PULLBACK_IDEAL = 2.0
+PULLBACK_DEEP = 3.5
+PULLBACK_CAP = 10.0
 SENTIMENT_CAP = 12.0
 CAPITAL_CAP = 8.0
 BASE_SCORE = 50.0
@@ -509,24 +517,37 @@ class SectorPredictor:
             return 0.0
 
         total = 0.0
-        if metric.ret_5d is not None:
-            points = _clamp(metric.ret_5d * 120.0, -10.0, 10.0)
+
+        # ---- L1 中期趋势：这个板块值不值得看 --------------------------------
+        # 用 20 日而不是 5 日。5 日涨幅高说明的恰恰是**已经涨过了**，把它当主要
+        # 权重就是在按「谁涨得最多」排序——2026-08-02 实测，前五名板块的 5 日中位
+        # 是 +10.16%/+10.48%/+9.48%/+8.03%/+4.80%，排序几乎就是已涨幅度倒序。
+        if metric.ret_20d is not None:
+            points = _clamp(metric.ret_20d * 60.0, -8.0, 10.0)
             total += points
-            reasons.append(f"5日中位涨幅 {metric.ret_5d:+.2%}（{points:+.1f}）")
+            reasons.append(f"20日中位涨幅 {metric.ret_20d:+.2%}，中期趋势（{points:+.1f}）")
+        if metric.above_ma20 is not None:
+            points = _clamp((metric.above_ma20 - 0.5) * 12.0, -5.0, 5.0)
+            total += points
+            reasons.append(f"站上20日均线占比 {metric.above_ma20:.0%}（{points:+.1f}）")
+
+        # ---- L2 回调窗口：现在是不是进场时机 --------------------------------
+        # 低吸要的板块画像是**中期强 + 短期弱**。回调用成分股中位的归一化深度，
+        # 和个股层同口径（`signals/dipbuy.py`）。
+        total += self._pullback_component(metric, reasons)
+
+        # ---- 短期读数降权为辅助 ----------------------------------------------
+        # 当日涨幅与上涨家数仍然有用（说明板块正在被关注），但权重砍到不再主导排序。
         if metric.ret_1d is not None:
-            points = _clamp(metric.ret_1d * 200.0, -6.0, 6.0)
+            points = _clamp(metric.ret_1d * 100.0, -4.0, 3.0)
             total += points
             reasons.append(f"当日中位涨幅 {metric.ret_1d:+.2%}（{points:+.1f}）")
         if metric.breadth is not None:
-            points = _clamp((metric.breadth - 0.5) * 16.0, -6.0, 6.0)
+            points = _clamp((metric.breadth - 0.5) * 8.0, -3.0, 3.0)
             total += points
             reasons.append(f"上涨家数占比 {metric.breadth:.0%}（{points:+.1f}）")
-        if metric.above_ma20 is not None:
-            points = _clamp((metric.above_ma20 - 0.5) * 10.0, -4.0, 4.0)
-            total += points
-            reasons.append(f"站上20日均线占比 {metric.above_ma20:.0%}（{points:+.1f}）")
         if metric.strong_count > 0:
-            points = min(4.0, metric.strong_count * 1.0)
+            points = min(2.0, metric.strong_count * 0.5)
             total += points
             reasons.append(f"涨幅超 9.5% 个股 {metric.strong_count} 只（{points:+.1f}）")
         if metric.volume_ratio is not None:
@@ -540,6 +561,32 @@ class SectorPredictor:
                 reasons.append(f"量比中位数 {metric.volume_ratio:.2f}，缩量（-3.0）")
 
         return _clamp(total, -MOMENTUM_CAP, MOMENTUM_CAP)
+
+    def _pullback_component(self, metric: SectorMetrics, reasons: list[str]) -> float:
+        """板块回调窗口。**这是低吸口径下唯一回答「现在该不该进」的一项。**
+
+        没有回调不扣分——那只是说明时机未到，不是板块不好；回调过深才扣分，因为
+        那时板块级的「回调」和「趋势转折」已经分不开。
+
+        用归一化深度（除以成分股各自的日波幅）而不是绝对回撤：银行板块回调 3%
+        和半导体板块回调 3% 完全不是一回事。
+        """
+        depth = metric.pullback_atr
+        if depth is None:
+            return 0.0
+
+        if depth < PULLBACK_NONE:
+            reasons.append(f"板块尚未回调（中位 {depth:.1f} 个日波幅，+0.0）")
+            return 0.0
+        if depth <= PULLBACK_DEEP:
+            points = PULLBACK_CAP * _ramp(depth, PULLBACK_NONE, PULLBACK_IDEAL)
+            label = f"{metric.pullback:+.2%}" if metric.pullback is not None else f"{depth:.1f} 个日波幅"
+            reasons.append(f"板块回调到位 {label}（中位 {depth:.1f} 个日波幅，{points:+.1f}）")
+            return points
+
+        points = -6.0 * _ramp(depth, PULLBACK_DEEP, PULLBACK_DEEP * 1.8)
+        reasons.append(f"板块回撤过深（中位 {depth:.1f} 个日波幅，{points:+.1f}）")
+        return points
 
     def _attribute_docs(
         self,

@@ -30,6 +30,7 @@ from ashare_decision_support.notify.base import Notifier
 from ashare_decision_support.notify.render import advice_mandatory_block, render_advice_brief
 from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
 from ashare_decision_support.screens import StScreen
+from ashare_decision_support.signals.dipbuy import measure_dip
 from ashare_decision_support.signals.intraday import IntradayAnalyzer
 from ashare_decision_support.writer import TemplateWriter, WriteRequest
 from ashare_decision_support.writer.base import BriefWriter
@@ -106,6 +107,7 @@ def run_advise(
                     snapshot=snapshots[symbol],
                     wyckoff=wyckoff.get(symbol),
                     news=sentiment.get(symbol),
+                    dip=measure_dip(rows, snapshots[symbol]),
                 )
                 for symbol, rows in usable_daily.items()
                 if symbol in snapshots

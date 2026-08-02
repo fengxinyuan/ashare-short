@@ -46,6 +46,11 @@ class SectorMetrics:
     strong_count: int = 0
     volume_ratio: float | None = None
     above_ma20: float | None = None
+    # 中期趋势与回调深度。低吸要的板块画像是「中期强 + 短期弱」，只有 1 日和 5 日
+    # 读数答不了这个问题——5 日涨幅高说明的恰恰是**已经涨过了**。
+    ret_20d: float | None = None
+    pullback: float | None = None       # 板块中位的「距 20 日高回撤」，≤0
+    pullback_atr: float | None = None   # 同上，除以各自日波幅后的中位数
 
     @property
     def coverage_ratio(self) -> float:

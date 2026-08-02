@@ -27,6 +27,7 @@ from ashare_decision_support.notify.base import Notifier
 from ashare_decision_support.research import ResearchPipeline, load_research_input
 from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
 from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
+from ashare_decision_support.signals.dipbuy import measure_dip
 
 WATCHLIST_SECTOR = "自选"
 MATRIX_LATEST_NAME = "decision_matrix_latest.json"
@@ -65,6 +66,9 @@ def run_post_close(
                 bars=rows,
                 snapshot=snapshots[symbol],
                 wyckoff=wyckoff_by_symbol.get(symbol),
+                # 必须和盘前同口径：少给 dip，这条链路的分数会系统性偏低，
+                # 盘前盘后两张表就不可比了。
+                dip=measure_dip(rows, snapshots[symbol]),
             )
             for symbol, rows in usable.items()
             if symbol in snapshots

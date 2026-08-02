@@ -354,3 +354,181 @@ def test_pullback_bands_become_a_statistical_layer() -> None:
 
     buckets = {item["bucket"]: item for item in summarize(rows)["by_pullback"]}
     assert buckets["ideal"]["median_close_pct"] > buckets["deep"]["median_close_pct"]
+
+
+# ---- 打分口径转向低吸 -------------------------------------------------------
+
+
+def snap(**kw):
+    from datetime import datetime
+    from ashare_decision_support.models.enums import TrendState
+    from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
+
+    d = dict(
+        symbol="600519.SH", last_open=99.0, last_high=101.0, last_low=98.0,
+        last_close=100.0, trend_state=TrendState.UPTREND, bar_count=250,
+        atr14=2.0, volume_ratio_20d=1.0, range_position_60d=0.5,
+        stop_reference=95.0, target_reference=115.0,
+        explanation="fixture", source_ts=datetime(2026, 8, 3, 15, 0),
+    )
+    d.update(kw)
+    return DailyTechnicalSnapshot(**d)
+
+
+def dip(**kw):
+    from ashare_decision_support.signals.dipbuy import DipFeatures
+    d = dict(pullback_pct=-0.06, atr_pct=0.02, pullback_atr=3.0,
+             pullback_band="ideal", shrinking=True, volume_contraction=0.5)
+    d.update(kw)
+    return DipFeatures(**d)
+
+
+def score(**kw):
+    from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput
+    kw.setdefault("snapshot", snap())
+    return RuleBasedScoreProvider().score(ScoreInput(symbol="A", bars=[], **kw))
+
+
+def test_a_stock_that_has_pulled_back_now_outranks_one_that_has_not() -> None:
+    """这是整次口径转向要成立的那一条：低吸要的是回调到位的票，不是正在涨的票。
+
+    2026-08-02 实测转向前的 30 只候选，落在理想窗口的 0 只、缩量 0 只——
+    打分一直在选主升段。
+    """
+    pulled_back = score(dip=dip())
+    at_the_high = score(dip=dip(pullback_pct=-0.002, pullback_atr=0.1, pullback_band="none",
+                                shrinking=False, volume_contraction=1.1))
+    assert pulled_back.score > at_the_high.score
+
+
+def test_a_pullback_too_deep_is_a_risk_not_an_opportunity() -> None:
+    """回调和趋势走坏分不开时，低吸就变成了接刀。"""
+    ideal = score(dip=dip())
+    knife = score(dip=dip(pullback_pct=-0.25, pullback_atr=9.0, pullback_band="deep"))
+
+    assert knife.score < ideal.score
+    assert any("接刀" in w for w in knife.warnings)
+
+
+def test_volume_flips_meaning_between_a_pullback_and_a_breakout() -> None:
+    """同一个量比，回调段要缩量（抛压有限），未回调段要放量（启动确认）。
+
+    转向前这里只有一个静态阈值：`ratio >= 1.0` 一律 +8、缩量 -5，对低吸恰好选反。
+    """
+    quiet_dip = score(snapshot=snap(volume_ratio_20d=0.5), dip=dip())
+    loud_dip = score(snapshot=snap(volume_ratio_20d=2.5), dip=dip())
+    assert quiet_dip.score > loud_dip.score
+    assert any("疑似出货" in r for r in loud_dip.reasons)
+
+    no_dip = dict(pullback_band="none", pullback_atr=0.2, pullback_pct=-0.004)
+    quiet_flat = score(snapshot=snap(volume_ratio_20d=0.5), dip=dip(**no_dip))
+    loud_flat = score(snapshot=snap(volume_ratio_20d=1.8), dip=dip(**no_dip))
+    assert loud_flat.score > quiet_flat.score
+
+
+def test_wyckoff_pullback_events_now_outweigh_the_breakout_event() -> None:
+    """Spring / LPS 是低吸信号，SOS 是「已经涨上去了」。"""
+    from ashare_decision_support.scoring.rule_based import (
+        LPS_POINTS, SOS_POINTS, SPRING_POINTS,
+    )
+    assert SPRING_POINTS > SOS_POINTS
+    assert LPS_POINTS > SOS_POINTS
+
+
+def test_a_hair_thin_stop_can_no_longer_earn_a_full_risk_reward_score() -> None:
+    """止损贴着现价时盈亏比会算出天文数字。
+
+    2026-08-02 实测 603508.SH：现价 23.16、止损 23.15，距离 0.04%，
+    盈亏比 172.84 直接拿满分。
+    """
+    absurd = score(snapshot=snap(stop_reference=99.96, target_reference=115.0))
+    sane = score(snapshot=snap(stop_reference=95.0, target_reference=115.0))
+
+    assert absurd.score <= sane.score
+    assert any("止损距离" in w for w in absurd.warnings)
+
+
+def test_the_stop_itself_keeps_a_minimum_distance_from_the_price() -> None:
+    """源头也要修——简报里报出一个 0.04% 的止损位本身就是误导。"""
+    from datetime import timedelta
+
+    from ashare_decision_support.signals.daily_technical import DailyTechnicalAnalyzer
+
+    start = date(2026, 3, 2)
+    rows = [
+        {"date": str(start + timedelta(days=i)), "open": 100.0, "high": 101.0,
+         "low": 99.0, "close": 100.0, "volume": 1000.0}
+        for i in range(70)
+    ]
+    s = DailyTechnicalAnalyzer().analyze("600000.SH", rows)
+    distance = 1.0 - s.stop_reference / s.last_close
+    assert distance >= 0.005          # 至少不是零距离
+    assert s.stop_reference < s.last_close
+
+
+def test_scoring_ramps_instead_of_jumping_at_a_threshold() -> None:
+    """阶跃在阈值两侧给出差很多的分，而阈值本身是拍脑袋定的。
+
+    项目在大盘层（sectors/predict.py）早就否定过阶跃，这里是补上个股层。
+    """
+    at = score(snapshot=snap(volume_ratio_20d=3.99), dip=dip(pullback_band="none"))
+    over = score(snapshot=snap(volume_ratio_20d=4.01), dip=dip(pullback_band="none"))
+    # 转向前 4.0 处有 13 分悬崖（+8 → -5）。
+    assert abs(at.score - over.score) < 1.0
+
+
+def test_a_missing_dip_reading_scores_zero_rather_than_penalising() -> None:
+    """dip=None 意思是「没算」，不是「没回调」。"""
+    absent = score()
+    assert not any("回调" in r for r in absent.reasons)
+    assert 0.0 <= absent.score <= 100.0
+
+
+def test_a_stock_at_its_high_is_not_a_dip_candidate_regardless_of_score() -> None:
+    """低吸门槛是**门槛不是权重**。
+
+    dip 在打分里只占 10/85，trend + wyckoff 占 50，靠加权永远压不过「趋势强、
+    位置高」的票。2026-08-02 实测：全市场随机 278 只里 27% 在 none 档、29% 在
+    ideal 档，而打分选出的 15 只有 10 只是 none——分布差这么远，说明问题出在
+    「要不要它」而不是「给它几分」。
+    """
+    from ashare_decision_support.jobs.morning import _is_dip_candidate
+    from ashare_decision_support.signals.dipbuy import DipFeatures
+
+    assert _is_dip_candidate(DipFeatures(pullback_band="ideal")) is True
+    assert _is_dip_candidate(DipFeatures(pullback_band="shallow")) is True
+    # deep 放行：是否值得买交给分数（已扣分并告警），门槛不替它判死。
+    assert _is_dip_candidate(DipFeatures(pullback_band="deep")) is True
+    assert _is_dip_candidate(DipFeatures(pullback_band="none")) is False
+    # 算不出来的放行——门槛挡的是「明确没回调」，不是「不知道」。
+    assert _is_dip_candidate(DipFeatures()) is True
+    assert _is_dip_candidate(None) is True
+
+
+def test_sector_ranking_no_longer_rewards_having_already_run() -> None:
+    """板块层此前 `ret_5d * 120` 单调递增，涨得越多分越高。
+
+    2026-08-02 实测：前五名板块的 5 日中位是 +10.16%/+10.48%/+9.48%/+8.03%/
+    +4.80%，排序几乎就是已涨幅度倒序——那是追涨的排法，不是低吸的。
+    """
+    from ashare_decision_support.sectors.predict import SectorPredictor
+    from ashare_decision_support.sectors.base import SectorMetrics
+
+    predictor = SectorPredictor(None)
+
+    def momentum(**kw):
+        d = dict(name="X", constituents=50, covered=50, ret_1d=0.005, ret_5d=0.03,
+                 ret_20d=0.08, breadth=0.6, above_ma20=0.7, volume_ratio=1.0)
+        d.update(kw)
+        return predictor._momentum_component(SectorMetrics(**d), [], [])
+
+    # 中期向上但已回调 > 中期向上却贴在高点：低吸要的是前者。
+    pulled_back = momentum(pullback_atr=2.0, pullback=-0.05)
+    at_high = momentum(pullback_atr=0.1, pullback=-0.002)
+    assert pulled_back > at_high
+
+    # 回撤过深转为扣分。
+    assert momentum(pullback_atr=6.0, pullback=-0.18) < pulled_back
+
+    # 中期趋势仍然是前提：跌了 20 日的板块不该因为「回调到位」而被选中。
+    assert momentum(ret_20d=-0.15, pullback_atr=2.0) < pulled_back

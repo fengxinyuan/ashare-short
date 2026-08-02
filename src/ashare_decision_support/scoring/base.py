@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, WyckoffSignal
 from ashare_decision_support.news.base import SymbolSentiment
+from ashare_decision_support.signals.dipbuy import DipFeatures
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,10 @@ class ScoreInput:
     `news` is optional and defaults to None, which means "not collected" rather
     than "collected and neutral" — the rule provider contributes nothing in that
     case instead of reading absence as a negative.
+
+    `dip` carries the pullback picture (`signals/dipbuy.py`). Same convention:
+    None means "not computed", and the provider scores nothing rather than
+    treating a missing pullback as "no pullback".
     """
 
     symbol: str
@@ -33,6 +38,7 @@ class ScoreInput:
     snapshot: DailyTechnicalSnapshot
     wyckoff: WyckoffSignal | None = None
     news: SymbolSentiment | None = None
+    dip: DipFeatures | None = None
 
 
 @dataclass(frozen=True)

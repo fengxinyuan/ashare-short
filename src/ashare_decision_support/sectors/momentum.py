@@ -15,6 +15,7 @@ from __future__ import annotations
 from statistics import fmean, median
 
 from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics
+from ashare_decision_support.signals.dipbuy import measure_dip
 
 # A 9.5% daily gain is at the main-board limit. 创业板/科创板 stocks cap at 20%,
 # so this counts "moved hard", not "sealed the limit".
@@ -53,13 +54,17 @@ class SectorMomentum:
     ) -> SectorMetrics:
         rets_1d: list[float] = []
         rets_5d: list[float] = []
+        rets_20d: list[float] = []
+        pullbacks: list[float] = []
+        pullbacks_atr: list[float] = []
         volume_ratios: list[float] = []
         above_ma = 0
         ma_samples = 0
         covered = 0
 
         for symbol in definition.symbols:
-            closes = _closes(bars_by_symbol.get(symbol) or [])
+            bars = bars_by_symbol.get(symbol) or []
+            closes = _closes(bars)
             if len(closes) < 2:
                 continue
             covered += 1
@@ -71,8 +76,19 @@ class SectorMomentum:
                 ret_5d = _pct_change(closes[-6], closes[-1])
                 if ret_5d is not None:
                     rets_5d.append(ret_5d)
+            if len(closes) >= MA_BARS + 1:
+                ret_20d = _pct_change(closes[-(MA_BARS + 1)], closes[-1])
+                if ret_20d is not None:
+                    rets_20d.append(ret_20d)
 
-            ratio = _volume_ratio(bars_by_symbol.get(symbol) or [])
+            # 成分股的回调画像沿用个股那一套，保证板块层与个股层口径一致。
+            features = measure_dip(bars)
+            if features.pullback_pct is not None:
+                pullbacks.append(features.pullback_pct)
+            if features.pullback_atr is not None:
+                pullbacks_atr.append(features.pullback_atr)
+
+            ratio = _volume_ratio(bars)
             if ratio is not None:
                 volume_ratios.append(ratio)
 
@@ -87,6 +103,9 @@ class SectorMomentum:
             covered=covered,
             ret_1d=round(median(rets_1d), 6) if rets_1d else None,
             ret_5d=round(median(rets_5d), 6) if rets_5d else None,
+            ret_20d=round(median(rets_20d), 6) if rets_20d else None,
+            pullback=round(median(pullbacks), 6) if pullbacks else None,
+            pullback_atr=round(median(pullbacks_atr), 4) if pullbacks_atr else None,
             breadth=round(sum(1 for value in rets_1d if value > 0) / len(rets_1d), 4) if rets_1d else None,
             strong_count=sum(1 for value in rets_1d if value >= self.strong_threshold),
             volume_ratio=round(median(volume_ratios), 4) if volume_ratios else None,
