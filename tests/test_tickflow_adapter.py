@@ -214,6 +214,27 @@ def test_free_mode_daily_proxy_returns_enough_bars_for_the_volume_baseline() -> 
     assert rows[-1]["close"] == 28.67
 
 
+def test_free_mode_tests_are_not_silently_upgraded_by_an_exported_key() -> None:
+    """A guard on the guard: `..._free_mode_...` tests must really run free mode.
+
+    `TickFlowAdapter.__init__` does `api_key or os.getenv("TICKFLOW_API_KEY")`,
+    which the CLI relies on. The side effect is that `api_key=None` in a test
+    means "free tier" only while no key is exported. Once the Pro tier was
+    activated, every free-mode assertion below started running against full mode
+    — three of them broke, and had the fixtures been a little more permissive
+    they would have kept passing while testing the wrong path entirely.
+
+    `tests/conftest.py:no_ambient_credentials` scrubs the variable. This test
+    fails if that scrubbing is ever dropped.
+    """
+    adapter = TickFlowAdapter(api_key=None, tickflow_module=FakeFreeTickFlowModule())
+
+    assert adapter.mode == "free"
+    assert adapter.supports_realtime is False
+    assert adapter.supports_intraday is False
+    assert adapter.supports_depth is False
+
+
 def test_tickflow_free_mode_daily_proxy_has_reasonable_vwap_and_gap() -> None:
     adapter = TickFlowAdapter(api_key=None, tickflow_module=FakeFreeTickFlowModule())
     feature = adapter.get_open_features(["603983.SH"])["603983.SH"]
