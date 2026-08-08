@@ -30,6 +30,10 @@ class NewsDoc:
     # 时效权重，由 `news/dedup.py:weigh_docs` 打上，聚合时按它加权。默认 1.0，
     # 所以没经过时效层的调用方（测试、外部脚本）行为完全不变。
     weight: float = 1.0
+    # Discovery-only metadata from an authorised social snapshot.  The
+    # sentiment scorer deliberately ignores it.
+    engagement: float | None = None
+    heat_rank: int | None = None
 
     @property
     def text(self) -> str:

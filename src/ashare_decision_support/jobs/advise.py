@@ -4,34 +4,49 @@ Covers the "问一下这几只该怎么办" workflow. Unlike `morning`, this job
 the symbols as given — you asked about them, so a risk flag is reported as a
 warning rather than silently removing the name from the answer.
 
-三条取数（日线结构、分时结构、个股舆情）互相独立且全是网络等待，所以走
+四条取数（日线结构、宽基对照、分时结构、个股舆情）互相独立且全是网络等待，所以走
 `agents/base.py:run_agents` 并行；串行跑等于把三段延迟加起来，而它们本可以重叠。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from ashare_decision_support.advice.engine import AdviceEngine, StockAdvice
+from ashare_decision_support.adapters.base import float_shares, metadata_names, security_metadata
+from ashare_decision_support.adapters.earnings import default_earnings_adapter
 from ashare_decision_support.adapters.tickflow_intraday import build_intraday_adapter
+from ashare_decision_support.advice.adjudicate import LevelAdjudicator
+from ashare_decision_support.advice.engine import AdviceEngine, StockAdvice
 from ashare_decision_support.agents import (
     AgentContext,
+    BenchmarkDailyAgent,
+    OrderBookAgent,
     SymbolDailyAgent,
     SymbolIntradayAgent,
     SymbolNewsAgent,
     run_agents,
 )
 from ashare_decision_support.agents.debate import DebatePanel
+from ashare_decision_support.jobs.progress import progress_reporter
 from ashare_decision_support.news import AkshareNewsSource
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.base import Notifier
 from ashare_decision_support.notify.render import advice_mandatory_block, render_advice_brief
 from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
-from ashare_decision_support.screens import StScreen
+from ashare_decision_support.screens import EarningsScreen, StScreen
 from ashare_decision_support.signals.dipbuy import measure_dip
+from ashare_decision_support.signals.distribution import judge_distribution
 from ashare_decision_support.signals.intraday import IntradayAnalyzer
+from ashare_decision_support.signals.relative_strength import (
+    benchmark_for,
+    measure_relative_strength,
+)
+from ashare_decision_support.signals.volume_price import measure_volume_price
+from ashare_decision_support.strategy.playbook import evaluate_playbooks
+from ashare_decision_support.symbols import normalize_symbol
 from ashare_decision_support.writer import TemplateWriter, WriteRequest
 from ashare_decision_support.writer.base import BriefWriter
 
@@ -52,10 +67,19 @@ def run_advise(
     news_source: Any | None = None,
     use_news: bool = True,
     debate: DebatePanel | None = None,
+    adjudicator: LevelAdjudicator | None = None,
+    use_order_book: bool = True,
+    snapshot_adapter: Any | None = None,
+    earnings_adapter: Any | None = None,
+    security_master_adapter: Any | None = None,
+    use_earnings: bool = True,
+    progress: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     today = trade_date or date.today()
     notes: list[str] = []
     provider = score_provider or RuleBasedScoreProvider()
+
+    _progress = progress_reporter(progress)
 
     # ---- 并行采集：日线 || 分时 || 个股舆情 --------------------------------
     source = intraday_adapter or _default_intraday(adapter)
@@ -74,11 +98,24 @@ def run_advise(
         symbols=list(symbols),
         period=period,
     )
-    findings = run_agents(
-        [SymbolDailyAgent(), SymbolIntradayAgent(), SymbolNewsAgent(symbols=list(symbols))],
-        ctx,
-        max_workers=3,
-    )
+    _progress(f"① 正在计算 {len(symbols)} 只标的的日线、分时、盘口和舆情")
+    # 证券简称在建 collector 之前先取：`SymbolNewsAgent` 要用它把「只在正文提到
+    # 这只票」的行业综述挡在个股舆情之外（见 `news/relevance.py`）。取不到就传空，
+    # 那一层自动放行，行为与从前一致。
+    master = security_metadata(adapter, symbols, security_master_adapter)
+    names = metadata_names(master, symbols)
+
+    collectors = [
+        SymbolDailyAgent(),
+        BenchmarkDailyAgent(symbols),
+        SymbolIntradayAgent(),
+        SymbolNewsAgent(symbols=list(symbols), names=names or None),
+    ]
+    if use_order_book:
+        # 五档是**整批一次**请求，和逐标的的分钟线延迟量级差一个数量级；
+        # 放进同一波并行里，它基本不增加这一轮的墙钟时间。
+        collectors.append(OrderBookAgent(adapter=snapshot_adapter))
+    findings = run_agents(collectors, ctx, max_workers=len(collectors))
     for finding in findings.values():
         notes.extend(finding.notes)
 
@@ -89,13 +126,47 @@ def run_advise(
     snapshots = daily.get("snapshots", {}) or {}
     wyckoff = daily.get("wyckoff", {}) or {}
     usable_daily = daily.get("bars", {}) or {}
+    benchmark_daily = findings["benchmark_daily"].get("bars", {}) or {}
     prev_closes = daily.get("prev_closes", {}) or {}
     sentiment = findings["symbol_news"].get("sentiment", {}) or {}
+    news_events = findings["symbol_news"].get("events", {}) or {}
+    books = findings["order_book"].get("readings", {}) if "order_book" in findings else {}
 
     # 分时的**取数**和日线并行，但 change_pct / 量比要用日线的昨收，所以拿回原始
     # bars 在这里重算一次。重算是纯计算，比让两次 HTTP 串行便宜得多。
     minute_bars = findings["symbol_intraday"].get("bars", {}) or {}
     intraday = IntradayAnalyzer(today=today).analyze_many(minute_bars, prev_closes)
+
+    # 低吸画像算一次，打分与打法判据共用。
+    dips = {
+        symbol: measure_dip(rows, snapshots[symbol])
+        for symbol, rows in usable_daily.items()
+        if symbol in snapshots
+    }
+    shares = float_shares(adapter, symbols)
+    volume_price = {
+        symbol: measure_volume_price(rows, snapshots[symbol], shares.get(symbol))
+        for symbol, rows in usable_daily.items()
+        if symbol in snapshots
+    }
+    relative_strength = {
+        symbol: measure_relative_strength(
+            symbol,
+            rows,
+            benchmark_daily.get(resolved[0], []) if (resolved := benchmark_for(symbol)) else [],
+        )
+        for symbol, rows in usable_daily.items()
+    }
+
+    # 打法判据。**不施加情绪周期约束**（`allowed=None`）：你点名问一只票时该看到
+    # 完整判断，不该被今天的大盘状态静默截断。周期的影响另有出口——盘前主链路
+    # 会拦，这里只负责把「这只票自己能用哪些打法、判据过没过」说清楚。
+    matches = {
+        symbol: evaluate_playbooks(
+            snapshots[symbol], dips.get(symbol), wyckoff.get(symbol), None
+        )
+        for symbol in snapshots
+    }
 
     scores = {
         result.symbol: result
@@ -107,7 +178,8 @@ def run_advise(
                     snapshot=snapshots[symbol],
                     wyckoff=wyckoff.get(symbol),
                     news=sentiment.get(symbol),
-                    dip=measure_dip(rows, snapshots[symbol]),
+                    dip=dips.get(symbol),
+                    volume_price=volume_price.get(symbol),
                 )
                 for symbol, rows in usable_daily.items()
                 if symbol in snapshots
@@ -116,9 +188,14 @@ def run_advise(
     }
 
     # ---- assemble ---------------------------------------------------------
-    names = _security_names(adapter, symbols)
     screen = StScreen()
-    engine = AdviceEngine()
+    # 业绩层在这条链路上**只提示、不移除**。`morning` 是系统主动选票，所以否决；
+    # `advise` 是你点名问一只票，答案必须是「它怎么样」而不是把它藏起来——「这只
+    # 票我不给你看」正是最没用的回答。和上面 ST 的处理完全同一条理由，见下方
+    # `Asked about explicitly, so it is answered — loudly.`
+    earnings_screen = EarningsScreen(_advise_earnings(earnings_adapter, today, use_earnings, notes))
+    earnings_verdicts = earnings_screen.evaluate(symbols)
+    engine = AdviceEngine(adjudicator=adjudicator)
     advices: list[StockAdvice] = []
     for symbol in symbols:
         result = scores.get(symbol)
@@ -129,6 +206,9 @@ def run_advise(
             wyckoff=wyckoff.get(symbol),
             name=names.get(symbol),
             score=result.score if result else None,
+            book=books.get(symbol),
+            instrument=master.get(symbol),
+            match=matches.get(symbol),
         )
         if result:
             advice.warnings.extend(result.warnings)
@@ -136,9 +216,29 @@ def run_advise(
         if not verdict.passed:
             # Asked about explicitly, so it is answered — loudly.
             advice.warnings.insert(0, f"⚠️ {verdict.reason}")
+        _apply_earnings(advice, earnings_verdicts.get(normalize_symbol(symbol)))
+        vp = volume_price.get(symbol)
+        intraday_read = intraday.get(symbol)
+        snapshot = snapshots.get(symbol)
+        wyckoff_read = wyckoff.get(symbol)
+        if vp is not None:
+            advice.volume_price = vp.to_dict()
+            advice.distribution = judge_distribution(
+                features=vp,
+                range_position_60d=(snapshot.range_position_60d if snapshot else None),
+                price_vs_vwap_pct=(intraday_read.price_vs_vwap_pct if intraday_read else None),
+                wyckoff_phase=(wyckoff_read.bias.value if wyckoff_read else None),
+            ).to_dict()
+        relative = relative_strength.get(symbol)
+        if relative is not None:
+            advice.relative_strength = relative.to_dict()
+        event = news_events.get(symbol)
+        if event is not None:
+            advice.event_evidence = event.to_dict()
         advices.append(advice)
 
-    facts = _facts(today, advices, notes, period, sentiment)
+    facts = _facts(today, advices, notes, period, sentiment, master)
+    _progress("② 结构、买卖点和情景已算完，正在整理简报与辩论")
 
     # ---- 多空辩论（可关）--------------------------------------------------
     debate_block = ""
@@ -182,6 +282,7 @@ def run_advise(
         # notifier list (the chat path) suppresses output.
         channels = notifiers if notifiers is not None else [ConsoleNotifier()]
         delivered = [c.capabilities.channel for c in channels if c.send(title, markdown)]
+    _progress("③ 个股分析已完成")
 
     return {
         "trade_date": str(today),
@@ -210,18 +311,40 @@ def _default_news() -> Any | None:
         return None
 
 
-def _security_names(adapter: Any, symbols: list[str]) -> dict[str, str | None]:
-    getter = getattr(adapter, "get_security_master", None)
-    if not callable(getter):
-        return {}
+def _advise_earnings(
+    adapter: Any | None, today: date, enabled: bool, notes: list[str]
+) -> Any:
+    """业绩快照。取不到就返回 None——`EarningsScreen(None)` 全部放行且自报未过滤。"""
+    if not enabled:
+        notes.append("已关闭业绩读数（--no-earnings），本次不提示业绩风险")
+        return None
+    source = adapter if adapter is not None else default_earnings_adapter()
+    if source is None:
+        return None
     try:
-        master = getter(symbols)
-    except Exception:
-        return {}
-    return {
-        symbol: (row.get("name") if isinstance(row, dict) else None)
-        for symbol, row in master.items()
-    }
+        snapshot = source.fetch(today)
+    except Exception as exc:
+        notes.append(f"业绩预告不可用（{type(exc).__name__}），本次不提示业绩风险")
+        return None
+    notes.extend(snapshot.notes)
+    return snapshot
+
+
+def _apply_earnings(advice: Any, verdict: Any) -> None:
+    """把业绩裁决贴到一条建议上。**否决在这里降级成置顶警告，不移除标的。**
+
+    置顶（`insert(0, ...)`）而不是追加：一条「中报首亏」如果排在第七条风险后面，
+    等于没说。和 ST 那条用同一个位置，理由也一样——你点名问的票，最该先看到的
+    就是这类硬事实。
+    """
+    if verdict is None:
+        return
+    for text in getattr(verdict, "blocking", []) or []:
+        advice.warnings.insert(0, f"⚠️ 业绩否决：{text}（盘前链路不会选它）")
+    for text in getattr(verdict, "warnings", []) or []:
+        advice.warnings.append(f"业绩：{text}")
+    for text in getattr(verdict, "catalysts", []) or []:
+        advice.reasons.append(text)
 
 
 def _facts(
@@ -230,8 +353,10 @@ def _facts(
     notes: list[str],
     period: str,
     sentiment: dict[str, Any] | None = None,
+    master: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     readings = sentiment or {}
+    instruments = master or {}
     return {
         "trade_date": str(today),
         "minute_period": period,
@@ -239,12 +364,21 @@ def _facts(
             {
                 "symbol": item.symbol,
                 "name": item.name,
+                "industries": list((instruments.get(item.symbol) or {}).get("industries") or []),
+                "industry": (instruments.get(item.symbol) or {}).get("industry"),
+                "industry_leaf": (instruments.get(item.symbol) or {}).get("industry_leaf"),
+                "industry_path": (instruments.get(item.symbol) or {}).get("industry_path"),
+                "concepts": list((instruments.get(item.symbol) or {}).get("concepts") or []),
                 "score": item.score,
                 "last_price": item.last_price,
                 "session_date": item.session_date,
                 "is_current_session": item.is_current_session,
                 "trend_state": item.trend_state,
                 "wyckoff_bias": item.wyckoff_bias,
+                # 打法与判据链。进 facts 是为了让写稿层能引用「凭哪条打法」，
+                # 也让数字闸门认得判据里的那些读数。
+                "playbook": item.playbook,
+                "setup": item.setup or None,
                 "entry_low": item.entry_low,
                 "entry_high": item.entry_high,
                 "stop": item.stop,
@@ -261,7 +395,27 @@ def _facts(
                 ],
                 "reasons": item.reasons,
                 "warnings": item.warnings,
+                "volume_price": (
+                    item.volume_price
+                ),
+                "distribution": item.distribution,
+                "relative_strength": item.relative_strength,
+                "event_evidence": item.event_evidence,
                 "intraday": item.intraday,
+                "trade_context": (
+                    item.trade_context.to_dict() if item.trade_context is not None else None
+                ),
+                "shortline": (
+                    item.shortline.to_dict() if item.shortline is not None else None
+                ),
+                # 盘口、候选集、裁决三样都进 facts。不只是为了给简报多点素材——
+                # 数字闸门比对的就是这份 facts，候选价不在里面的话，模型引用一个
+                # 合法候选反而会被当成编造。
+                "order_book": item.book or None,
+                "candidates": item.candidates.to_dict() if item.candidates else None,
+                "adjudication": (
+                    item.adjudication.to_dict() if item.adjudication else None
+                ),
                 "news": (
                     readings[item.symbol].to_dict() if item.symbol in readings else None
                 ),
