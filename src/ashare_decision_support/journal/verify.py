@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
+from ashare_decision_support.adapters.base import fetch_daily_bars
 from ashare_decision_support.journal.records import KIND_RECOMMENDATION, Outcome
 from ashare_decision_support.journal.store import Journal
 
@@ -38,7 +39,7 @@ def verify_pending(
     earliest = min(_as_date(row["trade_date"]) for row in pending)
     start = earliest - timedelta(days=10)
     try:
-        bars = _fetch(adapter, symbols, start, now)
+        bars = fetch_daily_bars(adapter, symbols, start, now)
     except Exception as exc:
         return {
             "checked": len(pending),
@@ -155,9 +156,13 @@ def _resolve(row: dict, bars: list[dict], today: date, horizon: int) -> Outcome 
         sector=row.get("sector"),
         trend_state=row.get("trend_state"),
         wyckoff_bias=row.get("wyckoff_bias"),
+        playbook=row.get("playbook"),
         rec_kind=row.get("kind") or KIND_RECOMMENDATION,
         dip=row.get("dip") or {},
         market_state=row.get("market_state") or {},
+        trade_flow=row.get("trade_flow") or {},
+        adjudication=row.get("adjudication") or {},
+        macro_context=row.get("macro_context") or {},
     )
 
 
@@ -186,10 +191,3 @@ def _as_date(value: Any) -> date | None:
         return date.fromisoformat(str(value)[:10])
     except (TypeError, ValueError):
         return None
-
-
-def _fetch(adapter: Any, symbols: list[str], start: date, end: date) -> dict[str, list[dict]]:
-    batch = getattr(adapter, "get_historical_bars_batch", None)
-    if callable(batch):
-        return batch(symbols, start, end)
-    return adapter.get_historical_bars(symbols, start, end)

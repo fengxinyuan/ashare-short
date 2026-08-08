@@ -14,15 +14,19 @@ silent degradation is impossible.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as clock_time
-from typing import Any, Callable
+from datetime import datetime
+from datetime import time as clock_time
 
 from ashare_decision_support.adapters.freshness import in_session
 from ashare_decision_support.monitor.session import MonitorSession
-from ashare_decision_support.monitor.triggers import Alert
-from ashare_decision_support.notify.base import Notifier
-from ashare_decision_support.notify.render import render_alerts, render_feed_suspension
+from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.notify.render import (
+    alert_title,
+    render_alerts,
+    render_feed_suspension,
+)
 
 # Poll intervals in seconds, from normal to most conservative. The loop walks
 # this ladder down on sustained failure and back up on sustained success.
@@ -35,7 +39,8 @@ BAD_PASS_FAILURE_RATIO = 0.5
 STEP_DOWN_AFTER = 2
 STEP_UP_AFTER = 5
 
-MONITOR_START = clock_time(9, 35)
+# 收盘前 5 分钟停。开始时刻由 `schedule/timetable.py` 决定——那里是时间表的
+# 唯一权威，这里再写一个 09:35 只会多一处可以和它对不上的地方。
 MONITOR_END = clock_time(14, 55)
 
 # Passes between announcement refreshes. The feed is a whole-day bulk pull, so
@@ -117,14 +122,14 @@ def run_monitor_loop(
 
         if result.health.usable:
             if suspended:
-                _publish(notifiers, "分时监控恢复", render_feed_suspension(result.health))
+                publish(notifiers, "分时监控恢复", render_feed_suspension(result.health))
                 suspended = False
             if result.alerts:
                 stats.alerts += len(result.alerts)
-                _publish(notifiers, _alert_title(result.alerts), render_alerts(result.alerts, result.health))
+                publish(notifiers, alert_title(result.alerts), render_alerts(result.alerts, result.health))
         elif result.verdict_changed and not suspended and active:
             # One message when the gate closes, not one per pass.
-            _publish(notifiers, "分时监控挂起", render_feed_suspension(result.health))
+            publish(notifiers, "分时监控挂起", render_feed_suspension(result.health))
             suspended = True
             stats.suspensions += 1
 
@@ -168,26 +173,3 @@ def _maybe_step_up(level: int, good_streak: int, stats: LoopStats) -> tuple[int,
         f"连续 {good_streak} 轮正常，轮询间隔 {INTERVAL_LADDER[level]} → {INTERVAL_LADDER[level - 1]} 秒"
     )
     return level - 1, 0
-
-
-def _alert_title(alerts: list[Alert]) -> str:
-    action = sum(1 for alert in alerts if alert.level == "ACTION")
-    if action:
-        return f"盘中告警 {action} 条 ACTION / 共 {len(alerts)} 条"
-    return f"盘中告警 {len(alerts)} 条"
-
-
-def _publish(notifiers: list[Notifier], title: str, content: str) -> None:
-    for notifier in notifiers:
-        try:
-            notifier.send(title, content)
-        except Exception:
-            # A notifier contract violation must not stop monitoring.
-            continue
-
-
-def monitor_window(day: date) -> tuple[datetime, datetime]:
-    return (
-        datetime.combine(day, MONITOR_START),
-        datetime.combine(day, MONITOR_END),
-    )
