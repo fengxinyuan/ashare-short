@@ -20,6 +20,8 @@ from ashare_decision_support.news.dedup import (
     recency_weight,
     weigh_docs,
 )
+from ashare_decision_support.news.official_source import OfficialNewsSource
+from ashare_decision_support.news.rss_source import RssNewsSource
 from ashare_decision_support.news.sentiment import LexiconSentiment
 from ashare_decision_support.news.store import IngestResult, NewsStore, StoredDoc
 from ashare_decision_support.news.wallstreet_source import WallstreetNewsSource
@@ -36,6 +38,8 @@ __all__ = [
     "NewsDoc",
     "NewsSource",
     "NewsStore",
+    "OfficialNewsSource",
+    "RssNewsSource",
     "SentimentAnalyzer",
     "SentimentScore",
     "StoredDoc",

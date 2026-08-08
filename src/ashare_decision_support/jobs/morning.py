@@ -45,6 +45,8 @@ from ashare_decision_support.news import (
     LexiconSentiment,
     NewsCache,
     NewsStore,
+    OfficialNewsSource,
+    RssNewsSource,
     WallstreetNewsSource,
 )
 from ashare_decision_support.news.llm_classifier import (
@@ -472,6 +474,8 @@ def _default_news_source(output_path: Path) -> Any | None:
     except RuntimeError:
         pass
     sources.append(WallstreetNewsSource())
+    sources.append(OfficialNewsSource())
+    sources.append(RssNewsSource())
     return CompositeNewsSource(*sources) if sources else None
 
 
