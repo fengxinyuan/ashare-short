@@ -1,108 +1,114 @@
 # A-share Ultra-Short AI Decision Support
 
-A 股超短线 **分析辅助** 系统。**不下单、不撤单、不接管证券账户。**
+A 股超短线事实采集与分析辅助系统。只做采集、整理、提醒和复盘，不下单、不撤单、不接管账户。
 
-**从这里开始：[`docs/SOLUTION.md`](docs/SOLUTION.md)**（总览）
+默认工作方式已经收敛成两层：
 
-| 文档 | 内容 |
-|---|---|
-| [`SOLUTION.md`](docs/SOLUTION.md) | 总览 · 四条需求 · 全天链路 · 三层自主度 · 设计约束 |
-| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图 · 层次边界 · 调度 · 状态 · 失败模式 |
-| [`DATA_SOURCES.md`](docs/DATA_SOURCES.md) | 实测矩阵 · 档位差异 · 量纲陷阱 · 校验 · 安装 |
-| [`PIPELINE.md`](docs/PIPELINE.md) | 舆情 → 板块 → 选股 → 买卖点，每段怎么算 |
-| [`DECISIONS.md`](docs/DECISIONS.md) | 为什么这么定 · 被否决的方案 · 已删除的东西 |
+- 系统负责：舆情、股价、分时、板块、公告、轮动等事实采集与结构化输出
+- 你负责：在 Codex / Claude 这类交互窗口里读取这些事实，再做总结和分析
 
-## 主体：自动运行
+系统默认**不自动调用模型**。模型相关能力都改成显式开关。
 
-```bash
-ashare-ds daemon                # 全天按时间表跑
-ashare-ds daemon --dry-run      # 只看时间表
-ashare-ds daemon --feishu       # 同时推飞书
-```
+从这里开始：[`docs/USAGE.md`](docs/USAGE.md)
 
-```text
-08:00 舆情采集入库 → 08:20 盘前主链路（舆情→大盘→板块→选股→候选池→台账）
-   → 09:15 执行卡 → 09:35–14:55 盘中监控 → 15:10 盘后复盘 → 15:40 兑现核对
-```
+## 能做什么
 
-非交易日整张表跳过；任务失败只重试三次并推一条通知，不影响其余任务；进程中途重启
-不会重发已完成的推送。
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 趋势分析 | `ashare-ds morning` / `ashare-ds ask "今天板块趋势怎么样"` | 盘前大盘、板块排序、候选池 |
+| 参数化选股 | `ashare-ds strategy-screen --profile all` | TickFlow 全市场日线筛选，多策略结果供 AI 比较 |
+| 股价分析 | `ashare-ds advise 600519.SH` / `ashare-ds ask "600519 现在怎么看"` | 单票结构、分时、成交量、盘口、买卖点 |
+| 自选股监控 | `ashare-ds monitor --once` | 盘中轮询、跃迁告警、持仓卖点 |
+| facts 导出 | `ashare-ds facts` | 导出当前事实、宏观联动和近期验证窗口，供 Codex / Claude 使用 |
+| facts 对话 | `ashare-ds chat` | 多轮查看同一份事实包；默认不调模型 |
+| 显式模型分析 | `ashare-ds ask --llm "600519 现在怎么看"` | 把事实包交给模型组织语言，数字仍过校验闸门 |
+| 买卖点裁决 | `ashare-ds advise --adjudicate --writer llm 600519.SH` | 在规则候选里做取舍，可弃权；仅在显式开启时调用模型 |
 
-## 手工插问
-
-```bash
-ashare-ds watchlist add 600519 000001.SZ --note "核心仓"   # 自选股是所有命令的默认输入
-ashare-ds watchlist hold 600519 --cost 1350.6              # 有成本价才能盯卖点
-
-ashare-ds morning                                          # 盘前主链路
-ashare-ds monitor --once                                   # 跑一轮盘中监控
-ashare-ds advise                                           # 自选股买卖点与情景
-ashare-ds chat                                             # 多轮追问
-ashare-ds review                                           # 兑现核对 + 统计
-ashare-ds journal --symbol 600519.SH                       # 某只票的建议与兑现
-ashare-ds state                                            # 当前状态一览
-```
-
-## 实现状态
-
-文档同时描述**已建成**与**已定但未建**的部分，后者一律标注。
-避免把设计当现状，是这套文档上一次需要重写的直接原因。
-
-| | 状态 |
-|---|---|
-| 舆情采集 → 持久语料库（记 first_seen） | ✅ `news/store.py`，已接盘前链路 |
-| 盘前主链路：舆情→大盘→板块→选股→候选池→台账 | ✅ |
-| 盘中监控：时效闸门 · 跃迁告警 · 持仓卖点 · 止跌确认 | ✅ |
-| 数据校验：跨源比对 · 量纲反推 · 浮点卫生 | ✅ `adapters/validate.py` |
-| 台账 → 兑现核对 → 统计（含对照组与筛选价值） | ✅ |
-| 多轮对话 | ✅ `chat` |
-| **买卖点三层（L2 候选集 + L3 模型裁决）** | ⬜ **未建**，现为单一规则路径，见 `SOLUTION.md` §三 |
-| **五档盘口进买卖点** | ⬜ **未建**，适配器已实测可用但无调用方 |
-| **热门股池（第三个标的列表）** | ⬜ **未建**，现只有自选股与候选池 |
-| **`ask` 单入口问答** | ⬜ **未建**，用 `chat` 的 `/` 命令 |
-
-
-## Install
+## 快速开始
 
 ```bash
 cd /root/a-share-ultra-short-ai-system
 python3 -m pip install -e ".[tickflow,akshare]"
 
-export TICKFLOW_API_KEY=...      # 可选。不设走免费档；设了自动切付费档，代码无需改动
-export DASHSCOPE_API_KEY=...     # 可选，仅 LLM 写稿 / 买卖点裁决 / 对话 / 多空辩论
-export FEISHU_WEBHOOK_URL=...    # 可选，--feishu 推送
-export ASHARE_DS_HOME=...        # 可选，状态目录，默认 ~/.ashare-ds
+cp .env.tickflow.example .env.tickflow
+cp .env.feishu.example .env.feishu   # 可选，填 webhook 后 `--feishu` 自动推送
 ```
 
-完整环境变量与诊断命令见 [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md) §七。
+常用命令：
 
-## 五件值得先知道的事
+```bash
+ashare-ds watchlist add 600519.SH 000001.SZ --note "核心仓"
+ashare-ds watchlist hold 600519.SH --cost 1350.6 --stop 1330 --target 1430
 
-- **数据时效是自动化的总开关。** 人看简报会自己判断「非当日数据」，自动推送不会。
-  监控每轮先验时效，数据不新就推一条「已挂起」然后停止产出信号，循环继续检测恢复。
-  每条推送都带 as-of 时间戳。
+ashare-ds morning
+ashare-ds monitor --once
+ashare-ds monitor --feishu
+ashare-ds advise 600519.SH
+ashare-ds facts
+ashare-ds ask "600519 现在趋势和买点怎么样"
+ashare-ds ask --llm "600519 现在趋势和买点怎么样"
+ashare-ds ask --deep "这几只低开了，结合成交量怎么处理"
+ashare-ds chat
+ashare-ds review
 
-- **数字只在确定性层产生，取舍才交给模型。** 规则算出所有数并给一组**带出处的候选
-  价位**；模型在候选集内选择、权衡、可以说「今天不该买」，但说出一个候选集外的价
-  就整段丢弃。台账同时记规则默认与模型裁决两套结论，让兑现核对回答哪个更好。
+# 全市场策略筛选
+ashare-ds strategy-screen --profile high-elasticity --price-max 60 --limit 30
+ashare-ds strategy-screen --profile all --price-max 40 --min-amount-yi 3 --limit 50
+ashare-ds strategy-screen --profile all --all-a --price-max 40
+```
 
-- **价格口径。** 日线比例前复权、分钟线不复权——两者本来就共用今天的价格尺度
-  （实测 400 只，最新一根无一例外完全相同）。所以那个换算比值**恒等于 1.0，
-  这正是它的价值**：一旦不等于 1.0 就说明两份数据对不上，此时宁可不给价。
-  台账存相对百分比，因为只有百分比对复权免疫。
+筛选结果默认落在 `briefs/strategy_screen_latest.json`，`ask` / `facts` 会自动带入最近一份结果。ST/退市风险标的默认纳入，并在候选的 `warnings` 中明示；需要排除时显式加 `--exclude-st`。批量模式会输出各策略的诊断漏斗、跨策略多样化短名单和重复命中标的；`setup_rank` 只用于同一策略内排序，不是胜率、收益率或次日收益承诺。筛选不生成或执行订单。
 
-- **没有概率。** 没有拟合模型，就不印胜率和预期收益率，只印会改变判断的价位。
-  台账攒够 200 条已兑现记录之前，统计只报告、不回写权重。
+如果你想让系统保持完全确定性，直接用默认值即可：`writer` 默认就是 `template`，
+`ask` / `chat` 默认就是 facts-only。只有显式加 `--llm` 或 `--writer llm` 才会走模型。
 
-- **五档是挂单快照，不是成交意图。** 可撤、可假挂、只有五档，所以设计上它只能是
-  **有界旁证**而不是主判据。真正的委托流（逐笔委托、撤单记录）任何档位都拿不到。
-  （适配器已实测可用，**尚未接进买卖点**。）
+## 推荐工作流
 
-## Project layout
+1. 用 `morning` / `advise` / `monitor` 先把事实和结构化结论跑出来。
+2. 用 `facts` 导出统一 bundle，直接在 Codex / Claude 窗口里粘贴或引用这些 facts / briefs 做后续分析。包内同时有当前事实和最近 20/60 个交易日的验证结果，避免只根据单次晨报下结论。JSON 包带有 `schema: "ashare-facts-v1"` 和 `contract` 字段：`as_of` 是统一数据时点，缺失值保持为 `null`/空集合，不能由分析者补猜；数值由确定性规则层产生，模型只负责解释和取舍。
+3. 如果只是想在命令行里让模型代写，再显式加 `--llm` 或 `--writer llm`。最终交易判断和执行由你自行决定。
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/USAGE.md`](docs/USAGE.md) | 场景到命令的对应表，优先看这个 |
+| [`docs/CODEX_WORKFLOW.md`](docs/CODEX_WORKFLOW.md) | Codex 做链路、板块与个股分析的事实包工作流与边界 |
+| [`docs/DAILY_PREOPEN_PROMPT.md`](docs/DAILY_PREOPEN_PROMPT.md) | 每日盘前研报提示词：外盘、政策、舆情、题材与先手条件 |
+| [`docs/SOLUTION.md`](docs/SOLUTION.md) | 总览 · 需求拆解 · 运行链路 · 设计约束 |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图 · 调度 · 状态 · 失败模式 |
+| [`docs/INVENTORY.md`](docs/INVENTORY.md) | **功能接线清单**：哪个模块今天真的跑、哪些建成但未接线 |
+| [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md) | 数据源实测矩阵与安装说明 |
+| [`docs/PIPELINE.md`](docs/PIPELINE.md) | 舆情 → 板块 → 选股 → 买卖点的计算细节 |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | 设计取舍、被否决方案、已删除内容 |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | **下一轮**：体检结论、七个真缺口、量价形态/轮动/记忆层设计与实施顺序 |
+| [`docs/REWORK.md`](docs/REWORK.md) | **本轮改造方案**：主链路清理 · 量价策略 · 筹码与元数据 · 行情记忆 |
+
+## 约束
+
+- 只做分析辅助，不接管证券账户。
+- 数字只在确定性层产生；模型只负责组织语言和取舍，而且默认关闭。
+- 盘口、成交量、趋势、买卖点都可以问，但都必须标明数据时点。
+
+## 目录
 
 ```text
-docs/      SOLUTION · ARCHITECTURE · DATA_SOURCES · PIPELINE · DECISIONS
-scripts/   source_audit.py 数据源审计
+docs/      设计、链路、数据源与使用指南
+scripts/   审计脚本
 src/       源码
 tests/     单元测试
 ```
+
+## 开发
+
+```bash
+python3 -m pip install -e ".[dev]"
+
+python -m pytest -q          # 单元测试，不打外网
+ruff check .                 # 静态检查
+ruff check . --fix           # 只应用安全修复
+```
+
+`ruff` 的规则族与每一条忽略的理由写在 `pyproject.toml` 的 `[tool.ruff.lint]`
+里。裸跑默认规则会报几千条中文标点告警，那个信噪比下没人会看第二次——所以规则
+是显式列出来的，加规则请连同理由一起加。
