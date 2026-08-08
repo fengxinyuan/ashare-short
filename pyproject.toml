@@ -30,6 +30,8 @@ backtest = [
 ]
 dev = [
   "pytest>=9.0",
+  "pytest-cov>=6.0",
+  "ruff>=0.16",
 ]
 
 [project.scripts]
@@ -43,3 +45,120 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src"]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# 显式列出规则族，不吃 ruff 的默认集。默认集随版本变——升一次 ruff 冒出几十条
+# 新告警，这道闸门第二天就没人看了。要加规则就在这里加，改动进 diff。
+select = [
+  "F",                  # pyflakes：未定义名、未使用的导入与变量
+  "E4", "E7", "E9",     # pycodestyle 里不与格式化打架的那部分
+  "I",                  # 导入分组与排序
+  "UP",                 # 语法现代化（本项目 requires-python >= 3.11）
+  "B",                  # bugbear：可变默认值、循环变量闭包一类的真错
+  "C4",                 # 多余的 comprehension / 集合构造
+  "SIM",                # 可直接简化的分支与表达式
+  "PERF",
+  "PIE",
+  "FLY",
+  "FURB",
+  "ISC",
+  "RUF",
+  "S",                  # bandit
+  "PL",                 # pylint 移植过来的那部分
+]
+
+ignore = [
+  # --- 与这套系统的写法冲突，属于有意为之 ---------------------------------
+  # 全角标点是正文的一部分：注释、docstring、给用户看的字符串都是中文，
+  # 「。，；」不是「打错的 ASCII」。这三条会在本仓库产生 5000+ 条告警。
+  "RUF001", "RUF002", "RUF003",
+  # 宽捕获是架构决定而非疏忽：单个数据源挂掉不能拖垮整轮跑批，
+  # 见 agents/base.py 与 ask/context.py 的模块注释。97 处逐个 noqa
+  # 只会把 noqa 变成背景噪声。个别需要强调的地方仍然保留了行内 noqa。
+  "BLE001",
+  # 全系统只有一个时区——沪深两市的交易时钟。带 tzinfo 的 datetime 在这里
+  # 不增加任何信息，只会让 09:15 / 15:00 这类边界判断多一层转换。
+  "DTZ",
+  # 函数内 import 是有意的：打断循环依赖，以及让 akshare / tickflow 这些
+  # 可选依赖在没装的时候不影响主链路启动。
+  "PLC0415",
+  # 阈值常量在这个域里满地都是（涨跌幅、换手率、连板数）。这条等于全文告警。
+  "PLR2004",
+  # job 层入口天然多参：一次跑批要的适配器、日期、开关就是这么多。
+  "PLR0913", "PLR0917",
+  # `for x in xs: lines.append(...)` 命中的全是**渲染**代码。改成 extend +
+  # 生成式，在一段每行都可能带条件的拼装里反而更难读，而这些循环一份简报
+  # 只跑几十次——省下的时间量不出来。
+  "PERF401",
+  # `line = line.strip()` 这类就地收窄是 Python 的常规写法，不是覆盖失误。
+  "PLW2901",
+  # 命中的 lambda 全是**延迟调用**的 thunk（数据源取数函数表）。摘掉 lambda
+  # 会把属性解析从调用时提前到建表时，那正是这张表想避免的。
+  "PLW0108",
+
+  # --- 命中的全是误报 -----------------------------------------------------
+  # 认的是变量名。命中的是 ENV_SECRET / TOKEN_URL 这类**环境变量名与常量名**，
+  # 以及测试里的假值。仓库里没有硬编码密钥，密钥走 .env（见 envfile.py）。
+  "S105", "S106",
+  # pytest 就是用 assert 断言的。
+  "S101",
+  # urllib 打的都是写死的行情站点域名，不接受外部 URL。
+  "S310",
+  # 拼进去的表名来自字面量元组；SQL 本来也不支持参数化表名。
+  "S608",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ashare_decision_support"]
+
+[tool.ruff.lint.pylint]
+# 默认 6 太紧，而且它罚的是**这套代码里正确的写法**。仓库里超过 6 个 return 的
+# 函数只有 1.5%，逐个看过之后没有一个是「一个函数干了两件事」，全部是两种形状：
+#
+#   1. 分档判定阶梯——`wyckoff._classify_bias` 把评分映射到 7 个结构档位，
+#      顺序本身是语义（前面的规则覆盖后面的），改成查表反而丢掉覆盖关系；
+#   2. 类型分发——`qmt_xtdata._to_plain` 要认 numpy 交出来的 8 种形状，
+#      有几种形状就有几个 return。
+#
+# 两种都是卫语句风格，摊平比嵌套好读。10 是「一次分发/一条阶梯」的天花板：
+# 再多基本意味着在两个维度上同时分发，那才是真该拆的信号。
+max-returns = 10
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里的桩类用类属性存调用记录，`= []` 是刻意的共享（每个测试新建一个实例，
+# 或者根本只用一次）。在这里放开，而不是给每个桩类加一行 noqa。
+"tests/*" = ["RUF012"]
+
+# 审计脚本是**线性过程**：一步步探测数据源、逐段打印结论。它没有分支复杂度，
+# 只是步骤多；拆成函数会把「按顺序读下来就是报告」这个唯一的优点弄没。
+"scripts/*" = ["PLR0915"]
+
+# --- 复杂度欠账：只豁免这几个历史长文件，不豁免全仓 -------------------------
+# 这四条规则原来在全局 `ignore` 里，等于**新写的文件也不受复杂度约束**——一笔
+# 局部欠账被摊成了「本来就没有这道闸门」。拆这几个文件要动的是判定顺序，该单独
+# 一轮做（见 docs/ROADMAP.md §7）；在那之前先把闸门对新代码恢复。
+#
+# `jobs/morning.py` 原本也在这张表里，2026-08-05 拆成六段之后**自己过了闸**，
+# 已经摘掉——这一行是这轮唯一真正还上的复杂度欠账，不是放宽规则换来的。
+"src/ashare_decision_support/notify/render.py" = ["C901", "PLR0911", "PLR0912", "PLR0915"]
+"src/ashare_decision_support/monitor/triggers.py" = ["C901", "PLR0911", "PLR0912", "PLR0915"]
+"src/ashare_decision_support/advice/engine.py" = ["C901", "PLR0911", "PLR0912", "PLR0915"]
+
+# --- 长度欠账：分支数/语句数超标，但拆开会更难读 ----------------------------
+# 和上面四个不同，这几个不是「以后要拆」，是**已经看过并决定不拆**：
+#   loop.py        一个轮询循环，5 份状态（档位、连败、连胜、挂起、统计）在
+#                  分支间共享。抽出「跑一轮」就得造一个状态包再传回来。
+#   advise.py      主链路编排，语句多是因为步骤多，分支只有 12。
+#   daily_technical 画 SVG：71 条语句全是坐标计算与标签摆放，没有判断。
+#   qmt/tickflow   适配器的字段兜底，分支数等于上游可能给出的字段组合数。
+"src/ashare_decision_support/monitor/loop.py" = ["PLR0912", "PLR0915"]
+"src/ashare_decision_support/jobs/advise.py" = ["PLR0912", "PLR0915"]
+"src/ashare_decision_support/signals/daily_technical.py" = ["PLR0915"]
+"src/ashare_decision_support/adapters/qmt_xtdata.py" = ["PLR0912"]
+"src/ashare_decision_support/adapters/tickflow_adapter.py" = ["PLR0912"]
+"src/ashare_decision_support/adapters/tickflow_intraday.py" = ["PLR0912"]

@@ -488,6 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _dump_json(payload: object, output_path: str | None = None) -> None:
     rendered = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
     if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as handle:
             handle.write(rendered)
             handle.write("\n")

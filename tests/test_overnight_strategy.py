@@ -5,6 +5,7 @@ from ashare_decision_support.strategy.overnight import (
     StrategyCandidate,
     StrategyScreenConfig,
     StrategyScreenResult,
+    _ordered_bars,
     diversified_shortlist,
     is_main_board,
     screen_overnight,
@@ -116,6 +117,27 @@ def test_symbol_and_metadata_keys_are_normalized() -> None:
     )
     assert result.scanned == 1
     assert result.candidates or result.rejected_shape == 1
+
+
+def test_bars_are_ordered_before_signal_day_is_selected() -> None:
+    rows = make_bars("600519.SH")
+    ordered = _ordered_bars(list(reversed(rows)))
+    assert [row["timestamp"] for row in ordered] == sorted(row["timestamp"] for row in rows)
+
+
+def test_scope_gate_runs_before_technical_analysis(monkeypatch) -> None:
+    seen: list[str] = []
+
+    def analyze_many(self, bars_by_symbol):
+        seen.extend(sorted(bars_by_symbol))
+        return {}
+
+    monkeypatch.setattr("ashare_decision_support.strategy.overnight.DailyTechnicalAnalyzer.analyze_many", analyze_many)
+    screen_overnight(
+        {"600519.SH": make_bars("600519.SH"), "300750.SZ": make_bars("300750.SZ")},
+        config=StrategyScreenConfig(profile="balanced-pullback"),
+    )
+    assert seen == ["600519.SH"]
 
 
 def test_rejection_reason_is_exposed_for_tuning() -> None:

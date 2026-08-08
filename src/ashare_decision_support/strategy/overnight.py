@@ -260,20 +260,23 @@ def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
     """
     cfg = config or StrategyScreenConfig()
     profile = cfg.resolved_profile()
+    normalized_names = {
+        normalized: value
+        for key, value in (names or {}).items()
+        if (normalized := normalize_symbol(key))
+    }
+    normalized_sectors = {
+        normalized: value
+        for key, value in (sectors or {}).items()
+        if (normalized := normalize_symbol(key))
+    }
     normalized_bars: dict[str, list[dict]] = {}
     for raw_symbol, rows in bars_by_symbol.items():
         symbol = normalize_symbol(raw_symbol)
         if symbol and symbol not in normalized_bars:
-            normalized_bars[symbol] = rows
+            normalized_bars[symbol] = _ordered_bars(rows)
     result = StrategyScreenResult(config=cfg, profile=profile, scanned=len(normalized_bars))
-    snapshots = DailyTechnicalAnalyzer().analyze_many(normalized_bars)
-    normalized_names = {
-        normalize_symbol(key): value for key, value in (names or {}).items() if normalize_symbol(key)
-    }
-    normalized_sectors = {
-        normalize_symbol(key): value for key, value in (sectors or {}).items() if normalize_symbol(key)
-    }
-
+    eligible_bars: dict[str, list[dict]] = {}
     for symbol, rows in normalized_bars.items():
         name = normalized_names.get(symbol)
         if cfg.main_board_only and not is_main_board(symbol):
@@ -282,6 +285,13 @@ def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
         if not cfg.allow_st and is_st_name(name):
             result.excluded_st += 1
             continue
+        eligible_bars[symbol] = rows
+
+    # Scope and name gates are deliberately before technical analysis: a full
+    # universe scan should not spend CPU deriving indicators for excluded boards.
+    snapshots = DailyTechnicalAnalyzer().analyze_many(eligible_bars)
+    for symbol, rows in eligible_bars.items():
+        name = normalized_names.get(symbol)
         if not rows or symbol not in snapshots:
             result.rejected_data += 1
             result.rejection_reasons["data_bars"] = result.rejection_reasons.get("data_bars", 0) + 1
@@ -315,6 +325,19 @@ def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
     if result.rejected_data:
         result.notes.append(f"{result.rejected_data} 只标的数据不足，未参与形态判断。")
     return result
+
+
+def _ordered_bars(rows: list[dict] | None) -> list[dict]:
+    """Return valid daily rows in chronological order for a stable signal day."""
+    if not isinstance(rows, list):
+        return []
+    valid = [row for row in rows if isinstance(row, dict)]
+    return sorted(
+        valid,
+        key=lambda row: str(
+            row.get("timestamp") or row.get("date") or row.get("日期") or row.get("时间") or ""
+        ),
+    )
 
 
 def diversified_shortlist(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,7 +21,7 @@ from ashare_decision_support.ask import (
     current_phase,
     run_ask,
 )
-from ashare_decision_support.cli import build_parser
+from ashare_decision_support.cli import _dump_json, build_parser
 from ashare_decision_support.facts import build_facts_bundle
 
 
@@ -136,6 +137,12 @@ def test_strategy_screen_payload_is_available_to_ask_context(tmp_path) -> None:
     assert ctx.blocks["参数化策略扫描"]["schema"] == "ashare-strategy-screen-v1"
 
 
+def test_dump_json_creates_missing_parent_directory(tmp_path) -> None:
+    target = tmp_path / "nested" / "result.json"
+    _dump_json({"ok": True}, str(target))
+    assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
+
+
 def test_strategy_screen_parser_accepts_all_profiles() -> None:
     args = build_parser().parse_args(["strategy-screen", "--profile", "all", "--all-a", "--allow-st"])
     assert args.profile == "all"
@@ -145,6 +152,41 @@ def test_strategy_screen_parser_accepts_all_profiles() -> None:
 
     excluded = build_parser().parse_args(["strategy-screen", "--exclude-st"])
     assert excluded.exclude_st is True
+
+
+def test_strategy_screen_cli_writes_batch_payload_with_stubbed_data(tmp_path, monkeypatch, capsys) -> None:
+    from ashare_decision_support import cli
+
+    class Profile:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def industry(self, level: str) -> str:
+            return "测试行业"
+
+    class Taxonomy:
+        def __init__(self, level: str) -> None:
+            self.snapshot = SimpleNamespace(
+                profiles={
+                    "600000.SH": Profile("测试银行"),
+                    "600001.SH": Profile("*ST测试"),
+                }
+            )
+            self.notes = ["fixture taxonomy"]
+
+    monkeypatch.setattr(cli, "ThsIndustryTaxonomy", Taxonomy)
+    monkeypatch.setattr(cli, "_tickflow", lambda args: object())
+    monkeypatch.setattr(cli, "fetch_daily_bars", lambda adapter, symbols, start, end: {symbol: [] for symbol in symbols})
+    target = tmp_path / "nested" / "screen.json"
+    args = build_parser().parse_args(
+        ["strategy-screen", "--profile", "all", "--exclude-st", "--output", str(target)]
+    )
+    cli._cmd_strategy_screen(args)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["schema"] == "ashare-strategy-screen-batch-v2"
+    assert payload["profiles"]["balanced-pullback"]["summary"]["excluded_st"] == 1
+    assert "fixture taxonomy" in payload["data_notes"]
+    assert capsys.readouterr().out
 
 
 def test_the_payloads_own_date_is_surfaced_so_stale_data_is_visible(tmp_path) -> None:

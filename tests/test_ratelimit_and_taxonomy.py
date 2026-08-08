@@ -21,9 +21,13 @@ from ashare_decision_support.adapters.ratelimit import (
     retry_after_seconds,
     wrap_client,
 )
+from ashare_decision_support.adapters.ths_taxonomy import (
+    SymbolProfile,
+    ThsTaxonomySnapshot,
+    ThsTaxonomySource,
+)
 from ashare_decision_support.sectors import SectorTaxonomyError, TickFlowSwTaxonomy
 from ashare_decision_support.sectors import taxonomy as taxonomy_module
-
 
 # ---- clock double --------------------------------------------------------
 
@@ -459,3 +463,52 @@ def test_batch_shards_are_still_throttled_on_the_free_tier() -> None:
     client.universes.batch(["CN_Equity_SW1_2"])
 
     assert clock.slept == [60.0]              # 第二次批量调用等过闸门
+
+
+class JsonResponse:
+    def __init__(self, payload: object) -> None:
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+
+def test_static_taxonomy_fixture_fetches_and_merges_concepts(tmp_path) -> None:
+    files = {
+        "industries.json": [{
+            "symbol": "600000",
+            "name": "测试银行",
+            "industries": ["银行", "银行Ⅱ"],
+        }],
+        "concepts.json": [{"symbol": "600000.SH", "concepts": ["金融科技", "融资融券"]}],
+    }
+
+    def opener(request, timeout):
+        return JsonResponse(files[request.full_url.rsplit("/", 1)[-1]])
+
+    snapshot = ThsTaxonomySource(opener=opener, cache_dir=tmp_path).load(
+        force_refresh=True
+    )
+    assert snapshot.ok is True
+    assert snapshot.profiles["600000.SH"].concepts == ("金融科技", "融资融券")
+
+
+def test_static_taxonomy_uses_stale_cache_when_refresh_fails(tmp_path, monkeypatch) -> None:
+    source = ThsTaxonomySource(cache_dir=tmp_path, max_age_days=0)
+    source._write_cache(
+        ThsTaxonomySnapshot(
+            profiles={"600000.SH": SymbolProfile("600000.SH", "测试银行")},
+            fetched_on="2000-01-01",
+        )
+    )
+    monkeypatch.setattr(source, "_fetch", lambda: (None, ["fixture failure"]))
+    snapshot = source.load(force_refresh=True)
+    assert snapshot.ok is True
+    assert snapshot.from_cache is True
+    assert any("继续使用" in note for note in snapshot.notes)
