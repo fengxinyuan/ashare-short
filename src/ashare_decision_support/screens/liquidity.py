@@ -1,10 +1,10 @@
 """可交易性硬筛：流通市值与成交额的下限。
 
-和 `st_filter.py` 同一类东西——**排除，不是扣分**。理由也一样：技术形态再好也
-救不回一只买得进卖不出的票，而扣分迟早会被别的因子投票盖过去。
+这是唯一与名称、代码段无关的执行性筛选：技术形态再好也救不回一只买得进卖不出的
+票，而扣分迟早会被别的因子投票盖过去。
 
-**为什么这一层此前是空的。** 候选池原来只过 ST 与致命公告，一只 15 亿流通、日成交
-3000 万的票和茅台在筛选层面完全等价。对超短线这是个真窟窿：
+**为什么这一层此前是空的。** 候选池原来只过名称/代码段与致命公告，一只 15 亿流通、
+日成交 3000 万的票和茅台在筛选层面完全等价。对超短线这是个真窟窿：
 
 - **流通市值太小**——20 亿以下拉一个板只要几千万，价格由不了基本面，也由不了你；
 - **成交额太小**——8000 万以下的票，几百万的仓位就能打穿盘口。**超短线的核心风险
@@ -22,7 +22,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from ashare_decision_support.adapters.market_scan import MIN_AMOUNT_YI, MIN_FLOAT_CAP_YI
-from ashare_decision_support.screens.st_filter import ScreenVerdict
+
+
+@dataclass(frozen=True)
+class ScreenVerdict:
+    """One liquidity-screen decision."""
+
+    symbol: str
+    passed: bool
+    reason: str = ""
 
 
 @dataclass(frozen=True)

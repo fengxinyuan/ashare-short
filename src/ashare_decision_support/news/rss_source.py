@@ -10,8 +10,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from ashare_decision_support.news.balance import balance_by_source
+from ashare_decision_support.fanout import gather
+from ashare_decision_support.news.balance import retain_market_docs
 from ashare_decision_support.news.base import NewsDoc, NewsSource
+from ashare_decision_support.news.cache import NewsCache
+from ashare_decision_support.news.health import probe_feeds
 
 USER_AGENT = "Mozilla/5.0"
 TIMEOUT_SECONDS = 15
@@ -29,8 +32,24 @@ class RssFeed:
 
 OFFICIAL_GLOBAL_FEEDS: tuple[RssFeed, ...] = (
     RssFeed("美联储", "https://www.federalreserve.gov/feeds/press_all.xml", "美联储"),
+    # 保留在册但**本机 403**（CDN 层拦的，换 UA 无效，`api.bls.gov` 同样 503）。
+    # 不删是因为「取不到」和「不存在」是两回事——换个部署环境它就回来了，这条
+    # 分界线是 `DATA_SOURCES.md` §三 一直在守的。并发之后它只花 0.25s 就失败，
+    # 不占墙钟时间，代价只有 note 里的一行。
     RssFeed("美国劳工统计局", "https://www.bls.gov/feed/bls_latest.rss", "美国劳工统计局"),
     RssFeed("美国能源信息署", "https://www.eia.gov/rss/todayinenergy.xml", "美国能源信息署"),
+    # BLS 一挂，**就业与通胀**整块就没了，而这恰好是「宽松预期 → 风格切换」那条
+    # 推理链的输入端。这两路补的不是同一个数，但补的是同一个判断：
+    #
+    # - 经济分析局：GDP、**个人收入与支出（PCE，美联储真正盯的通胀口径）**、贸易差额
+    # - 人口普查局：零售、耐用品、批发库存、新屋销售
+    #
+    # 拿 PCE 代替 CPI 在这条链路上不是退而求其次——议息决策看的本来就是 PCE。
+    # 非农仍然没有第二个官方来源，这一块只能靠华尔街见闻那一路的中文快讯兜。
+    RssFeed("美国经济分析局", "https://apps.bea.gov/rss/rss.xml", "美国经济分析局"),
+    RssFeed(
+        "美国人口普查局", "https://www.census.gov/economic-indicators/indicator.xml", "美国人口普查局"
+    ),
 )
 
 
@@ -44,44 +63,54 @@ class RssNewsSource(NewsSource):
         opener: Callable[..., Any] | None = None,
         timeout: int = TIMEOUT_SECONDS,
         feeds: tuple[RssFeed, ...] = OFFICIAL_GLOBAL_FEEDS,
+        cache: NewsCache | None = None,
     ) -> None:
         self._opener = opener or urllib.request.urlopen
         self.timeout = timeout
         self.feeds = feeds
+        self.cache = cache
         self.last_market_stats: dict[str, object] = {}
 
     def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
         docs: list[NewsDoc] = []
         notes: list[str] = []
         raw_by_source: dict[str, int] = {}
-        failed: list[str] = []
-        for feed in self.feeds:
-            try:
-                rows = self._fetch_feed(feed)
-            except Exception:
-                failed.append(feed.name)
-                continue
+        # 每个 feed 一个独立往返，且都在盘前链路上——并发跑，慢的那个决定这一段。
+        fetched, unreachable = gather(self.feeds, lambda feed: self._feed_docs(trade_date, feed))
+        for feed, rows in fetched:
             raw_by_source[feed.source] = len(rows)
             docs.extend(rows)
 
-        if failed:
-            notes.append(f"海外官方信息源 {'、'.join(failed)} 不可用，本次跳过")
+        if unreachable:
+            notes.append(
+                f"海外官方信息源 {'、'.join(f'{item.name}（{type(exc).__name__}）' for item, exc in unreachable)}"
+                " 不可用，本次跳过"
+            )
         if not docs:
             notes.append("海外官方宏观信息源未返回可用条目")
             return [], notes
-        retained, retained_by_source = balance_by_source(docs, limit)
-        self.last_market_stats = {
-            "raw_doc_count": len(docs),
-            "retained_doc_count": len(retained),
-            "raw_by_source": dict(sorted(raw_by_source.items())),
-            "retained_by_source": retained_by_source,
-        }
+        retained, self.last_market_stats = retain_market_docs(docs, limit, raw_by_source)
         return retained, notes
 
     def fetch_for_symbols(
         self, symbols: list[str], limit: int = 10
     ) -> tuple[dict[str, list[NewsDoc]], list[str]]:
         return {}, []
+
+    def health_check(self) -> dict[str, Any]:
+        return probe_feeds("official_global", self.feeds, lambda f: f.name, self._fetch_feed)
+
+    def _feed_docs(self, trade_date: date, feed: RssFeed) -> list[NewsDoc]:
+        """一个 feed 一个缓存键，理由同 `official_source.py:_listing_docs`。"""
+        key = f"rss_{feed.source}"
+        if self.cache is not None:
+            cached = self.cache.read_docs(trade_date, key)
+            if cached is not None:
+                return cached
+        docs = self._fetch_feed(feed)
+        if self.cache is not None:
+            self.cache.write_docs(trade_date, key, docs)
+        return docs
 
     def _fetch_feed(self, feed: RssFeed) -> list[NewsDoc]:
         request = urllib.request.Request(feed.url, headers={"User-Agent": USER_AGENT})

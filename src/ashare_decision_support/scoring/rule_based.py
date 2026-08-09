@@ -20,10 +20,14 @@ MODEL_READY_SAMPLES`）之后才谈拟合——在那之前，按统计调这里
 
 from __future__ import annotations
 
+import math
+
 from ashare_decision_support.models.enums import TrendState, WyckoffBias
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, WyckoffSignal
 from ashare_decision_support.news.base import SymbolSentiment
+from ashare_decision_support.numeric import clamp, finite
 from ashare_decision_support.scoring.base import ScoreInput, ScoreProvider, ScoreResult
+from ashare_decision_support.scoring.context import read_catalysts
 from ashare_decision_support.signals.dipbuy import DipFeatures
 
 TREND_WEIGHTS: dict[TrendState, float] = {
@@ -65,10 +69,23 @@ NEWS_CAP = 6.0
 # as a reason makes the brief noisier without changing any ordering.
 NEWS_MIN_POINTS = 1.0
 
+# Cross-layer context is deliberately a secondary ranking layer. It can break
+# ties between technically viable names, but it must not turn a broken chart
+# into a buy merely because a headline is exciting.
+CONTEXT_DELTA_CAP = 20.0
+CONTEXT_POSITIVE_BROKEN_CAP = 6.0
+SECTOR_RELATION_CAP = 5.0
+CAPITAL_FLOW_CAP = 5.0
+VOLUME_PRICE_CAP = 6.0
+# 业绩没有上限常量，因为它不产生分数。删掉而不是设成 0.0：一个存在的 `EARNINGS_CAP`
+# 迟早会有人把它接回 `total`，而那正是这一层刻意不做的事。见 `_score_earnings`。
+CATALYST_CAP = 6.0
+
 # 回调质量的分值上限。这是整套打分里唯一直接回答「这是不是一个低吸位置」的一项，
 # 给得比量能重，但压不过趋势——趋势坏了的回调是接刀，L1 必须能否决 L2。
 DIP_CAP = 10.0
 VOLUME_CAP = 6.0
+COST_CAP = 5.0
 
 # 盈亏比分母的下限：止损距离至少要有一个日波幅，否则算出来的比值反映的是止损贴
 # 得多近，不是机会有多好。第二个是绝对兜底，防止 ATR 本身异常小的情况。
@@ -82,16 +99,15 @@ MIN_RRR_DENOMINATOR_PCT = 0.015
 #   trend        +12 / -15
 #   wyckoff      +10 bias +10 structure +8 spring +7 LPS +3 SOS  /  -15 -10 -8
 #   dip          +10 / -8
+#   成交成本代理 +5 / -5（可选，不计入基础分值映射范围）
 #   volume        +6 /  -6
 #   range         +5 /  -6
 #   risk-reward   +8 /  -8
 #   news          +6 /  -6
+# 成交成本代理不是所有数据源都能提供。它作为增量读数参与排序，但不计入基础
+# 分值映射范围，否则成本数据缺失会让原本的满分样例凭空降分。
 MAX_COMPONENT_TOTAL = 12.0 + 38.0 + DIP_CAP + VOLUME_CAP + 5.0 + 8.0 + NEWS_CAP
 MIN_COMPONENT_TOTAL = -15.0 - 33.0 - 8.0 - VOLUME_CAP - 6.0 - 8.0 - NEWS_CAP
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(value, high))
 
 
 def _ramp(value: float, onset: float, full: float) -> float:
@@ -103,7 +119,7 @@ def _ramp(value: float, onset: float, full: float) -> float:
     """
     if full == onset:
         return 1.0 if value >= full else 0.0
-    return _clamp((value - onset) / (full - onset), 0.0, 1.0)
+    return clamp((value - onset) / (full - onset), 0.0, 1.0)
 
 
 class RuleBasedScoreProvider(ScoreProvider):
@@ -120,19 +136,36 @@ class RuleBasedScoreProvider(ScoreProvider):
         raw += self._score_trend(item.snapshot, reasons)
         raw += self._score_wyckoff(item.wyckoff, reasons)
         raw += self._score_dip(item.dip, reasons, warnings)
+        raw += self._score_cost_basis(item.dip, reasons, warnings)
         raw += self._score_volume(item.snapshot, item.dip, reasons, warnings)
         raw += self._score_range_position(item.snapshot, reasons, warnings)
         raw += self._score_risk_reward(item.snapshot, reasons, warnings)
-        raw += self._score_news(item.news, reasons, warnings)
+        news_points = self._score_news(item.news, reasons, warnings)
+        raw += news_points
 
         if item.snapshot.bar_count < MIN_BARS_FOR_CONFIDENCE:
             warnings.append(f"历史样本仅 {item.snapshot.bar_count} 根，结构判断置信度偏低")
 
+        technical_score = self._to_scale(raw)
+        # `technical` 过去把个股舆情也包进去了，展示时看不出新闻到底改变了
+        # 多少。按同一条缩放曲线重算一次无舆情基准，差额就是新闻的真实边际影响；
+        # 不改变总分、排序或任何门槛。
+        price_structure_score = self._to_scale(raw - news_points)
+        news_delta = technical_score - price_structure_score
+        context_delta, components = self._score_context(item, reasons, warnings)
+        score = clamp(technical_score + context_delta, 0.0, 100.0)
+        components = {
+            "technical": round(price_structure_score, 2),
+            "news": round(news_delta, 2),
+            **components,
+            "context_delta": round(context_delta, 2),
+        }
         return ScoreResult(
             symbol=item.symbol,
-            score=round(self._to_scale(raw), 2),
+            score=round(score, 2),
             reasons=reasons,
             warnings=warnings,
+            components=components,
         )
 
     def _to_scale(self, raw: float) -> float:
@@ -147,7 +180,7 @@ class RuleBasedScoreProvider(ScoreProvider):
         """
         span = MAX_COMPONENT_TOTAL if raw >= 0 else abs(MIN_COMPONENT_TOTAL)
         headroom = (100.0 - self.base_score) if raw >= 0 else self.base_score
-        return _clamp(self.base_score + raw / span * headroom, 0.0, 100.0)
+        return clamp(self.base_score + raw / span * headroom, 0.0, 100.0)
 
     def _score_trend(self, snapshot: DailyTechnicalSnapshot, reasons: list[str]) -> float:
         weight = TREND_WEIGHTS.get(snapshot.trend_state, 0.0)
@@ -222,6 +255,60 @@ class RuleBasedScoreProvider(ScoreProvider):
         points = -8.0 * _ramp(depth, 4.0, 7.0)
         reasons.append(f"回撤过深 {dip.pullback_pct:+.1%}（{points:+.1f}）")
         return points
+
+    def _score_cost_basis(
+        self,
+        dip: DipFeatures | None,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> float:
+        """把成交成本代理当作支撑读数，不把它写成真实筹码成本。
+
+        30 日线负责识别中段成本，15 日线负责识别更近的交易密集区。只有在价格
+        接近成本、或盘中跌破后收回时才加分；明显跌穿 30 日成本则转为风险提示。
+        """
+        if dip is None:
+            return 0.0
+
+        points = 0.0
+        distance_30 = dip.dist_to_turnover_cost_30_pct
+        distance_15 = dip.dist_to_turnover_cost_15_pct
+        down_day = dip.ret_1d is not None and dip.ret_1d < 0
+
+        if dip.turnover_cost_30_reclaimed:
+            points += 4.5 if down_day else 3.5
+            label = "当日下跌踩回" if down_day else "踩回"
+            reasons.append(
+                f"{label}30日成交成本代理 {dip.turnover_cost_30:.2f}（{points:+.1f}）"
+            )
+        elif distance_30 is not None:
+            if distance_30 < -0.05:
+                penalty = -COST_CAP * _ramp(-distance_30, 0.05, 0.12)
+                points += penalty
+                warnings.append(
+                    f"收盘低于30日成交成本代理 {abs(distance_30):.1%}，"
+                    "成本线承接未确认"
+                )
+                reasons.append(f"跌破30日成交成本代理 {distance_30:+.1%}（{penalty:+.1f}）")
+            elif abs(distance_30) <= 0.03:
+                proximity = 2.5 * (1.0 - abs(distance_30) / 0.03)
+                if down_day:
+                    proximity += 0.5
+                points += proximity
+                reasons.append(
+                    f"接近30日成交成本代理 {dip.turnover_cost_30:.2f}"
+                    f"（偏离 {distance_30:+.1%}，{proximity:+.1f}）"
+                )
+
+        if distance_15 is not None and abs(distance_15) <= 0.025:
+            fine = 1.5 * (1.0 - abs(distance_15) / 0.025)
+            points += fine
+            reasons.append(
+                f"接近15日成交成本代理 {dip.turnover_cost_15:.2f}"
+                f"（偏离 {distance_15:+.1%}，{fine:+.1f}）"
+            )
+
+        return clamp(points, -COST_CAP, COST_CAP)
 
     def _score_volume(
         self,
@@ -355,7 +442,7 @@ class RuleBasedScoreProvider(ScoreProvider):
         if news is None or news.is_neutral:
             return 0.0
 
-        points = _clamp(news.polarity * news.intensity * NEWS_CAP * 2.0, -NEWS_CAP, NEWS_CAP)
+        points = clamp(news.polarity * news.intensity * NEWS_CAP * 2.0, -NEWS_CAP, NEWS_CAP)
         if abs(points) < NEWS_MIN_POINTS:
             return 0.0
 
@@ -368,3 +455,238 @@ class RuleBasedScoreProvider(ScoreProvider):
             # what actually gets read at decision time.
             warnings.append(f"个股舆情偏空：{'、'.join(hits[:4])}")
         return points
+
+    def _score_context(
+        self,
+        item: ScoreInput,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> tuple[float, dict[str, float]]:
+        """Score cross-layer evidence after the technical score.
+
+        The components are independently capped and then capped again as a
+        group. This prevents a single stale earnings headline or a single
+        large-flow print from dominating price structure.
+        """
+        context = item.context
+        if context is None:
+            return 0.0, {}
+
+        components: dict[str, float] = {}
+        total = 0.0
+        sector = context.sector
+        if sector is not None:
+            sector_points = self._score_sector_relation(item, sector, reasons, warnings)
+            components["sector_relation"] = round(sector_points, 2)
+            total += sector_points
+
+        flow_points = self._score_capital_flow(context, reasons)
+        if flow_points:
+            components["capital_flow"] = round(flow_points, 2)
+            total += flow_points
+
+        volume_points = self._score_volume_price_context(item.volume_price, reasons, warnings)
+        if volume_points:
+            components["volume_price"] = round(volume_points, 2)
+            total += volume_points
+
+        # 业绩**刻意不计入分数**，只写进理由与风险。
+        #
+        # 这不是遗漏，是 `DECISIONS.md` §六b 那条教训的直接应用：上一轮把缩量做成
+        # ±6 分的权重，结果 60 条建议里 52 条是放量回调——**只要它是权重，就能被
+        # 别的项买回来**。业绩层的正面读数（预增/扭亏）在样本够之前和缩量当时的
+        # 处境一模一样：看起来该加分，但没有任何回测支持这个幅度。
+        #
+        # 否决那一侧照旧是硬的（`screens/earnings.py`，在打分之前就把标的移除），
+        # 所以「不给权重」削弱的只有加分方向。两侧不对称是设计，不是不一致。
+        #
+        # 它的可验证出口是台账：`Recommendation.earnings` 存下完整裁决，
+        # `journal/stats.py:_veto_cost` 与 `by_group` 负责在样本够之后回答
+        # 「带业绩催化的那批兑现率高多少」。**先落台账，等 edge，再谈权重。**
+        self._score_earnings(context.earnings, reasons, warnings)
+        catalyst_points = self._score_catalysts(item, reasons, warnings)
+        if catalyst_points:
+            components["catalyst"] = round(catalyst_points, 2)
+            total += catalyst_points
+
+        total = clamp(total, -CONTEXT_DELTA_CAP, CONTEXT_DELTA_CAP)
+        if item.snapshot.trend_state == TrendState.DOWNTREND and total > CONTEXT_POSITIVE_BROKEN_CAP:
+            warnings.append("个股处于下跌趋势，板块/事件利好只作观察，正向上下文加分已限额")
+            total = CONTEXT_POSITIVE_BROKEN_CAP
+        return total, components
+
+    def _score_sector_relation(
+        self,
+        item: ScoreInput,
+        sector: object,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> float:
+        trusted = bool(getattr(sector, "trusted", False))
+        if not trusted:
+            warnings.append("所属板块覆盖率不足，未使用板块关系分")
+            return 0.0
+
+        points = 0.0
+        score = finite(getattr(sector, "score", None))
+        if score is not None:
+            sector_points = clamp((score - 50.0) / 50.0 * 2.5, -2.5, 2.5)
+            points += sector_points
+            if abs(sector_points) >= 0.5:
+                reasons.append(f"板块评分 {score:.1f}，个股与板块方向一致（{sector_points:+.1f}）")
+
+        breadth = finite(getattr(sector, "breadth", None))
+        if breadth is not None:
+            breadth_points = clamp((breadth - 0.5) * 4.0, -2.0, 2.0)
+            points += breadth_points
+            if abs(breadth_points) >= 0.5:
+                reasons.append(f"板块上涨宽度 {breadth:.0%}（{breadth_points:+.1f}）")
+
+        flow_norm = finite(getattr(sector, "flow_norm", None))
+        if flow_norm is not None:
+            flow_points = clamp(flow_norm * 1.5, -1.5, 1.5)
+            points += flow_points
+            if abs(flow_points) >= 0.5:
+                reasons.append(f"板块资金相对强度 {flow_norm:+.2f}（{flow_points:+.1f}）")
+
+        stock_ret_5d = _bars_return(item.bars, 5)
+        sector_ret_5d = finite(getattr(sector, "ret_5d", None))
+        if stock_ret_5d is not None and sector_ret_5d is not None:
+            excess = stock_ret_5d - sector_ret_5d
+            relative_points = clamp(excess * 45.0, -1.5, 1.5)
+            points += relative_points
+            if abs(relative_points) >= 0.5:
+                label = "跑赢" if relative_points > 0 else "跑输"
+                reasons.append(
+                    f"个股5日相对板块{label} {excess:+.2%}（{relative_points:+.1f}）"
+                )
+
+        return clamp(points, -SECTOR_RELATION_CAP, SECTOR_RELATION_CAP)
+
+    def _score_capital_flow(self, context: object, reasons: list[str]) -> float:
+        flow_norm = finite(getattr(context, "flow_norm", None))
+        flow_ratio = finite(getattr(context, "flow_ratio", None))
+        if flow_norm is None and flow_ratio is None:
+            return 0.0
+
+        # Prefer cross-sectional normalization. The ratio is only a fallback
+        # because the raw flow window and the turnover window may differ.
+        basis = flow_norm
+        if basis is None and flow_ratio is not None:
+            basis = math.tanh(flow_ratio / 0.03)
+        points = clamp((basis or 0.0) * CAPITAL_FLOW_CAP, -CAPITAL_FLOW_CAP, CAPITAL_FLOW_CAP)
+        if abs(points) >= 0.75:
+            raw = getattr(context, "net_inflow", None)
+            amount = getattr(context, "amount", None)
+            detail = ""
+            if isinstance(raw, (int, float)):
+                detail = f"，净流入 {raw / 1e8:+.2f} 亿"
+            if isinstance(amount, (int, float)) and amount > 0:
+                detail += f"，占当日成交额 {raw / amount:.1%}" if isinstance(raw, (int, float)) else ""
+            reasons.append(f"个股资金流相对强度 {basis:+.2f}{detail}（{points:+.1f}）")
+        return points
+
+    def _score_volume_price_context(
+        self,
+        features: object | None,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> float:
+        if features is None:
+            return 0.0
+        points = 0.0
+        quadrant = getattr(features, "quadrant", None)
+        if quadrant == "放量上涨":
+            points += 2.0
+        elif quadrant == "缩量上涨":
+            points += 1.0
+        elif quadrant == "放量下跌":
+            points -= 2.5
+        elif quadrant == "缩量下跌":
+            points -= 0.5
+
+        if getattr(features, "expanding", None) is True:
+            points += 1.5
+        if getattr(features, "up_down_vol_ratio", None) is not None:
+            ratio = float(features.up_down_vol_ratio)
+            points += clamp((ratio - 1.0) * 2.0, -2.0, 2.0)
+            if ratio >= 1.25:
+                reasons.append(f"近20日上涨量强于下跌量（量能比 {ratio:.2f}）")
+        if getattr(features, "climax_stall", None):
+            points -= 3.5
+            warnings.append("天量滞涨，资金流入可能是高位换手，不按正向量价加分")
+        elif getattr(features, "climax", None):
+            points -= 1.5
+        if getattr(features, "breakdown_on_volume", None):
+            points -= 3.0
+            warnings.append("放量跌破均线，量能读数转为风险而非支持")
+
+        points = clamp(points, -VOLUME_PRICE_CAP, VOLUME_PRICE_CAP)
+        if abs(points) >= 0.75:
+            reasons.append(f"持续量价关系 {quadrant or '未分类'}（{points:+.1f}）")
+        return points
+
+    def _score_earnings(
+        self,
+        verdict: object | None,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> None:
+        """把业绩裁决写进理由与风险。**返回 None——这一层不产生分数。**
+
+        名字保留 `_score_` 前缀会误导，但改名会波及调用方；真正防止它悄悄变回
+        权重的是签名：返回 `None` 的函数没法被 `total +=` 用上，改回去必须是
+        一次显式的、看得见的改动。上限常量也已删除，见 `EARNINGS_CAP` 的去处。
+        """
+        if verdict is None:
+            return
+        if getattr(verdict, "is_strong_catalyst", False):
+            reasons.append("新鲜且可盈利的业绩催化（不计分）")
+        elif getattr(verdict, "catalysts", None):
+            reasons.append("业绩正向披露（不计分）")
+        elif getattr(verdict, "warnings", None):
+            warnings.append("业绩披露存在不确定性，未按业绩催化处理")
+        if getattr(verdict, "blocking", None):
+            # 走到这里说明标的绕过了 `screens/earnings.py`（例如 `advise` 手工
+            # 指定一只已被否决的票）。必须显形，不能因为「没进分数」就不说。
+            warnings.append("⚠️ 该标的触发业绩风险否决，盘前链路不会选它")
+
+    def _score_catalysts(
+        self,
+        item: ScoreInput,
+        reasons: list[str],
+        warnings: list[str],
+    ) -> float:
+        sector = item.context.sector if item.context is not None else None
+        sector_catalyst = getattr(sector, "catalyst", None)
+        stock_catalyst = read_catalysts(
+            getattr(item.news, "headlines", ()) if item.news is not None else ()
+        )
+        sector_value = float(getattr(sector_catalyst, "net_score", 0.0) or 0.0)
+        stock_value = float(stock_catalyst.net_score)
+        points = clamp((sector_value * 0.65) + (stock_value * 0.85), -CATALYST_CAP, CATALYST_CAP)
+        if abs(points) >= 0.75:
+            hits = tuple(dict.fromkeys(
+                (*getattr(sector_catalyst, "hits", ()), *stock_catalyst.hits)
+            ))
+            risk_hits = tuple(dict.fromkeys(
+                (*getattr(sector_catalyst, "risk_hits", ()), *stock_catalyst.risk_hits)
+            ))
+            if points > 0:
+                reasons.append(f"板块/个股事件催化：{'、'.join(hits[:5])}（{points:+.1f}）")
+            else:
+                warnings.append(f"板块/个股风险事件：{'、'.join(risk_hits[:5])}（{points:+.1f}）")
+        return points
+
+
+def _bars_return(bars: list[dict], window: int) -> float | None:
+    closes = [
+        float(row["close"])
+        for row in bars
+        if isinstance(row.get("close"), (int, float)) and row["close"] > 0
+    ]
+    if len(closes) <= window:
+        return None
+    return closes[-1] / closes[-window - 1] - 1.0
+
+

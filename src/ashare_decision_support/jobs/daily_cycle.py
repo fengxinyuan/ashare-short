@@ -6,16 +6,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
 from ashare_decision_support.jobs.advise import run_advise
 from ashare_decision_support.jobs.monitor import run_monitor
-from ashare_decision_support.jobs.morning import run_morning
+from ashare_decision_support.jobs.morning import MorningConfig, Sources, run_morning
 from ashare_decision_support.jobs.post_close import run_post_close
 from ashare_decision_support.jobs.review import run_review
-from ashare_decision_support.monitor import DEFAULT_LEVELS
+from ashare_decision_support.monitor import DEFAULT_LEVELS, SECTOR_EVERY
 from ashare_decision_support.news import AkshareNewsSource, NewsCache
 from ashare_decision_support.schedule import (
     TASK_MONITOR,
@@ -29,6 +31,8 @@ from ashare_decision_support.schedule import (
     describe,
     run_daemon,
 )
+from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.sectors import ThsIndustryTaxonomy
 from ashare_decision_support.state import CandidatePool, Watchlist
 
 
@@ -45,10 +49,13 @@ def run_daily_cycle(
     candidates_per_sector: int = 3,
     max_constituents: int | None = None,
     alert_levels: tuple[str, ...] = DEFAULT_LEVELS,
+    sectors: bool = True,
+    sector_every: int = SECTOR_EVERY,
     calendar: TradingCalendar | None = None,
+    progress: Callable[[str], Any] | None = None,
     **daemon_kwargs: Any,
 ) -> dict[str, Any]:
-    today = trade_date or date.today()
+    today = trade_date or beijing_today()
     output = Path(output_dir)
     writer = writer_factory or (lambda: None)
     debate = debate_factory or (lambda: None)
@@ -74,21 +81,25 @@ def run_daily_cycle(
 
     def morning_task() -> dict:
         return run_morning(
-            adapter=adapter_factory(),
-            output_dir=output,
+            Sources(
+                adapter=adapter_factory(),
+                writer=writer(),
+                debate=debate(),
+                notifiers=notifiers("morning"),
+                industry_taxonomy=ThsIndustryTaxonomy(),
+            ),
+            output,
+            config=MorningConfig(
+                top_sectors=top_sectors,
+                candidates_per_sector=candidates_per_sector,
+                max_constituents=max_constituents,
+            ),
             trade_date=today,
-            top_sectors=top_sectors,
-            candidates_per_sector=candidates_per_sector,
-            max_constituents=max_constituents,
-            writer=writer(),
-            debate=debate(),
-            notifiers=notifiers("morning"),
+            progress=progress,
         )
 
     def preopen_task() -> dict:
-        symbols = list(
-            dict.fromkeys(Watchlist().symbols() + CandidatePool(today=today).symbols())
-        )
+        symbols = list(dict.fromkeys(Watchlist().symbols() + CandidatePool(today=today).symbols()))
         if not symbols:
             return {"skipped": "自选股与候选池均为空"}
         return run_advise(
@@ -99,6 +110,8 @@ def run_daily_cycle(
             writer=writer(),
             news_source=_cached_news(),
             notifiers=notifiers("preopen"),
+            security_master_adapter=SecurityMasterAdapter(),
+            progress=progress,
         )
 
     def monitor_task() -> dict:
@@ -108,6 +121,8 @@ def run_daily_cycle(
             alert_levels=alert_levels,
             news_source=_cached_news(),
             notifiers=notifiers("alerts"),
+            sectors=sectors,
+            sector_every=sector_every,
         )
 
     def postclose_task() -> dict:
@@ -120,6 +135,7 @@ def run_daily_cycle(
             output_dir=str(output),
             trade_date=today,
             debate=debate(),
+            security_master_adapter=SecurityMasterAdapter(),
         )
 
     def review_task() -> dict:

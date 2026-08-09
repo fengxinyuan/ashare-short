@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import json
 import urllib.request
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
+
+from ashare_decision_support.numeric import finite
 
 BASE_URL = (
     "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
@@ -96,9 +99,7 @@ class MarketRow:
         """
         if self.float_cap_yi is not None and self.float_cap_yi < min_float_cap_yi:
             return False
-        if self.amount_yi is not None and self.amount_yi < min_amount_yi:
-            return False
-        return True
+        return not (self.amount_yi is not None and self.amount_yi < min_amount_yi)
 
 
 @dataclass
@@ -112,7 +113,7 @@ class MarketScan:
 
     def get(self, symbol: str) -> MarketRow | None:
         """按 `600519.SH` 或 `600519` 都能取。"""
-        return self.rows.get(symbol.split(".")[0])
+        return self.rows.get(symbol.split(".", maxsplit=1)[0])
 
     # ---- breadth ---------------------------------------------------------
 
@@ -137,8 +138,8 @@ class MarketScan:
         if not self.rows:
             return []
         lines = [
-            f"全市场 {len(self.rows)} 只：涨 {self.advancers} / 跌 {self.decliners}"
-            f"（上涨面 {self.breadth:.0%}），成交额 {self.total_amount / 1e12:.2f} 万亿"
+            (f"全市场 {len(self.rows)} 只：涨 {self.advancers} / 跌 {self.decliners}"
+            f"（上涨面 {self.breadth:.0%}），成交额 {self.total_amount / 1e12:.2f} 万亿")
         ]
         st = sum(1 for r in self.rows.values() if r.is_st)
         if st:
@@ -173,7 +174,7 @@ class MarketScanAdapter:
             results = list(pool.map(self._safe_page, pages))
 
         empty_streak = 0
-        for page, payload in zip(pages, results):
+        for _page, payload in zip(pages, results, strict=True):
             if payload is None:
                 failures += 1
                 continue
@@ -189,7 +190,7 @@ class MarketScanAdapter:
         if failures:
             notes.append(f"全市场扫描 {failures}/{len(pages)} 页取数失败，宽度读数按已取到的算")
         if not rows:
-            return MarketScan(notes=notes + ["全市场扫描没有取到任何数据"], ok=False)
+            return MarketScan(notes=[*notes, "全市场扫描没有取到任何数据"], ok=False)
 
         notes.append(
             f"全市场扫描 {len(rows)} 只（{len(pages) - failures - empty_streak} 页有数据）"
@@ -221,35 +222,26 @@ class MarketScanAdapter:
 def _parse_row(raw: dict) -> MarketRow | None:
     code = str(raw.get("code") or "").strip()
     name = str(raw.get("name") or "").strip()
-    price = _float(raw.get("trade"))
+    price = finite(raw.get("trade"))
     if not code or not name or price is None or price <= 0:
         return None
 
     # 市值字段的单位是**万元**，不是元。忘了换算会让 20 亿的门槛变成 20 万，
     # 等于这一层没开。
-    float_cap = _float(raw.get("nmc"))
-    total_cap = _float(raw.get("mktcap"))
+    float_cap = finite(raw.get("nmc"))
+    total_cap = finite(raw.get("mktcap"))
 
     return MarketRow(
         code=code,
         name=name,
         price=price,
-        prev_close=_float(raw.get("settlement")),
-        change_pct=_float(raw.get("changepercent")),
-        amount=_float(raw.get("amount")),
-        volume=_float(raw.get("volume")),
-        turnover_ratio=_float(raw.get("turnoverratio")),
-        pe=_float(raw.get("per")),
-        pb=_float(raw.get("pb")),
+        prev_close=finite(raw.get("settlement")),
+        change_pct=finite(raw.get("changepercent")),
+        amount=finite(raw.get("amount")),
+        volume=finite(raw.get("volume")),
+        turnover_ratio=finite(raw.get("turnoverratio")),
+        pe=finite(raw.get("per")),
+        pb=finite(raw.get("pb")),
         float_cap=None if float_cap is None else float_cap * 1e4,
         total_cap=None if total_cap is None else total_cap * 1e4,
     )
-
-
-def _float(value: Any) -> float | None:
-    if value in (None, "", "-", "null"):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None

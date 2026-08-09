@@ -3,15 +3,16 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from ashare_decision_support.news import LexiconSentiment, NewsCache, NewsDoc
-from ashare_decision_support.news.akshare_source import AkshareNewsSource
-from ashare_decision_support.screens import AnnouncementScreen, StScreen
+from ashare_decision_support.news.akshare_source import CJZC_LIMIT, AkshareNewsSource
+from ashare_decision_support.screens import AnnouncementScreen
 from ashare_decision_support.sectors import (
+    SectorMetrics,
     SectorMomentum,
     SectorPredictor,
+    SectorRotationStore,
     TickFlowSwTaxonomy,
 )
 from ashare_decision_support.sectors.base import SectorDefinition
-
 
 # ---- sentiment -----------------------------------------------------------
 
@@ -66,31 +67,6 @@ def test_score_docs_weights_by_intensity_not_by_count() -> None:
     assert analyzer.score_docs(docs).polarity < 0
 
 
-# ---- screens -------------------------------------------------------------
-
-
-def test_st_screen_blocks_flagged_names_and_out_of_scope_boards() -> None:
-    screen = StScreen()
-    kept, rejected = screen.filter(
-        {
-            "600519.SH": "贵州茅台",
-            "300430.SZ": "*ST益通",
-            "000001.SZ": "ST平安",
-            "830799.BJ": "艾能聚",
-            "600001.SH": "退市海润",
-        }
-    )
-
-    assert kept == ["600519.SH"]
-    assert {item.symbol for item in rejected} == {"300430.SZ", "000001.SZ", "830799.BJ", "600001.SH"}
-    assert any("*ST" in item.reason for item in rejected)
-
-
-def test_st_screen_passes_symbols_without_a_known_name() -> None:
-    """A missing name must not silently disqualify a tradable symbol."""
-    assert StScreen().check("600519.SH", None).passed
-
-
 def test_announcement_screen_separates_blocking_from_warning() -> None:
     verdicts = AnnouncementScreen().evaluate(
         [
@@ -134,9 +110,9 @@ def test_sector_momentum_uses_median_not_mean() -> None:
     flat = [0.0] * 25
     definition = SectorDefinition(name="测试", level="SW1", symbols=("A", "B", "C"))
     bars = {
-        "A": bars_with_returns(flat + [0.001]),
-        "B": bars_with_returns(flat + [0.002]),
-        "C": bars_with_returns(flat + [0.50]),
+        "A": bars_with_returns([*flat, 0.001]),
+        "B": bars_with_returns([*flat, 0.002]),
+        "C": bars_with_returns([*flat, 0.5]),
     }
 
     metrics = SectorMomentum().measure([definition], bars)["测试"]
@@ -257,6 +233,36 @@ def test_market_sentiment_cuts_the_suggestion_when_the_move_is_extended() -> Non
     assert any("普涨末段" in reason for reason in hot.reasons)
 
 
+def test_sector_rotation_memory_marks_persistent_and_fresh_leaders(tmp_path) -> None:
+    def outlook(name: str, score: float) -> object:
+        metrics = SectorMetrics(name=name, constituents=10, covered=10, ret_1d=0.01, ret_5d=0.03)
+        from ashare_decision_support.sectors.base import SectorOutlook
+
+        return SectorOutlook(name=name, score=score, metrics=metrics)
+
+    store = SectorRotationStore(tmp_path / "rotation.json")
+    store.record(date(2026, 7, 30), "SW1", [
+        outlook("电子", 80.0),
+        outlook("电力设备", 78.0),
+        outlook("券商", 72.0),
+    ])
+    store.record(date(2026, 7, 31), "SW1", [
+        outlook("电力设备", 81.0),
+        outlook("创新药", 77.0),
+        outlook("电子", 74.0),
+    ])
+    summary = store.remember(date(2026, 8, 3), "SW1", [
+        outlook("电力设备", 82.0),
+        outlook("创新药", 79.0),
+        outlook("家用电器", 75.0),
+    ], lookback_days=5, leader_count=3)
+
+    assert summary.regime == "主线延续"
+    assert summary.persistent == ("电力设备", "创新药")
+    assert summary.new_entries == ("家用电器",)
+    assert any("昨天靠前" in text for text in summary.observations)
+
+
 # ---- taxonomy ------------------------------------------------------------
 
 
@@ -334,6 +340,25 @@ class FakeAk:
         self._guard("em")
         return [{"标题": "光伏涨价", "摘要": "组件提价", "发布时间": "2026-08-01", "链接": "http://x"}]
 
+    def stock_info_global_ths(self):
+        self._guard("ths")
+        return [{"标题": "储能中标", "内容": "正文", "发布时间": "2026-08-01 08:30:00",
+                 "链接": "http://t"}]
+
+    def stock_info_global_sina(self):
+        self._guard("sina")
+        # 这一路真的没有「标题」列，只有时间与内容——测试必须照实模拟，
+        # 否则「内容当标题」那条兜底永远走不到。
+        return [{"时间": "2026-08-01 08:40:00", "内容": "统计局公布 7 月 PMI 为 50.2"}]
+
+    def stock_info_cjzc_em(self):
+        self._guard("cjzc")
+        return [
+            {"标题": f"财经早餐 {day}", "摘要": "汇总", "发布时间": f"2026-07-{day:02d} 06:00:00",
+             "链接": "http://c"}
+            for day in range(1, 21)
+        ]
+
     def news_cctv(self, date):
         self._guard("cctv")
         return [{"title": "政策支持制造业", "content": "内容", "date": date}]
@@ -358,20 +383,55 @@ def test_news_source_collects_every_reachable_feed() -> None:
     source = AkshareNewsSource(ak_module=FakeAk())
     docs, notes = source.fetch_market(date(2026, 8, 1))
 
-    assert {doc.source for doc in docs} == {"财联社", "东方财富", "新闻联播"}
+    assert {doc.source for doc in docs} == {
+        "财联社", "东方财富", "同花顺", "新浪财经", "财经早餐", "新闻联播",
+    }
     assert notes == []
+
+
+def test_sina_flash_survives_having_no_title_column() -> None:
+    """新浪那一路只有「时间 + 内容」。
+
+    `fetch_market` 末尾按 `doc.title` 过滤，所以标题留空不是「少了摘要」，
+    是**整路源静默消失**——一条都不剩，而且不会有任何报错。
+    """
+    source = AkshareNewsSource(ak_module=FakeAk())
+    docs, _ = source.fetch_market(date(2026, 8, 1))
+
+    sina = [doc for doc in docs if doc.source == "新浪财经"]
+    assert len(sina) == 1
+    assert "PMI" in sina[0].title
+
+
+def test_daily_digest_cannot_crowd_out_the_realtime_feeds() -> None:
+    """财经早餐返回的是跨月归档（实测 400 条），每天只有一份有意义。
+
+    不限量的话这一路会吃掉 `limit` 预算的大头，把时效最好的几路挤出去——
+    而挤掉的正是超短线最需要的那批。
+    """
+    source = AkshareNewsSource(ak_module=FakeAk())
+    docs, _ = source.fetch_market(date(2026, 8, 1))
+
+    digests = [doc for doc in docs if doc.source == "财经早餐"]
+    assert len(digests) == CJZC_LIMIT < 20
 
 
 def test_news_source_degrades_one_feed_at_a_time() -> None:
     source = AkshareNewsSource(ak_module=FakeAk(broken={"em"}))
     docs, notes = source.fetch_market(date(2026, 8, 1))
 
-    assert len(docs) == 2
+    # 断言「死掉的那路不见了、其余全在」，而不是断言一个总条数：后者会在每次
+    # 新增一路源时失败一次，而失败的原因和这个测试要守的性质毫无关系。
+    sources = {doc.source for doc in docs}
+    assert "东方财富" not in sources
+    assert {"财联社", "同花顺", "新浪财经", "财经早餐", "新闻联播"} <= sources
     assert any("东财全球快讯" in note for note in notes)
 
 
 def test_news_source_notes_when_everything_is_down() -> None:
-    source = AkshareNewsSource(ak_module=FakeAk(broken={"cls", "em", "cctv"}))
+    source = AkshareNewsSource(
+        ak_module=FakeAk(broken={"cls", "em", "ths", "sina", "cjzc", "cctv"})
+    )
     docs, notes = source.fetch_market(date(2026, 8, 1))
 
     assert docs == []

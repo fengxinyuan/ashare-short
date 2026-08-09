@@ -20,6 +20,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
+from ashare_decision_support.numeric import finite
+from ashare_decision_support.tabular import records
+
 # Sina caps the response at this many bars per period, so the window each
 # period covers differs: 1m ≈ 8 sessions, 5m ≈ 41, 60m ≈ 2 years.
 SINA_MAX_BARS = 1970
@@ -127,37 +130,27 @@ def sina_symbol(symbol: str) -> str:
 
 
 def _to_bars(table: Any, symbol: str) -> list[dict]:
-    rows = _rows(table)
+    rows = records(table)
     bars: list[dict] = []
     for row in rows:
         timestamp = _parse_ts(row.get("day"))
-        close = _float(row.get("close"))
+        close = finite(row.get("close"))
         if timestamp is None or close is None:
             continue
         bars.append(
             {
                 "symbol": symbol,
                 "timestamp": timestamp,
-                "open": _float(row.get("open")),
-                "high": _float(row.get("high")),
-                "low": _float(row.get("low")),
+                "open": finite(row.get("open")),
+                "high": finite(row.get("high")),
+                "low": finite(row.get("low")),
                 "close": close,
-                "volume": _float(row.get("volume")),
-                "amount": _float(row.get("amount")),
+                "volume": finite(row.get("volume")),
+                "amount": finite(row.get("amount")),
             }
         )
     return bars
 
-
-def _rows(table: Any) -> list[dict]:
-    if table is None:
-        return []
-    if isinstance(table, list):
-        return [row for row in table if isinstance(row, dict)]
-    to_dict = getattr(table, "to_dict", None)
-    if callable(to_dict):
-        return list(table.to_dict(orient="records"))
-    return []
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -172,13 +165,3 @@ def _parse_ts(value: Any) -> datetime | None:
         except ValueError:
             continue
     return None
-
-
-def _float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if number != number else number

@@ -28,7 +28,11 @@ STRONG_MOVE_THRESHOLD = 0.095
 
 VOLUME_BASELINE_BARS = 20
 MA_BARS = 20
-MIN_COVERAGE_RATIO = 0.3
+
+# 覆盖率闸门**不在这里**：这一层只负责测量，`covered / constituents` 原样带出去，
+# 由 `sectors/predict.py:MIN_TRUSTED_COVERAGE` 决定多少算达标。此处原来还有一个
+# 同名不同值的 MIN_COVERAGE_RATIO，从未被读过——两个覆盖率阈值放在两个模块里，
+# 迟早有人去调那个不生效的。
 
 
 class SectorMomentum:

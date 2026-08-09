@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, WyckoffSignal
 from ashare_decision_support.news.base import SymbolSentiment
+from ashare_decision_support.scoring.context import StockFactorContext
 from ashare_decision_support.signals.dipbuy import DipFeatures
 
 
@@ -39,6 +41,8 @@ class ScoreInput:
     wyckoff: WyckoffSignal | None = None
     news: SymbolSentiment | None = None
     dip: DipFeatures | None = None
+    volume_price: Any | None = None
+    context: StockFactorContext | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,7 @@ class ScoreResult:
     score: float
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    components: dict[str, float] = field(default_factory=dict)
 
 
 class ScoreProvider(ABC):

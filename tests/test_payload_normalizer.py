@@ -51,3 +51,49 @@ def test_missing_auction_required_field_raises() -> None:
         assert "indicative_match_price" in str(exc)
     else:
         raise AssertionError("NormalizationError was expected")
+
+
+def test_non_finite_price_is_a_normalization_failure_not_a_number() -> None:
+    """NaN 属于「不能安全归一」，不属于「一个数」。
+
+    此前这里是 `try/float`，而 `float(nan)` 与 `float("nan")` 都**成功**——于是
+    一份带 NaN 报价的载荷会「归一成功」，把这一层存在的理由整个绕过去。之后
+    NaN 参与的每一次比较都是 False，「跌破」「高于」全部静默变成否。
+    """
+    normalizer = PayloadNormalizer()
+    base = {
+        "symbol": "300001.SZ",
+        "MatchedQty": 1000,
+        "UnmatchedQty": 100,
+        "UnmatchedSide": "B",
+        "PrevClose": 12.0,
+        "sourceTs": "2026-07-31T09:24:58",
+    }
+
+    for bad in (float("nan"), float("inf"), float("-inf"), "nan"):
+        try:
+            normalizer.normalize_auction({**base, "BidPrice1": bad})
+        except NormalizationError:
+            continue
+        raise AssertionError(f"{bad!r} 应当被拒绝，却归一成功了")
+
+
+def test_a_bool_in_a_price_field_is_rejected_rather_than_read_as_one() -> None:
+    """`float(True)` 是 1.0。价格字段里出现 True 的含义是上游给错了。"""
+    normalizer = PayloadNormalizer()
+
+    try:
+        normalizer.normalize_auction(
+            {
+                "symbol": "300001.SZ",
+                "MatchedQty": 1000,
+                "UnmatchedQty": 100,
+                "UnmatchedSide": "B",
+                "BidPrice1": True,
+                "PrevClose": 12.0,
+                "sourceTs": "2026-07-31T09:24:58",
+            }
+        )
+    except NormalizationError:
+        return
+    raise AssertionError("价格字段里的 True 应当被拒绝")

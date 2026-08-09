@@ -2,7 +2,6 @@
 
 from ashare_decision_support.news.akshare_source import AkshareNewsSource
 from ashare_decision_support.news.base import (
-    NewsBundle,
     NewsDoc,
     NewsSource,
     SentimentAnalyzer,
@@ -62,7 +61,6 @@ __all__ = [
     "LexiconSentiment",
     "MacroDigest",
     "MacroLink",
-    "NewsBundle",
     "NewsCache",
     "NewsDoc",
     "NewsSource",

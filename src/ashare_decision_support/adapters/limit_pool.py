@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+from ashare_decision_support.numeric import as_int, finite
+
 BASE_URL = (
     "https://push2ex.eastmoney.com/getTopic{pool}Pool"
     "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt"
@@ -126,21 +128,13 @@ class LimitPoolSnapshot:
                 counts[item.streak] = counts.get(item.streak, 0) + 1
         return dict(sorted(counts.items()))
 
-    def limit_up_by_sector(self) -> dict[str, list[str]]:
-        """东财行业 → 涨停标的。用来替掉 `strong_count` 的 9.5% 近似。"""
-        grouped: dict[str, list[str]] = {}
-        for item in self.limit_up:
-            if item.sector:
-                grouped.setdefault(item.sector, []).append(item.symbol)
-        return grouped
-
     def describe(self) -> list[str]:
         """给简报用的人话描述。每一句都挂在一个实际读数上。"""
         if not self.ok:
             return ["涨停池不可用，本次无连板与炸板读数"]
         lines = [
-            f"涨停 {self.limit_up_count} 只、炸板 {self.blowup_count} 只、"
-            f"跌停 {self.limit_down_count} 只"
+            (f"涨停 {self.limit_up_count} 只、炸板 {self.blowup_count} 只、"
+            f"跌停 {self.limit_down_count} 只")
         ]
         rate = self.blowup_rate
         if rate is not None:
@@ -285,40 +279,23 @@ def _parse_stock(row: dict) -> LimitStock:
         symbol=f"{code}{suffix}" if code else "",
         name=str(row.get("n") or "").strip(),
         price=_scaled(row.get("p")),
-        change_pct=_float(row.get("zdp")),
-        amount=_float(row.get("amount")),
-        turnover=_float(row.get("hs")),
-        seal_fund=_float(row.get("fund")),
+        change_pct=finite(row.get("zdp")),
+        amount=finite(row.get("amount")),
+        turnover=finite(row.get("hs")),
+        seal_fund=finite(row.get("fund")),
         first_seal=_clock(row.get("fbt")),
-        blowups=_int(row.get("zbc")),
-        streak=_int(row.get("lbc")),
-        window_days=_int(stats.get("days")) or None,
-        window_limit_ups=_int(stats.get("ct")) or None,
+        blowups=as_int(row.get("zbc")),
+        streak=as_int(row.get("lbc")),
+        window_days=as_int(stats.get("days")) or None,
+        window_limit_ups=as_int(stats.get("ct")) or None,
         sector=(str(row.get("hybk")).strip() or None) if row.get("hybk") else None,
         limit_price=_scaled(row.get("ztp")),
     )
 
 
 def _scaled(value: Any) -> float | None:
-    number = _float(value)
+    number = finite(value)
     return None if number is None else round(number / PRICE_SCALE, 3)
-
-
-def _float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if number != number else number
-
-
-def _int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _parse_qdate(value: Any) -> date | None:
@@ -334,7 +311,7 @@ def _parse_qdate(value: Any) -> date | None:
 
 def _clock(value: Any) -> str | None:
     """`92500` -> `09:25`。上游给的是去掉前导零的 HHMMSS 整数。"""
-    number = _int(value)
+    number = as_int(value)
     if number <= 0:
         return None
     text = f"{number:06d}"

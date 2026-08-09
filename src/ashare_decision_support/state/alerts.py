@@ -27,9 +27,10 @@ class AlertState:
     fired: dict[str, dict] = field(default_factory=dict)
     observed: dict[str, dict] = field(default_factory=dict)
     pinned: dict[str, dict] = field(default_factory=dict)
+    peaks: dict[str, float] = field(default_factory=dict)
 
     @classmethod
-    def load(cls, session: date, path: Path | None = None) -> "AlertState":
+    def load(cls, session: date, path: Path | None = None) -> AlertState:
         resolved = Path(path) if path is not None else state_path("alerts", f"{session}.json")
         payload = read_json(resolved, default={}) or {}
         return cls(
@@ -38,6 +39,9 @@ class AlertState:
             fired=payload.get("fired") or {},
             observed=payload.get("observed") or {},
             pinned=payload.get("pinned") or {},
+            # 老的 alerts/*.json 没有这个键。缺省空字典即「今天还没记过峰值」，
+            # 读旧文件不会炸。
+            peaks=payload.get("peaks") or {},
         )
 
     # ---- what has already fired -----------------------------------------
@@ -85,6 +89,27 @@ class AlertState:
             "at": at.isoformat(timespec="seconds"),
         }
 
+    # ---- 持仓期最高价 -----------------------------------------------------
+
+    def peak_of(self, symbol: str) -> float | None:
+        """这笔持仓到目前为止摸到过的最高价，移动止损的分母。"""
+        value = self.peaks.get(normalize_symbol(symbol))
+        return float(value) if isinstance(value, (int, float)) and value > 0 else None
+
+    def observe_peak(self, symbol: str, price: float | None) -> float | None:
+        """记下新高并返回当前峰值。只涨不跌——峰值回落就不是峰值了。
+
+        **必须持久化。** 监控进程盘中重启是常事（改配置、断网重连），而峰值只
+        存在内存里的话，重启会把上午冲出来的高点抹掉，于是「已回吐一半浮盈」
+        重新读成「刚建仓没多久」。移动止损被静默关掉，恰好在最需要它的那天。
+        """
+        code = normalize_symbol(symbol)
+        current = self.peak_of(code)
+        if price is not None and price > 0 and (current is None or price > current):
+            self.peaks[code] = float(price)
+            return float(price)
+        return current
+
     def save(self) -> None:
         write_json(
             self.path,
@@ -93,6 +118,7 @@ class AlertState:
                 "fired": self.fired,
                 "observed": self.observed,
                 "pinned": self.pinned,
+                "peaks": self.peaks,
             },
         )
 

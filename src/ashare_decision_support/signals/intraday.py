@@ -28,6 +28,9 @@ CLOSING_WINDOW_MINUTES = 30
 # Prior sessions used as the volume baseline.
 VOLUME_BASELINE_SESSIONS = 5
 
+# 一个完整交易日的分钟数（上午 120 + 下午 120）。`_minutes_since_open` 的上界。
+FULL_SESSION_MINUTES = 240
+
 
 @dataclass(frozen=True)
 class IntradaySnapshot:
@@ -43,19 +46,22 @@ class IntradaySnapshot:
     price_vs_open_pct: float | None = None
     price_vs_vwap_pct: float | None = None
     open_gap_pct: float | None = None
+    # 现价相对**昨收**——也就是行情软件上那个「涨幅」。此前只能由
+    # `open_gap_pct` 与 `price_vs_open_pct` 两个数复合还原，每个调用方各还原一次
+    # 就是各错一次的机会。尾盘打法的第一道筛（涨幅 3%–5%）直接读它。
+    day_change_pct: float | None = None
     opening_drive_pct: float | None = None
     closing_drive_pct: float | None = None
+    # 与 `closing_drive_pct` 成对：那个说尾盘这段涨了多少，这个说是放着量涨的还是
+    # 缩着量涨的。单看涨幅，「尾盘缓拉吸筹」与「尾盘急拉做 K 线」长得一模一样。
+    closing_volume_ratio: float | None = None
     range_position: float | None = None
     volume_ratio: float | None = None
+    session_volume: float = 0.0
+    session_amount: float | None = None
     minutes_since_open: int = 0
     last_timestamp: datetime | None = None
     notes: list[str] = field(default_factory=list)
-
-    @property
-    def above_vwap(self) -> bool | None:
-        if self.price_vs_vwap_pct is None:
-            return None
-        return self.price_vs_vwap_pct >= 0
 
 
 class IntradayAnalyzer:
@@ -93,6 +99,15 @@ class IntradayAnalyzer:
 
         vwap = _vwap(session)
         span = session_high - session_low
+        session_volume = sum(
+            float(bar.get("volume") or 0.0)
+            for bar in session
+        )
+        session_amount = sum(
+            float(bar.get("amount") or ((bar.get("close") or 0.0) * (bar.get("volume") or 0.0)))
+            for bar in session
+            if bar.get("volume")
+        )
 
         return IntradaySnapshot(
             symbol=symbol,
@@ -109,8 +124,11 @@ class IntradayAnalyzer:
             open_gap_pct=_pct(prev_close, open_price) if prev_close else None,
             opening_drive_pct=_window_return(session, OPENING_WINDOW_MINUTES, from_start=True),
             closing_drive_pct=_window_return(session, CLOSING_WINDOW_MINUTES, from_start=False),
+            closing_volume_ratio=_closing_volume_ratio(sessions, session_date),
             range_position=round((last_price - session_low) / span, 4) if span > 0 else None,
             volume_ratio=_volume_ratio(sessions, session_date),
+            session_volume=round(session_volume, 4),
+            session_amount=round(session_amount, 4) if session_amount > 0 else None,
             minutes_since_open=_minutes_since_open(session[-1]["timestamp"]),
             last_timestamp=session[-1]["timestamp"],
             notes=notes,
@@ -153,7 +171,7 @@ def _vwap(session: list[dict]) -> float | None:
             continue
         amount = bar.get("amount")
         volume_total += volume
-        amount_total += amount if amount else bar["close"] * volume
+        amount_total += amount or bar["close"] * volume
     if volume_total <= 0:
         return None
     return amount_total / volume_total
@@ -175,31 +193,111 @@ def _window_return(session: list[dict], minutes: int, from_start: bool) -> float
 
 
 def _volume_ratio(sessions: dict[date, list[dict]], session_date: date) -> float | None:
-    """Session volume against the mean of the preceding sessions."""
+    """Session volume against the preceding sessions **at the same point of day**.
+
+    这里原先拿基线日的*全天*量按 `elapsed / 240` 线性折算。A 股成交显著前置——
+    开盘那几分钟经常单根就占掉全天两成——所以线性折算等于假设成交在 240 分钟里
+    均匀发生，早盘会系统性高估。
+
+    2026-08-04 牧原股份实测：10:50（elapsed=80）读数 **2.36**，当日收盘实际
+    64.8 万手 / 前 5 日均量 59.7 万手 = **1.09**。高估了一倍以上，而这个数还被
+    `advice/` 写成「分钟量能比前 5 日 2.36，资金参与偏强」喂进了结论文案。
+
+    改成拿基线日在**同一分钟数**上的累计量作分母。基线日的分钟线本来就在手上，
+    不需要外部的日内分布曲线，而且自动带上了这只票自己的成交节奏。
+
+    **这个数仍然是个外推，不是全天定论。** 它等价于「假设余下时段按常态节奏走」
+    的全天量比——今天恰好是反例：开盘砸完之后整个下午近乎停摆，10:50 的 1.7 倍
+    最终落到 1.09 倍。所以盘中读数只说「到此刻为止的量偏大」，不说「今天会放量」。
+    """
     ordered = sorted(sessions)
     index = ordered.index(session_date)
     baseline_dates = ordered[max(0, index - VOLUME_BASELINE_SESSIONS) : index]
     if not baseline_dates:
         return None
 
-    def total(day: date) -> float:
-        return sum(bar.get("volume") or 0.0 for bar in sessions[day])
+    current_session = sessions[session_date]
+    elapsed = _minutes_since_open(current_session[-1]["timestamp"])
+    current = sum(bar.get("volume") or 0.0 for bar in current_session)
 
-    baseline = fmean([total(day) for day in baseline_dates])
-    if baseline <= 0:
+    def total(day: date, cutoff: int | None) -> float:
+        rows = sessions[day]
+        if cutoff is not None:
+            rows = [bar for bar in rows if _minutes_since_open(bar["timestamp"]) <= cutoff]
+        return sum(bar.get("volume") or 0.0 for bar in rows)
+
+    # `elapsed == 0`（开盘第一根）也要走 cutoff：拿基线日的第一根比，读数才是 1.0。
+    # 原实现里的 `0 < elapsed` 守卫是给线性公式防除零的（`baseline *= 0/240` 会归零），
+    # cutoff 口径下这个风险由下面的 `> 0` 过滤兜住，守卫反而会让首根回退到全天基线。
+    cutoff = elapsed if elapsed < FULL_SESSION_MINUTES else None
+    # 基线日在该时点前没有任何成交（数据缺口、停牌半天）时整条丢掉，而不是让一个
+    # 0 把均值拖下去——那会把量比放大成一个看起来很吓人的数。
+    baselines = [value for day in baseline_dates if (value := total(day, cutoff)) > 0]
+    if not baselines:
         return None
-    current = total(session_date)
-    # A partial session compared against full ones reads low by construction;
-    # scale the baseline to the fraction of the day elapsed.
-    elapsed = _minutes_since_open(sessions[session_date][-1]["timestamp"])
-    full_day = 240
-    if 0 < elapsed < full_day:
-        baseline *= elapsed / full_day
+    baseline = fmean(baselines)
+    return round(current / baseline, 4) if baseline > 0 else None
+
+
+def _closing_volume_ratio(sessions: dict[date, list[dict]], session_date: date) -> float | None:
+    """最近 `CLOSING_WINDOW_MINUTES` 分钟的成交量，对前几日**同一分钟区间**的均值。
+
+    这是 `closing_drive_pct` 缺的那一半。§2.3 那张尾盘意图表的四行里，头两行的
+    涨幅可以完全一样——「缓步拉升 + 量同步放大」是吸筹，「急拉冲高 + 量萎缩」是
+    为次日出货做 K 线——**区别全在量**。没有这个读数，两者在系统里不可分。
+
+    ## 分母为什么不用「当日分钟均量」
+
+    A 股日内成交是 U 形的，尾盘天然抬升。拿全天分钟均量做分母，几乎每只票都会读出
+    大于 1 的值，阈值因此失去分辨力。这和 `_volume_ratio` 当初弃用 `elapsed / 240`
+    线性折算是**同一个错误的两面**：都是拿一条「日内均匀分布」的假设，去比一个本来
+    就不均匀的东西。改用前几日同一分钟区间，基线自动带上这只票自己的尾盘节奏。
+
+    ## 窗口锚在最后一根 K 线，不是 15:00
+
+    盘中 14:00 调用，得到的是 13:30–14:00 那一段。**它是不是「尾盘」由调用方按时钟
+    判断**——同 `is_current_session` 的契约，也同 `closing_drive_pct` 现有的行为。
+    未来的 `Playbook.TAIL_END` 应当由 `schedule/timetable.py` 的时段来保证这件事，
+    而不是靠这里猜。
+
+    窗口不足 `CLOSING_WINDOW_MINUTES` 时返回 None：开盘 10 分钟时「最近 30 分钟」
+    并不存在，给一个数会让它冒充尾盘读数。
+    """
+    ordered = sorted(sessions)
+    index = ordered.index(session_date)
+    baseline_dates = ordered[max(0, index - VOLUME_BASELINE_SESSIONS) : index]
+    if not baseline_dates:
+        return None
+
+    current_session = sessions[session_date]
+    elapsed = _minutes_since_open(current_session[-1]["timestamp"])
+    if elapsed < CLOSING_WINDOW_MINUTES:
+        return None
+    start = elapsed - CLOSING_WINDOW_MINUTES
+
+    def window(day: date) -> float:
+        return sum(
+            bar.get("volume") or 0.0
+            for bar in sessions[day]
+            if start < _minutes_since_open(bar["timestamp"]) <= elapsed
+        )
+
+    # 当日窗口零成交按「无读数」处理，不按「尾盘萎缩到 0」。交易时段里连续 30 分钟
+    # 没有成交，现实中是停牌或数据缺口，不是行情——而 0.0 会直接落进「急拉缩量 =
+    # 诱多」那一行。基线侧丢零值是同一条理由（见 `_volume_ratio`）。
+    current = window(session_date)
+    if current <= 0:
+        return None
+    baselines = [value for day in baseline_dates if (value := window(day)) > 0]
+    if not baselines:
+        return None
+    baseline = fmean(baselines)
     return round(current / baseline, 4) if baseline > 0 else None
 
 
 def _minutes_since_open(timestamp: datetime) -> int:
     """Trading minutes elapsed, skipping the 11:30-13:00 break."""
+
     moment = timestamp.time()
     if moment <= MORNING_OPEN:
         return 0

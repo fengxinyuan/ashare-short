@@ -22,7 +22,8 @@ import os
 import re
 import time
 from collections import deque
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 # 服务端在 429 消息里自报的等待时长，例：「请 38266ms 后重试」。
 _WAIT_MS = re.compile(r"(\d+)\s*ms\s*后重试")
@@ -128,8 +129,13 @@ class RateLimiter:
         }
 
 
-class _Namespace:
-    """代理 ``client.klines`` 这类中间层，把下面的可调用对象继续包起来。"""
+class _Proxy:
+    """透明代理的共同部分：可调用的过闸门，命名空间继续往下包，其余原样透传。
+
+    `_Namespace` 和 `RateLimitedClient` 的转发逻辑必须**逐字一致**——一边改了
+    另一边没改，表现是「顶层调用限了速、`client.klines.*` 没限」，而超限只在
+    跑量大的那天才炸。所以共同部分放在基类里，两个子类只保留各自多出来的东西。
+    """
 
     def __init__(self, target: Any, limiter: RateLimiter) -> None:
         object.__setattr__(self, "_target", target)
@@ -146,6 +152,10 @@ class _Namespace:
 
     def __setattr__(self, name: str, value: Any) -> None:
         setattr(object.__getattribute__(self, "_target"), name, value)
+
+
+class _Namespace(_Proxy):
+    """代理 ``client.klines`` 这类中间层，把下面的可调用对象继续包起来。"""
 
 
 def _is_namespace(value: Any) -> bool:
@@ -167,7 +177,7 @@ def _throttled(func: Callable[..., Any], limiter: RateLimiter) -> Callable[..., 
             limiter.acquire()
             try:
                 return func(*args, **kwargs)
-            except Exception as exc:  # noqa: BLE001 - 只对限流重试，其余立刻上抛
+            except Exception as exc:
                 if not is_rate_limit_error(exc):
                     raise
                 last = exc
@@ -179,33 +189,13 @@ def _throttled(func: Callable[..., Any], limiter: RateLimiter) -> Callable[..., 
     return wrapper
 
 
-class RateLimitedClient:
+class RateLimitedClient(_Proxy):
     """TickFlow SDK client 的透明代理，所有调用先过闸门。
 
     包在 client 而不是适配器方法上，是因为 `sectors/taxonomy.py` 拿的是
     `adapter.client` 直接调 `universes.*`，绕过了适配器的全部方法。包 client
     是唯一能同时覆盖两条路径的位置。
     """
-
-    def __init__(self, client: Any, limiter: RateLimiter) -> None:
-        object.__setattr__(self, "_target", client)
-        object.__setattr__(self, "_limiter", limiter)
-
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(object.__getattribute__(self, "_target"), name)
-        limiter = object.__getattribute__(self, "_limiter")
-        if callable(attr) and not isinstance(attr, type):
-            return _throttled(attr, limiter)
-        if _is_namespace(attr):
-            return _Namespace(attr, limiter)
-        return attr
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        setattr(object.__getattribute__(self, "_target"), name, value)
-
-    @property
-    def rate_limiter(self) -> RateLimiter:
-        return object.__getattribute__(self, "_limiter")
 
     @property
     def unwrapped(self) -> Any:

@@ -13,10 +13,11 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 DEFAULT_WORKERS = 6
 
@@ -98,10 +99,3 @@ def run_agents(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(execute, agents))
     return {finding.agent: finding for finding in results}
-
-
-def collect_notes(findings: dict[str, Finding]) -> list[str]:
-    notes: list[str] = []
-    for finding in findings.values():
-        notes.extend(finding.notes)
-    return notes

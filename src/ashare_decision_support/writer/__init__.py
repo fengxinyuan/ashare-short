@@ -1,4 +1,4 @@
-"""Brief writing: deterministic template by default, LLM as an opt-in overlay."""
+"""Brief writing: deterministic template plus an LLM rewrite layer."""
 
 from ashare_decision_support.writer.base import BriefWriter, WriteRequest, WriteResult
 from ashare_decision_support.writer.llm import (

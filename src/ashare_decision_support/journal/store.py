@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from ashare_decision_support.journal.records import (
-    KIND_CONTROL,
     KIND_OUTCOME,
     KIND_RECOMMENDATION,
     VERIFIABLE_KINDS,
@@ -60,9 +59,6 @@ class Journal:
 
     def recommendations(self, since: date | None = None, until: date | None = None) -> list[dict]:
         return [row for row in self.rows(since, until) if row.get("kind") == KIND_RECOMMENDATION]
-
-    def controls(self, since: date | None = None, until: date | None = None) -> list[dict]:
-        return [row for row in self.rows(since, until) if row.get("kind") == KIND_CONTROL]
 
     def outcomes(self, since: date | None = None, until: date | None = None) -> list[dict]:
         return [row for row in self.rows(since, until) if row.get("kind") == KIND_OUTCOME]

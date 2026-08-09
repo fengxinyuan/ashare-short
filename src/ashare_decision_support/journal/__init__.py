@@ -16,8 +16,15 @@
 """
 
 from ashare_decision_support.journal.records import Outcome, Recommendation
-from ashare_decision_support.journal.stats import summarize
+from ashare_decision_support.journal.stats import rolling_validation, summarize
 from ashare_decision_support.journal.store import Journal
 from ashare_decision_support.journal.verify import verify_pending
 
-__all__ = ["Journal", "Outcome", "Recommendation", "summarize", "verify_pending"]
+__all__ = [
+    "Journal",
+    "Outcome",
+    "Recommendation",
+    "rolling_validation",
+    "summarize",
+    "verify_pending",
+]

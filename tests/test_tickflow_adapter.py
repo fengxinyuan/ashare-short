@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import math
 from datetime import date, datetime
-from types import SimpleNamespace
 
 from ashare_decision_support.adapters.tickflow_adapter import TickFlowAdapter
 
@@ -328,3 +328,78 @@ def test_every_symbol_comes_back_when_the_chunking_is_right() -> None:
 
     assert len(bars) == 250
     assert all(rows for rows in bars.values())
+
+
+# ---- 列式载荷：这一支此前是全仓唯一不过 `finite` 的取数路径 ----------------
+
+
+class _ColumnarKlines:
+    """TickFlow 返回**列式**载荷时的样子：每个字段一个数组。"""
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def get(self, *args, **kwargs):
+        return self.payload
+
+
+def _columnar_adapter(payload: dict) -> TickFlowAdapter:
+    module = type(
+        "Mod",
+        (),
+        {"TickFlow": staticmethod(lambda **kw: type("C", (), {"klines": _ColumnarKlines(payload)})())},
+    )
+    return TickFlowAdapter(
+        api_key="k", tickflow_module=module, auto_connect=False, rate_limit=None
+    )
+
+
+def test_columnar_bars_drop_non_finite_readings() -> None:
+    """NaN 不是 None，`close is not None` 那道过滤挡不住它。
+
+    挡不住的后果不是报错：`dipbuy` 的 `float(high)` 收得下 NaN，真实波幅变成
+    NaN，ATR 跟着变成 NaN，而 NaN 的比较永远是 False——「跌破止损」于是静默
+    变成「没跌破」。这条钉住的是取数那一层，不是下游每一处比较。
+    """
+    nan = float("nan")
+    adapter = _columnar_adapter(
+        {
+            "timestamp": [1_785_000_000_000, 1_785_086_400_000, 1_785_172_800_000],
+            "open": [10.0, nan, 10.2],
+            "high": [10.5, 10.6, float("inf")],
+            "low": [9.8, 9.9, 10.0],
+            "close": [10.2, 10.4, nan],
+            "volume": [1000, nan, 1200],
+            "amount": [10200, 10400, 12000],
+        }
+    )
+
+    bars = adapter.get_historical_bars(["600519.SH"], date(2026, 8, 1), date(2026, 8, 3))["600519.SH"]
+
+    # close 为 NaN 的那一根整根丢掉——和 close 缺失是同一种情况。
+    assert len(bars) == 2
+    assert [bar["close"] for bar in bars] == [10.2, 10.4]
+    # 单格的 NaN 只让那一格缺失，不带走整根。
+    assert bars[1]["open"] is None
+    assert bars[1]["volume"] is None
+    assert all(
+        value is None or math.isfinite(value)
+        for bar in bars
+        for value in (bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"])
+    )
+
+
+def test_columnar_bars_tolerate_short_columns() -> None:
+    """各列不保证等长，短的那一列越界只该让那一格缺失。"""
+    adapter = _columnar_adapter(
+        {
+            "timestamp": [1_785_000_000_000, 1_785_086_400_000],
+            "close": [10.2, 10.4],
+            "amount": [10200],  # 比 timestamp 短
+        }
+    )
+
+    bars = adapter.get_historical_bars(["600519.SH"], date(2026, 8, 1), date(2026, 8, 2))["600519.SH"]
+
+    assert len(bars) == 2
+    assert bars[1]["amount"] is None

@@ -1,49 +1,53 @@
-"""Pre-open job: restate yesterday's matrix as this morning's execution card.
+"""次日盘前：把昨日盘后的执行卡复述一遍。
 
-Adds no new market view — the free tier has nothing new to say before the open.
-Its job is to put the levels, position bands and auction-timing rules in front of
-the trader while there is still time to act on them.
+不产生任何新的市场判断——开盘前没有当日分时，现算只会拿到昨天的数据然后被当成
+今天的。它的职责是在还来得及动手的时候，把价位、仓位上限与竞价纪律摆到眼前。
+
+**这条路只在 CLI 上。** 守护进程 09:15 的 `preopen` 任务跑的是 `run_advise`
+（见 `jobs/daily_cycle.py`），那条路有当日分时可用。
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
-import json
 
-from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, DecisionMatrix
+from ashare_decision_support.jobs.post_close import POST_CLOSE_LATEST_NAME, SNAPSHOT_LATEST_NAME
+from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_pre_open_brief
-from ashare_decision_support.notify.base import Notifier
-from ashare_decision_support.jobs.post_close import SNAPSHOT_LATEST_NAME
+from ashare_decision_support.notify.base import Notifier, publish
 
 
 def run_pre_open(
-    matrix_path: str | Path,
+    payload_path: str | Path | None = None,
     output_dir: str | Path | None = None,
     adapter: Any | None = None,
     notifiers: list[Notifier] | None = None,
 ) -> dict[str, Any]:
-    matrix_file = Path(matrix_path)
-    matrix = DecisionMatrix.model_validate(json.loads(matrix_file.read_text(encoding="utf-8")))
+    source = Path(payload_path) if payload_path else Path("briefs") / POST_CLOSE_LATEST_NAME
+    payload = json.loads(source.read_text(encoding="utf-8"))
 
-    target_dir = Path(output_dir) if output_dir else matrix_file.parent
-    snapshots, snapshot_note = _load_snapshots(matrix, matrix_file, adapter)
+    target_dir = Path(output_dir) if output_dir else source.parent
+    rows = list(payload.get("actionable") or [])
+    snapshots, snapshot_note = _load_snapshots(rows, source, adapter)
 
-    data_notes = [f"决策矩阵来源：{matrix_file}"]
+    data_notes = [f"执行卡来源：{source}"]
     if snapshot_note:
         data_notes.append(snapshot_note)
 
-    content = render_pre_open_brief(matrix, snapshots, data_notes)
-    title = f"盘前提示（对应 {matrix.trade_date}）"
+    content = render_pre_open_brief(payload, snapshots, data_notes)
+    title = f"盘前提示（对应 {payload.get('trade_date')}）"
 
     file_notifier = FileNotifier(target_dir, slug="pre-open")
     channels = notifiers if notifiers is not None else [ConsoleNotifier(), file_notifier]
-    delivered = [notifier.capabilities.channel for notifier in channels if notifier.send(title, content)]
+    delivered = publish(channels, title, content)
 
     return {
         "title": title,
-        "trade_date": str(matrix.trade_date),
-        "candidates": len(matrix.candidates),
+        "trade_date": str(payload.get("trade_date")),
+        "candidates": len(rows),
+        "watch_only": len(payload.get("watch_only") or []),
         "delivered": delivered,
         "data_notes": data_notes,
         "brief_path": str(file_notifier.last_path) if file_notifier.last_path else None,
@@ -52,17 +56,18 @@ def run_pre_open(
 
 
 def _load_snapshots(
-    matrix: DecisionMatrix,
-    matrix_file: Path,
+    rows: list[dict],
+    source: Path,
     adapter: Any | None,
 ) -> tuple[dict[str, DailyTechnicalSnapshot], str | None]:
-    """Prefer the snapshots the post-close run already wrote; refetch only if asked."""
-    sibling = matrix_file.parent / SNAPSHOT_LATEST_NAME
+    """优先复用盘后已经写好的快照，只有明确要求时才重新取数。"""
+    sibling = source.parent / SNAPSHOT_LATEST_NAME
     if sibling.exists():
         try:
             payload = json.loads(sibling.read_text(encoding="utf-8"))
             snapshots = {
-                symbol: DailyTechnicalSnapshot.model_validate(item) for symbol, item in payload.items()
+                symbol: DailyTechnicalSnapshot.model_validate(item)
+                for symbol, item in payload.items()
             }
             return snapshots, f"价位取自盘后快照：{sibling.name}"
         except (OSError, ValueError) as exc:
@@ -75,10 +80,10 @@ def _load_snapshots(
 
     from ashare_decision_support.signals import DailyTechnicalAnalyzer
 
-    symbols = [candidate.symbol for candidate in matrix.candidates]
+    symbols = [row["symbol"] for row in rows if row.get("symbol")]
     if not symbols:
         return {}, None
     end = date.today()
     bars = adapter.get_historical_bars(symbols, end - timedelta(days=180), end)
-    usable = {symbol: rows for symbol, rows in bars.items() if rows}
+    usable = {symbol: rows_ for symbol, rows_ in bars.items() if rows_}
     return DailyTechnicalAnalyzer().analyze_many(usable), "价位为盘前实时重算"

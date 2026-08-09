@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
-import json
-from pathlib import Path
 from typing import Any
 
 from ashare_decision_support.adapters.base import MarketDataAdapter
 from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
+from ashare_decision_support.numeric import first_finite
+from ashare_decision_support.schedule.calendar import parse_trade_date
+from ashare_decision_support.schedule.clock import minutes_since_open
 
 
 class AkshareAdapterError(RuntimeError):
@@ -26,18 +27,6 @@ class AkshareAdapter(MarketDataAdapter):
                     "or `pip install akshare` on your local machine."
                 ) from exc
         self.ak = ak_module
-
-    def subscribe_quotes(self, symbols: list[str]) -> None:
-        return None
-
-    def subscribe_l2_snapshot(self, symbols: list[str]) -> None:
-        return None
-
-    def subscribe_ticks(self, symbols: list[str]) -> None:
-        return None
-
-    def subscribe_orders(self, symbols: list[str]) -> None:
-        return None
 
     def get_security_master(self, symbols: list[str]) -> dict[str, dict]:
         rows_by_code = self._spot_rows_by_code(symbols)
@@ -74,7 +63,7 @@ class AkshareAdapter(MarketDataAdapter):
             for row in rows:
                 value = row.get("trade_date") or row.get("交易日") or row.get("date")
                 if value:
-                    result.append(self._parse_date(value))
+                    result.append(parse_trade_date(value))
             return result
         return []
 
@@ -86,11 +75,11 @@ class AkshareAdapter(MarketDataAdapter):
             row = rows_by_code.get(self._code(symbol))
             if row is None:
                 raise AkshareAdapterError(f"symbol {symbol} not found in ak.stock_zh_a_spot_em() output")
-            latest = self._float(row, "最新价")
-            open_price = self._float(row, "今开")
-            prev_close = self._float(row, "昨收")
-            amount = self._float(row, "成交额")
-            volume_hand = self._float(row, "成交量")
+            latest = first_finite(row, "最新价")
+            open_price = first_finite(row, "今开")
+            prev_close = first_finite(row, "昨收")
+            amount = first_finite(row, "成交额")
+            volume_hand = first_finite(row, "成交量")
             matched_qty = int(volume_hand * 100) if volume_hand is not None else 0
             open_gap_pct = 0.0
             if open_price is not None and prev_close not in (None, 0):
@@ -138,21 +127,21 @@ class AkshareAdapter(MarketDataAdapter):
             minute_rows = self._rows(minute_df)
             minute_rows = [item for item in minute_rows if item]
 
-            latest_price = self._float(row, "最新价")
-            open_price = self._float(row, "今开")
-            prev_close = self._float(row, "昨收")
-            volume_ratio = self._float(row, "量比") or 1.0
+            latest_price = first_finite(row, "最新价")
+            open_price = first_finite(row, "今开")
+            prev_close = first_finite(row, "昨收")
+            volume_ratio = first_finite(row, "量比") or 1.0
 
             last_bar = minute_rows[-1] if minute_rows else {}
-            bar_close = self._float(last_bar, "收盘")
+            bar_close = first_finite(last_bar, "收盘")
             current_price = bar_close or latest_price or open_price or prev_close
             if current_price is None:
                 raise AkshareAdapterError(f"cannot determine current price for symbol {symbol}")
 
-            vwap = self._float(last_bar, "均价")
+            vwap = first_finite(last_bar, "均价")
             if vwap is None:
-                amount = self._float(last_bar, "成交额")
-                volume_hand = self._float(last_bar, "成交量")
+                amount = first_finite(last_bar, "成交额")
+                volume_hand = first_finite(last_bar, "成交量")
                 if amount is not None and volume_hand not in (None, 0):
                     vwap = amount / (volume_hand * 100)
                 else:
@@ -168,7 +157,7 @@ class AkshareAdapter(MarketDataAdapter):
 
             features[symbol] = OpenFeatures(
                 symbol=symbol,
-                minutes_since_open=self._minutes_since_open(bar_dt),
+                minutes_since_open=minutes_since_open(bar_dt),
                 price_vs_open_pct=((current_price / open_price - 1.0) * 100.0) if open_price not in (None, 0) else 0.0,
                 price_vs_vwap_pct=((current_price / vwap - 1.0) * 100.0) if vwap not in (None, 0) else 0.0,
                 volume_ratio=volume_ratio,
@@ -218,10 +207,6 @@ class AkshareAdapter(MarketDataAdapter):
                 snapshot["minute"][symbol] = {"error": str(exc)}
         return snapshot
 
-    def dump_snapshot_to_file(self, symbols: list[str], output_path: str | Path) -> None:
-        payload = self.dump_snapshot(symbols)
-        Path(output_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
     def _spot_rows_by_code(self, symbols: list[str]) -> dict[str, dict]:
         spot_fn = getattr(self.ak, "stock_zh_a_spot_em", None)
         if not callable(spot_fn):
@@ -249,32 +234,15 @@ class AkshareAdapter(MarketDataAdapter):
                     data = to_dict()
                     if isinstance(data, list):
                         return data
-                except Exception:
+                except Exception:  # noqa: S110 — 逐个试签名，试不通就换下一种
                     pass
         if isinstance(table, dict):
             return [table]
         raise AkshareAdapterError(f"unsupported AkShare table payload type: {type(table)!r}")
 
     def _code(self, symbol: str) -> str:
-        base = symbol.split(".")[0]
+        base = symbol.split(".", maxsplit=1)[0]
         return base.zfill(6)
-
-    def _float(self, row: dict, key: str) -> float | None:
-        value = row.get(key)
-        if value in (None, "", "-"):
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _parse_date(self, value: Any) -> date:
-        if isinstance(value, date):
-            return value
-        text = str(value)
-        if len(text) == 8 and text.isdigit():
-            return datetime.strptime(text, "%Y%m%d").date()
-        return datetime.fromisoformat(text).date()
 
     def _parse_datetime(self, value: Any) -> datetime:
         if isinstance(value, datetime):
@@ -285,14 +253,3 @@ class AkshareAdapter(MarketDataAdapter):
         if len(text) == 16:
             return datetime.fromisoformat(f"{text}:00")
         return datetime.now()
-
-    def _minutes_since_open(self, dt: datetime) -> int:
-        morning_open = datetime.combine(dt.date(), time(9, 30))
-        afternoon_open = datetime.combine(dt.date(), time(13, 0))
-        if dt <= morning_open:
-            return 0
-        if dt < datetime.combine(dt.date(), time(11, 30)):
-            return int((dt - morning_open).total_seconds() // 60)
-        if dt < afternoon_open:
-            return 120
-        return 120 + int((dt - afternoon_open).total_seconds() // 60)

@@ -15,9 +15,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time as clock_time
-from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import date
+from datetime import time as clock_time
+from typing import Any
 
 from ashare_decision_support.schedule.daemon import ScheduledTask
 
@@ -72,8 +73,3 @@ def describe(tasks: list[ScheduledTask], day: date | None = None) -> str:
     header = f"交易日 {day or date.today()} 时间表"
     rows = [f"  {task.at:%H:%M}  {task.key:<10} {task.label}" for task in sorted(tasks, key=lambda t: t.at)]
     return "\n".join([header, *rows])
-
-
-def next_task(tasks: list[ScheduledTask], moment: datetime) -> ScheduledTask | None:
-    upcoming = [task for task in sorted(tasks, key=lambda t: t.at) if task.at > moment.time()]
-    return upcoming[0] if upcoming else None

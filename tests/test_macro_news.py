@@ -103,7 +103,7 @@ def test_paging_is_driven_by_a_time_window_not_a_page_count() -> None:
     07-31 09:30 的 PMI 恰好落在那个盲区里。"""
     busy = [
         [_item(f"2026-08-02 0{h}:00", title=f"噪音{h}") for h in range(1, 10)],
-        [_item(f"2026-08-01 1{h}:00", title=f"噪音b{h}") for h in range(0, 9)],
+        [_item(f"2026-08-01 1{h}:00", title=f"噪音b{h}") for h in range(9)],
         [PMI],
     ]
     http = StubHttp({"global-channel": busy, "a-stock-channel": [[]]})
@@ -250,3 +250,22 @@ def test_partial_coverage_is_stated_not_hidden() -> None:
 def test_composite_needs_at_least_one_source() -> None:
     with pytest.raises(ValueError):
         CompositeNewsSource()
+
+
+def test_composite_market_limit_is_shared_fairly_across_sources() -> None:
+    busy = FakeSource(
+        "busy",
+        market=[NewsDoc(title=f"盘面{i}", source="忙源") for i in range(20)],
+    )
+    industry = FakeSource(
+        "industry",
+        market=[NewsDoc(title=f"纸浆消息{i}", source="行业源") for i in range(2)],
+    )
+
+    docs, _ = CompositeNewsSource(busy, industry).fetch_market(
+        date(2026, 8, 2), limit=10
+    )
+
+    assert len(docs) == 10
+    assert len([doc for doc in docs if doc.source == "行业源"]) == 2
+    assert len([doc for doc in docs if doc.source == "忙源"]) == 8

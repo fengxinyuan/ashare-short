@@ -18,24 +18,22 @@ from ashare_decision_support.schedule.timetable import (
     TASK_REVIEW,
     build_timetable,
     describe,
-    next_task,
 )
 
 __all__ = [
     "DEFAULT_TIMES",
     "LABELS",
     "MAX_ATTEMPTS",
-    "DaemonReport",
-    "ScheduledTask",
     "TASK_MONITOR",
     "TASK_MORNING",
     "TASK_NEWS",
     "TASK_POSTCLOSE",
     "TASK_PREOPEN",
     "TASK_REVIEW",
+    "DaemonReport",
+    "ScheduledTask",
     "TradingCalendar",
     "build_timetable",
     "describe",
-    "next_task",
     "run_daemon",
 ]

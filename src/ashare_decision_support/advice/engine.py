@@ -27,6 +27,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.advice.adjudicate import Adjudication, LevelAdjudicator, rule_default
+from ashare_decision_support.advice.candidates import (
+    BASIS_NOISE_FLOOR,
+    BASIS_STRUCTURE_BREAK,
+    CandidateSet,
+    build_candidates,
+)
+from ashare_decision_support.models.enums import Playbook, TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, WyckoffSignal
 from ashare_decision_support.signals.intraday import IntradaySnapshot
 
@@ -51,10 +59,55 @@ class Scenario:
 
 
 @dataclass
+class TradeContext:
+    session_volume: float = 0.0
+    session_amount: float | None = None
+    turnover_ratio: float | None = None
+    float_cap_yi: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_volume": self.session_volume,
+            "session_amount": self.session_amount,
+            "turnover_ratio": self.turnover_ratio,
+            "float_cap_yi": self.float_cap_yi,
+        }
+
+
+@dataclass
+class ShortlineView:
+    bias: str
+    action: str
+    score: int
+    summary: str
+    reasons: list[str] = field(default_factory=list)
+    reclaim_level: float | None = None
+    support_level: float | None = None
+    pressure_level: float | None = None
+    defense_level: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bias": self.bias,
+            "action": self.action,
+            "score": self.score,
+            "summary": self.summary,
+            "reasons": list(self.reasons),
+            "reclaim_level": self.reclaim_level,
+            "support_level": self.support_level,
+            "pressure_level": self.pressure_level,
+            "defense_level": self.defense_level,
+        }
+
+
+@dataclass
 class StockAdvice:
     symbol: str
     name: str | None = None
     score: float | None = None
+    # 评分的确定性拆分。总分本身不能说明行情结构、资金和事件分别改变了多少，
+    # 但这里绝不存模型主观归因。
+    score_components: dict[str, float] = field(default_factory=dict)
     last_price: float | None = None
     session_date: str | None = None
     is_current_session: bool = False
@@ -69,14 +122,71 @@ class StockAdvice:
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     intraday: dict[str, Any] = field(default_factory=dict)
+    # 盘口读数（`signals/orderflow.py`）。取不到就是 None——五档缺失只让候选集少
+    # 两类，不影响其余部分。
+    book: dict[str, Any] = field(default_factory=dict)
+    # 盘口读数的成稿行。存渲染好的文本而不是让简报自己拼，是因为同一句话监控
+    # 那边已经在用（`OrderBookReading.describe`）——两处各写一份措辞，迟早会
+    # 出现「监控说买不进、简报说可以挂单」这种自相矛盾。
+    #
+    # 不进 `_facts`：它是 `book` 里那些数的复述，混进数字闸门的比对集只会凭空
+    # 放宽闸门（多出「68 万元」「56%」这类换算过的数），不增加任何事实。
+    book_lines: list[str] = field(default_factory=list)
+    # L2 候选集与 L3 裁决。`candidates` 永远有（只要有分时数据），`adjudication`
+    # 在没有裁决器时是规则默认那一份，`used_fallback=True`。
+    candidates: CandidateSet | None = None
+    adjudication: Adjudication | None = None
+    # 入场带的宽度。存在 advice 上而不是 engine 上：一个 engine 实例会连续处理
+    # 几十只票，把它挂在 self 上等于让上一只的带宽泄漏给下一只。
+    entry_band_width: float | None = None
+    trade_context: TradeContext | None = None
+    shortline: ShortlineView | None = None
+    # 打法判据（`strategy/playbook.py`）。**这一层此前不在 advise 上**：盘前主链路
+    # 过打法门槛，而人主动问一只票走的是这条路，于是最常被读的那份输出反而只有一个
+    # 加权分数和一组价位，答不了「凭哪条打法买」「今天为什么不能买」。
+    #
+    # 这里**不做过滤**，只做标注：你点名问的票，答案是「今天没有可用打法，因为
+    # ……」，不是让它从结果里消失。同一条口径见 `jobs/advise.py` 对 ST 的处理。
+    setup: dict[str, Any] = field(default_factory=dict)
+    playbook: str | None = None
+    # 收盘量价判别（只描述已发生结构，不产生动作）。
+    distribution: dict[str, Any] | None = None
+    volume_price: dict[str, Any] | None = None
+    # 个股相对所属宽基指数的超额收益。只作事实展示，不改变打分或动作。
+    relative_strength: dict[str, Any] | None = None
+    # 个股新闻与公告提取的事件类别和风险词。展示/复盘用，不产生动作。
+    event_evidence: dict[str, Any] | None = None
+    # 仅持仓路径填写：回本价相对日线阻力的结构说明。
+    breakeven_lines: list[str] = field(default_factory=list)
 
     @property
     def has_actionable_levels(self) -> bool:
         return self.entry_low is not None and self.stop is not None
 
+    @property
+    def has_playbook(self) -> bool:
+        """今天有没有一条成立的打法。价位算得出来 ≠ 现在该买。"""
+        return bool(self.setup.get("matched"))
+
+    @property
+    def abstained(self) -> bool:
+        return bool(self.adjudication and self.adjudication.abstained)
+
 
 class AdviceEngine:
-    """Turns daily structure plus intraday behaviour into levels and scenarios."""
+    """Turns daily structure plus intraday behaviour into levels and scenarios.
+
+    三层的落点都在 `build` 里：L1 读数由调用方传进来，L2 候选在 `_levels` 生成，
+    L3 裁决由可选的 `adjudicator` 做。
+
+    **`adjudicator` 默认是 None，而且盘中循环永远不要传它。** 它是每标的一次
+    LLM 调用：20 只票的一轮监控会变成 20 次网络往返、几十秒延迟、二十个失败
+    机会——而告警要的是秒级时效。见 `docs/ARCHITECTURE.md` §五。它的位置在
+    `advise`（你主动问）和盘前执行卡（一天一次），不在 `monitor`。
+    """
+
+    def __init__(self, adjudicator: LevelAdjudicator | None = None) -> None:
+        self.adjudicator = adjudicator
 
     def build(
         self,
@@ -86,8 +196,36 @@ class AdviceEngine:
         wyckoff: WyckoffSignal | None = None,
         name: str | None = None,
         score: float | None = None,
+        score_components: dict[str, float] | None = None,
+        book: Any = None,
+        instrument: Any = None,
+        match: Any = None,
     ) -> StockAdvice:
-        advice = StockAdvice(symbol=symbol, name=name, score=score)
+        advice = StockAdvice(
+            symbol=symbol,
+            name=name,
+            score=score,
+            score_components=dict(score_components or {}),
+        )
+        if match is not None:
+            advice.setup = match.to_dict()
+            primary = match.primary
+            advice.playbook = primary.value if primary else None
+            # 判据链的理由排在价位理由之前——它回答「为什么现在可以买」，价位只
+            # 回答「买在哪」。没有一条打法成立时，拒绝理由进 warnings 而不是
+            # reasons：那不是买入依据，是不买的依据。
+            if match.ok:
+                advice.reasons.extend(match.reasons)
+                advice.warnings.extend(match.warnings)
+            else:
+                advice.warnings.extend(
+                    f"无可用打法：{text}" for text in match.reject_reasons
+                )
+                blocked = advice.setup.get("blocked_by_regime") or []
+                if blocked:
+                    advice.warnings.append(
+                        f"{'、'.join(blocked)} 被今天的情绪周期挡掉"
+                    )
         if daily is None and intraday is None:
             advice.warnings.append("既无日线也无分钟线数据，无法给出任何判断")
             return advice
@@ -107,13 +245,22 @@ class AdviceEngine:
         advice.is_current_session = intraday.is_current_session
         advice.warnings.extend(intraday.notes)
         advice.intraday = _intraday_facts(intraday)
+        advice.trade_context = _trade_context(instrument, intraday)
+        if book is not None:
+            advice.book = book.to_dict() if hasattr(book, "to_dict") else dict(book)
+            advice.warnings.extend(getattr(book, "notes", []) or [])
+            describe = getattr(book, "describe", None)
+            if callable(describe):
+                advice.book_lines = list(describe())
 
         factor = _session_alignment(daily, intraday)
         if daily is not None and factor is None:
             advice.warnings.append("日线快照与分钟线对不上（疑似不同交易日或不同标的），日线位置未纳入价位计算")
 
-        self._levels(advice, daily, intraday, factor)
+        self._levels(advice, daily, intraday, factor, book)
+        self._adjudicate(advice, intraday)
         self._scenarios(advice, daily, intraday, factor)
+        self._shortline(advice, daily, intraday)
         self._reasons(advice, daily, intraday, wyckoff)
         return advice
 
@@ -125,6 +272,7 @@ class AdviceEngine:
         daily: DailyTechnicalSnapshot | None,
         intraday: IntradaySnapshot,
         factor: float | None,
+        book: Any = None,
     ) -> None:
         last = intraday.last_price
         vwap = intraday.vwap
@@ -136,22 +284,28 @@ class AdviceEngine:
         # point. Anchoring both edges on VWAP collapsed it to zero width
         # whenever price sat above the mean, which is the normal case in an
         # uptrend and made the band useless exactly when it mattered.
-        anchor = vwap if vwap else (low + high) / 2
+        anchor = vwap or (low + high) / 2
         band = span * ENTRY_BAND_RATIO
         advice.entry_low = round(max(low, anchor - band), 3)
         advice.entry_high = round(min(max(anchor, advice.entry_low + band), last if last > anchor else high), 3)
         if advice.entry_high <= advice.entry_low:
             advice.entry_high = round(advice.entry_low + band, 3)
+        pullback_entry = advice.entry_low
 
         supports = _levels_if_aligned(daily.supports if daily else [], factor)
         below = [level for level in supports if level < low]
         structural_stop = max(below) if below else None
 
         stop = low - span * STOP_BUFFER
-        if structural_stop is not None:
-            # Prefer the structural level when it is not absurdly far away.
-            if (advice.entry_low - structural_stop) / advice.entry_low <= 0.09:
-                stop = min(stop, structural_stop)
+        stop_basis = BASIS_NOISE_FLOOR
+        # Prefer the structural level when it is not absurdly far away.
+        if (
+            structural_stop is not None
+            and (advice.entry_low - structural_stop) / advice.entry_low <= 0.09
+        ):
+            if structural_stop < stop:
+                stop_basis = BASIS_STRUCTURE_BREAK
+            stop = min(stop, structural_stop)
         advice.stop = round(stop, 3)
 
         resistances = _levels_if_aligned(daily.resistances if daily else [], factor)
@@ -159,6 +313,40 @@ class AdviceEngine:
         targets = [high] if high > last else []
         targets.extend(above[:2])
         advice.targets = [round(level, 3) for level in sorted(dict.fromkeys(targets)) if level > last]
+
+        # 突破与低吸的执行条件相反：前者必须等价格确认越过触发位，后者才是在
+        # 现价下方挂回踩单。此前两条策略共用 `entry_low`，导致已经选为突破的票
+        # 仍报出均价回踩位。只用当日高点作触发位，不从日线压力位凭空推一个价。
+        breakout_trigger = high if advice.playbook == Playbook.BREAKOUT.value and high >= last else None
+        if breakout_trigger is not None and (breakout_trigger - last) / last <= 0.03:
+            advice.entry_low = round(breakout_trigger, 3)
+            advice.entry_high = advice.entry_low
+
+        # ---- L2：把上面这些数变成带出处的候选 ----------------------------
+        # 顺序很重要：规则的两个数先算完，再作为 rank 0 传进去，候选集的默认
+        # 答案才和改造前逐位相同。
+        advice.candidates = build_candidates(
+            symbol=advice.symbol,
+            last_price=last,
+            vwap=vwap,
+            session_low=low,
+            session_high=high,
+            span=span,
+            daily_supports=supports,
+            daily_resistances=resistances,
+            book=book,
+            entry_band=pullback_entry,
+            breakout_trigger=breakout_trigger,
+            rule_stop=advice.stop,
+            rule_stop_basis=stop_basis,
+        )
+        # 带宽存下来：L3 换掉买入价之后，要用同一个带宽重建上沿，而不是
+        # 让「买入区间」的宽度随模型的选择漂移。
+        advice.entry_band_width = (
+            0.0
+            if breakout_trigger is not None and (breakout_trigger - last) / last <= 0.03
+            else round(band, 3)
+        )
 
         if not advice.targets:
             # At the session high with no overhead daily resistance there is
@@ -168,11 +356,7 @@ class AdviceEngine:
                 "属于无参照的追高位置，只能用移动止损跟随"
             )
 
-        if advice.entry_low and advice.stop and advice.targets:
-            downside = advice.entry_low - advice.stop
-            upside = advice.targets[-1] - advice.entry_low
-            if downside > 0 and upside > 0:
-                advice.rrr = round(upside / downside, 2)
+        advice.rrr = risk_reward(advice)
 
         if advice.stop and advice.entry_low:
             distance = (advice.entry_low - advice.stop) / advice.entry_low
@@ -182,6 +366,47 @@ class AdviceEngine:
                 )
         if advice.rrr is not None and advice.rrr < 1.5:
             advice.warnings.append(f"盈亏比仅 {advice.rrr}，不满足超短线最低要求")
+
+    # ---- L3 裁决 ---------------------------------------------------------
+
+    def _adjudicate(self, advice: StockAdvice, intraday: IntradaySnapshot) -> None:
+        """让模型在候选集里做取舍。没有裁决器时这里只是记录规则的默认选择。"""
+        candidates = advice.candidates
+        if candidates is None:
+            return
+        if self.adjudicator is None:
+            advice.adjudication = rule_default(candidates)
+            return
+
+        verdict = self.adjudicator.adjudicate(candidates, facts=advice.intraday)
+        advice.adjudication = verdict
+        advice.warnings.extend(verdict.notes)
+        if verdict.used_fallback:
+            return
+
+        if verdict.abstained:
+            # 弃权只清买入侧。已持仓的人仍然需要止损位——「今天不该买」和
+            # 「今天不该拿」是两个问题，模型回答的是前一个。
+            advice.entry_low = None
+            advice.entry_high = None
+            advice.rrr = None
+            advice.warnings.insert(0, f"⚖️ 模型裁决：今天不该买入——{verdict.reason}")
+            return
+
+        if verdict.entry is not None:
+            advice.entry_low = verdict.entry.price
+            advice.entry_high = round(
+                verdict.entry.price + (advice.entry_band_width or 0.0), 3
+            )
+        if verdict.stop is not None:
+            advice.stop = verdict.stop.price
+        if verdict.target is not None:
+            # 模型选了**一个**目标就只报这一个：它做的取舍就是「这个位置才是
+            # 该看的」，把规则那串阶梯留着等于把它的结论稀释回原样。
+            advice.targets = [verdict.target.price]
+        advice.rrr = risk_reward(advice)
+        if verdict.reason and verdict.entry is not None:
+            advice.reasons.append(f"价位裁决：{verdict.reason}（{verdict.entry.basis}）")
 
     # ---- scenarios -------------------------------------------------------
 
@@ -260,6 +485,201 @@ class AdviceEngine:
             advice.reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}")
             if intraday.volume_ratio > 3.0:
                 advice.warnings.append(f"成交量为近 5 日均量的 {intraday.volume_ratio:.2f} 倍，注意情绪透支")
+        trade = advice.trade_context
+        if trade is not None:
+            if trade.turnover_ratio is not None:
+                advice.reasons.append(f"换手率 {trade.turnover_ratio:.2f}%")
+            if trade.session_amount is not None:
+                advice.reasons.append(f"当日成交额 {trade.session_amount / 1e8:.2f} 亿")
+
+    def _shortline(
+        self,
+        advice: StockAdvice,
+        daily: DailyTechnicalSnapshot | None,
+        intraday: IntradaySnapshot,
+    ) -> None:
+        trade = advice.trade_context or TradeContext(
+            session_volume=intraday.session_volume,
+            session_amount=intraday.session_amount,
+        )
+        reclaim_level = _nearest_above(
+            intraday.last_price,
+            intraday.vwap,
+            advice.entry_high,
+            daily.ma5 if daily else None,
+            daily.ma10 if daily else None,
+        )
+        support_level = _nearest_below(
+            intraday.last_price,
+            advice.entry_low,
+            daily.stop_reference if daily else None,
+            intraday.session_low,
+        )
+        pressure_level = _nearest_above(
+            intraday.last_price,
+            intraday.session_high,
+            advice.targets[0] if advice.targets else None,
+        )
+        defense_level = round(advice.stop, 3) if advice.stop is not None else support_level
+
+        score = 0
+        reasons: list[str] = []
+        short_ma_weak = 0
+        trend_up = False
+        trend_down = False
+
+        if daily is not None:
+            trend_up = daily.trend_state in {TrendState.UPTREND, TrendState.REBOUND}
+            trend_down = daily.trend_state == TrendState.DOWNTREND
+            if daily.ma20 is not None and daily.ma60 is not None:
+                if daily.last_close > daily.ma20 > daily.ma60:
+                    score += 2
+                    reasons.append("日线仍在 MA20/MA60 上方，中期趋势未坏")
+                elif daily.last_close > daily.ma20 and daily.ma20 <= daily.ma60:
+                    score += 1
+                    reasons.append("日线处于反弹修复阶段")
+                elif daily.last_close < daily.ma20 < daily.ma60:
+                    score -= 2
+                    reasons.append("日线仍在 MA20/MA60 下方，中期偏弱")
+                elif daily.last_close < daily.ma20:
+                    score -= 1
+                    reasons.append("日线仍在 MA20 下方，修复未完成")
+
+            for _label, average in (("MA5", daily.ma5), ("MA10", daily.ma10)):
+                if average is None:
+                    continue
+                if daily.last_close >= average:
+                    score += 1
+                else:
+                    score -= 1
+                    short_ma_weak += 1
+            if short_ma_weak >= 2:
+                reasons.append("收盘压在 MA5/MA10 下方，短线主动性不足")
+            elif short_ma_weak == 0 and daily.ma5 is not None and daily.ma10 is not None:
+                reasons.append("收盘站在 MA5/MA10 上方，短线趋势尚可")
+
+            if daily.volume_ratio_20d is not None:
+                if daily.volume_ratio_20d >= 1.2:
+                    score += 1
+                    reasons.append(f"日线量比 {daily.volume_ratio_20d:.2f}，有增量配合")
+                elif daily.volume_ratio_20d < 0.9:
+                    score -= 1
+                    reasons.append(f"日线量比 {daily.volume_ratio_20d:.2f}，承接偏弱")
+
+        under_vwap = intraday.price_vs_vwap_pct is not None and intraday.price_vs_vwap_pct <= -0.003
+        above_vwap = intraday.price_vs_vwap_pct is not None and intraday.price_vs_vwap_pct >= 0.003
+        near_low = intraday.range_position is not None and intraday.range_position <= 0.35
+        near_high = intraday.range_position is not None and intraday.range_position >= 0.7
+
+        if intraday.price_vs_vwap_pct is not None:
+            if above_vwap:
+                score += 1
+                reasons.append(f"现价位于分时均价上方 {intraday.price_vs_vwap_pct:.2%}")
+            elif under_vwap:
+                score -= 1
+                reasons.append(f"现价位于分时均价下方 {abs(intraday.price_vs_vwap_pct):.2%}")
+
+        if intraday.range_position is not None:
+            if near_high:
+                score += 1
+                reasons.append(f"日内位置 {intraday.range_position:.0%}，接近高位")
+            elif near_low:
+                score -= 1
+                reasons.append(f"日内位置 {intraday.range_position:.0%}，偏近低位")
+
+        if intraday.volume_ratio is not None:
+            if intraday.volume_ratio >= 1.2:
+                score += 1
+                reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}，资金参与偏强")
+            elif intraday.volume_ratio < 0.8:
+                score -= 1
+                reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}，跟随资金不足")
+
+        if trade.turnover_ratio is not None:
+            if 1.5 <= trade.turnover_ratio <= 12.0:
+                reasons.append(f"换手率 {trade.turnover_ratio:.2f}%，筹码交换较充分")
+            elif trade.turnover_ratio < 0.8:
+                reasons.append(f"换手率 {trade.turnover_ratio:.2f}%，换手偏低")
+            else:
+                reasons.append(f"换手率 {trade.turnover_ratio:.2f}%")
+        if trade.session_amount is not None:
+            reasons.append(f"成交额 {trade.session_amount / 1e8:.2f} 亿")
+
+        if short_ma_weak >= 2 and under_vwap and near_low:
+            bias = "谨慎"
+            action = "wait_reclaim"
+            summary = "短线偏弱，不宜追买"
+            if reclaim_level is not None:
+                summary += f"；先等收回 {reclaim_level:.2f} 再看修复"
+        elif trend_up and above_vwap and near_high and (intraday.volume_ratio or 0.0) >= 1.0:
+            bias = "偏多"
+            action = "breakout_follow"
+            summary = "强势延续"
+            if pressure_level is not None:
+                summary += f"，放量过 {pressure_level:.2f} 可跟随"
+            else:
+                summary += "，优先沿分时均价看承接"
+        elif trend_up and advice.entry_low is not None and advice.entry_high is not None and (
+            advice.entry_low * 0.995 <= intraday.last_price <= advice.entry_high * 1.01
+        ):
+            bias = "偏多"
+            action = "buy_pullback"
+            summary = (
+                f"趋势未坏，回踩 {advice.entry_low:.2f}-{advice.entry_high:.2f} "
+                "可观察承接，不必追价"
+            )
+        elif trend_down and under_vwap:
+            bias = "谨慎"
+            action = "reduce_risk"
+            summary = "趋势仍弱，反弹先按修复看，优先防守而不是抢反抽"
+            if reclaim_level is not None:
+                summary += f"；至少先看 {reclaim_level:.2f} 能否站回"
+        elif score >= 3:
+            bias = "中性偏多"
+            action = "wait_trigger"
+            summary = "结构尚可，优先看回踩承接，突破再加速"
+            if pressure_level is not None:
+                summary += f"；上破 {pressure_level:.2f} 更主动"
+        elif score <= -3:
+            bias = "谨慎"
+            action = "wait_reclaim"
+            summary = "信号偏弱，以等待确认或防守为主"
+            if reclaim_level is not None:
+                summary += f"；先看 {reclaim_level:.2f} 能否收回"
+        else:
+            bias = "中性"
+            action = "wait_trigger"
+            summary = "信号不够集中，先等关键位触发"
+            if reclaim_level is not None and support_level is not None:
+                summary += f"；上看 {reclaim_level:.2f}，下看 {support_level:.2f}"
+
+        advice.shortline = ShortlineView(
+            bias=bias,
+            action=action,
+            score=score,
+            summary=summary,
+            reasons=_unique(reasons)[:6],
+            reclaim_level=reclaim_level,
+            support_level=support_level,
+            pressure_level=pressure_level,
+            defense_level=defense_level,
+        )
+
+
+def risk_reward(advice: StockAdvice) -> float | None:
+    """盈亏比。**用最远的那个目标**——`targets` 已排序，取 [-1]。
+
+    `monitor/session.py` 原来自己有一份逐字相同的实现，用来在锁定价位之后重算。
+    两份公式各自独立漂移是迟早的事，而它们必须相等：告警里报的盈亏比和它旁边
+    那组价位不一致，读的人无从判断该信哪个。
+    """
+    if not (advice.entry_low and advice.stop and advice.targets):
+        return None
+    downside = advice.entry_low - advice.stop
+    upside = advice.targets[-1] - advice.entry_low
+    if downside <= 0 or upside <= 0:
+        return None
+    return round(upside / downside, 2)
 
 
 def _intraday_facts(intraday: IntradaySnapshot) -> dict[str, Any]:
@@ -270,14 +690,105 @@ def _intraday_facts(intraday: IntradaySnapshot) -> dict[str, Any]:
         "high": intraday.session_high,
         "low": intraday.session_low,
         "vwap": intraday.vwap,
+        "session_volume": intraday.session_volume,
+        "session_amount": intraday.session_amount,
+        # 今开相对**昨收**的跳空。它一直算着却没被带出来，于是「今天低开了怎么看」
+        # 这类问题在下游只能拿现价对今开去凑——那是开盘之后走了多少，不是跳空。
+        "open_gap_pct": intraday.open_gap_pct,
         "price_vs_vwap_pct": intraday.price_vs_vwap_pct,
         "price_vs_open_pct": intraday.price_vs_open_pct,
         "opening_drive_pct": intraday.opening_drive_pct,
         "closing_drive_pct": intraday.closing_drive_pct,
+        # 和 closing_drive_pct 必须成对带出来：尾盘涨幅一样、量能相反的两只票，
+        # 只给涨幅会让下游把「做 K 线诱多」读成「吸筹」。
+        "closing_volume_ratio": intraday.closing_volume_ratio,
         "range_position": intraday.range_position,
         "volume_ratio": intraday.volume_ratio,
         "bar_count": intraday.bar_count,
+        "last_timestamp": (
+            intraday.last_timestamp.isoformat(timespec="seconds")
+            if intraday.last_timestamp is not None
+            else None
+        ),
     }
+
+
+def _trade_context(instrument: Any, intraday: IntradaySnapshot) -> TradeContext:
+    float_shares = _nested_number(
+        instrument,
+        ("ext", "float_shares"),
+        ("float_shares",),
+        ("circulating_shares",),
+        ("流通股本",),
+    )
+
+    turnover_ratio = None
+    if float_shares is not None and float_shares > 0 and intraday.session_volume > 0:
+        turnover_ratio = intraday.session_volume / float_shares * 100.0
+    else:
+        turnover_ratio = _turnover_ratio_from_instrument(instrument)
+
+    float_cap_yi = None
+    if float_shares is not None and float_shares > 0 and intraday.last_price > 0:
+        float_cap_yi = float_shares * intraday.last_price / 1e8
+
+    return TradeContext(
+        session_volume=intraday.session_volume,
+        session_amount=intraday.session_amount,
+        turnover_ratio=round(turnover_ratio, 4) if turnover_ratio is not None else None,
+        float_cap_yi=round(float_cap_yi, 2) if float_cap_yi is not None else None,
+    )
+
+
+def _turnover_ratio_from_instrument(instrument: Any) -> float | None:
+    tickflow_ratio = _nested_number(instrument, ("ext", "turnover_rate"), ("turnover_rate",))
+    if tickflow_ratio is not None:
+        return tickflow_ratio * 100.0 if tickflow_ratio <= 1.0 else tickflow_ratio
+
+    return _nested_number(instrument, ("换手率",), ("turnover_ratio",), ("turnoverRatio",))
+
+
+def _nested_number(payload: Any, *paths: tuple[str, ...]) -> float | None:
+    for path in paths:
+        value = payload
+        for key in path:
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(key)
+        number = _to_number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _to_number(value: Any) -> float | None:
+    if value in (None, "", "-"):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    text = text.removesuffix("%")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _nearest_above(last_price: float, *levels: float | None) -> float | None:
+    usable = [float(level) for level in levels if isinstance(level, (int, float)) and level > last_price]
+    return round(min(usable), 3) if usable else None
+
+
+def _nearest_below(last_price: float, *levels: float | None) -> float | None:
+    usable = [float(level) for level in levels if isinstance(level, (int, float)) and level < last_price]
+    return round(max(usable), 3) if usable else None
+
+
+def _unique(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(item for item in items if item))
 
 
 def _session_alignment(

@@ -2,7 +2,7 @@
 
 ```text
 base.py        统一契约 Finding / AgentContext / run_agents（并行 + 失败隔离）
-collectors.py  确定性算子：市场舆情 · 个股舆情 · 板块动量 · 个股日线 · 个股分时
+collectors.py  确定性算子：市场舆情 · 个股舆情 · 板块动量 · 个股日线 · 个股分时 · 五档盘口
 debate.py      LLM 角色：多头举证 · 空头举证 · 裁判指出分歧点
 ```
 
@@ -14,11 +14,12 @@ from ashare_decision_support.agents.base import (
     Agent,
     AgentContext,
     Finding,
-    collect_notes,
     run_agents,
 )
 from ashare_decision_support.agents.collectors import (
+    BenchmarkDailyAgent,
     NewsAgent,
+    OrderBookAgent,
     SectorMetricsAgent,
     SymbolDailyAgent,
     SymbolIntradayAgent,
@@ -30,14 +31,15 @@ __all__ = [
     "Agent",
     "AgentContext",
     "Argument",
+    "BenchmarkDailyAgent",
     "DebatePanel",
     "DebateResult",
     "Finding",
     "NewsAgent",
+    "OrderBookAgent",
     "SectorMetricsAgent",
     "SymbolDailyAgent",
     "SymbolIntradayAgent",
     "SymbolNewsAgent",
-    "collect_notes",
     "run_agents",
 ]

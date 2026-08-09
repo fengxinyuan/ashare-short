@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as clock_time
-from typing import Any, Callable
+from datetime import date, datetime
+from datetime import time as clock_time
+from typing import Any
 
-from ashare_decision_support.notify.base import Notifier
+from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.schedule.calendar import TradingCalendar
 from ashare_decision_support.state import STATUS_FAILED, STATUS_OK, DaemonState
 
@@ -111,7 +113,7 @@ def run_daemon(
             run_state.record(task.key, STATUS_FAILED, moment, error=detail)
             report.failed.append(task.key)
             report.notes.append(f"{task.label} 失败（第 {run_state.attempts(task.key)} 次）：{detail}")
-            _publish(
+            publish(
                 notifiers or [],
                 f"任务失败：{task.label}",
                 f"**{task.label}** 执行失败\n\n```\n{detail}\n```\n\n"
@@ -143,11 +145,3 @@ def _summarize(value: Any) -> Any:
         for key, item in value.items()
         if isinstance(item, (int, float, str, bool)) and key != "content"
     }
-
-
-def _publish(notifiers: list[Notifier], title: str, content: str) -> None:
-    for notifier in notifiers:
-        try:
-            notifier.send(title, content)
-        except Exception:
-            continue

@@ -29,7 +29,7 @@ class DaemonState:
     tasks: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
-    def load(cls, day: date, path: Path | None = None) -> "DaemonState":
+    def load(cls, day: date, path: Path | None = None) -> DaemonState:
         resolved = Path(path) if path is not None else state_path(STATE_FILE)
         payload = read_json(resolved, default={}) or {}
         # A state file from a previous day describes a previous day. Starting

@@ -27,11 +27,14 @@ from __future__ import annotations
 import json
 import re
 import urllib.request
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Callable, Iterable
+from typing import Any
+
+from ashare_decision_support.state.paths import state_home
 
 BASE_URL = "https://d.10jqka.com.cn/v6/line/bk_{code}/01/last.js"
 USER_AGENT = (
@@ -48,6 +51,18 @@ CODE_END = 881419
 CACHE_NAME = "ths_sector_codes.json"
 CACHE_SCHEMA = "ths-bk-v1"
 
+# 日线序列的落盘位置与格式。
+#
+# **取数已经把整条序列拿回来了，这里只是别再扔掉它。** `last.js` 一次回当年全部
+# 日线（2026 年 140 根），而 `_measure` 只留最新一根——板块轮动、跷跷板、相对强弱
+# 排名要的历史因此每天被丢一次，尽管它一分钱额外成本都没有。
+#
+# 落在状态目录而不是 `--output-dir`：后者常按日期命名，那样序列会散成一天一份、
+# 永远拼不起来，而这份数据的全部价值就在于跨日累积。同 `jobs/morning.py` 里
+# 语料库那段的理由。
+HISTORY_DIR_NAME = "sector_index"
+HISTORY_SCHEMA = "ths-bk-series-v1"
+
 TIMEOUT_SECONDS = 12
 MAX_WORKERS = 16
 
@@ -56,7 +71,7 @@ HIGH_WINDOW = 20
 VOLUME_WINDOW = 5
 MIN_BARS = 25
 
-_CALLBACK = re.compile(r"\((.*)\)\s*;?\s*$", re.S)
+_CALLBACK = re.compile(r"\((.*)\)\s*;?\s*$", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -159,11 +174,16 @@ class ThsSectorIndexAdapter:
         opener: Callable[..., Any] | None = None,
         timeout: int = TIMEOUT_SECONDS,
         max_workers: int = MAX_WORKERS,
+        history_dir: str | Path | None = None,
+        persist_history: bool = True,
     ) -> None:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self._opener = opener or urllib.request.urlopen
         self.timeout = timeout
         self.max_workers = max_workers
+        self._history_dir = Path(history_dir) if history_dir else None
+        self.persist_history = persist_history
+        self.history_written = 0
 
     # ---- public ----------------------------------------------------------
 
@@ -171,12 +191,12 @@ class ThsSectorIndexAdapter:
         notes: list[str] = []
         wanted = list(codes) if codes is not None else self._codes(notes)
         if not wanted:
-            return SectorIndexSnapshot(notes=notes + ["同花顺行业指数：没有可用板块代码"], ok=False)
+            return SectorIndexSnapshot(notes=[*notes, "同花顺行业指数：没有可用板块代码"], ok=False)
 
         parsed: list[tuple[str, str, list[dict]]] = []
         failures = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            for code, result in zip(wanted, pool.map(self._safe_fetch_one, wanted)):
+            for code, result in zip(wanted, pool.map(self._safe_fetch_one, wanted), strict=True):
                 if result is None:
                     failures += 1
                     continue
@@ -185,10 +205,13 @@ class ThsSectorIndexAdapter:
                     parsed.append((code, name, bars))
 
         readings = [r for r in (_measure(c, n, b) for c, n, b in parsed) if r is not None]
+        # 落盘在 `_measure` 之后、闸门之前：即使某个板块的最新交易日对不齐、
+        # 当日读数被排除，它的历史序列仍然是好的，没有理由跟着丢。
+        self._persist_history(parsed)
         if failures:
             notes.append(f"同花顺行业指数 {failures}/{len(wanted)} 个板块取数失败，其余照常")
         if not readings:
-            return SectorIndexSnapshot(notes=notes + ["同花顺行业指数全部取数失败"], ok=False)
+            return SectorIndexSnapshot(notes=[*notes, "同花顺行业指数全部取数失败"], ok=False)
 
         # 各板块最新交易日必须一致，否则是在拿不同天的读数排名次。
         stamps = {r.trade_date for r in readings}
@@ -222,7 +245,9 @@ class ThsSectorIndexAdapter:
         candidates = [str(c) for c in range(CODE_START, CODE_END + 1)]
         alive: list[str] = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            for code, result in zip(candidates, pool.map(self._safe_fetch_one, candidates)):
+            for code, result in zip(
+                candidates, pool.map(self._safe_fetch_one, candidates), strict=True
+            ):
                 if result is not None and result[0] and result[1]:
                     alive.append(code)
         notes.append(
@@ -248,6 +273,26 @@ class ThsSectorIndexAdapter:
 
     def _cache_path(self) -> Path | None:
         return None if self.cache_dir is None else self.cache_dir / CACHE_NAME
+
+    # ---- 日线序列落盘 ------------------------------------------------------
+
+    def history_dir(self) -> Path:
+        return self._history_dir if self._history_dir is not None else state_home() / HISTORY_DIR_NAME
+
+    def _persist_history(self, parsed: list[tuple[str, str, list[dict]]]) -> int:
+        """把整条日线按日期并进已有序列。**失败只降速，不影响当日读数。**
+
+        并而不是覆盖：`last.js` 只回当年的数据，跨年之后覆盖会把去年整段抹掉，
+        而那正是 60 日以上窗口要用的部分。
+        """
+        if not self.persist_history:
+            return 0
+        written = 0
+        for code, name, bars in parsed:
+            if _write_series(self.history_dir(), code, name, bars):
+                written += 1
+        self.history_written = written
+        return written
 
     def _read_cache(self) -> list[str]:
         path = self._cache_path()
@@ -275,6 +320,84 @@ class ThsSectorIndexAdapter:
         except OSError:
             return False
         return True
+
+
+# ---- 日线序列的读写 -------------------------------------------------------
+
+
+def _series_path(root: Path, code: str) -> Path:
+    return root / f"{code}.json"
+
+
+def _write_series(root: Path, code: str, name: str, bars: list[dict]) -> bool:
+    if not bars:
+        return False
+    merged = {str(bar["date"]): bar for bar in load_series(code, root)}
+    merged.update({str(bar["date"]): bar for bar in bars})
+    payload = {
+        "schema": HISTORY_SCHEMA,
+        "code": code,
+        "name": name,
+        "bars": [merged[key] for key in sorted(merged)],
+    }
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        _series_path(root, code).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        return False
+    return True
+
+
+def load_series(code: str, root: str | Path | None = None) -> list[dict]:
+    """读回一个板块的日线序列，按日期升序。没有就返回空列表。
+
+    这是板块轮动那一层（主线持续度、跷跷板相关性、相对强弱排名）唯一的输入口。
+    """
+    directory = Path(root) if root is not None else state_home() / HISTORY_DIR_NAME
+    try:
+        payload = json.loads(_series_path(directory, str(code)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or payload.get("schema") != HISTORY_SCHEMA:
+        return []
+    bars = payload.get("bars")
+    return [bar for bar in bars if isinstance(bar, dict) and bar.get("date")] if isinstance(bars, list) else []
+
+
+def load_all_series(root: str | Path | None = None) -> dict[str, tuple[str, list[dict]]]:
+    """读回全部已落盘的板块序列，`{code: (板块名, 日线)}`。
+
+    板块名只在文件里，`load_series` 不带它出来——而轮动层报的是「电力设备排名
+    上升最快」，不是「881155 排名上升最快」，所以这里单独走一遍 payload。
+
+    目录不存在就返回空字典：`morning` 第一次跑之前本来就没有历史，那是预期状态
+    而不是错误。**第一次跑完就有 140 根**（`last.js` 一次回当年全部日线），
+    所以轮动层不需要等着攒够天数才能用。
+    """
+    directory = Path(root) if root is not None else state_home() / HISTORY_DIR_NAME
+    result: dict[str, tuple[str, list[dict]]] = {}
+    try:
+        paths = sorted(directory.glob("*.json"))
+    except OSError:
+        return result
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("schema") != HISTORY_SCHEMA:
+            continue
+        bars = payload.get("bars")
+        if not isinstance(bars, list):
+            continue
+        usable = [bar for bar in bars if isinstance(bar, dict) and bar.get("date")]
+        if not usable:
+            continue
+        code = str(payload.get("code") or path.stem)
+        result[code] = (str(payload.get("name") or code), usable)
+    return result
 
 
 # ---- parsing -------------------------------------------------------------

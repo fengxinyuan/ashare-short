@@ -9,7 +9,7 @@ touching the network.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 
 
@@ -57,20 +57,6 @@ class SentimentScore:
     @property
     def is_neutral(self) -> bool:
         return not self.bullish_hits and not self.bearish_hits
-
-
-@dataclass
-class NewsBundle:
-    """Everything the sentiment layer collected for one trading day."""
-
-    trade_date: date
-    market_docs: list[NewsDoc] = field(default_factory=list)
-    stock_docs: dict[str, list[NewsDoc]] = field(default_factory=dict)
-    notes: list[str] = field(default_factory=list)
-
-    @property
-    def doc_count(self) -> int:
-        return len(self.market_docs) + sum(len(docs) for docs in self.stock_docs.values())
 
 
 @dataclass(frozen=True)

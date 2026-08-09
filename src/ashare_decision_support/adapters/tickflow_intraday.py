@@ -52,6 +52,8 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from ashare_decision_support.numeric import finite
+
 CN_TZ = timezone(timedelta(hours=8))
 
 # 仓内沿用的周期写法（"1"/"5"/…）到 TickFlow 写法（"1m"/"5m"/…）。
@@ -87,10 +89,6 @@ LOTS_TO_SHARES = 100.0
 ADJUST_RAW = "none"
 
 
-class TickFlowIntradayError(RuntimeError):
-    """一只都取不到时才抛。个别标的失败只记 note。"""
-
-
 class TickFlowIntradayAdapter:
     """分钟线，接口与 `SinaIntradayAdapter` 一致（`get_minute_bars`）。"""
 
@@ -107,7 +105,7 @@ class TickFlowIntradayAdapter:
         symbols: list[str],
         period: str = "5",
         max_bars: int | None = None,
-        max_workers: int | None = None,   # noqa: ARG002 - 批量接口不需要，保持签名一致
+        max_workers: int | None = None,
     ) -> tuple[dict[str, list[dict]], list[str]]:
         if period not in SUPPORTED_PERIODS:
             raise ValueError(f"unsupported period {period!r}; expected one of {SUPPORTED_PERIODS}")
@@ -318,15 +316,15 @@ def _px(value: float | None) -> float | None:
 
 
 def _at(values: list, index: int) -> float | None:
-    if index >= len(values):
-        return None
-    value = values[index]
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    """列式载荷按下标取一个**有限**读数，取不到返回 None。
+
+    走 `finite` 而不是 `try/float`：后者对 NaN 是**成功**的（`float(nan)` 不抛），
+    于是 NaN 会一路进到分钟线的 OHLCV 里。`_px` 的 `round(nan, 4)` 还是 NaN，
+    `volume_lots * LOTS_TO_SHARES` 也还是 NaN，而 `signals/intraday.py` 里
+    `float(bar.get("volume") or 0.0)` 收得下它——NaN 是真值，所以连那个 `or 0.0`
+    的兜底都不会触发，当日累计成交量整个变成 NaN。
+    """
+    return finite(values[index]) if index < len(values) else None
 
 
 def _to_dt(value: Any) -> datetime | None:

@@ -88,7 +88,7 @@ from ashare_decision_support.news.llm_classifier import (
     build_client,
 )
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
-from ashare_decision_support.notify.base import Notifier
+from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import (
     render_sector_brief,
     render_theme_radar,
@@ -104,7 +104,6 @@ from ashare_decision_support.screens import (
     AnnouncementScreen,
     EarningsScreen,
     LiquidityScreen,
-    StScreen,
 )
 from ashare_decision_support.sectors import (
     SectorPredictor,
@@ -630,12 +629,10 @@ def _stage_select(
         if collected.metric_bars.get(symbol)
     ]
     kept, earnings_verdicts, screen_notes = _apply_screens(
-        sources.adapter,
         shortlist,
         collected.announcements,
         fusion.market_scan,
         fusion.earnings,
-        metadata_by_symbol=universe.metadata,
     )
     notes.extend(screen_notes)
 
@@ -899,7 +896,7 @@ def _stage_publish(
     channels = (
         sources.notifiers if sources.notifiers is not None else [ConsoleNotifier(), file_notifier]
     )
-    delivered = [c.capabilities.channel for c in channels if c.send(title, markdown)]
+    delivered = publish(channels, title, markdown)
     file_notifier.write_payload(facts, MORNING_LATEST_NAME)
     # The caller may have supplied its own FileNotifier, in which case the one
     # built here never sent and its `last_path` is None. Report the path that
@@ -1223,13 +1220,19 @@ def _default_news_source(output_path: Path) -> Any | None:
     分开列而不是合成一个源：akshare 那三路覆盖盘面与政策文件，华尔街见闻补的是
     **数据发布**（PMI/CPI/社融）与海外流动性。实测 2026-08-02 全市场 200 条里
     「PMI/统计局/制造业/美债/降准」命中全为 0——不是权重低，是压根没进来。
+
+    四路共用同一个 `NewsCache`：缓存按「交易日 + 源自己的键」分目录，四路的键互不
+    相同，所以共用一个实例只是共用一个根目录。此前只有 akshare 那一路收 cache，
+    另外三路每次重跑都重新打网络——而盘前本来就会跑好几次，拿到的是几批不同的
+    快讯流，板块舆情分也跟着变，简报上还看不出来是哪一次。
     """
+    cache = NewsCache(output_path)
     sources: list[Any] = []
     with contextlib.suppress(RuntimeError):
-        sources.append(AkshareNewsSource(cache=NewsCache(output_path)))
-    sources.append(WallstreetNewsSource())
-    sources.append(OfficialNewsSource())
-    sources.append(RssNewsSource())
+        sources.append(AkshareNewsSource(cache=cache))
+    sources.append(WallstreetNewsSource(cache=cache))
+    sources.append(OfficialNewsSource(cache=cache))
+    sources.append(RssNewsSource(cache=cache))
     return CompositeNewsSource(*sources) if sources else None
 
 
@@ -1296,23 +1299,16 @@ def _sample_across_sectors(definitions: list, budget: int) -> list[str]:
 
 
 def _apply_screens(
-    adapter: Any,
     symbols: list[str],
     announcements: list[dict],
     scan: Any | None = None,
     earnings: Any | None = None,
-    metadata_by_symbol: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[str], dict[str, Any], list[str]]:
     notes: list[str] = []
-    names = _symbol_names(adapter, symbols, metadata_by_symbol)
 
-    kept, rejected = StScreen().filter({symbol: names.get(symbol) for symbol in symbols})
-    if rejected:
-        notes.append(f"ST/退市/非可交易板块过滤掉 {len(rejected)} 只")
-
-    # 可交易性。放在 ST 之后、公告之前：它最便宜（本地查表），先砍掉一批能让后面
-    # 的公告匹配少做无用功。
-    kept, illiquid, stats = LiquidityScreen(scan).filter(kept)
+    # ST/退市状态不再是候选池的过滤条件。可交易性仍然是独立门槛：它处理的是
+    # 成交额和流通市值不足导致的执行问题，不以证券名称或代码段替代真实流动性。
+    kept, illiquid, stats = LiquidityScreen(scan).filter(symbols)
     liquidity_note = stats.note()
     if liquidity_note:
         notes.append(liquidity_note)

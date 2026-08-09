@@ -17,6 +17,8 @@ from statistics import median
 from typing import Any
 
 from ashare_decision_support.news.base import NewsDoc, SentimentAnalyzer
+from ashare_decision_support.news.events import detect_events
+from ashare_decision_support.numeric import clamp
 from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics, SectorOutlook
 from ashare_decision_support.sectors.keywords import MARKET_LEVEL_KEYWORDS, sector_terms
 
@@ -93,7 +95,7 @@ def overheat_factor(breadth: float | None, ret_5d: float | None) -> float:
 def _ramp(value: float, onset: float, full: float) -> float:
     if full <= onset:
         return 1.0 if value >= full else 0.0
-    return _clamp((value - onset) / (full - onset), 0.0, 1.0)
+    return clamp((value - onset) / (full - onset), 0.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -212,7 +214,7 @@ def limit_pool_points(
         points += streak
         reasons.append(f"最高连板 {max_streak} 板，{verdict}（{streak:+.1f}）")
 
-    return _clamp(points, -MARKET_LIMIT_CAP, MARKET_LIMIT_CAP), reasons
+    return clamp(points, -MARKET_LIMIT_CAP, MARKET_LIMIT_CAP), reasons
 
 
 class SectorPredictor:
@@ -233,8 +235,14 @@ class SectorPredictor:
         market_docs: list[NewsDoc] | None = None,
         net_inflow_by_symbol: dict[str, float] | None = None,
         attribution: dict[str, tuple[str, ...]] | None = None,
+        fallback_empty_labels: bool = False,
     ) -> list[SectorOutlook]:
-        docs_by_sector = self._attribute_docs(definitions, market_docs or [], attribution)
+        docs_by_sector = self._attribute_docs(
+            definitions,
+            market_docs or [],
+            attribution,
+            fallback_empty_labels=fallback_empty_labels,
+        )
         inflow_by_sector = self._attribute_inflow(definitions, net_inflow_by_symbol or {})
         inflow_scale = max((abs(value) for value in inflow_by_sector.values()), default=0.0)
 
@@ -254,8 +262,9 @@ class SectorPredictor:
 
             docs = docs_by_sector.get(definition.name, [])
             sentiment = self.analyzer.score_docs(docs)
+            evidence = detect_events(doc.text for doc in docs)
             confidence = sentiment_confidence(len(docs))
-            sentiment_points = _clamp(
+            sentiment_points = clamp(
                 sentiment.polarity * sentiment.intensity * confidence * SENTIMENT_CAP * 2.0,
                 -SENTIMENT_CAP,
                 SENTIMENT_CAP,
@@ -268,11 +277,20 @@ class SectorPredictor:
                     f"（{sentiment_points:+.1f}，关键词：{'、'.join(hits[:4])}{thin}）"
                 )
             score += sentiment_points
+            if evidence.event_types:
+                reasons.append(
+                    "行业事件 "
+                    + "、".join(evidence.event_types[:4])
+                    + "："
+                    + "、".join(evidence.hits[:5])
+                )
+            if evidence.risk_hits:
+                warnings.append("新闻风险词：" + "、".join(evidence.risk_hits[:5]))
 
             inflow = inflow_by_sector.get(definition.name)
             capital_points = 0.0
             if inflow is not None and inflow_scale > 0:
-                capital_points = _clamp(inflow / inflow_scale * CAPITAL_CAP, -CAPITAL_CAP, CAPITAL_CAP)
+                capital_points = clamp(inflow / inflow_scale * CAPITAL_CAP, -CAPITAL_CAP, CAPITAL_CAP)
                 if abs(capital_points) >= 1.0:
                     reasons.append(f"龙虎榜净额 {inflow / 1e8:+.2f} 亿（{capital_points:+.1f}）")
             score += capital_points
@@ -280,7 +298,7 @@ class SectorPredictor:
             outlooks.append(
                 SectorOutlook(
                     name=definition.name,
-                    score=round(_clamp(score, 0.0, 100.0), 2),
+                    score=round(clamp(score, 0.0, 100.0), 2),
                     metrics=metric,
                     sentiment_polarity=sentiment.polarity,
                     sentiment_intensity=sentiment.intensity,
@@ -289,6 +307,10 @@ class SectorPredictor:
                     reasons=reasons,
                     warnings=warnings,
                     headlines=[doc.title for doc in docs[:3]],
+                    news_doc_count=len(docs),
+                    news_event_types=evidence.event_types,
+                    news_hits=evidence.hits,
+                    news_risk_hits=evidence.risk_hits,
                 )
             )
 
@@ -360,24 +382,24 @@ class SectorPredictor:
 
         score = BASE_SCORE
         if breadth is not None:
-            points = _clamp((breadth - 0.5) * 2.0 * MARKET_BREADTH_CAP, -MARKET_BREADTH_CAP, MARKET_BREADTH_CAP)
+            points = clamp((breadth - 0.5) * 2.0 * MARKET_BREADTH_CAP, -MARKET_BREADTH_CAP, MARKET_BREADTH_CAP)
             score += points
             reasons.append(f"{len(trusted)} 个板块 {covered} 只成分股，加权上涨占比 {breadth:.0%}（{points:+.1f}）")
         if ret_1d is not None:
-            points = _clamp(ret_1d * 400.0, -MARKET_RET_CAP, MARKET_RET_CAP)
+            points = clamp(ret_1d * 400.0, -MARKET_RET_CAP, MARKET_RET_CAP)
             score += points
             reasons.append(f"板块当日中位涨幅 {ret_1d:+.2%}（{points:+.1f}）")
         if ret_5d is not None:
-            points = _clamp(ret_5d * 150.0, -MARKET_RET_CAP, MARKET_RET_CAP)
+            points = clamp(ret_5d * 150.0, -MARKET_RET_CAP, MARKET_RET_CAP)
             score += points
             reasons.append(f"板块 5 日中位涨幅 {ret_5d:+.2%}（{points:+.1f}）")
         if above_ma20 is not None:
-            points = _clamp((above_ma20 - 0.5) * 2.0 * MARKET_MA20_CAP, -MARKET_MA20_CAP, MARKET_MA20_CAP)
+            points = clamp((above_ma20 - 0.5) * 2.0 * MARKET_MA20_CAP, -MARKET_MA20_CAP, MARKET_MA20_CAP)
             score += points
             reasons.append(f"站上 20 日均线占比 {above_ma20:.0%}（{points:+.1f}）")
         if sentiment.doc_count:
             confidence = sentiment_confidence(sentiment.doc_count)
-            points = _clamp(
+            points = clamp(
                 sentiment.polarity * sentiment.intensity * confidence * MARKET_SENTIMENT_CAP * 2.0,
                 -MARKET_SENTIMENT_CAP,
                 MARKET_SENTIMENT_CAP,
@@ -397,7 +419,7 @@ class SectorPredictor:
                     "以封板质量为准降低预期"
                 )
 
-        score = round(_clamp(score, 0.0, 100.0), 2)
+        score = round(clamp(score, 0.0, 100.0), 2)
         direction = next(label for threshold, label in DIRECTION_BANDS if score >= threshold)
 
         haircut = overheat_factor(breadth, ret_5d)
@@ -468,7 +490,7 @@ class SectorPredictor:
                 f"仅 {len(trusted)}/{len(metrics)} 个板块覆盖率达标，无可信宽度读数，建议系数取中性 0.50"
             )
         else:
-            factor = _clamp(0.15 + breadth * 0.75, 0.1, MAX_SUGGESTED_FACTOR)
+            factor = clamp(0.15 + breadth * 0.75, 0.1, MAX_SUGGESTED_FACTOR)
             reasons.append(
                 f"{len(trusted)} 个板块（{covered_total} 只成分股）加权上涨占比 {breadth:.0%}，"
                 f"基准建议 {factor:.2f}（上限 {MAX_SUGGESTED_FACTOR:.2f}）"
@@ -478,7 +500,7 @@ class SectorPredictor:
             median_5d = median(extended_rets) if extended_rets else None
             haircut = overheat_factor(breadth, median_5d)
             if haircut < 1.0:
-                factor = _clamp(factor * haircut, 0.1, MAX_SUGGESTED_FACTOR)
+                factor = clamp(factor * haircut, 0.1, MAX_SUGGESTED_FACTOR)
                 reasons.append(
                     f"5 日板块中位涨幅已达 {median_5d:+.1%} 且上涨面 {breadth:.0%}，"
                     f"越靠近普涨末段追高风险越高，按 {haircut:.2f} 折减至 {factor:.2f}"
@@ -486,8 +508,8 @@ class SectorPredictor:
 
         if macro_docs and abs(sentiment.polarity) > 0.2:
             confidence = sentiment_confidence(len(macro_docs))
-            adjust = _clamp(sentiment.polarity * sentiment.intensity * confidence * 0.3, -0.15, 0.15)
-            factor = _clamp(factor + adjust, 0.1, MAX_SUGGESTED_FACTOR)
+            adjust = clamp(sentiment.polarity * sentiment.intensity * confidence * 0.3, -0.15, 0.15)
+            factor = clamp(factor + adjust, 0.1, MAX_SUGGESTED_FACTOR)
             reasons.append(
                 f"宏观舆情 {len(macro_docs)} 条，情绪 {sentiment.polarity:+.2f}，"
                 f"调整 {adjust:+.2f} 后为 {factor:.2f}"
@@ -523,11 +545,11 @@ class SectorPredictor:
         # 权重就是在按「谁涨得最多」排序——2026-08-02 实测，前五名板块的 5 日中位
         # 是 +10.16%/+10.48%/+9.48%/+8.03%/+4.80%，排序几乎就是已涨幅度倒序。
         if metric.ret_20d is not None:
-            points = _clamp(metric.ret_20d * 60.0, -8.0, 10.0)
+            points = clamp(metric.ret_20d * 60.0, -8.0, 10.0)
             total += points
             reasons.append(f"20日中位涨幅 {metric.ret_20d:+.2%}，中期趋势（{points:+.1f}）")
         if metric.above_ma20 is not None:
-            points = _clamp((metric.above_ma20 - 0.5) * 12.0, -5.0, 5.0)
+            points = clamp((metric.above_ma20 - 0.5) * 12.0, -5.0, 5.0)
             total += points
             reasons.append(f"站上20日均线占比 {metric.above_ma20:.0%}（{points:+.1f}）")
 
@@ -539,11 +561,11 @@ class SectorPredictor:
         # ---- 短期读数降权为辅助 ----------------------------------------------
         # 当日涨幅与上涨家数仍然有用（说明板块正在被关注），但权重砍到不再主导排序。
         if metric.ret_1d is not None:
-            points = _clamp(metric.ret_1d * 100.0, -4.0, 3.0)
+            points = clamp(metric.ret_1d * 100.0, -4.0, 3.0)
             total += points
             reasons.append(f"当日中位涨幅 {metric.ret_1d:+.2%}（{points:+.1f}）")
         if metric.breadth is not None:
-            points = _clamp((metric.breadth - 0.5) * 8.0, -3.0, 3.0)
+            points = clamp((metric.breadth - 0.5) * 8.0, -3.0, 3.0)
             total += points
             reasons.append(f"上涨家数占比 {metric.breadth:.0%}（{points:+.1f}）")
         if metric.strong_count > 0:
@@ -560,7 +582,7 @@ class SectorPredictor:
                 total -= 3.0
                 reasons.append(f"量比中位数 {metric.volume_ratio:.2f}，缩量（-3.0）")
 
-        return _clamp(total, -MOMENTUM_CAP, MOMENTUM_CAP)
+        return clamp(total, -MOMENTUM_CAP, MOMENTUM_CAP)
 
     def _pullback_component(self, metric: SectorMetrics, reasons: list[str]) -> float:
         """板块回调窗口。**这是低吸口径下唯一回答「现在该不该进」的一项。**
@@ -593,6 +615,7 @@ class SectorPredictor:
         definitions: list[SectorDefinition],
         docs: list[NewsDoc],
         attribution: dict[str, tuple[str, ...]] | None = None,
+        fallback_empty_labels: bool = False,
     ) -> dict[str, list[NewsDoc]]:
         """Assign each document to every sector whose vocabulary it matches.
 
@@ -613,7 +636,16 @@ class SectorPredictor:
                 continue
             key = dedup_key(doc)
             if labels and key in labels:
-                # 模型给了结论就以它为准，**空归属也是结论**。
+                # 模型给了结论就以它为准。盘前的定向补抓可以显式开启
+                # `fallback_empty_labels`，让产业链价格/供给词重新作为召回证据；
+                # 默认仍保留「空归属就是结论」的严格行为，避免普通宏观消息误挂板块。
+                if not labels[key] and not fallback_empty_labels:
+                    continue
+                if not labels[key] and fallback_empty_labels:
+                    for sector, terms in terms_by_sector.items():
+                        if any(term in text for term in terms):
+                            result[sector].append(doc)
+                    continue
                 for sector in labels[key]:
                     if sector in known:
                         result[sector].append(doc)
@@ -641,12 +673,8 @@ class SectorPredictor:
         return totals
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(value, high))
-
-
 def _bare(symbol: str) -> str:
-    return symbol.split(".")[0].strip()
+    return symbol.split(".", maxsplit=1)[0].strip()
 
 
 def _weighted(metrics: list[SectorMetrics], attribute: str, covered_total: int) -> float | None:

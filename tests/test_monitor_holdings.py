@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from ashare_decision_support.monitor.holdings import (
     TIME_STOP_DAYS,
@@ -16,11 +17,29 @@ from ashare_decision_support.monitor.holdings import (
     structure_broken,
     time_stop_due,
 )
+from ashare_decision_support.monitor.session import _breakeven_lines
 from ashare_decision_support.monitor.triggers import TriggerEngine
 from ashare_decision_support.state.alerts import AlertState
 from ashare_decision_support.state.watchlist import Watchlist
 
 NOW = datetime(2026, 8, 3, 10, 30)
+
+
+def test_breakeven_context_only_describes_the_path_out_of_a_loss() -> None:
+    daily = SimpleNamespace(
+        ma5=39.0,
+        ma10=39.15,
+        ma20=39.01,
+        ma60=None,
+        resistances=[],
+    )
+
+    underwater = _breakeven_lines(39.12, 38.02, daily)
+    profitable = _breakeven_lines(39.12, 39.50, daily)
+
+    assert any("回本还需" in line for line in underwater)
+    assert any("重合" in line for line in underwater)
+    assert profitable == ["当前浮盈，回本价已在下方"]
 
 
 class Advice:
@@ -56,8 +75,8 @@ def fire(engine, state, advice, intraday, holding=None, support=None):
 
 
 def held(**kw):
-    d = dict(symbol="601939.SH", cost_price=10.64, shares=1000,
-             opened_on="2026-08-01", held_days=2)
+    d = {"symbol": "601939.SH", "cost_price": 10.64, "shares": 1000,
+             "opened_on": "2026-08-01", "held_days": 2}
     d.update(kw)
     return HoldingView(**d)
 
@@ -142,6 +161,15 @@ def test_time_stop_fires_on_the_first_pass_because_it_is_a_state() -> None:
 
     assert [a.trigger for a in alerts] == ["time_stop"]
     assert any("证伪" in line for line in alerts[0].detail)
+
+
+def test_stop_break_fires_on_the_first_pass_when_already_broken() -> None:
+    """监控中午才启动时，已经跌破止损的持仓也必须立刻提醒。"""
+    engine, state = TriggerEngine(), AlertState(date(2026, 8, 3), Path('/dev/null'))
+    alerts = fire(engine, state, Advice(stop=10.50), Intraday(10.40), held())
+
+    assert [a.trigger for a in alerts] == ["stop_break"]
+    assert "启动监控时已低于止损" in " ".join(alerts[0].detail)
 
 
 # ---- 持仓上下文进告警 --------------------------------------------------------
@@ -245,6 +273,48 @@ def test_holding_alerts_sort_ahead_of_candidate_alerts() -> None:
     )
     assert text.index("建设银行") < text.index("候选票")
     assert "【持仓】" in text
+    assert text.startswith("## 先处理")
+    assert "## 触发依据" in text
+
+
+def test_alert_render_starts_with_action_summary() -> None:
+    from ashare_decision_support.notify.render import render_alerts
+
+    class A:
+        level = "ACTION"
+        headline = "丸美生物 止跌确认，位于买入区间内"
+        detail = ["现价 28.28"]
+        as_of = NOW
+        holding = False
+        watchlist = True
+        trigger = "entry_confirmed"
+        symbol = "603983.SH"
+
+    text = render_alerts([A()], None)
+
+    summary, _, details = text.partition("## 触发依据")
+    assert "买点确认" in summary
+    assert "现价 28.28" in details
+
+
+def test_monitor_alerts_carry_shortline_context_and_trade_data() -> None:
+    engine, state = TriggerEngine(), AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[12.0], entry=(10.0, 10.6))
+    advice.shortline = type(
+        "Shortline", (),
+        {"summary": "短线偏弱，不宜追买；先等收回 10.50 再看修复"}
+    )()
+    advice.trade_context = type(
+        "TradeContext", (),
+        {"turnover_ratio": 3.2, "session_amount": 560000000.0}
+    )()
+
+    fire(engine, state, advice, Intraday(11.0))
+    alert = fire(engine, state, advice, Intraday(10.3))[0]
+
+    body = " ".join(alert.detail)
+    assert "短线判断：短线偏弱，不宜追买；先等收回 10.50 再看修复" in body
+    assert "交易数据：换手率 3.20%，成交额 5.60 亿" in body
 
 
 # ---- L3 止跌确认：进入区间不等于可以买 --------------------------------------
@@ -254,7 +324,7 @@ def minutes(prices, volumes=None, span=0.004):
     vols = volumes or [1000.0] * len(prices)
     return [
         {"high": p * (1 + span), "low": p * (1 - span), "close": p, "volume": v}
-        for p, v in zip(prices, vols)
+        for p, v in zip(prices, vols, strict=True)
     ]
 
 
@@ -273,7 +343,8 @@ def test_a_falling_tape_is_not_confirmed_however_deep_it_has_gone() -> None:
 def test_volume_drying_up_without_new_lows_counts_as_stabilising() -> None:
     """卖压自然衰竭：没人急着出了。"""
     from ashare_decision_support.signals.stabilise import (
-        PATTERN_CONTRACTION, assess_stabilisation,
+        PATTERN_CONTRACTION,
+        assess_stabilisation,
     )
 
     prices = [100.0 - i * 0.4 for i in range(20)] + [92.2 + i * 0.01 for i in range(15)]
@@ -288,7 +359,8 @@ def test_volume_drying_up_without_new_lows_counts_as_stabilising() -> None:
 def test_a_volume_reversal_bar_confirms_immediately() -> None:
     """有资金主动买回来——比缩量止跌更硬的信号。"""
     from ashare_decision_support.signals.stabilise import (
-        PATTERN_REVERSAL, assess_stabilisation,
+        PATTERN_REVERSAL,
+        assess_stabilisation,
     )
 
     prices = [100.0 - i * 0.2 for i in range(34)] + [98.0]
@@ -349,3 +421,161 @@ def test_stabilising_inside_the_band_is_the_actual_buy_signal() -> None:
     triggers = [a.trigger for a in alerts]
     assert "entry_confirmed" in triggers
     assert next(a for a in alerts if a.trigger == "entry_confirmed").level == "ACTION"
+
+
+def test_reclaiming_the_watch_line_is_a_warn_not_a_buy_signal() -> None:
+    """弱票先收回观察线只是从「别碰」变成「继续盯」，不能自动升级成买点。"""
+    from ashare_decision_support.notify.render import render_alerts
+
+    engine, state = TriggerEngine(), AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[], entry=(11.0, 11.5))
+    advice.shortline = type(
+        "Shortline",
+        (),
+        {
+            "action": "wait_reclaim",
+            "reclaim_level": 10.50,
+            "summary": "短线偏弱，不宜追买；先等收回 10.50 再看修复",
+        },
+    )()
+
+    fire(engine, state, advice, Intraday(10.20, vwap=10.0))
+    alerts = fire(engine, state, advice, Intraday(10.55, vwap=10.0))
+
+    assert [a.trigger for a in alerts] == ["reclaim_confirmed"]
+    assert alerts[0].level == "WARN"
+    body = " ".join(alerts[0].detail)
+    assert "不是追高买点" in body
+    assert "弱票先确认站稳 10.50" in body
+    assert "修复观察" in render_alerts(alerts, None)
+
+
+def test_volume_breakout_becomes_action_only_for_quality_trend_names() -> None:
+    """等回踩的趋势票如果直接放量突破，才允许升级成突破跟随。"""
+    from ashare_decision_support.notify.render import render_alerts
+
+    engine, state = TriggerEngine(levels=("ACTION",)), AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[10.8], entry=(10.0, 10.2))
+    advice.rrr = 2.2
+    advice.shortline = type(
+        "Shortline",
+        (),
+        {"action": "buy_pullback", "reclaim_level": 10.2, "summary": "趋势未坏，回踩可观察承接"},
+    )()
+
+    fire(engine, state, advice, Intraday(10.30, vwap=10.0))
+    second = Intraday(10.80, vwap=10.4)
+    second.session_high = 10.80
+    second.session_low = 10.20
+    second.volume_ratio = 1.35
+    alerts = fire(engine, state, advice, second)
+
+    assert [a.trigger for a in alerts] == ["breakout_confirmed"]
+    body = " ".join(alerts[0].detail)
+    assert "突破买法" in body
+    assert "只做回踩承接，不追分时拉升" in body
+    assert "突破确认" in render_alerts(alerts, None)
+
+
+def test_low_rrr_names_do_not_get_breakout_action_alerts() -> None:
+    """盈亏比太差的票就算拉到日内高点，也只应按原有观察/目标逻辑处理。"""
+    engine, state = TriggerEngine(levels=("ACTION",)), AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[], entry=(10.0, 10.2))
+    advice.rrr = 0.6
+    advice.shortline = type(
+        "Shortline",
+        (),
+        {"action": "buy_pullback", "reclaim_level": 10.2, "summary": "趋势未坏，但性价比不足"},
+    )()
+
+    fire(engine, state, advice, Intraday(10.30, vwap=10.0))
+    second = Intraday(10.80, vwap=10.4)
+    second.session_high = 10.80
+    second.session_low = 10.20
+    second.volume_ratio = 1.35
+
+    assert fire(engine, state, advice, second) == []
+
+
+def test_low_rrr_names_do_not_get_entry_action_alerts() -> None:
+    """质量闸门此前只接在突破路径上，低吸这一路是漏的：一只盈亏比 1.09、命中
+    业绩否决的票跌进买入区间，照样会推 ACTION 级「进入买入区间」和「止跌确认」，
+    而同一份数据下简报写的是「今日无可用打法」。区间确实进了，所以照发，
+    但降级成 WARN 的 entry_blocked。"""
+    from ashare_decision_support.signals.stabilise import Stabilisation
+
+    engine = TriggerEngine(levels=("ACTION", "WARN"))
+    state = AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[10.8], entry=(10.0, 10.6))
+    advice.rrr = 1.09
+
+    fire(engine, state, advice, Intraday(10.90, vwap=10.9))
+    alerts = engine.evaluate(
+        advice=advice, intraday=Intraday(10.30, vwap=10.4), state=state, now=NOW,
+        watchlist=True,
+        stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
+    )
+
+    triggers = [a.trigger for a in alerts]
+    assert "entry_blocked" in triggers
+    assert "entry_zone" not in triggers
+    assert "entry_confirmed" not in triggers
+    assert next(a for a in alerts if a.trigger == "entry_blocked").level == "WARN"
+
+
+def test_low_rrr_names_are_blocked_on_the_first_pass_too() -> None:
+    """启动补报那一路是另一处 emit，要一起堵——否则重启一次监控就绕过了闸门。"""
+    from ashare_decision_support.signals.stabilise import Stabilisation
+
+    engine = TriggerEngine(levels=("ACTION", "WARN"))
+    state = AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[12.0], entry=(10.0, 10.6))
+    advice.rrr = 1.09
+
+    alerts = engine.evaluate(
+        advice=advice, intraday=Intraday(10.35), state=state, now=NOW, watchlist=True,
+        stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
+    )
+
+    assert [a.trigger for a in alerts] == ["entry_blocked"]
+    assert alerts[0].level == "WARN"
+
+
+def test_earnings_veto_also_blocks_the_entry_action() -> None:
+    """闸门的另一半是警告文案，不只是盈亏比。业绩否决原先不在拦截清单里，
+    所以一只盈亏比漂亮、但中报预告首亏的票照样能推 ACTION 买点——而这条否决
+    比盈亏比更硬：盈亏比是算出来的估计，首亏是公司自己签字披露的事实。"""
+    from ashare_decision_support.signals.stabilise import Stabilisation
+
+    engine = TriggerEngine(levels=("ACTION", "WARN"))
+    state = AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[12.0], entry=(10.0, 10.6))
+    advice.rrr = 3.0
+    advice.warnings = ["⚠️ 业绩否决：预告首亏 -158.9%，2026-07-11 披露（盘前链路不会选它）"]
+
+    alerts = engine.evaluate(
+        advice=advice, intraday=Intraday(10.35), state=state, now=NOW, watchlist=True,
+        stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
+    )
+
+    assert [a.trigger for a in alerts] == ["entry_blocked"]
+
+
+def test_confirmed_entry_fires_on_the_first_pass_when_already_valid() -> None:
+    """监控不是 09:35 准点启动时，已经成立的买点不能等下一次穿越才提示。"""
+    from ashare_decision_support.signals.stabilise import Stabilisation
+
+    engine, state = TriggerEngine(), AlertState(date(2026, 8, 3), Path("/dev/null"))
+    advice = Advice(stop=9.5, targets=[12.0], entry=(10.0, 10.6))
+    advice.rrr = 2.5
+
+    alerts = engine.evaluate(
+        advice=advice, intraday=Intraday(10.35), state=state, now=NOW,
+        stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
+    )
+
+    assert [a.trigger for a in alerts] == ["entry_confirmed"]
+    body = " ".join(alerts[0].detail)
+    assert "启动监控时买点已经成立" in body
+    assert "止损 9.50" in body
+    assert "目标 12.00" in body

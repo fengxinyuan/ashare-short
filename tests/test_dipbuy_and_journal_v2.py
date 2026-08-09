@@ -14,7 +14,7 @@ from ashare_decision_support.journal.records import (
     KIND_RECOMMENDATION,
     Recommendation,
 )
-from ashare_decision_support.journal.stats import summarize
+from ashare_decision_support.journal.stats import rolling_validation, summarize
 from ashare_decision_support.journal.store import Journal
 from ashare_decision_support.journal.verify import verify_pending
 from ashare_decision_support.signals.dipbuy import measure_dip
@@ -37,8 +37,9 @@ def bars(
             "low": close * (1 - amplitude / 2),
             "close": close,
             "volume": vol,
+            "amount": close * vol,
         }
-        for index, (close, vol) in enumerate(zip(closes, vols))
+        for index, (close, vol) in enumerate(zip(closes, vols, strict=True))
     ]
 
 
@@ -126,6 +127,62 @@ def test_volume_contraction_tells_a_healthy_dip_from_distribution() -> None:
     assert expanding.shrinking is False
 
 
+def test_turnover_cost_handles_shares_and_tickflow_lots() -> None:
+    """成本代理不能因上游把成交量写成手而放大 100 倍。"""
+    shares_rows = bars([100.0] * 30, [1000.0] * 30)
+    lots_rows = [
+        {**row, "volume": row["volume"] / 100.0, "amount": row["amount"]}
+        for row in shares_rows
+    ]
+
+    shares = measure_dip(shares_rows)
+    lots = measure_dip(lots_rows)
+
+    assert shares.turnover_cost_15 == 100.0
+    assert shares.turnover_cost_30 == 100.0
+    assert lots.turnover_cost_15 == 100.0
+    assert lots.turnover_cost_30 == 100.0
+
+
+def test_cost_proxy_marks_a_down_day_that_reclaims_the_30_day_cost() -> None:
+    rows = bars([100.0] * 28 + [101.0, 100.5], [1000.0] * 30)
+    rows[-1]["low"] = 99.0
+
+    features = measure_dip(rows)
+
+    assert features.ret_1d is not None and features.ret_1d < 0
+    assert features.turnover_cost_30 is not None
+    assert features.turnover_cost_30_reclaimed is True
+    assert features.dist_to_turnover_cost_30_pct is not None
+    assert features.dist_to_turnover_cost_30_pct > 0
+
+
+def test_cost_proxy_is_unknown_without_amount() -> None:
+    rows = bars([100.0] * 30)
+    for row in rows:
+        row.pop("amount")
+
+    features = measure_dip(rows)
+
+    assert features.turnover_cost_15 is None
+    assert features.turnover_cost_30 is None
+    assert features.turnover_cost_30_reclaimed is None
+
+
+def test_cost_proxy_enters_the_score_as_a_support_reading() -> None:
+    from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput
+
+    rows = bars([100.0] * 28 + [101.0, 100.5], [1000.0] * 30)
+    rows[-1]["low"] = 99.0
+    features = measure_dip(rows)
+
+    result = RuleBasedScoreProvider().score(
+        ScoreInput(symbol="A", bars=rows, snapshot=snap(), dip=features)
+    )
+
+    assert any("当日下跌踩回30日成交成本代理" in reason for reason in result.reasons)
+
+
 def test_missing_data_yields_none_not_zero() -> None:
     """「没算出来」和「算出来是零」在事后统计里必须能分开。"""
     features = measure_dip(bars([100.0, 101.0]))
@@ -201,7 +258,7 @@ def test_outcome_remembers_which_group_it_came_from(tmp_path) -> None:
 
     class Adapter:
         def get_historical_bars(self, symbols, start, end):
-            return {symbol: rows for symbol in symbols}
+            return dict.fromkeys(symbols, rows)
 
     result = verify_pending(book, Adapter(), today=date(2026, 6, 20))
     assert result["resolved"] == 1
@@ -227,7 +284,7 @@ def test_next_session_readings_are_recorded_separately_from_the_five_day_window(
 
     class Adapter:
         def get_historical_bars(self, symbols, start, end):
-            return {symbol: rows for symbol in symbols}
+            return dict.fromkeys(symbols, rows)
 
     outcome = verify_pending(book, Adapter(), today=date(2026, 6, 20))["outcomes"][0]
 
@@ -294,6 +351,7 @@ def test_old_watchlist_files_load_as_unheld(tmp_path) -> None:
 def outcome_row(rec_kind: str, close_pct: float, blowup: float | None = None, band: str = "ideal"):
     return {
         "kind": "outcome",
+        "trade_date": "2026-08-01",
         "rec_kind": rec_kind,
         "mfe_pct": close_pct + 0.02,
         "mae_pct": -0.01,
@@ -332,6 +390,32 @@ def test_edge_is_unavailable_rather_than_zero_when_one_group_is_missing() -> Non
     assert edge["available"] is False
 
 
+def test_a_nan_reading_is_dropped_instead_of_silently_shifting_the_median() -> None:
+    """NaN 不会让 median 报错，它会让 median 悄悄给错数。
+
+    台账是 JSONL，`json.dumps(nan)` 写出裸 `NaN`、`json.loads` 原样读回来，所以
+    一个 NaN 收盘涨幅是能一路进到这里的。它参与排序时所有比较都是 False，于是
+    它落在哪、把谁挤到中位，取决于原始顺序——统计表会整张偏掉且不报任何错。
+    """
+    clean = [0.1, 0.9, 0.2, 0.3]
+    rows = [outcome_row("recommendation", value) for value in clean]
+    rows.insert(1, outcome_row("recommendation", float("nan")))
+
+    stats = summarize(rows)["overall"]
+    # 去掉 NaN 之后的真中位数是 0.25。把 NaN 留在列里，statistics.median 会给 0.2。
+    assert stats["median_close_pct"] == 0.25
+    assert stats["samples"] == 5
+
+
+def test_a_boolean_is_not_counted_as_a_one_percent_gain() -> None:
+    """`isinstance(True, (int, float))` 是 True——写错类型的字段会变成 +100%。"""
+    rows = [outcome_row("recommendation", 0.05) for _ in range(2)]
+    rows[0]["close_pct"] = True
+
+    # 留着 True 的话中位数是 (1.0 + 0.05) / 2 = 0.525。
+    assert summarize(rows)["overall"]["median_close_pct"] == 0.05
+
+
 def test_regime_buckets_separate_a_healthy_tape_from_a_fading_one() -> None:
     """同一套规则在退潮期和启动期的期望值可以是反号的。"""
     rows = [outcome_row("recommendation", 0.05, blowup=0.15) for _ in range(3)]
@@ -361,24 +445,25 @@ def test_pullback_bands_become_a_statistical_layer() -> None:
 
 def snap(**kw):
     from datetime import datetime
+
     from ashare_decision_support.models.enums import TrendState
     from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 
-    d = dict(
-        symbol="600519.SH", last_open=99.0, last_high=101.0, last_low=98.0,
-        last_close=100.0, trend_state=TrendState.UPTREND, bar_count=250,
-        atr14=2.0, volume_ratio_20d=1.0, range_position_60d=0.5,
-        stop_reference=95.0, target_reference=115.0,
-        explanation="fixture", source_ts=datetime(2026, 8, 3, 15, 0),
-    )
+    d = {
+        "symbol": "600519.SH", "last_open": 99.0, "last_high": 101.0, "last_low": 98.0,
+        "last_close": 100.0, "trend_state": TrendState.UPTREND, "bar_count": 250,
+        "atr14": 2.0, "volume_ratio_20d": 1.0, "range_position_60d": 0.5,
+        "stop_reference": 95.0, "target_reference": 115.0,
+        "explanation": "fixture", "source_ts": datetime(2026, 8, 3, 15, 0),
+    }
     d.update(kw)
     return DailyTechnicalSnapshot(**d)
 
 
 def dip(**kw):
     from ashare_decision_support.signals.dipbuy import DipFeatures
-    d = dict(pullback_pct=-0.06, atr_pct=0.02, pullback_atr=3.0,
-             pullback_band="ideal", shrinking=True, volume_contraction=0.5)
+    d = {"pullback_pct": -0.06, "atr_pct": 0.02, "pullback_atr": 3.0,
+             "pullback_band": "ideal", "shrinking": True, "volume_contraction": 0.5}
     d.update(kw)
     return DipFeatures(**d)
 
@@ -420,7 +505,7 @@ def test_volume_flips_meaning_between_a_pullback_and_a_breakout() -> None:
     assert quiet_dip.score > loud_dip.score
     assert any("疑似出货" in r for r in loud_dip.reasons)
 
-    no_dip = dict(pullback_band="none", pullback_atr=0.2, pullback_pct=-0.004)
+    no_dip = {"pullback_band": "none", "pullback_atr": 0.2, "pullback_pct": -0.004}
     quiet_flat = score(snapshot=snap(volume_ratio_20d=0.5), dip=dip(**no_dip))
     loud_flat = score(snapshot=snap(volume_ratio_20d=1.8), dip=dip(**no_dip))
     assert loud_flat.score > quiet_flat.score
@@ -429,7 +514,9 @@ def test_volume_flips_meaning_between_a_pullback_and_a_breakout() -> None:
 def test_wyckoff_pullback_events_now_outweigh_the_breakout_event() -> None:
     """Spring / LPS 是低吸信号，SOS 是「已经涨上去了」。"""
     from ashare_decision_support.scoring.rule_based import (
-        LPS_POINTS, SOS_POINTS, SPRING_POINTS,
+        LPS_POINTS,
+        SOS_POINTS,
+        SPRING_POINTS,
     )
     assert SPRING_POINTS > SOS_POINTS
     assert LPS_POINTS > SOS_POINTS
@@ -485,24 +572,29 @@ def test_a_missing_dip_reading_scores_zero_rather_than_penalising() -> None:
 
 
 def test_a_stock_at_its_high_is_not_a_dip_candidate_regardless_of_score() -> None:
-    """低吸门槛是**门槛不是权重**。
+    """打法门槛是**门槛不是权重**。
 
     dip 在打分里只占 10/85，trend + wyckoff 占 50，靠加权永远压不过「趋势强、
     位置高」的票。2026-08-02 实测：全市场随机 278 只里 27% 在 none 档、29% 在
     ideal 档，而打分选出的 15 只有 10 只是 none——分布差这么远，说明问题出在
     「要不要它」而不是「给它几分」。
-    """
-    from ashare_decision_support.jobs.morning import _is_dip_candidate
-    from ashare_decision_support.signals.dipbuy import DipFeatures
 
-    assert _is_dip_candidate(DipFeatures(pullback_band="ideal")) is True
-    assert _is_dip_candidate(DipFeatures(pullback_band="shallow")) is True
-    # deep 放行：是否值得买交给分数（已扣分并告警），门槛不替它判死。
-    assert _is_dip_candidate(DipFeatures(pullback_band="deep")) is True
-    assert _is_dip_candidate(DipFeatures(pullback_band="none")) is False
-    # 算不出来的放行——门槛挡的是「明确没回调」，不是「不知道」。
-    assert _is_dip_candidate(DipFeatures()) is True
-    assert _is_dip_candidate(None) is True
+    门槛现在按打法分（`strategy/playbook.py`）：没回调的票进不了「回踩」，
+    但在 UPTREND 且情绪周期允许时可以走「突破」——这是改造前不存在的那条路。
+    """
+    from ashare_decision_support.models.enums import Playbook
+    from ashare_decision_support.signals.dipbuy import DipFeatures
+    from ashare_decision_support.strategy.playbook import evaluate_playbooks
+
+    at_high = DipFeatures(pullback_band="none", volume_contraction=1.4, dist_to_ma20_pct=0.08)
+    snapshot = snap(range_position_60d=0.97, volume_ratio_20d=1.6)
+
+    match = evaluate_playbooks(snapshot, at_high, None, frozenset({Playbook.PULLBACK}))
+    assert not match.ok, "贴在 20 日高的票不能进回踩候选"
+
+    # 同一只票在允许突破的周期里走另一条判据链，并且命中。
+    both = evaluate_playbooks(snapshot, at_high, None, None)
+    assert both.primary is Playbook.BREAKOUT
 
 
 def test_sector_ranking_no_longer_rewards_having_already_run() -> None:
@@ -511,14 +603,14 @@ def test_sector_ranking_no_longer_rewards_having_already_run() -> None:
     2026-08-02 实测：前五名板块的 5 日中位是 +10.16%/+10.48%/+9.48%/+8.03%/
     +4.80%，排序几乎就是已涨幅度倒序——那是追涨的排法，不是低吸的。
     """
-    from ashare_decision_support.sectors.predict import SectorPredictor
     from ashare_decision_support.sectors.base import SectorMetrics
+    from ashare_decision_support.sectors.predict import SectorPredictor
 
     predictor = SectorPredictor(None)
 
     def momentum(**kw):
-        d = dict(name="X", constituents=50, covered=50, ret_1d=0.005, ret_5d=0.03,
-                 ret_20d=0.08, breadth=0.6, above_ma20=0.7, volume_ratio=1.0)
+        d = {"name": "X", "constituents": 50, "covered": 50, "ret_1d": 0.005, "ret_5d": 0.03,
+                 "ret_20d": 0.08, "breadth": 0.6, "above_ma20": 0.7, "volume_ratio": 1.0}
         d.update(kw)
         return predictor._momentum_component(SectorMetrics(**d), [], [])
 
@@ -532,3 +624,368 @@ def test_sector_ranking_no_longer_rewards_having_already_run() -> None:
 
     # 中期趋势仍然是前提：跌了 20 日的板块不该因为「回调到位」而被选中。
     assert momentum(ret_20d=-0.15, pullback_atr=2.0) < pulled_back
+
+
+# ---- 只出读数那几层的验收位 -----------------------------------------------
+
+
+def state_row(close_pct: float, **market_state):
+    """带自定义 `market_state` 的兑现记录。"""
+    row = outcome_row("recommendation", close_pct)
+    row["market_state"] = dict(market_state)
+    return row
+
+
+def test_unscored_layers_get_their_own_buckets() -> None:
+    """三层「只出读数」的必须各有一组分层统计。
+
+    没有这三组的话，它们永远停在读数状态：`review` 回答不了「这一层报出来的东西
+    有没有区分度」，于是也永远谈不上该给权重还是该撤掉。
+    """
+    rows = [
+        state_row(0.05, rotation_adjacent="高低切换", turnover_total_change=-0.14,
+                  index_divergence="等权强加权弱")
+        for _ in range(3)
+    ]
+    rows += [
+        state_row(0.01, rotation_adjacent="强者恒强", turnover_total_change=0.08,
+                  index_divergence="等权与加权一致")
+        for _ in range(3)
+    ]
+
+    stats = summarize(rows)
+
+    rotation = {item["bucket"]: item for item in stats["by_rotation"]}
+    assert set(rotation) == {"高低切换", "强者恒强"}
+    assert rotation["高低切换"]["samples"] == 3
+
+    turnover = {item["bucket"]: item for item in stats["by_turnover"]}
+    assert any("缩量" in name for name in turnover)
+    assert any("放量" in name for name in turnover)
+
+    index = {item["bucket"]: item for item in stats["by_index_divergence"]}
+    assert set(index) == {"等权强加权弱", "等权与加权一致"}
+
+
+def test_old_records_land_in_unrecorded_instead_of_a_real_bucket() -> None:
+    """这一层上线之前写的记录没有这些字段，必须落进「未记录」。
+
+    把它们混进任何一个真实档位，都是**用一段从没测过的历史去支持一个结论**——
+    而台账里那批待兑现记录恰好全是这种，数量还远多于新记录。
+    """
+    rows = [outcome_row("recommendation", 0.03) for _ in range(4)]
+
+    stats = summarize(rows)
+
+    assert [item["bucket"] for item in stats["by_rotation"]] == ["未记录"]
+    assert [item["bucket"] for item in stats["by_turnover"]] == ["未记录"]
+    assert [item["bucket"] for item in stats["by_index_divergence"]] == ["未记录"]
+
+
+def test_macro_buckets_distinguish_recorded_empty_from_unrecorded() -> None:
+    rows = [
+        {
+            **outcome_row("recommendation", 0.05),
+            "trade_date": "2026-08-01",
+            "macro_context": {
+                "recorded": True,
+                "topics": ["oil"],
+                "signals": ["oil:bullish"],
+                "expectations": ["oil:beat"],
+            },
+        },
+        {
+            **outcome_row("recommendation", 0.01),
+            "trade_date": "2026-08-02",
+            "macro_context": {"recorded": True, "topics": [], "signals": [], "expectations": []},
+        },
+        {**outcome_row("recommendation", -0.01), "trade_date": "2026-08-03"},
+    ]
+
+    stats = summarize(rows)
+
+    topic = {item["bucket"]: item for item in stats["by_macro_topic"]}
+    assert topic["oil"]["samples"] == 1
+    assert topic["无明确宏观链路"]["samples"] == 1
+    assert topic["未记录"]["samples"] == 1
+
+    signal = {item["bucket"]: item for item in stats["by_macro_signal"]}
+    assert signal["oil:bullish"]["samples"] == 1
+    assert signal["无方向信号"]["samples"] == 1
+    assert signal["未记录"]["samples"] == 1
+
+    expectation = {item["bucket"]: item for item in stats["by_macro_expectation"]}
+    assert expectation["oil:beat"]["samples"] == 1
+    assert expectation["无预期差"]["samples"] == 1
+    assert expectation["未记录"]["samples"] == 1
+
+
+def test_rolling_validation_uses_distinct_trade_sessions_not_last_rows() -> None:
+    rows: list[dict] = []
+    for day, close_pct in (
+        ("2026-08-01", 0.01),
+        ("2026-08-02", 0.03),
+        ("2026-08-03", -0.02),
+    ):
+        rows.extend(
+            [
+                {**outcome_row("recommendation", close_pct), "trade_date": day},
+                {**outcome_row("control", close_pct / 2), "trade_date": day},
+            ]
+        )
+
+    validation = rolling_validation(rows, windows=(2,))
+    window = validation["windows"]["last_2_sessions"]
+
+    assert validation["available_sessions"] == 3
+    assert window["from"] == "2026-08-02"
+    assert window["to"] == "2026-08-03"
+    assert window["sessions"] == 2
+    assert window["samples"] == 4
+    assert window["selection_edge"]["available"] is True
+    assert window["selection_edge"]["next_close_gap"] == 0.0025
+
+
+def test_outcome_carries_macro_context_from_the_recommendation(tmp_path) -> None:
+    book = Journal(root=tmp_path)
+    record = make_record("600002.SH", KIND_RECOMMENDATION, tmp_path)
+    record = Recommendation(
+        **{
+            **record.to_dict(),
+            "macro_context": {
+                "recorded": True,
+                "topics": ["china_macro"],
+                "signals": ["china_macro:bullish"],
+                "expectations": ["china_macro:beat"],
+            },
+        }
+    )
+    book.record(record)
+
+    rows = [
+        {"date": f"2026-06-{day:02d}", "open": 100.0, "high": 104.0, "low": 98.0, "close": 102.0}
+        for day in range(1, 12)
+    ]
+
+    class Adapter:
+        def get_historical_bars(self, symbols, start, end):
+            return dict.fromkeys(symbols, rows)
+
+    outcome = verify_pending(book, Adapter(), today=date(2026, 6, 20))["outcomes"][0]
+
+    assert outcome["macro_context"]["recorded"] is True
+    assert outcome["macro_context"]["topics"] == ["china_macro"]
+    assert outcome["macro_context"]["expectations"] == ["china_macro:beat"]
+
+
+def test_incomparable_is_not_folded_into_unrecorded() -> None:
+    """「跨日不可比」与「未记录」是两件事，合并会让两种相反的情况长得一样。
+
+    前者＝这一层跑了但两边日期对不上（盘中取数的常态），后者＝压根没有这个读数。
+    合成一个桶的话，「从来没生效过」和「每天都在被跳过」就分不出来了。
+    """
+    rows = [state_row(0.02, index_divergence="跨日不可比") for _ in range(2)]
+    rows += [outcome_row("recommendation", 0.02) for _ in range(2)]
+
+    buckets = {item["bucket"]: item for item in summarize(rows)["by_index_divergence"]}
+
+    assert buckets["跨日不可比"]["samples"] == 2
+    assert buckets["未记录"]["samples"] == 2
+
+
+def test_review_renders_every_group_it_computes() -> None:
+    """算了但不渲染 = 没算。
+
+    此前 `by_playbook` / `by_entry_basis` / `by_decider` 三组一直在 payload 里躺着，
+    从来没进过复盘正文。这条测试守的是「统计层新增一组，正文必须跟着出现」——
+    否则下一层读数还会重复同一个结局。
+    """
+    from datetime import date as _date
+
+    from ashare_decision_support.jobs.review import render_review
+
+    rows = [
+        state_row(0.05, rotation_adjacent="高低切换", turnover_total_change=-0.14,
+                  index_divergence="等权强加权弱")
+        for _ in range(3)
+    ]
+    for row in rows:
+        row["playbook"] = "回踩"
+        row["adjudication"] = {"chosen_entry": {"basis": "分时均价回踩"}, "used_fallback": True}
+
+    text = render_review(
+        _date(2026, 8, 4),
+        {"resolved": 3, "checked": 3, "notes": []},
+        summarize(rows),
+    )
+
+    for title in (
+        "按打法",
+        "按买入位依据",
+        "按裁决方",
+        "按宏观主题",
+        "按宏观方向信号",
+        "按预期差",
+        "按周度轮动方向",
+        "按全场成交额",
+        "按等权与加权是否背离",
+    ):
+        assert title in text, f"复盘正文缺了「{title}」这一组"
+
+
+def test_review_renders_recent_validation_windows() -> None:
+    from datetime import date as _date
+
+    from ashare_decision_support.jobs.review import render_review
+
+    rows = [
+        {**outcome_row("recommendation", 0.04), "trade_date": "2026-08-01"},
+        {**outcome_row("control", 0.02), "trade_date": "2026-08-01"},
+        {**outcome_row("recommendation", -0.01), "trade_date": "2026-08-02"},
+        {**outcome_row("control", 0.01), "trade_date": "2026-08-02"},
+    ]
+    text = render_review(
+        _date(2026, 8, 7),
+        {"resolved": 4, "checked": 4, "notes": []},
+        summarize(rows),
+        rolling_validation(rows, windows=(2,)),
+    )
+
+    assert "## 近期验证" in text
+    assert "last_2_sessions" in text
+
+
+def test_trade_flow_reaches_the_stats_layer() -> None:
+    """逐笔旁证必须一路走到统计层，否则存了也白存。
+
+    链路有三段，断任何一段结果都一样（分组永远是「未记录」）：
+    `Recommendation.trade_flow` → `verify.py` 带进 `Outcome` → `stats.py` 分档。
+    """
+    rows = [
+        {**outcome_row("recommendation", 0.06), "trade_flow": {"ok": True, "large_net_amount": 9e7}}
+        for _ in range(3)
+    ]
+    rows += [
+        {**outcome_row("recommendation", -0.01), "trade_flow": {"ok": True, "large_net_amount": -4e7}}
+        for _ in range(3)
+    ]
+
+    buckets = {item["bucket"]: item for item in summarize(rows)["by_large_net"]}
+
+    assert set(buckets) == {"大单净流入", "大单净流出"}
+    assert buckets["大单净流入"]["samples"] == 3
+    # 只分正负不分档：金额跨标的不可比，方向才可比。
+    assert buckets["大单净流出"]["samples"] == 3
+
+
+def test_trade_flow_that_failed_to_fetch_is_not_a_direction() -> None:
+    """`ok=False` 与 `--no-trade-flow` 跑出来的批次都落「未记录」。
+
+    半成品读数进了统计比没有更糟：它看起来是一个可分组的维度，实际是噪声。
+    """
+    rows = [
+        {**outcome_row("recommendation", 0.02), "trade_flow": {"ok": False, "large_net_amount": 5e7}},
+        {**outcome_row("recommendation", 0.02), "trade_flow": {}},
+        outcome_row("recommendation", 0.02),
+    ]
+
+    buckets = {item["bucket"]: item for item in summarize(rows)["by_large_net"]}
+
+    assert list(buckets) == ["未记录"]
+    assert buckets["未记录"]["samples"] == 3
+
+
+def test_outcome_carries_trade_flow_from_the_recommendation(tmp_path) -> None:
+    """链路中段：`Recommendation.trade_flow` 必须被 `verify.py` 带进 `Outcome`。
+
+    这一段断掉的症状与另外两段一模一样——分组永远是「未记录」，而建议记录里
+    那个字段明明有值。所以三段各测一条，不能只测两头。
+    """
+    book = Journal(root=tmp_path)
+    record = make_record("600002.SH", KIND_RECOMMENDATION, tmp_path)
+    record = Recommendation(
+        **{
+            **record.to_dict(),
+            "trade_flow": {"ok": True, "large_net_amount": 1.5e8, "buy_ratio": 0.61},
+        }
+    )
+    book.record(record)
+
+    rows = [
+        {"date": f"2026-06-{day:02d}", "open": 100.0, "high": 104.0, "low": 98.0, "close": 102.0}
+        for day in range(1, 12)
+    ]
+
+    class Adapter:
+        def get_historical_bars(self, symbols, start, end):
+            return dict.fromkeys(symbols, rows)
+
+    outcome = verify_pending(book, Adapter(), today=date(2026, 6, 20))["outcomes"][0]
+
+    assert outcome["trade_flow"]["large_net_amount"] == 1.5e8
+    assert outcome["trade_flow"]["ok"] is True
+
+
+# ---- 状态文件里的 NaN：两个方向都要挡 -------------------------------------
+
+
+def test_state_file_never_persists_an_invalid_json_constant(tmp_path) -> None:
+    """`json.dump` 对 NaN 会写出裸的 `NaN`——那**不是合法 JSON**。
+
+    症状特别隐蔽：Python 自己读得回来，所以系统内部一切正常；但文件从此 `jq`
+    读不了、别的语言读不了。而持仓成本、止损、台账都存在这里。宁可在写入点抛，
+    也不要写出这种文件。
+    """
+    from ashare_decision_support.state.store import write_json
+
+    target = tmp_path / "holdings.json"
+    try:
+        write_json(target, {"600519.SH": {"cost": float("nan")}})
+    except ValueError:
+        # 抛了，且**没有留下半个文件**——写是原子的。
+        assert not target.exists()
+        assert not list(tmp_path.glob(".*"))
+        return
+    raise AssertionError("NaN 应当在写入点被拒绝")
+
+
+def test_a_poisoned_state_file_is_treated_as_corrupt_not_as_readings(tmp_path) -> None:
+    """`json.load` **默认接受** `NaN` 字面量并还原成 float。
+
+    不挡的话，一个被写坏过一次的文件会**永久**把 NaN 喂给每一次跑批：成本是
+    NaN、浮盈是 NaN、「跌破止损」的比较恒为 False。按既有约定当成文件损坏处理，
+    返回 default 让调用方重建。
+    """
+    from ashare_decision_support.state.store import read_json
+
+    poisoned = tmp_path / "holdings.json"
+    poisoned.write_text('{"600519.SH": {"cost": NaN, "stop": Infinity}}', encoding="utf-8")
+
+    assert read_json(poisoned, default={"rebuilt": True}) == {"rebuilt": True}
+
+
+def test_a_healthy_state_file_still_round_trips(tmp_path) -> None:
+    from ashare_decision_support.state.store import read_json, write_json
+
+    target = tmp_path / "holdings.json"
+    payload = {"600519.SH": {"cost": 1350.6, "stop": 1330.0, "note": "核心仓"}}
+    write_json(target, payload)
+
+    assert read_json(target) == payload
+
+
+def test_one_poisoned_journal_line_costs_only_that_line(tmp_path) -> None:
+    """台账是逐行独立的，含 NaN 的那条丢掉，其余照常读。"""
+    from ashare_decision_support.state.store import read_jsonl
+
+    path = tmp_path / "journal.jsonl"
+    path.write_text(
+        '{"symbol": "600519.SH", "pnl": 1.5}\n'
+        '{"symbol": "000001.SZ", "pnl": NaN}\n'
+        '{"symbol": "300750.SZ", "pnl": -2.0}\n',
+        encoding="utf-8",
+    )
+
+    rows = read_jsonl(path)
+
+    assert [row["symbol"] for row in rows] == ["600519.SH", "300750.SZ"]

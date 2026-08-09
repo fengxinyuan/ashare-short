@@ -42,6 +42,11 @@ class WatchEntry:
     symbol: str
     name: str | None = None
     sector: str | None = None
+    industries: list[str] = field(default_factory=list)
+    industry: str | None = None
+    industry_leaf: str | None = None
+    industry_path: str | None = None
+    concepts: list[str] = field(default_factory=list)
     source: str = SOURCE_MANUAL
     note: str | None = None
     added_on: str | None = None
@@ -58,11 +63,16 @@ class WatchEntry:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "WatchEntry":
+    def from_dict(cls, payload: dict) -> WatchEntry:
         return cls(
             symbol=normalize_symbol(payload.get("symbol", "")),
             name=payload.get("name"),
             sector=payload.get("sector"),
+            industries=[str(item) for item in (payload.get("industries") or []) if str(item)],
+            industry=payload.get("industry"),
+            industry_leaf=payload.get("industry_leaf"),
+            industry_path=payload.get("industry_path"),
+            concepts=[str(item) for item in (payload.get("concepts") or []) if str(item)],
             source=payload.get("source") or SOURCE_MANUAL,
             note=payload.get("note"),
             added_on=payload.get("added_on"),
@@ -130,6 +140,11 @@ class Watchlist(_EntryList):
         symbol: str,
         name: str | None = None,
         sector: str | None = None,
+        industries: list[str] | None = None,
+        industry: str | None = None,
+        industry_leaf: str | None = None,
+        industry_path: str | None = None,
+        concepts: list[str] | None = None,
         note: str | None = None,
         source: str = SOURCE_MANUAL,
         score: float | None = None,
@@ -144,9 +159,21 @@ class Watchlist(_EntryList):
         if existing is not None:
             # Update in place, but never overwrite a field with None — a later
             # `add` without a note must not erase the note you typed earlier.
-            for attribute, value in (("name", name), ("sector", sector), ("note", note), ("score", score)):
+            for attribute, value in (
+                ("name", name),
+                ("sector", sector),
+                ("industry", industry),
+                ("industry_leaf", industry_leaf),
+                ("industry_path", industry_path),
+                ("note", note),
+                ("score", score),
+            ):
                 if value is not None:
                     setattr(existing, attribute, value)
+            if industries is not None:
+                existing.industries = list(industries)
+            if concepts is not None:
+                existing.concepts = list(concepts)
             self.save()
             return existing, False
 
@@ -154,6 +181,11 @@ class Watchlist(_EntryList):
             symbol=code,
             name=name,
             sector=sector,
+            industries=list(industries or []),
+            industry=industry,
+            industry_leaf=industry_leaf,
+            industry_path=industry_path,
+            concepts=list(concepts or []),
             source=source,
             note=note,
             score=score,

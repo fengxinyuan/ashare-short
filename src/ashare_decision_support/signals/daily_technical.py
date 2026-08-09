@@ -1,19 +1,14 @@
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from statistics import fmean
-from typing import Any
-import html
 
 from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, PriceLevel
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(value, high))
-
+from ashare_decision_support.numeric import clamp
+from ashare_decision_support.signals.series import normalize_bars
 
 # 止损距离的上下限，单位是标的自身的 ATR。低于下限的止损是随机噪声（必被打掉），
 # 高于上限的止损保护不了任何东西。用 ATR 而非固定百分比，理由见 `_stop_reference`。
@@ -135,35 +130,10 @@ class DailyTechnicalAnalyzer:
         if not candidate or candidate <= 0:
             candidate = ceiling
         # 支撑在现价上方时它不是支撑，退回到按波幅算的位置。
-        return round(_clamp(min(candidate, ceiling), floor, ceiling), 4)
+        return round(clamp(min(candidate, ceiling), floor, ceiling), 4)
 
     def _normalize_rows(self, bars: list[dict]) -> list[dict]:
-        rows: list[dict] = []
-        for row in bars:
-            if not isinstance(row, dict):
-                continue
-            close = self._float(row, "close", "收盘")
-            open_price = self._float(row, "open", "开盘")
-            high = self._float(row, "high", "最高")
-            low = self._float(row, "low", "最低")
-            volume = self._float(row, "volume", "成交量")
-            timestamp = self._datetime(row.get("timestamp") or row.get("date") or row.get("日期") or row.get("时间"))
-            if close is None:
-                continue
-            open_price = close if open_price is None else open_price
-            high = max(open_price, close) if high is None else high
-            low = min(open_price, close) if low is None else low
-            rows.append(
-                {
-                    "timestamp": timestamp,
-                    "open": open_price,
-                    "high": high,
-                    "low": low,
-                    "close": close,
-                    "volume": 0.0 if volume is None else volume,
-                }
-            )
-        return sorted(rows, key=lambda item: item["timestamp"])
+        return normalize_bars(bars)
 
     def _moving_average(self, values: list[float], window: int) -> float | None:
         if len(values) < window:
@@ -199,7 +169,7 @@ class DailyTechnicalAnalyzer:
         span = high - low
         if span <= 0:
             return 0.5
-        return round(_clamp((rows[-1]["close"] - low) / span, 0.0, 1.0), 4)
+        return round(clamp((rows[-1]["close"] - low) / span, 0.0, 1.0), 4)
 
     def _trend_state(self, last_close: float, ma20: float | None, ma60: float | None) -> TrendState:
         if ma20 is None or ma60 is None:
@@ -377,35 +347,6 @@ class DailyTechnicalAnalyzer:
             "volume": row["volume"],
         }
 
-    def _float(self, row: dict, *keys: str) -> float | None:
-        for key in keys:
-            value = row.get(key)
-            if value in (None, "", "-"):
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def _datetime(self, value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value
-        if value is None:
-            return datetime.now()
-        if isinstance(value, (int, float)):
-            ts = float(value)
-            if ts > 1e12:
-                ts /= 1000.0
-            return datetime.fromtimestamp(ts)
-        text = str(value)
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
-            try:
-                return datetime.strptime(text, fmt)
-            except ValueError:
-                continue
-        return datetime.fromisoformat(text)
-
 
 class DailyKChartRenderer:
     def __init__(self, width: int = 1200, height: int = 760) -> None:
@@ -509,12 +450,6 @@ class DailyKChartRenderer:
 
         parts.append("</svg>")
         return "".join(parts)
-
-    def render_to_file(self, snapshot: DailyTechnicalSnapshot, output_path: str | Path) -> str:
-        svg = self.render_svg(snapshot)
-        path = Path(output_path)
-        path.write_text(svg, encoding="utf-8")
-        return str(path)
 
     def _add_ma(self, parts: list[str], bars: list[dict], window: int, color: str, px, py) -> None:
         if len(bars) < window:

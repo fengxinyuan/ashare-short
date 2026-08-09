@@ -28,10 +28,15 @@ from __future__ import annotations
 
 import json
 import urllib.request
-from datetime import date, datetime, timezone, timedelta
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
+from ashare_decision_support.fanout import gather
+from ashare_decision_support.news.balance import retain_market_docs
 from ashare_decision_support.news.base import NewsDoc, NewsSource
+from ashare_decision_support.news.cache import NewsCache
+from ashare_decision_support.news.health import probe_feeds
 
 BASE_URL = "https://api-one.wallstcn.com/apiv1/content/lives?channel={channel}&limit={limit}"
 CURSOR_SUFFIX = "&cursor={cursor}"
@@ -67,20 +72,21 @@ class WallstreetNewsSource(NewsSource):
         channels: tuple[str, ...] = (CHANNEL_GLOBAL, CHANNEL_A_SHARE),
         lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
         max_pages: int = MAX_PAGES,
+        cache: NewsCache | None = None,
     ) -> None:
         self._opener = opener or urllib.request.urlopen
         self.timeout = timeout
         self.channels = channels
         self.lookback_hours = lookback_hours
         self.max_pages = max_pages
+        self.cache = cache
+        self.last_market_stats: dict[str, object] = {}
 
     # ---- market-wide -----------------------------------------------------
 
     def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
         docs: list[NewsDoc] = []
         notes: list[str] = []
-        failed: list[str] = []
-
         # 截止时间锚在 `trade_date` 当天 24:00，而不是 `now`——这样同一个交易日
         # 无论几点跑，取回的窗口都一样，盘前跑两次不会得到两份不同的输入。
         cutoff = int(
@@ -91,12 +97,19 @@ class WallstreetNewsSource(NewsSource):
             ).timestamp()
         )
 
-        for channel in self.channels:
-            got, ok = self._channel(channel, cutoff)
-            if not ok:
-                failed.append(channel)
-                continue
-            docs.extend(got)
+        # 两个频道各自要翻十几页，彼此没有依赖。并发之后这一段的墙钟时间由**翻页
+        # 更深的那个频道**决定，而不是两个频道之和。
+        fetched, unreachable = gather(
+            self.channels, lambda channel: self._channel_docs(trade_date, channel, cutoff)
+        )
+        # `_channel` 自己不抛异常，翻第一页就失败时返回 ok=False；两种失败都要
+        # 进同一条 note，否则「频道挂了」会读起来像「今天这个频道没消息」。
+        partial = {channel for channel, (_, ok) in fetched if not ok}
+        dead = {channel for channel, _exc in unreachable}
+        failed = [channel for channel in self.channels if channel in partial or channel in dead]
+        for _, (got, ok) in fetched:
+            if ok:
+                docs.extend(got)
 
         if failed:
             notes.append(
@@ -115,7 +128,11 @@ class WallstreetNewsSource(NewsSource):
         notes.append(
             f"华尔街见闻快讯 {len(result)} 条（宏观数据发布与海外流动性），回溯至 {oldest}"
         )
-        return result[:limit], notes
+        # 这一路的 `raw_by_source` 交给文档自报：两个频道混在一起去重之后，一条
+        # 快讯来自哪个频道已经无从分辨，而它自报的 `source` 才是下游按来源配额
+        # 分配时真正用的那个键。
+        result, self.last_market_stats = retain_market_docs(result, limit)
+        return result, notes
 
     def fetch_for_symbols(
         self, symbols: list[str], limit: int = 10
@@ -129,16 +146,53 @@ class WallstreetNewsSource(NewsSource):
     def fetch_dragon_tiger(self, start: date, end: date) -> tuple[list[dict], list[str]]:
         return [], []
 
+    def health_check(self) -> dict[str, Any]:
+        # 只探第一页：这里问的是「频道还通不通」，翻满 16 页是取数的事。
+        return probe_feeds(
+            "wallstreetcn",
+            self.channels,
+            lambda channel: channel,
+            lambda channel: (self._page(channel, None) or {}).get("items") or [],
+        )
+
     # ---- internals -------------------------------------------------------
 
-    def _channel(self, channel: str, cutoff: int | None) -> tuple[list[NewsDoc], bool]:
+    def _channel_docs(
+        self, trade_date: date, channel: str, cutoff: int | None
+    ) -> tuple[list[NewsDoc], bool]:
+        """带缓存的单频道取数。缓存命中直接算成功。
+
+        这一路是四路源里最贵的：一个频道最多翻 16 页、每页 100 条，两个频道就是
+        32 个往返。盘前重跑一次就再来一遍，而 `cutoff` 已经锚死在交易日 24:00，
+        同一天翻回来的本来就该是同一批——那就没有理由再打一次。
+
+        **只缓存翻完整的那次。** `_channel` 中途失败会返回已经拿到的半截加
+        `ok=True`（有多少算多少），把半截写进缓存等于让后面每一次重跑都只看到
+        半截，而且看不出来。半截值得用，不值得记住。
+        """
+        key = f"wallstreet_{channel}"
+        if self.cache is not None:
+            cached = self.cache.read_docs(trade_date, key)
+            if cached is not None:
+                return cached, True
+        docs, ok, complete = self._channel(channel, cutoff)
+        if ok and complete and self.cache is not None:
+            self.cache.write_docs(trade_date, key, docs)
+        return docs, ok
+
+    def _channel(self, channel: str, cutoff: int | None) -> tuple[list[NewsDoc], bool, bool]:
+        """返回 (文档, 这一路算不算取到, 是否翻完整)。
+
+        第三个值只给缓存用。翻页中途挂掉时前两个值仍然是「有多少算多少」——那是
+        这一路一贯的降级约定，不因为多了个缓存就改。
+        """
         docs: list[NewsDoc] = []
         cursor: str | None = None
         for _ in range(max(self.max_pages, 1)):
             try:
                 payload = self._page(channel, cursor)
             except Exception:
-                return docs, bool(docs)
+                return docs, bool(docs), False
             items = payload.get("items")
             if not isinstance(items, list) or not items:
                 break
@@ -153,7 +207,7 @@ class WallstreetNewsSource(NewsSource):
             cursor = payload.get("next_cursor")
             if not cursor:
                 break
-        return docs, True
+        return docs, True, True
 
     def _page(self, channel: str, cursor: str | None) -> dict:
         url = BASE_URL.format(channel=channel, limit=PAGE_LIMIT)

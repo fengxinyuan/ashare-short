@@ -134,6 +134,41 @@ def _trade_context_summary(item: Any) -> str | None:
     return _join(parts) if parts else None
 
 
+_SCORE_COMPONENT_LABELS = {
+    "sector_relation": "板块关系",
+    "capital_flow": "资金",
+    "volume_price": "量价",
+    "catalyst": "事件催化",
+}
+
+
+def _score_attribution(item: Any) -> str | None:
+    """Render the deterministic score as technical baseline plus context deltas."""
+    components = getattr(item, "score_components", None)
+    if not isinstance(components, dict):
+        return None
+
+    technical = components.get("technical")
+    news = components.get("news")
+    context_delta = components.get("context_delta")
+    detail = [
+        f"{label} {value:+.1f}"
+        for key, label in _SCORE_COMPONENT_LABELS.items()
+        if isinstance((value := components.get(key)), (int, float)) and value
+    ]
+    parts: list[str] = []
+    if isinstance(technical, (int, float)):
+        parts.append(f"价格/结构基准 {technical:.1f}")
+    if isinstance(news, (int, float)) and news:
+        parts.append(f"个股舆情 {news:+.1f}")
+    if isinstance(context_delta, (int, float)):
+        suffix = f"（{'、'.join(detail)}）" if detail else ""
+        parts.append(f"上下文 {context_delta:+.1f}{suffix}")
+    elif detail:
+        parts.append("、".join(detail))
+    return "；".join(parts) or None
+
+
 def _render_notes_section(notes: list[str], heading: str = "数据边界") -> list[str]:
     if not notes:
         return []
@@ -676,6 +711,9 @@ def render_advice_brief(trade_date, advices: list, data_notes: list[str] | None 
         trade_summary = _trade_context_summary(item)
         if trade_summary:
             lines.append("- 交易数据：" + trade_summary)
+        attribution = _score_attribution(item)
+        if attribution:
+            lines.append("- 评分归因：" + attribution)
         distribution = getattr(item, "distribution", None) or {}
         if distribution.get("verdict"):
             lines.append(
@@ -974,3 +1012,84 @@ def render_feed_suspension(health) -> str:
             DISCLAIMER,
         ]
     )
+
+
+# ---- 板块告警 --------------------------------------------------------------
+
+# 与文件顶部的 `SECTOR_CAVEAT` 是两件事：那条讲的是**盘后板块打分**的权重未经
+# 回测，这条讲的是**盘中截面**根本不打分。名字必须分开——同名会静默覆盖，
+# 而覆盖之后盘前简报底部会印出一句和它无关的免责声明。
+INTRADAY_SECTOR_CAVEAT = (
+    "> 板块读数按**超额涨幅**（板块成分股涨幅中位数 − 全市场中位数）排序，"
+    "只回答「此刻资金在哪」，**不打分、不进选股链路、不预测下一步**。"
+    "成交额是双边的，占比高说明注意力集中，不等于净流入。"
+)
+
+# 每条板块触发器对应的动作口径。和 `_alert_action_line` 同一个用途：
+# 「排名跃升」是读数，「先看这里，再从里面挑票」才是接下来要做的事。
+_SECTOR_ACTION = {
+    "session_open": "开盘定位：先确认今天的钱在哪几条线上。",
+    "rank_surge": "资金正在往这里挪：先看这个方向，再从里面找票，不要直接追已经拉起来的那只。",
+    "tone_strong": "整体转强：板块级别的强，不是个别票的强。",
+    "limit_up_wave": "涨停潮：情绪最集中的位置，也是最容易买在顶上的位置。",
+    "amount_surge": "注意力在集中：成交额占比放大，但这不是净流入。",
+    "fade": "领涨板块退潮：手上属于这个方向的仓位需要一个决定，不必等个股跌到止损位。",
+    "rank_slide": "排名下滑：这个方向今天已经不是主线。",
+}
+
+
+def sector_alert_title(alerts: list) -> str:
+    """标题是通知栏里唯一看得见的那一行，所以点名**具体板块**而不是只报条数。
+
+    「板块异动 3 条」和「有色金属 排名跃升 14→1 等 3 条」决定他要不要现在打开。
+    同 `alert_title` 的理由。
+    """
+    if not alerts:
+        return "盘中板块观察"
+    action = sum(1 for item in alerts if getattr(item, "level", "") == "ACTION")
+    lead = alerts[0]
+    name = getattr(lead, "sector", "") or "板块"
+    label = getattr(lead, "label", "")
+    head = f"{name} {label}" if name != "板块" else label
+    if len(alerts) == 1:
+        return f"板块异动：{head}"
+    suffix = f"（含 {action} 条 ACTION）" if action else ""
+    return f"板块异动：{head} 等 {len(alerts)} 条{suffix}"
+
+
+def render_sector_alerts(alerts: list, snapshot=None) -> str:
+    """板块告警卡片。与 `render_alerts` 同为模板渲染，不碰 LLM——理由见
+    `docs/ARCHITECTURE.md` §五：告警是时效敏感的，加两秒网络延迟买不到任何东西。
+    """
+    lines: list[str] = []
+    ordered = list(alerts)
+
+    lines.append("## 先看哪里")
+    for alert in ordered:
+        badge = LEVEL_BADGE.get(getattr(alert, "level", ""), "•")
+        trigger = str(getattr(alert, "trigger", ""))
+        action = _SECTOR_ACTION.get(trigger, "")
+        lines.append(f"- {badge} **{alert.headline}**" + (f"　{action}" if action else ""))
+
+    lines.append("")
+    lines.append("## 触发依据")
+    for alert in ordered:
+        badge = LEVEL_BADGE.get(getattr(alert, "level", ""), "•")
+        stamp = f"{alert.as_of:%H:%M}" if getattr(alert, "as_of", None) else "时间未知"
+        # 命中自选/持仓的板块标出来。同一条「退潮」，发生在你有仓位的方向上
+        # 和发生在一个你没碰过的方向上，紧急程度差一个量级。
+        flag = "【关联自选】" if getattr(alert, "touches_watchlist", False) else ""
+        lines.append(f"{badge} **[{alert.level}] {flag}{alert.headline}**　as-of {stamp}")
+        lines.extend(f"　{item}" for item in getattr(alert, "detail", []) or [])
+        lines.append("")
+
+    if snapshot is not None and getattr(snapshot, "market_median_pct", None) is not None:
+        breadth = getattr(snapshot, "breadth_advance", None)
+        lines.append(
+            f"> 当前全市场：中位涨幅 {snapshot.market_median_pct:+.2f}%"
+            + (f"，上涨占比 {breadth:.0%}" if breadth is not None else "")
+            + f"，成交额 {snapshot.market_amount_yi:.0f} 亿。"
+        )
+    lines.append(INTRADAY_SECTOR_CAVEAT)
+    lines.append(DISCLAIMER)
+    return "\n".join(lines).strip()

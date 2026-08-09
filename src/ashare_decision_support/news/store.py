@@ -35,11 +35,12 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing, contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.dedup import dedup_key, parse_published
@@ -351,12 +352,9 @@ class NewsStore:
                 ).fetchall()
                 if not rows:
                     return []
-                sources = {
-                    key: count
-                    for key, count in conn.execute(
+                sources = dict(conn.execute(
                         "SELECT key, COUNT(*) FROM doc_sources GROUP BY key"
-                    ).fetchall()
-                }
+                    ).fetchall())
         except Exception:
             return []
 

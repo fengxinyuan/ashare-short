@@ -1,8 +1,16 @@
-"""Post-close job: pull daily bars, score the watchlist, publish the brief.
+"""盘后：给自选股与持仓打分，产出次日执行卡。
 
-This is the only job that fully works on the TickFlow free tier, which serves
-daily bars and nothing else. It runs after the close, when the day's daily bar
-is final.
+和 `morning.py` 相反：那个从全市场出发自上而下选票，这个给**你已经在盯的那批**
+打分。两者共用同一段选股逻辑（`strategy/select.py`），所以两张表的分数可比。
+
+**改造前这条链路走的是另一套规则。** 它把加权分数直接喂进 `research.py` 的矩阵
+管线，那套管线自带一份阶跃函数的仓位算法和一套四档市场状态字符串，与盘前链路的
+`EmotionCycle` 七档互不映射——于是盘后给出的次日候选，用的正是盘前明确否定过的
+逻辑，而两边没有任何地方对账。矩阵管线已随本次改造删除。
+
+**自选股不做隐式过滤。** 打法门槛在这里只做**标注**不做剔除（`require_playbook=
+False`）：这批票是你自己放进来的，「今天没有可用打法」是一个要说出口的结论，不是
+让它从表里消失的理由。同一条口径见 `jobs/advise.py` 对 ST 标的的处理。
 """
 
 from __future__ import annotations
@@ -11,26 +19,26 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from ashare_decision_support.agents.debate import DebatePanel
-from ashare_decision_support.models.enums import Route
-from ashare_decision_support.models.schemas import (
-    CandidateBlueprint,
-    DailyTechnicalSnapshot,
-    DecisionMatrix,
-    MarketContext,
-    MatrixBuildConfig,
-    ResearchInput,
-    SectorBlueprint,
+from ashare_decision_support.adapters.base import (
+    apply_security_metadata_rows,
+    float_shares,
+    metadata_names,
+    security_metadata,
 )
+from ashare_decision_support.agents.debate import DebatePanel
+from ashare_decision_support.jobs.sources import fetch_lhb_seats, fetch_limit_pool, fetch_trade_flow
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_post_close_brief
-from ashare_decision_support.notify.base import Notifier
-from ashare_decision_support.research import ResearchPipeline, load_research_input
-from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
-from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
-from ashare_decision_support.signals.dipbuy import measure_dip
+from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.scoring import (
+    RuleBasedScoreProvider,
+    ScoreProvider,
+    build_factor_contexts,
+)
+from ashare_decision_support.strategy.positioning import resolve_position_sizing
+from ashare_decision_support.strategy.regime import regime_from_limit_pool
+from ashare_decision_support.strategy.select import evaluate_universe
 
-WATCHLIST_SECTOR = "自选"
-MATRIX_LATEST_NAME = "decision_matrix_latest.json"
+POST_CLOSE_LATEST_NAME = "post_close_latest.json"
 SNAPSHOT_LATEST_NAME = "snapshots_latest.json"
 
 
@@ -40,13 +48,19 @@ def run_post_close(
     output_dir: str | Path,
     days: int = 180,
     strategy_version: str = "rule-v1",
-    position_factor: float = 0.5,
-    research_input_path: str | Path | None = None,
+    position_factor: float | None = None,
     score_provider: ScoreProvider | None = None,
     notifiers: list[Notifier] | None = None,
     top_n: int | None = None,
     debate: DebatePanel | None = None,
     trade_date: date | None = None,
+    limit_pool_adapter: Any | None = None,
+    use_limit_pool: bool = True,
+    detail_adapter: Any | None = None,
+    security_master_adapter: Any | None = None,
+    use_trade_flow: bool = True,
+    lhb_seat_adapter: Any | None = None,
+    use_lhb_seats: bool = True,
 ) -> dict[str, Any]:
     provider = score_provider or RuleBasedScoreProvider()
     end = trade_date or date.today()
@@ -56,169 +70,156 @@ def run_post_close(
     usable = {symbol: rows for symbol, rows in bars_by_symbol.items() if rows}
     data_notes = _data_notes(adapter, symbols, usable, end)
 
-    snapshots = DailyTechnicalAnalyzer().analyze_many(usable)
-    wyckoff_by_symbol = {signal.symbol: signal for signal in WyckoffAnalyzer().analyze_many(usable)}
-
-    results = provider.score_many(
-        [
-            ScoreInput(
-                symbol=symbol,
-                bars=rows,
-                snapshot=snapshots[symbol],
-                wyckoff=wyckoff_by_symbol.get(symbol),
-                # 必须和盘前同口径：少给 dip，这条链路的分数会系统性偏低，
-                # 盘前盘后两张表就不可比了。
-                dip=measure_dip(rows, snapshots[symbol]),
-            )
-            for symbol, rows in usable.items()
-            if symbol in snapshots
-        ]
+    # 情绪周期闸门。**盘后也要过**——「明天允许哪一类打法、仓位上限多少」是一个
+    # 独立于个股分数的判断，而次日执行卡正是拿来照着做的那张纸。
+    limit_snapshot = fetch_limit_pool(
+        limit_pool_adapter,
+        end,
+        enabled=use_limit_pool,
+        notes=data_notes,
+        off_note="已关闭涨停池读数，本次无情绪周期判定",
     )
-    if top_n is not None:
-        results = results[:top_n]
+    regime = regime_from_limit_pool(limit_snapshot)
+    data_notes.extend(regime.reasons)
+    data_notes.extend(regime.warnings)
 
-    matrix = _build_matrix(
-        results=results,
-        snapshots=snapshots,
-        usable=usable,
-        strategy_version=strategy_version,
-        position_factor=position_factor,
-        research_input_path=research_input_path,
-        fallback_date=end,
+    trade_flow = fetch_trade_flow(
+        detail_adapter,
+        list(usable),
+        enabled=use_trade_flow,
+        notes=data_notes,
+        off_note="已关闭逐笔资金旁证，本次盘后卡不含主动买卖摘要",
+        subject="本次盘后卡",
     )
-    _attach_scores(matrix, results)
+    factor_contexts = build_factor_contexts(
+        [],
+        {},
+        trade_flow_by_symbol=trade_flow,
+    )
+    metadata = security_metadata(adapter, list(usable), security_master_adapter)
+    names = metadata_names(metadata, list(usable))
+    # 换手率与筹码分布都要流通股本；缺了这两项整体弃权，其余读数照算。
+    shares = float_shares(adapter, list(usable))
+    if not shares:
+        data_notes.append("未取到流通股本，本次无换手率与筹码分布估算")
+    result = evaluate_universe(
+        usable,
+        float_shares=shares,
+        regime=regime,
+        names=names,
+        contexts=factor_contexts,
+        provider=provider,
+        # 见模块 docstring：自选股只标注不剔除。
+        require_playbook=False,
+    )
+    data_notes.extend(result.notes)
 
-    content = render_post_close_brief(matrix, results, snapshots, data_notes)
+    actionable = result.selected[:top_n] if top_n is not None else result.selected
+    watch_only = result.rejected
 
-    # 辩论跑在**已经算完的**结论上，输入只有 facts。文档里写的「盘前与盘后各一次」
-    # 到这里才真正成立——在此之前只有盘前跑。
-    facts = _facts(matrix, results, snapshots, data_notes)
+    sizing = resolve_position_sizing(
+        cycle_label=regime.cycle.value,
+        cycle_cap=regime.position_cap,
+        manual_factor=position_factor,
+    )
+    data_notes.extend(sizing.notes)
+    effective_factor = sizing.effective_factor
+
+    trade_date_resolved = _latest_bar_date(usable, end)
+    lhb_seats = fetch_lhb_seats(
+        lhb_seat_adapter, list(usable), trade_date_resolved, enabled=use_lhb_seats, notes=data_notes
+    )
+    actionable_rows = _attach_lhb_seats(_attach_trade_flow(
+        apply_security_metadata_rows([item.to_row() for item in actionable], metadata),
+        trade_flow,
+    ), lhb_seats)
+    watch_only_rows = _attach_lhb_seats(_attach_trade_flow(
+        apply_security_metadata_rows([item.to_row() for item in watch_only], metadata),
+        trade_flow,
+    ), lhb_seats)
+    payload = {
+        "trade_date": str(trade_date_resolved),
+        "kind": "post_close",
+        "strategy_version": strategy_version,
+        "regime": regime.to_dict(),
+        "position_factor": effective_factor,
+        "actionable": actionable_rows,
+        "watch_only": watch_only_rows,
+        "data_notes": data_notes,
+    }
+
+    content = render_post_close_brief(payload)
+
+    # 辩论跑在**已经算完的**结论上，输入只有 facts。
     if debate is not None:
-        debated = debate.run(facts)
+        debated = debate.run(payload)
         data_notes.extend(debated.notes)
         block = debated.markdown()
         if block:
             content = f"{content}\n\n## 多空视角\n\n{block}"
 
-    title = f"盘后简报 {matrix.trade_date}"
-
+    title = f"盘后简报 {trade_date_resolved}"
     file_notifier = FileNotifier(output_dir, slug="post-close")
     channels = notifiers if notifiers is not None else [ConsoleNotifier(), file_notifier]
-    delivered = [notifier.capabilities.channel for notifier in channels if notifier.send(title, content)]
+    delivered = publish(channels, title, content)
 
-    # Hand off to the pre-open run.
-    file_notifier.write_payload(matrix.model_dump(mode="json"), MATRIX_LATEST_NAME)
+    # 交给次日盘前那一步。
+    file_notifier.write_payload(payload, POST_CLOSE_LATEST_NAME)
     file_notifier.write_payload(
-        {symbol: snapshot.model_dump(mode="json") for symbol, snapshot in snapshots.items()},
+        {
+            symbol: snapshot.model_dump(mode="json")
+            for symbol, snapshot in _snapshots_of(result).items()
+        },
         SNAPSHOT_LATEST_NAME,
     )
 
     return {
         "title": title,
-        "trade_date": str(matrix.trade_date),
-        "scored": len(results),
+        "trade_date": str(trade_date_resolved),
+        "scored": len(actionable) + len(watch_only),
+        "actionable": len(actionable),
+        "watch_only": len(watch_only),
         "requested": len(symbols),
+        "regime": regime.cycle.value,
+        "position_factor": effective_factor,
         "delivered": delivered,
         "data_notes": data_notes,
-        "matrix_path": str(Path(output_dir) / MATRIX_LATEST_NAME),
+        "payload_path": str(Path(output_dir) / POST_CLOSE_LATEST_NAME),
         "brief_path": str(file_notifier.last_path) if file_notifier.last_path else None,
         "content": content,
     }
 
 
-def _facts(
-    matrix: DecisionMatrix,
-    results: list,
-    snapshots: dict[str, DailyTechnicalSnapshot],
-    data_notes: list[str],
-) -> dict[str, Any]:
-    """辩论层与 LLM 唯一能看到的东西。所有数字都出自确定性层。"""
-    by_symbol = {result.symbol: result for result in results}
+# ---- helpers -------------------------------------------------------------
+
+
+def _snapshots_of(result: Any) -> dict[str, Any]:
     return {
-        "trade_date": str(matrix.trade_date),
-        "strategy_version": matrix.strategy_version,
-        "position_band_factor": matrix.position_band_factor,
-        "symbols": [
-            {
-                "symbol": symbol,
-                "score": by_symbol[symbol].score if symbol in by_symbol else None,
-                "last_close": snapshot.last_close,
-                "trend_state": snapshot.trend_state.value,
-                "volume_ratio_20d": snapshot.volume_ratio_20d,
-                "range_position_60d": snapshot.range_position_60d,
-                "stop_reference": snapshot.stop_reference,
-                "target_reference": snapshot.target_reference,
-                "reasons": by_symbol[symbol].reasons if symbol in by_symbol else [],
-                "warnings": by_symbol[symbol].warnings if symbol in by_symbol else [],
-            }
-            for symbol, snapshot in snapshots.items()
-        ],
-        "data_notes": data_notes,
+        item.symbol: item.snapshot for item in list(result.selected) + list(result.rejected)
     }
 
 
-def _attach_scores(matrix: DecisionMatrix, results: list) -> None:
-    """Carry the score and its warnings into the matrix.
+def _attach_trade_flow(
+    rows: list[dict[str, Any]],
+    trade_flow: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    attached: list[dict[str, Any]] = []
+    for row in rows:
+        copied = dict(row)
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol in trade_flow:
+            copied["trade_flow"] = dict(trade_flow[symbol])
+        attached.append(copied)
+    return attached
 
-    The pre-open card is what gets read at decision time, so risk flags have to
-    survive the handoff rather than living only in the post-close markdown.
-    """
-    by_symbol = {result.symbol: result for result in results}
-    for candidate in matrix.candidates:
-        result = by_symbol.get(candidate.symbol)
-        if result is None:
-            continue
-        candidate.research_score = result.score
-        candidate.warnings = list(result.warnings)
 
-
-def _build_matrix(
-    results: list,
-    snapshots: dict[str, DailyTechnicalSnapshot],
-    usable: dict[str, list[dict]],
-    strategy_version: str,
-    position_factor: float,
-    research_input_path: str | Path | None,
-    fallback_date: date | None = None,
-) -> DecisionMatrix:
-    if research_input_path:
-        return ResearchPipeline().build_matrix(load_research_input(research_input_path))
-
-    trade_date = _latest_bar_date(usable, fallback_date)
-    blueprints = [
-        CandidateBlueprint(
-            symbol=result.symbol,
-            sector=WATCHLIST_SECTOR,
-            thesis=("；".join(result.reasons) if result.reasons else "规则打分入选"),
-            priority_score=result.score,
-        )
-        for result in results
+def _attach_lhb_seats(rows: list[dict[str, Any]], readings: dict[str, dict]) -> list[dict[str, Any]]:
+    return [
+        {**row, "lhb_seats": dict(readings[row["symbol"]])}
+        if row.get("symbol") in readings
+        else dict(row)
+        for row in rows
     ]
-
-    research_input = ResearchInput(
-        trade_date=trade_date,
-        strategy_version=strategy_version,
-        # No market-breadth feed on the free tier, so the position factor is an
-        # explicit operator input rather than something inferred from bad data.
-        market_context=MarketContext(
-            limit_down_count=0,
-            blowup_rate=0.0,
-            breadth_score=0.0,
-            manual_position_factor=position_factor,
-        ),
-        sectors=[SectorBlueprint(name=WATCHLIST_SECTOR, route=Route.MAINLINE, policy_score=0.0)],
-        candidates=blueprints,
-    )
-    # A hand-picked watchlist has already passed sector selection by definition,
-    # so drop the sector threshold instead of faking a score that clears it.
-    config = MatrixBuildConfig(
-        mainline_min_sector_score=0.0,
-        max_mainline_sectors=1,
-        max_candidates_per_sector=max(len(blueprints), 1),
-    )
-    return ResearchPipeline(config).build_matrix(research_input)
-
-
 def _latest_bar_date(usable: dict[str, list[dict]], fallback: date | None = None) -> date:
     latest: date | None = None
     for rows in usable.values():

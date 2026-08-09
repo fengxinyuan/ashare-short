@@ -3,6 +3,10 @@
 `monitor/` 负责判断（时效闸门、跃迁触发、降频），这里负责取名单、建会话、决定
 跑一轮还是跑一天，以及**把当日公告喂进去**——`risk_notice` 那条 WARN 触发器在
 代码里一直存在，但在此之前没有任何调用点给它数据，等于结构上永不触发。
+
+**板块监控不依赖名单。** 个股那条链路要自选股或候选池才有东西可盯；板块截面读的
+是全市场，空仓的日子照样有话说——而空仓的日子恰恰是最需要「现在该看哪个方向」的
+那一天。所以名单为空时不再整体 return，只跳过个股那一半。
 """
 
 from __future__ import annotations
@@ -11,13 +15,24 @@ from datetime import date, datetime
 from typing import Any
 
 from ashare_decision_support.adapters.freshness import in_session
+from ashare_decision_support.adapters.snapshot import default_snapshot_adapter
 from ashare_decision_support.adapters.tickflow_intraday import build_intraday_adapter
 from ashare_decision_support.monitor import DEFAULT_LEVELS, MonitorSession, run_monitor_loop
+from ashare_decision_support.monitor.sector_session import (
+    SECTOR_EVERY,
+    SectorSession,
+    publish_sector_alerts,
+)
 from ashare_decision_support.monitor.session import MONITOR_PERIOD
 from ashare_decision_support.news import AkshareNewsSource, NewsCache
 from ashare_decision_support.notify import ConsoleNotifier
-from ashare_decision_support.notify.base import Notifier
-from ashare_decision_support.notify.render import render_alerts, render_feed_suspension
+from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.notify.render import (
+    alert_title,
+    render_alerts,
+    render_feed_suspension,
+)
+from ashare_decision_support.schedule.timezone import beijing_now, beijing_today
 from ashare_decision_support.state import CandidatePool, Watchlist
 
 
@@ -34,9 +49,14 @@ def run_monitor(
     now: datetime | None = None,
     news_source: Any | None = None,
     news_cache_dir: str | None = None,
+    snapshot_adapter: Any | None = None,
+    use_order_book: bool = True,
+    sectors: bool = True,
+    sector_every: int = SECTOR_EVERY,
+    sector_session: Any | None = None,
 ) -> dict[str, Any]:
-    today = trade_date or date.today()
-    moment = now or datetime.now()
+    today = trade_date or beijing_today()
+    moment = now or beijing_now()
     channels = notifiers if notifiers is not None else [ConsoleNotifier()]
 
     # 显式给了标的就只盯它；否则自选股 + 当日候选池。
@@ -48,15 +68,23 @@ def run_monitor(
         pool = CandidatePool(today=today)
         candidates = [item for item in pool.symbols() if item not in set(watch)]
 
+    notes: list[str] = []
+    sector = _build_sector_session(
+        enabled=sectors, provided=sector_session, today=today, symbols=symbols, notes=notes
+    )
+
     if not watch and not candidates:
-        return {
-            "trade_date": str(today),
-            "watch": 0,
-            "candidates": 0,
-            "passes": 0,
-            "alerts": 0,
-            "notes": ["自选股与候选池都为空，先用 `ashare-ds watchlist add <代码>` 加入标的"],
-        }
+        notes.append("自选股与候选池都为空，本次只跑板块监控；加标的用 `ashare-ds watchlist add <代码>`")
+        if sector is None:
+            return {
+                "trade_date": str(today),
+                "watch": 0,
+                "candidates": 0,
+                "passes": 0,
+                "alerts": 0,
+                "notes": [*notes, "板块监控也未启用，本次没有任何可做的事"],
+            }
+        return _sector_only(sector, channels, today, moment, once, max_passes, sector_every, notes)
 
     source = intraday_adapter or build_intraday_adapter(adapter)
     session = MonitorSession(
@@ -65,8 +93,13 @@ def run_monitor(
         session_date=today,
         levels=alert_levels,
         period=period,
+        snapshot_adapter=(
+            snapshot_adapter
+            if snapshot_adapter is not None
+            else (default_snapshot_adapter() if use_order_book else None)
+        ),
     )
-    notes = session.prime(watch + candidates)
+    notes.extend(session.prime(watch + candidates))
     # 持仓在 prime 之后加载：已持仓的票要盯的是卖点（止损/目标/结构破坏/时间止损），
     # 未持仓的盯买点。两套判断的紧急程度不同，没有这一步 monitor 分不清。
     notes.extend(session.load_positions(book))
@@ -78,13 +111,14 @@ def run_monitor(
     if once or max_passes == 1:
         result = session.poll(watch, candidates, moment, in_session=in_session(moment))
         notes.extend(result.notes)
+        # 走 `publish` 而不是逐个 `channel.send`：投递是副作用，一个渠道的契约
+        # 违约（webhook 404、磁盘满）不该让这一轮监控整个抛出去。循环那一侧
+        # 一直是这么做的，单轮这一侧此前不是——同一件事按调用路径有两种韧性。
         if result.alerts:
-            content = render_alerts(result.alerts, result.health)
-            for channel in channels:
-                channel.send(f"盘中告警 {len(result.alerts)} 条", content)
+            publish(channels, alert_title(result.alerts), render_alerts(result.alerts, result.health))
         elif not result.health.usable:
-            for channel in channels:
-                channel.send("分时监控状态", render_feed_suspension(result.health))
+            publish(channels, "分时监控状态", render_feed_suspension(result.health))
+        sector_summary = _sector_pass(sector, channels, moment, notes)
         return {
             "trade_date": str(today),
             "watch": len(watch),
@@ -94,21 +128,26 @@ def run_monitor(
             "risk_blocked": blocked,
             "feed_verdict": result.health.verdict,
             "feed_reason": result.health.reason,
-            "as_of": result.health.latest.isoformat(timespec="seconds") if result.health.latest else None,
+            "as_of": result.health.latest.isoformat(timespec="seconds")
+            if result.health.latest
+            else None,
             "alert_list": [_alert_dict(item) for item in result.alerts],
+            **sector_summary,
             "notes": notes,
         }
 
     stats = run_monitor_loop(
         session=session,
         # 每轮重读，这样盘中 `watchlist add` 立刻生效，不用重启监控。
-        watch_symbols=lambda: (list(symbols) if symbols else Watchlist().symbols()),
-        candidate_symbols=lambda: ([] if symbols else CandidatePool(today=today).symbols()),
+        watch_symbols=lambda: list(symbols) if symbols else Watchlist().symbols(),
+        candidate_symbols=lambda: [] if symbols else CandidatePool(today=today).symbols(),
         notifiers=channels,
         max_passes=max_passes,
         # 盘中会新挂临时公告，所以不能只在开盘时读一次；但公告源是整日全量拉取，
         # 每轮都拉是浪费，走慢周期。
         refresh_risk=(lambda: _refresh_risk(session, news, today)[1]) if news is not None else None,
+        sector_session=sector,
+        sector_every=sector_every,
     )
     return {
         "trade_date": str(today),
@@ -120,8 +159,140 @@ def run_monitor(
         "bad_passes": stats.bad_passes,
         "suspensions": stats.suspensions,
         "interval_seconds": stats.interval_seconds,
+        "sector_passes": stats.sector_passes,
+        "sector_alerts": stats.sector_alerts,
         "notes": notes + stats.notes,
     }
+
+
+# ---- 板块那一半 ------------------------------------------------------------
+
+
+def default_sector_session(today: date, symbols: list[str] | None) -> Any:
+    """默认板块会话。**单独一个函数，是为了让测试能把它掐掉。**
+
+    构造本身不打网络（分类与全市场适配器都是懒加载），但第一次 `poll()` 会打
+    56 页新浪扫描。测试里 `run_monitor(once=True)` 因此会静默地发一批真实请求——
+    不会失败，只会让整套测试依赖一个第三方站点。`tests/conftest.py` 把这个函数
+    补成返回 None，与 `default_snapshot_adapter` / `default_earnings_adapter`
+    那几条同一个处置。
+    """
+    return SectorSession(
+        session_date=today,
+        # 板块告警里「你盯着的票在这个板块里」那一行要每轮重读，理由同
+        # `run_monitor_loop` 的 watch_symbols。
+        watch_symbols=lambda: (
+            list(symbols)
+            if symbols
+            else list(Watchlist().symbols()) + list(CandidatePool(today=today).symbols())
+        ),
+    )
+
+
+def _build_sector_session(
+    enabled: bool, provided: Any, today: date, symbols: list[str] | None, notes: list[str]
+) -> Any | None:
+    """构造失败只关掉板块这一半，不影响个股监控。
+
+    分类源要读两个 HTTP 文件，拉不到时 `list_sectors()` 会抛 `SectorTaxonomyError`
+    ——但那发生在第一次 poll，不是构造时。这里挡的是更早的失败（导入、状态目录）。
+    """
+    if provided is not None:
+        return provided
+    if not enabled:
+        return None
+    try:
+        return default_sector_session(today, symbols)
+    except Exception as exc:
+        notes.append(f"板块监控初始化失败（{type(exc).__name__}: {exc}），本次只跑个股监控")
+        return None
+
+
+def _sector_pass(sector: Any, channels: list[Notifier], moment: datetime, notes: list[str]) -> dict:
+    """单轮模式下的板块 pass。循环模式在 `monitor/loop.py:_run_sector_pass`，
+    两者共用 `publish_sector_alerts`——标题与正文只有一份实现。"""
+    if sector is None:
+        return {}
+    try:
+        outcome = sector.poll(moment)
+    except Exception as exc:
+        notes.append(f"板块截面失败（{type(exc).__name__}: {exc}）")
+        return {}
+    notes.extend(outcome.notes or [])
+    return {
+        "sector_passes": 1,
+        "sector_alerts": publish_sector_alerts(channels, outcome),
+        "sector_reads": len(outcome.snapshot.reads) if outcome.snapshot else 0,
+        "sector_alert_list": [_sector_alert_dict(item) for item in outcome.alerts],
+    }
+
+
+def _sector_only(
+    sector: Any,
+    channels: list[Notifier],
+    today: date,
+    moment: datetime,
+    once: bool,
+    max_passes: int | None,
+    sector_every: int,
+    notes: list[str],
+) -> dict[str, Any]:
+    """名单为空时的路径：只跑板块。
+
+    单轮直接跑一次；循环模式借用 `run_monitor_loop` 的节奏与降频，个股那一侧传
+    一个空名单——`MonitorSession.poll` 对空名单的处置本来就是「什么都不做，
+    只报一条 note」，不会产生任何个股告警，也不会打分钟线适配器。
+    """
+    if once or max_passes == 1:
+        summary = _sector_pass(sector, channels, moment, notes)
+        return {
+            "trade_date": str(today),
+            "watch": 0,
+            "candidates": 0,
+            "passes": 0,
+            "alerts": 0,
+            **summary,
+            "notes": notes,
+        }
+
+    stats = run_monitor_loop(
+        session=_NullSession(),
+        watch_symbols=list,
+        candidate_symbols=list,
+        notifiers=channels,
+        max_passes=max_passes,
+        sector_session=sector,
+        sector_every=sector_every,
+    )
+    return {
+        "trade_date": str(today),
+        "watch": 0,
+        "candidates": 0,
+        "passes": stats.passes,
+        "alerts": 0,
+        "sector_passes": stats.sector_passes,
+        "sector_alerts": stats.sector_alerts,
+        "interval_seconds": stats.interval_seconds,
+        "notes": notes + stats.notes,
+    }
+
+
+class _NullSession:
+    """空名单时的个股侧占位。
+
+    比给 `run_monitor_loop` 加一个 `session: MonitorSession | None` 参数干净：
+    那会让循环里每一处用到 `result` 的地方都要判一次 None，而循环的主线本来就是
+    个股。这里返回的健康度是「没有标的可取」，与真实的取数失败可区分。
+    """
+
+    def poll(self, watch, candidates, now, in_session=True):
+        from ashare_decision_support.monitor.feed import assess_feed
+        from ashare_decision_support.monitor.session import PassResult
+
+        return PassResult(
+            health=assess_feed({}, 0, now, None, in_session),
+            notes=["自选股与候选池为空，本轮只跑板块"],
+        )
 
 
 def _default_news_source(cache_dir: str | None) -> Any | None:
@@ -131,7 +302,9 @@ def _default_news_source(cache_dir: str | None) -> Any | None:
         return None
 
 
-def _refresh_risk(session: MonitorSession, news_source: Any | None, today: date) -> tuple[int, list[str]]:
+def _refresh_risk(
+    session: MonitorSession, news_source: Any | None, today: date
+) -> tuple[int, list[str]]:
     """把当日公告里的否决项喂给监控会话。
 
     取不到公告不是错误，是降级：说清楚这一轮没有公告否决输入，然后继续跑。沉默地
@@ -162,4 +335,19 @@ def _alert_dict(alert) -> dict:
         "as_of": alert.as_of.isoformat(timespec="seconds") if alert.as_of else None,
         "lag_minutes": alert.lag_minutes,
         "watchlist": alert.watchlist,
+    }
+
+
+def _sector_alert_dict(alert) -> dict:
+    return {
+        "sector": alert.sector,
+        "sector_level": alert.sector_level,
+        "level": alert.level,
+        "trigger": alert.trigger,
+        "headline": alert.headline,
+        "detail": alert.detail,
+        "rank": alert.rank,
+        "excess_pct": alert.excess_pct,
+        "watch_hits": [list(item) for item in alert.watch_hits],
+        "as_of": alert.as_of.isoformat(timespec="seconds") if alert.as_of else None,
     }

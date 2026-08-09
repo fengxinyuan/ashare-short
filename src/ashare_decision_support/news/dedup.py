@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from ashare_decision_support.news.base import NewsDoc
 
@@ -139,7 +139,7 @@ def weigh_docs(
             continue
 
         duplicates += 1
-        kept_doc, kept_at = existing
+        _kept_doc, kept_at = existing
         if published is not None and (kept_at is None or published < kept_at):
             best[key] = (doc, published)
 
@@ -174,7 +174,3 @@ def age_hours(published: datetime | None, now: datetime) -> float | None:
     if published is None:
         return None
     return round(max(0.0, (now - published).total_seconds() / 3600.0), 1)
-
-
-def window_start(now: datetime, hours: float = MAX_AGE_HOURS) -> datetime:
-    return now - timedelta(hours=hours)

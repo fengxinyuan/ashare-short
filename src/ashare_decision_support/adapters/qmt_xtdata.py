@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
-import json
-from pathlib import Path
+from datetime import date, datetime
 from typing import Any
 
 from ashare_decision_support.adapters.base import MarketDataAdapter
 from ashare_decision_support.adapters.mapping import MappingProfile, PayloadNormalizer
 from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
+from ashare_decision_support.numeric import finite
+from ashare_decision_support.schedule.calendar import parse_trade_date
+from ashare_decision_support.schedule.clock import minutes_since_open
 
 
 class QmtAdapterError(RuntimeError):
@@ -36,7 +37,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
         self.xtdata = xtdata_module
         self.normalizer = PayloadNormalizer(profile)
         self.calendar_market = calendar_market
-        self.subscription_ids: list[int] = []
 
         if auto_connect:
             self.connect()
@@ -47,40 +47,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
             result = connect_fn()
             if result is False:
                 raise QmtAdapterError("xtdata.connect() returned False")
-
-    def subscribe_quotes(self, symbols: list[str]) -> None:
-        subscribe_fn = getattr(self.xtdata, "subscribe_quote", None)
-        if not callable(subscribe_fn):
-            raise QmtAdapterError("xtdata.subscribe_quote is not available")
-        for symbol in symbols:
-            sub_id = self._try_call(
-                subscribe_fn,
-                ((symbol,), {"period": "tick", "count": 0, "callback": None}),
-                ((symbol,), {"period": "tick", "count": 0}),
-                ((symbol, "tick", 0), {}),
-            )
-            if isinstance(sub_id, int):
-                self.subscription_ids.append(sub_id)
-
-    def subscribe_l2_snapshot(self, symbols: list[str]) -> None:
-        subscribe_fn = getattr(self.xtdata, "subscribe_whole_quote", None)
-        if callable(subscribe_fn):
-            sub_id = self._try_call(
-                subscribe_fn,
-                ((symbols,), {"callback": None}),
-                ((symbols,), {}),
-            )
-            if isinstance(sub_id, int):
-                self.subscription_ids.append(sub_id)
-            return
-        self.subscribe_quotes(symbols)
-
-    def subscribe_ticks(self, symbols: list[str]) -> None:
-        self.subscribe_quotes(symbols)
-
-    def subscribe_orders(self, symbols: list[str]) -> None:
-        # Order-detail subscription support varies by local QMT environment.
-        return None
 
     def get_security_master(self, symbols: list[str]) -> dict[str, dict]:
         detail_fn = getattr(self.xtdata, "get_instrument_detail", None)
@@ -119,7 +85,7 @@ class QmtXtDataAdapter(MarketDataAdapter):
         )
         if raw is None:
             return []
-        return [self._parse_calendar_value(item) for item in raw]
+        return [parse_trade_date(item) for item in raw]
 
     def get_auction_features(self, symbols: list[str]) -> dict[str, AuctionFeatures]:
         full_tick = self.get_full_tick_raw(symbols)
@@ -191,10 +157,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
         except Exception as exc:
             snapshot["instrument_detail_error"] = str(exc)
         return snapshot
-
-    def dump_snapshot_to_file(self, symbols: list[str], output_path: str | Path) -> None:
-        payload = self.dump_snapshot(symbols)
-        Path(output_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
     def health_check(self) -> dict[str, Any]:
         capabilities = {
@@ -356,17 +318,17 @@ class QmtXtDataAdapter(MarketDataAdapter):
         else:
             vwap = current_price
 
-        minutes_since_open = self._minutes_since_open(source_dt)
+        elapsed = minutes_since_open(source_dt)
         volume_ratio = 1.0
-        if volume is not None and minutes_since_open > 0:
-            volume_ratio = max(0.1, min(5.0, volume / max(minutes_since_open, 1)))
+        if volume is not None and elapsed > 0:
+            volume_ratio = max(0.1, min(5.0, volume / max(elapsed, 1)))
 
         price_vs_open_pct = (current_price / open_price - 1.0) * 100.0 if open_price > 0 else 0.0
         price_vs_vwap_pct = (current_price / vwap - 1.0) * 100.0 if vwap > 0 else 0.0
 
         return {
             "symbol": symbol,
-            "minutesSinceOpen": minutes_since_open,
+            "minutesSinceOpen": elapsed,
             "priceVsOpenPct": price_vs_open_pct,
             "priceVsVwapPct": price_vs_vwap_pct,
             "volumeRatio": volume_ratio,
@@ -431,11 +393,14 @@ class QmtXtDataAdapter(MarketDataAdapter):
             return datetime.now()
         if isinstance(raw, datetime):
             return raw
-        if isinstance(raw, (int, float)):
-            ts = float(raw)
-            if ts > 1e12:
-                ts /= 1000.0
-            return datetime.fromtimestamp(ts)
+        # 走 `finite` 而不是 `isinstance(raw, (int, float))`：后者放 `True` 过去
+        # （`fromtimestamp(1.0)` 是 1970 年，一个看不出错的错时间戳），也放 NaN
+        # 过去（`fromtimestamp(nan)` 直接抛 ValueError，把一次取数变成一次崩溃）。
+        stamp = finite(raw)
+        if stamp is not None:
+            if stamp > 1e12:
+                stamp /= 1000.0
+            return datetime.fromtimestamp(stamp)
         if isinstance(raw, str):
             try:
                 return datetime.fromisoformat(raw)
@@ -447,25 +412,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
                     return datetime.fromtimestamp(ts)
         return datetime.now()
 
-    def _minutes_since_open(self, dt: datetime) -> int:
-        morning_open = datetime.combine(dt.date(), time(9, 30))
-        afternoon_open = datetime.combine(dt.date(), time(13, 0))
-        if dt <= morning_open:
-            return 0
-        if dt < datetime.combine(dt.date(), time(11, 30)):
-            return int((dt - morning_open).total_seconds() // 60)
-        if dt < afternoon_open:
-            return 120
-        return 120 + int((dt - afternoon_open).total_seconds() // 60)
-
-    def _parse_calendar_value(self, value: Any) -> date:
-        if isinstance(value, date):
-            return value
-        text = str(value)
-        if len(text) == 8 and text.isdigit():
-            return datetime.strptime(text, "%Y%m%d").date()
-        return datetime.fromisoformat(text).date()
-
     def _first_value(self, payload: dict[str, Any], *keys: str) -> Any:
         for key in keys:
             if key in payload:
@@ -474,12 +420,7 @@ class QmtXtDataAdapter(MarketDataAdapter):
 
     def _first_float(self, payload: dict[str, Any], *keys: str) -> float | None:
         value = self._first_value(payload, *keys)
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
+        return finite(value)
 
     def _first_int(self, payload: dict[str, Any], *keys: str) -> int | None:
         value = self._first_value(payload, *keys)
@@ -519,10 +460,10 @@ class QmtXtDataAdapter(MarketDataAdapter):
             return value
         if isinstance(value, datetime):
             return value.isoformat()
-        if hasattr(value, "item") and callable(getattr(value, "item")):
+        if hasattr(value, "item") and callable(value.item):
             try:
                 return value.item()
-            except Exception:
+            except Exception:  # noqa: S110 — 探测失败即「不是标量」，这就是答案
                 pass
         if isinstance(value, dict):
             return {str(key): self._to_plain(item) for key, item in value.items()}
@@ -541,7 +482,7 @@ class QmtXtDataAdapter(MarketDataAdapter):
         if hasattr(value, "tolist"):
             try:
                 return self._to_plain(value.tolist())
-            except Exception:
+            except Exception:  # noqa: S110 — 同上，落到下面的通用分支
                 pass
         if hasattr(value, "__dict__"):
             return {key: self._to_plain(item) for key, item in vars(value).items()}

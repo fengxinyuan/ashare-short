@@ -18,6 +18,10 @@ impossible:
   detection no longer has to approximate with "rose ≥ 9.5%" — an approximation
   that cannot tell a 10% board from a 20% ChiNext/STAR board at all.
 
+腾讯那一路**同时**带五档和涨跌停价，所以要五档的调用方直接 `prefer="tencent"`
+一次请求拿全，不需要为了涨跌停价再打一次新浪。代价是它的量纲是手/万元——已在
+解析层归一化，见 `Snapshot` 的量纲契约。
+
 Standard library only. `easyquotation` wraps these same endpoints, but the
 parsing is thirty lines and the package deliberately has no HTTP dependency.
 """
@@ -32,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from ashare_decision_support.numeric import positive
 from ashare_decision_support.symbols import normalize_symbol
 
 SINA_URL = "https://hq.sinajs.cn/list="
@@ -42,14 +47,17 @@ TENCENT_REFERER = "https://gu.qq.com"
 USER_AGENT = "Mozilla/5.0"
 DEFAULT_TIMEOUT = 10.0
 
+# 腾讯的量纲和新浪不一样：成交量与五档挂单量记**手**，成交额记**万元**。
+# 2026-08-02 实测 600519，两边同一时刻的读数比值是 99.999 和 10000.004——不是
+# 近似，是单位。归一化放在解析层，因为 `Snapshot` 只有一个 `volume` 字段，让它
+# 的含义取决于 `source` 等于把量纲错误埋进每一个下游消费者。
+TENCENT_VOLUME_TO_SHARES = 100.0
+TENCENT_AMOUNT_TO_YUAN = 10000.0
+
 # Symbols per request. Both hosts accept long comma-separated lists; keeping
 # batches bounded avoids a URL long enough to be rejected by an intermediary.
 BATCH_SIZE = 400
 MAX_WORKERS = 4
-
-
-class SnapshotError(RuntimeError):
-    """Raised only when no symbol at all could be fetched."""
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,17 @@ class OrderBookLevel:
 
 @dataclass(frozen=True)
 class Snapshot:
+    """一个时点的行情快照。
+
+    **量纲契约**：`volume` 一律为**股**，`amount` 一律为**元**，五档的 `volume`
+    一律为**股**——无论 `source` 是新浪还是腾讯。腾讯原始口径是手/万元，在解析
+    层就换算掉了（见 `TENCENT_VOLUME_TO_SHARES`）。
+
+    代价是腾讯的五档挂单量只精确到手：实测同一时刻新浪报 930020 股、腾讯报
+    9300 手（= 930000 股），差的是那 20 股零股。做委比、做挂单墙都用不到这个
+    精度，但如果哪天要按股数对账，得知道腾讯那一路是截断过的。
+    """
+
     symbol: str
     name: str | None
     last_price: float
@@ -150,21 +169,6 @@ class SnapshotAdapter:
             notes.append(f"以下标的未取到快照：{'、'.join(missing[:8])}")
         return results, notes
 
-    def get_limit_prices(self, symbols: list[str]) -> tuple[dict[str, tuple[float, float]], list[str]]:
-        """涨停价/跌停价 from Tencent, which publishes them directly."""
-        codes = [normalize_symbol(item) for item in symbols if normalize_symbol(item)]
-        if not codes:
-            return {}, []
-        parsed, notes = self._fetch_tencent(codes)
-        return (
-            {
-                symbol: (snap.limit_up, snap.limit_down)
-                for symbol, snap in parsed.items()
-                if snap.limit_up is not None and snap.limit_down is not None
-            },
-            notes,
-        )
-
     def health_check(self) -> dict[str, Any]:
         started = time.monotonic()
         try:
@@ -197,7 +201,8 @@ class SnapshotAdapter:
             return {}, [f"新浪快照请求失败（{type(exc).__name__}），本轮缺 {len(codes)} 只"]
 
         parsed: dict[str, Snapshot] = {}
-        for line, code in zip(body.splitlines(), codes):
+        # 服务端可能少回几行；截断即缺失，缺哪几只由 `get_snapshots` 统一报。
+        for line, code in zip(body.splitlines(), codes, strict=False):
             snapshot = _parse_sina(line, code)
             if snapshot is not None:
                 parsed[code] = snapshot
@@ -211,7 +216,7 @@ class SnapshotAdapter:
             return {}, [f"腾讯快照请求失败（{type(exc).__name__}），本轮缺 {len(codes)} 只"]
 
         parsed: dict[str, Snapshot] = {}
-        for line, code in zip(body.splitlines(), codes):
+        for line, code in zip(body.splitlines(), codes, strict=False):
             snapshot = _parse_tencent(line, code)
             if snapshot is not None:
                 parsed[code] = snapshot
@@ -242,30 +247,30 @@ def _parse_sina(line: str, symbol: str) -> Snapshot | None:
     if len(fields) < 32:
         return None
 
-    last = _float(fields[3])
+    last = positive(fields[3])
     if not last:
         # A halted or unlisted symbol answers with zeros. Publishing 0.00 as a
         # price is worse than reporting the symbol as missing.
         return None
 
     bids = [
-        OrderBookLevel(price=_float(fields[11 + i * 2]) or 0.0, volume=_float(fields[10 + i * 2]) or 0.0)
+        OrderBookLevel(price=positive(fields[11 + i * 2]) or 0.0, volume=positive(fields[10 + i * 2]) or 0.0)
         for i in range(5)
     ]
     asks = [
-        OrderBookLevel(price=_float(fields[21 + i * 2]) or 0.0, volume=_float(fields[20 + i * 2]) or 0.0)
+        OrderBookLevel(price=positive(fields[21 + i * 2]) or 0.0, volume=positive(fields[20 + i * 2]) or 0.0)
         for i in range(5)
     ]
     return Snapshot(
         symbol=symbol,
         name=fields[0] or None,
         last_price=last,
-        prev_close=_float(fields[2]),
-        open_price=_float(fields[1]),
-        high=_float(fields[4]),
-        low=_float(fields[5]),
-        volume=_float(fields[8]),
-        amount=_float(fields[9]),
+        prev_close=positive(fields[2]),
+        open_price=positive(fields[1]),
+        high=positive(fields[4]),
+        low=positive(fields[5]),
+        volume=positive(fields[8]),
+        amount=positive(fields[9]),
         as_of=_parse_dt(fields[30], fields[31]),
         bids=[level for level in bids if level.price > 0],
         asks=[level for level in asks if level.price > 0],
@@ -281,43 +286,43 @@ def _parse_tencent(line: str, symbol: str) -> Snapshot | None:
     if len(fields) < 50:
         return None
 
-    last = _float(fields[3])
+    last = positive(fields[3])
     if not last:
         return None
 
     bids = [
-        OrderBookLevel(price=_float(fields[9 + i * 2]) or 0.0, volume=_float(fields[10 + i * 2]) or 0.0)
+        OrderBookLevel(
+            price=positive(fields[9 + i * 2]) or 0.0,
+            volume=(positive(fields[10 + i * 2]) or 0.0) * TENCENT_VOLUME_TO_SHARES,
+        )
         for i in range(5)
     ]
     asks = [
-        OrderBookLevel(price=_float(fields[19 + i * 2]) or 0.0, volume=_float(fields[20 + i * 2]) or 0.0)
+        OrderBookLevel(
+            price=positive(fields[19 + i * 2]) or 0.0,
+            volume=(positive(fields[20 + i * 2]) or 0.0) * TENCENT_VOLUME_TO_SHARES,
+        )
         for i in range(5)
     ]
+    volume = positive(fields[6])
+    amount = positive(fields[37]) if len(fields) > 37 else None
     return Snapshot(
         symbol=symbol,
         name=fields[1] or None,
         last_price=last,
-        prev_close=_float(fields[4]),
-        open_price=_float(fields[5]),
-        high=_float(fields[33]) if len(fields) > 33 else None,
-        low=_float(fields[34]) if len(fields) > 34 else None,
-        volume=_float(fields[6]),
-        amount=_float(fields[37]) if len(fields) > 37 else None,
+        prev_close=positive(fields[4]),
+        open_price=positive(fields[5]),
+        high=positive(fields[33]) if len(fields) > 33 else None,
+        low=positive(fields[34]) if len(fields) > 34 else None,
+        volume=volume * TENCENT_VOLUME_TO_SHARES if volume else None,
+        amount=amount * TENCENT_AMOUNT_TO_YUAN if amount else None,
         as_of=_parse_compact_dt(fields[30] if len(fields) > 30 else ""),
         bids=[level for level in bids if level.price > 0],
         asks=[level for level in asks if level.price > 0],
-        limit_up=_float(fields[47]) if len(fields) > 47 else None,
-        limit_down=_float(fields[48]) if len(fields) > 48 else None,
+        limit_up=positive(fields[47]) if len(fields) > 47 else None,
+        limit_down=positive(fields[48]) if len(fields) > 48 else None,
         source="tencent",
     )
-
-
-def _float(value: Any) -> float | None:
-    try:
-        number = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    return number if number != 0.0 else None
 
 
 def _parse_dt(day: str, clock: str) -> datetime | None:
@@ -331,4 +336,15 @@ def _parse_compact_dt(value: str) -> datetime | None:
     try:
         return datetime.strptime(value.strip()[:14], "%Y%m%d%H%M%S")
     except (TypeError, ValueError):
+        return None
+
+
+def default_snapshot_adapter() -> SnapshotAdapter | None:
+    """腾讯那一路：同一份响应里既有五档也有真实涨跌停价，一次请求拿全。
+
+    构造失败返回 None——盘口是加分项，不该让一个可选数据源决定监控能不能开跑。
+    """
+    try:
+        return SnapshotAdapter(prefer="tencent")
+    except Exception:
         return None

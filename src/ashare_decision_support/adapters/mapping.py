@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
-import json
 from pathlib import Path
 
 from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
+from ashare_decision_support.numeric import finite
 
 
 class NormalizationError(ValueError):
-    """Raised when a raw payload cannot be normalized safely."""
+    """Raised when a raw payload cannot be normalized safely.
+
+    **NaN 属于「不能安全归一」，不属于「一个数」。** 这里此前用 `try/float`，而
+    `float(nan)` 和 `float("nan")` 都是**成功**的——于是一份带 NaN 报价的载荷会
+    「归一成功」，把这一层存在的理由绕过去。改走 `numeric.finite` 之后，非有限
+    值和解析失败一样抛 `NormalizationError`，由调用方决定丢这一条还是丢整批。
+    """
 
 
 @dataclass(frozen=True)
@@ -78,10 +85,6 @@ PROFILES: dict[str, MappingProfile] = {
 }
 
 
-def profile_names() -> list[str]:
-    return sorted(PROFILES)
-
-
 def get_profile(name: str) -> MappingProfile:
     try:
         return PROFILES[name]
@@ -108,10 +111,6 @@ def load_profile_from_path(path: str | Path) -> MappingProfile:
     if not isinstance(payload, dict):
         raise NormalizationError("mapping profile file must contain a JSON object")
     return mapping_profile_from_dict(payload)
-
-
-def load_json_payload(path: str | Path) -> dict:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 class PayloadNormalizer:
@@ -192,19 +191,19 @@ class PayloadNormalizer:
         value = resolved.get(key)
         if value is None:
             raise NormalizationError(f"missing required field: {key}")
-        try:
-            return float(value)
-        except (TypeError, ValueError) as exc:
-            raise NormalizationError(f"field {key} is not a valid float: {value!r}") from exc
+        number = finite(value)
+        if number is None:
+            raise NormalizationError(f"field {key} is not a valid float: {value!r}")
+        return number
 
     def _optional_float(self, resolved: dict[str, object], key: str) -> float | None:
         value = resolved.get(key)
         if value is None:
             return None
-        try:
-            return float(value)
-        except (TypeError, ValueError) as exc:
-            raise NormalizationError(f"field {key} is not a valid float: {value!r}") from exc
+        number = finite(value)
+        if number is None:
+            raise NormalizationError(f"field {key} is not a valid float: {value!r}")
+        return number
 
     def _optional_bool(self, resolved: dict[str, object], key: str, default: bool) -> bool:
         value = resolved.get(key)

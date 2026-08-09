@@ -2,14 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from statistics import median
-from typing import Any
 
 from ashare_decision_support.models.enums import EffortResult, WyckoffBias
 from ashare_decision_support.models.schemas import WyckoffSignal
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(value, high))
+from ashare_decision_support.numeric import clamp
+from ashare_decision_support.signals.series import normalize_bars
 
 
 class WyckoffAnalyzer:
@@ -59,7 +56,7 @@ class WyckoffAnalyzer:
         range_low = min(row["low"] for row in prior_trend_window)
         range_high = max(row["high"] for row in prior_trend_window)
         range_span = max(range_high - range_low, 0.01)
-        close_position = _clamp((last["close"] - range_low) / range_span, 0.0, 1.0)
+        close_position = clamp((last["close"] - range_low) / range_span, 0.0, 1.0)
 
         short_return_pct = self._return_pct(recent_short[0]["close"], last["close"])
         medium_return_pct = self._return_pct(recent_medium[0]["close"], last["close"])
@@ -112,10 +109,17 @@ class WyckoffAnalyzer:
         elif effort_result == EffortResult.ABSORPTION:
             score += 8.0 if close_position >= 0.5 else -8.0
         elif effort_result == EffortResult.EXHAUSTION:
-            score -= 8.0 if close_position >= 0.5 else 8.0
+            # 【存疑，本轮清理未改动行为】两个分支都是 8.0，所以 `close_position`
+            # 这个判据是**死的**——不论收在上半区还是下半区，结果都是 -8.0。
+            # 邻近的 ABSORPTION 写的是 `+8.0 if ... else -8.0`，对称地看，这里
+            # 原意大概是 `-8.0 if close_position >= 0.5 else +8.0`（衰竭出现在
+            # 上涨末端偏空，出现在下跌末端偏多）。
+            # 没有一条测试覆盖这个分支，改它会直接改动评分输出，属于口径决策
+            # 而不是清理，所以留给你定。
+            score -= 8.0 if close_position >= 0.5 else 8.0  # noqa: RUF034
         elif effort_result == EffortResult.COMPRESSION:
             score += 4.0 if short_return_pct >= 0 else -4.0
-        score = round(_clamp(score, -100.0, 100.0), 2)
+        score = round(clamp(score, -100.0, 100.0), 2)
 
         bias = self._classify_bias(
             score=score,
@@ -153,32 +157,7 @@ class WyckoffAnalyzer:
         )
 
     def _normalize_rows(self, bars: list[dict]) -> list[dict]:
-        normalized: list[dict] = []
-        for row in bars:
-            if not isinstance(row, dict):
-                continue
-            open_price = self._float_from_keys(row, "open", "开盘")
-            high = self._float_from_keys(row, "high", "最高")
-            low = self._float_from_keys(row, "low", "最低")
-            close = self._float_from_keys(row, "close", "收盘")
-            volume = self._float_from_keys(row, "volume", "成交量")
-            timestamp = self._datetime_from_keys(row, "timestamp", "date", "日期", "时间")
-            if close is None:
-                continue
-            open_price = close if open_price is None else open_price
-            high = max(open_price, close) if high is None else high
-            low = min(open_price, close) if low is None else low
-            normalized.append(
-                {
-                    "timestamp": timestamp,
-                    "open": open_price,
-                    "high": high,
-                    "low": low,
-                    "close": close,
-                    "volume": 0.0 if volume is None else volume,
-                }
-            )
-        return sorted(normalized, key=lambda row: row["timestamp"])
+        return normalize_bars(bars)
 
     def _classify_bias(
         self,
@@ -259,7 +238,7 @@ class WyckoffAnalyzer:
         baseline_range = median(self._range_pct(row) for row in baseline)
         if baseline_range <= 0:
             return 0.0
-        return _clamp(1.0 - recent_range / baseline_range, 0.0, 1.0)
+        return clamp(1.0 - recent_range / baseline_range, 0.0, 1.0)
 
     def _volume_ratio(self, rows: list[dict]) -> float:
         baseline = [row["volume"] for row in rows[-21:-1] if row["volume"] > 0]
@@ -277,38 +256,3 @@ class WyckoffAnalyzer:
         if start_price == 0:
             return 0.0
         return (end_price / start_price - 1.0) * 100.0
-
-    def _float_from_keys(self, row: dict, *keys: str) -> float | None:
-        for key in keys:
-            value = row.get(key)
-            if value in (None, "", "-"):
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def _datetime_from_keys(self, row: dict, *keys: str) -> datetime:
-        for key in keys:
-            value = row.get(key)
-            if value in (None, ""):
-                continue
-            return self._parse_datetime(value)
-        return datetime.now()
-
-    def _parse_datetime(self, value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, (int, float)):
-            ts = float(value)
-            if ts > 1e12:
-                ts /= 1000.0
-            return datetime.fromtimestamp(ts)
-        text = str(value)
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
-            try:
-                return datetime.strptime(text, fmt)
-            except ValueError:
-                continue
-        return datetime.fromisoformat(text)

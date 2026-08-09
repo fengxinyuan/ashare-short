@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -66,12 +66,19 @@ class TradingCalendar:
         )
 
     def refresh_from(self, adapter: Any, year: int) -> int:
-        """行情源给得出日历就用它，给不出就保持现状并返回 0。"""
+        """行情源给得出日历就用它，给不出就保持现状并返回 0。
+
+        **契约是零参数的**（`adapters/base.py:get_trading_calendar`）：四个适配器
+        全部返回全量交易日，不接受区间。这里原来按 `(start, end)` 调，任何适配器
+        都会抛 `TypeError`，而下面那个 `except Exception` 把它咽成「这个源没有
+        日历」——一个永远返回 0 的刷新，看起来和「免费档确实没有日历」一模一样。
+        年份的筛选在下面那个循环里做，本来就不需要数据源配合。
+        """
         getter = getattr(adapter, "get_trading_calendar", None)
         if not callable(getter):
             return 0
         try:
-            days = getter(date(year, 1, 1), date(year, 12, 31))
+            days = getter()
         except Exception:
             return 0
         trading = {str(item) for item in days or []}
@@ -80,13 +87,33 @@ class TradingCalendar:
 
         holidays: list[str] = []
         workdays: list[str] = []
+        in_year = 0
         current = date(year, 1, 1)
         while current.year == year:
             key = str(current)
+            if key in trading:
+                in_year += 1
             if current.weekday() < 5 and key not in trading:
                 holidays.append(key)
             elif current.weekday() >= 5 and key in trading:
                 workdays.append(key)
             current = date.fromordinal(current.toordinal() + 1)
         self.save(holidays, workdays)
-        return len(trading)
+        # 返回的是**这一年**的交易日数，不是数据源给了多少天。akshare 一次给回
+        # 1990 年以来的全部日期，报 `len(trading)` 会让「刷新了 2026 年」打印出
+        # 八千多天。
+        return in_year
+
+
+def parse_trade_date(value: Any) -> date:
+    """把行情源给的交易日值解析成 `date`。
+
+    两种写法都要认：`"20260803"`（八位数字，QMT 与多数国内源的口径）和
+    ISO 的 `"2026-08-03"`。两个适配器原来各写了一份逐字相同的实现。
+    """
+    if isinstance(value, date):
+        return value
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return datetime.strptime(text, "%Y%m%d").date()
+    return datetime.fromisoformat(text).date()

@@ -69,3 +69,25 @@ def _split_long_piece(text: str, limit: int) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def publish(notifiers: list[Notifier], title: str, content: str) -> list[str]:
+    """挨个投递，谁挂了跳过谁。返回**投递成功**的渠道名。
+
+    通知是**副作用**，不是结果。一个渠道的契约违约（webhook 404、磁盘满）不该
+    让盘中循环或守护进程停摆——那等于让最不重要的一环决定最重要的一环跑不跑。
+
+    返回投递结果而不是 None，是因为六个 job 都要把它写进 summary（「这份简报发到
+    了哪几个通道」）。此前它们各写一遍 `[c.capabilities.channel for c in channels
+    if c.send(...)]`——那个写法拿得到结果，但**没有这里的 try**：内置的三个
+    notifier 恰好都不抛，所以它一直没出事，可它守的是一个契约而不是一个事实。
+    自定义通道一旦抛出来，崩的是已经算完的那份简报。
+    """
+    delivered: list[str] = []
+    for notifier in notifiers:
+        try:
+            if notifier.send(title, content):
+                delivered.append(notifier.capabilities.channel)
+        except Exception:  # noqa: S112 — 见上：一个渠道不能决定整轮跑不跑
+            continue
+    return delivered

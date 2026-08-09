@@ -23,9 +23,10 @@ import json
 import signal
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 CALL_TIMEOUT_SECONDS = 45
 
@@ -37,7 +38,7 @@ class ProbeTimeout(RuntimeError):
     pass
 
 
-def _timeout_handler(signum, frame):  # noqa: ANN001
+def _timeout_handler(signum, frame):
     raise ProbeTimeout(f"exceeded {CALL_TIMEOUT_SECONDS}s")
 
 
@@ -74,7 +75,7 @@ def run_once(probe: Probe) -> Result:
         result = probe.call()
         result.seconds = time.perf_counter() - start
         return result
-    except Exception as exc:  # noqa: BLE001 - a probe failing is the measurement
+    except Exception as exc:
         return Result(ok=False, seconds=time.perf_counter() - start, error=f"{type(exc).__name__}: {exc}"[:200])
     finally:
         signal.alarm(0)
@@ -639,7 +640,7 @@ def watch(symbols: list[str], seconds: int, interval: float) -> dict:
         feeds["sina_quote"] = sina_one
         feeds["sina_market_all"] = sina_all
         feeds["tencent_quote"] = tencent_one
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"easyquotation unavailable: {exc}")
 
     try:
@@ -651,7 +652,7 @@ def watch(symbols: list[str], seconds: int, interval: float) -> dict:
             return len(rows), newest(rows, "day")
 
         feeds["sina_minute_1m"] = sina_minute
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"akshare unavailable: {exc}")
 
     stats: dict[str, dict] = {
@@ -669,7 +670,7 @@ def watch(symbols: list[str], seconds: int, interval: float) -> dict:
             try:
                 signal.signal(signal.SIGALRM, _timeout_handler)
                 signal.alarm(CALL_TIMEOUT_SECONDS)
-                count, stamp = fetch()
+                _count, stamp = fetch()
                 signal.alarm(0)
                 entry["ok"] += 1
                 entry["latencies"].append(time.perf_counter() - start)
@@ -678,7 +679,7 @@ def watch(symbols: list[str], seconds: int, interval: float) -> dict:
                     if entry["last_stamp"] is not None and stamp > entry["last_stamp"]:
                         entry["advances"] += 1
                     entry["last_stamp"] = stamp
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 signal.alarm(0)
                 entry["errors"].append(f"{type(exc).__name__}: {exc}"[:120])
         time.sleep(interval)
@@ -741,7 +742,7 @@ def main() -> None:
 
     try:
         import akshare as ak
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"akshare unavailable: {exc}")
         ak = None
 
@@ -753,7 +754,7 @@ def main() -> None:
         connect = getattr(tf_client, "connect", None)
         if callable(connect):
             connect()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"tickflow unavailable: {exc}")
 
     probes = build_probes(ak, tf_client, args.symbols) + build_library_probes(args.symbols)

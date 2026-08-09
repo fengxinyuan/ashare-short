@@ -52,7 +52,14 @@ from ashare_decision_support.jobs import (
     run_review,
 )
 from ashare_decision_support.journal import Journal, summarize
-from ashare_decision_support.monitor import DEFAULT_LEVELS, LEVEL_ACTION, LEVEL_INFO, LEVEL_WARN
+from ashare_decision_support.monitor import (
+    DEFAULT_LEVELS,
+    LEVEL_ACTION,
+    LEVEL_INFO,
+    LEVEL_WARN,
+    SECTOR_EVERY,
+)
+from ashare_decision_support.monitor.sector_triggers import fired_sectors_today
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.feishu import FeishuNotifier
 from ashare_decision_support.schedule import TradingCalendar
@@ -136,6 +143,15 @@ def _parser_daemon(subparsers) -> None:
     daemon.add_argument(
         "--no-llm-news", action="store_true", help="舆情归因只用关键词词典，不调大模型"
     )
+    daemon.add_argument(
+        "--no-sectors", action="store_true", help="盘中监控里关闭板块截面与板块告警"
+    )
+    daemon.add_argument(
+        "--sector-every",
+        type=int,
+        default=SECTOR_EVERY,
+        help=f"每多少轮个股监控做一次板块截面，默认 {SECTOR_EVERY}",
+    )
     _add_writer_args(daemon)
     _add_notify_args(daemon)
     _add_tickflow_args(daemon)
@@ -207,6 +223,17 @@ def _parser_monitor(subparsers) -> None:
     )
     monitor.add_argument(
         "--no-news", action="store_true", help="跳过公告采集，关闭突发风险公告告警"
+    )
+    monitor.add_argument(
+        "--no-sectors",
+        action="store_true",
+        help="关闭盘中板块监控（默认开启：每 5 轮做一次全市场板块截面并按跃迁告警）",
+    )
+    monitor.add_argument(
+        "--sector-every",
+        type=int,
+        default=SECTOR_EVERY,
+        help=f"每多少轮个股监控做一次板块截面，默认 {SECTOR_EVERY}（约 10 分钟）",
     )
     _add_notify_args(monitor)
     _add_tickflow_args(monitor)
@@ -658,6 +685,8 @@ def _cmd_daemon(args) -> None:
         candidates_per_sector=args.per_sector,
         max_constituents=args.max_constituents,
         alert_levels=tuple(args.alert_levels),
+        sectors=not getattr(args, "no_sectors", False),
+        sector_every=getattr(args, "sector_every", SECTOR_EVERY),
         progress=_progress(args),
     )
     _dump_json(_trim(summary))
@@ -713,6 +742,8 @@ def _cmd_monitor(args) -> None:
         alert_levels=tuple(args.alert_levels),
         news_source=None if getattr(args, "no_news", False) else _news_source(args.output_dir),
         use_order_book=not args.no_order_book,
+        sectors=not getattr(args, "no_sectors", False),
+        sector_every=getattr(args, "sector_every", SECTOR_EVERY),
         notifiers=_notifiers(args, args.output_dir, "alerts"),
     )
     _dump_json(_trim(summary))
@@ -1192,6 +1223,8 @@ def _state_report() -> dict:
         "candidates": pool.symbols(),
         "candidates_stale": pool.stale,
         "alerts_today": alerts.fired_summary()[:20],
+        # 板块告警是另一个状态文件，不单独读的话 `state` 会漏报整条链路。
+        "sector_alerts_today": fired_sectors_today(today)[:20],
         "daemon_tasks": daemon.tasks,
         "journal": {
             "recommendations": len(journal.recommendations()),

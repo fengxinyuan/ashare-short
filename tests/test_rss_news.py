@@ -64,3 +64,35 @@ def test_a_dead_feed_does_not_drop_live_foreign_sources() -> None:
 
     assert len(docs) == 1
     assert any("BLS" in note for note in notes)
+
+
+def test_default_feeds_cover_inflation_after_bls_is_unreachable() -> None:
+    """BLS 本机 403，就业与通胀整块会跟着没有——除非有别的官方口径顶上。
+
+    这条钉的不是「有几个 feed」，是**那条推理链的输入端还在不在**：PMI/通胀
+    破位直接对应「宽松预期升温 → 红利/消费占优、顺周期走弱」，而议息真正盯的
+    通胀口径是 PCE，它在经济分析局那一路（Personal Income and Outlays），不在
+    BLS。有人删掉 BEA 时，症状不是报错，是风格切换的判断悄悄没了依据。
+    """
+    from ashare_decision_support.news.rss_source import OFFICIAL_GLOBAL_FEEDS
+
+    sources = {feed.source for feed in OFFICIAL_GLOBAL_FEEDS}
+    assert "美国经济分析局" in sources     # GDP / PCE / 贸易差额
+    assert "美国人口普查局" in sources     # 零售 / 耐用品 / 库存
+    assert "美联储" in sources             # 议息与声明
+    # 取不到不等于不存在：换个部署环境 BLS 就回来了，不能因为本机 403 就删掉。
+    assert "美国劳工统计局" in sources
+
+
+def test_one_dead_feed_costs_only_its_own_documents() -> None:
+    """BLS 那一路今天就是这个状态：它挂掉不能带走另外四路。"""
+    live = RssFeed("美国经济分析局", "https://bea.example/rss", "美国经济分析局")
+    dead = RssFeed("美国劳工统计局", "https://bls.example/rss", "美国劳工统计局")
+    source = RssNewsSource(
+        opener=Http({live.url: RSS}, dead={dead.url}), feeds=(live, dead)
+    )
+
+    docs, notes = source.fetch_market(date(2026, 8, 8))
+
+    assert len(docs) == 1
+    assert any("美国劳工统计局" in note for note in notes)

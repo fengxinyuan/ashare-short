@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
-from statistics import median
-import json
 import os
+from datetime import date, datetime, time, timedelta, timezone
+from statistics import median
 from typing import Any
 
 from ashare_decision_support.adapters.base import MarketDataAdapter
 from ashare_decision_support.adapters.ratelimit import wrap_client
 from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
-
+from ashare_decision_support.numeric import finite, first_finite
+from ashare_decision_support.schedule.clock import minutes_since_open
 
 # Exchange timezone. Epoch-millisecond windows must be anchored to it explicitly,
 # otherwise a host running in UTC shifts the request window by 8 hours and
@@ -105,24 +104,6 @@ class TickFlowAdapter(MarketDataAdapter):
         if auto_connect:
             self._connect()
 
-    @property
-    def rate_limit_stats(self) -> dict[str, Any] | None:
-        """节流实际等了多久。免费档链路慢在哪，这是唯一的直接读数。"""
-        limiter = getattr(self.client, "rate_limiter", None)
-        return limiter.stats() if limiter is not None else None
-
-    def subscribe_quotes(self, symbols: list[str]) -> None:
-        return None
-
-    def subscribe_l2_snapshot(self, symbols: list[str]) -> None:
-        return None
-
-    def subscribe_ticks(self, symbols: list[str]) -> None:
-        return None
-
-    def subscribe_orders(self, symbols: list[str]) -> None:
-        return None
-
     def get_security_master(self, symbols: list[str]) -> dict[str, dict]:
         normalized_map = self._normalized_symbol_map(symbols)
         rows = self._instruments_rows(list(normalized_map.values()))
@@ -197,18 +178,6 @@ class TickFlowAdapter(MarketDataAdapter):
             for raw_symbol, normalized in normalized_map.items()
         }
 
-    def list_universe_sectors(self, level: str = "SW1") -> dict[str, list[str]]:
-        """申万 sector name -> constituent symbols, merged across TickFlow shards.
-
-        Exposed on the adapter so the sector layer depends on the adapter
-        contract rather than reaching into the SDK client directly.
-        """
-        from ashare_decision_support.sectors.taxonomy import TickFlowSwTaxonomy
-
-        taxonomy = TickFlowSwTaxonomy(self.client, level=level)
-        return {item.name: list(item.symbols) for item in taxonomy.list_sectors()}
-
-
     def get_trading_calendar(self) -> list[date]:
         return []
 
@@ -223,13 +192,13 @@ class TickFlowAdapter(MarketDataAdapter):
                 raise TickFlowAdapterError(f"no TickFlow payload found for symbol {raw_symbol} (normalized: {normalized_symbol})")
 
             bid_total, ask_total = self._depth_totals(depth)
-            last_price = self._float(quote, "last_price", "lastPrice", "price", "close")
-            open_price = self._float(quote, "open", "open_price", "openPrice")
-            prev_close = self._float(quote, "prev_close", "prevClose", "pre_close", "preClose")
+            last_price = first_finite(quote, "last_price", "lastPrice", "price", "close")
+            open_price = first_finite(quote, "open", "open_price", "openPrice")
+            prev_close = first_finite(quote, "prev_close", "prevClose", "pre_close", "preClose")
             if prev_close is None and len(source_rows) >= 2:
-                prev_close = self._float(source_rows[-2], "close", "last_price", "lastPrice", "price")
-            volume = self._float(quote, "volume", "vol", "matched_qty")
-            amount = self._float(quote, "amount", "turnover")
+                prev_close = first_finite(source_rows[-2], "close", "last_price", "lastPrice", "price")
+            volume = first_finite(quote, "volume", "vol", "matched_qty")
+            amount = first_finite(quote, "amount", "turnover")
             source_ts = self._source_datetime(quote)
 
             if last_price is None:
@@ -307,19 +276,19 @@ class TickFlowAdapter(MarketDataAdapter):
 
             reference_row = quote_rows[-1] if quote_rows else row
 
-            current_price = self._float(row, "close", "last_price", "lastPrice", "price")
-            open_price = self._float(reference_row, "open", "open_price", "openPrice")
-            prev_close = self._float(reference_row, "prev_close", "prevClose", "pre_close", "preClose")
+            current_price = first_finite(row, "close", "last_price", "lastPrice", "price")
+            open_price = first_finite(reference_row, "open", "open_price", "openPrice")
+            prev_close = first_finite(reference_row, "prev_close", "prevClose", "pre_close", "preClose")
             if prev_close is None and len(rows) >= 2:
-                prev_close = self._float(rows[-2], "close", "last_price", "lastPrice", "price")
+                prev_close = first_finite(rows[-2], "close", "last_price", "lastPrice", "price")
             source_ts = self._source_datetime(row)
 
             if current_price is None:
                 current_price = open_price or prev_close or 0.01
 
-            vwap = self._float(row, "vwap", "vWap", "weighted_avg_price")
-            amount = self._float(row, "amount", "turnover")
-            volume = self._float(row, "volume", "vol")
+            vwap = first_finite(row, "vwap", "vWap", "weighted_avg_price")
+            amount = first_finite(row, "amount", "turnover")
+            volume = first_finite(row, "volume", "vol")
             volume_multiplier, volume_unit_known = self._volume_multiplier(volume, amount, current_price)
             adjusted_volume = volume if volume_multiplier is None else volume * volume_multiplier
             # Deriving VWAP from amount/volume while the volume unit is unknown is
@@ -333,7 +302,7 @@ class TickFlowAdapter(MarketDataAdapter):
 
             minute_volume_ratio = self._volume_ratio(self._rows_only(rows))
             if not self.supports_intraday:
-                minute_volume_ratio = self._float(row, "volume_ratio", "volumeRatio") or self._daily_volume_ratio(rows)
+                minute_volume_ratio = first_finite(row, "volume_ratio", "volumeRatio") or self._daily_volume_ratio(rows)
 
             open_gap_pct = 0.0
             if open_price is not None and prev_close not in (None, 0):
@@ -343,7 +312,7 @@ class TickFlowAdapter(MarketDataAdapter):
 
             features[raw_symbol] = OpenFeatures(
                 symbol=raw_symbol,
-                minutes_since_open=self._minutes_since_open(source_ts),
+                minutes_since_open=minutes_since_open(source_ts),
                 price_vs_open_pct=((current_price / open_price - 1.0) * 100.0) if open_price not in (None, 0) else 0.0,
                 price_vs_vwap_pct=((current_price / vwap - 1.0) * 100.0) if vwap not in (None, 0) else 0.0,
                 volume_ratio=minute_volume_ratio,
@@ -404,12 +373,6 @@ class TickFlowAdapter(MarketDataAdapter):
             except Exception as exc:
                 payload["instruments"][symbol] = {"error": str(exc)}
         return payload
-
-    def dump_snapshot_to_file(self, symbols: list[str], output_path: str | Path) -> None:
-        Path(output_path).write_text(
-            json.dumps(self.dump_snapshot(symbols), ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
 
     def _connect(self) -> None:
         connect_fn = getattr(self.client, "connect", None)
@@ -561,8 +524,8 @@ class TickFlowAdapter(MarketDataAdapter):
         bid_total = 0
         ask_total = 0
         for index in range(1, 11):
-            bid_total += int(self._float(first, f"bidVol{index}", f"BidVol{index}", f"bid_volume_{index}") or 0)
-            ask_total += int(self._float(first, f"askVol{index}", f"AskVol{index}", f"ask_volume_{index}") or 0)
+            bid_total += int(first_finite(first, f"bidVol{index}", f"BidVol{index}", f"bid_volume_{index}") or 0)
+            ask_total += int(first_finite(first, f"askVol{index}", f"AskVol{index}", f"ask_volume_{index}") or 0)
         return bid_total, ask_total
 
     def _depth_summary(self, payload: Any) -> dict[str, Any]:
@@ -603,7 +566,7 @@ class TickFlowAdapter(MarketDataAdapter):
                     rows = to_dict()
                     if isinstance(rows, list):
                         return [item for item in rows if isinstance(item, dict)]
-                except Exception:
+                except Exception:  # noqa: S110 — 逐个试签名，试不通就换下一种
                     pass
         return []
 
@@ -620,13 +583,13 @@ class TickFlowAdapter(MarketDataAdapter):
                     {
                         "symbol": symbol or str(row.get("symbol") or row.get("code") or ""),
                         "timestamp": timestamp,
-                        "open": self._float(row, "open", "Open", "开盘"),
-                        "high": self._float(row, "high", "High", "最高"),
-                        "low": self._float(row, "low", "Low", "最低"),
-                        "close": self._float(row, "close", "Close", "收盘"),
-                        "volume": self._float(row, "volume", "Volume", "成交量"),
-                        "amount": self._float(row, "amount", "Amount", "成交额"),
-                        "prev_close": self._float(row, "prev_close", "prevClose", "pre_close", "preClose"),
+                        "open": first_finite(row, "open", "Open", "开盘"),
+                        "high": first_finite(row, "high", "High", "最高"),
+                        "low": first_finite(row, "low", "Low", "最低"),
+                        "close": first_finite(row, "close", "Close", "收盘"),
+                        "volume": first_finite(row, "volume", "Volume", "成交量"),
+                        "amount": first_finite(row, "amount", "Amount", "成交额"),
+                        "prev_close": first_finite(row, "prev_close", "prevClose", "pre_close", "preClose"),
                     }
                 )
             return [row for row in compact_rows if row.get("close") is not None]
@@ -648,13 +611,22 @@ class TickFlowAdapter(MarketDataAdapter):
                     {
                         "symbol": symbol,
                         "timestamp": self._parse_datetime(timestamp),
-                        "open": opens[idx] if idx < len(opens) else None,
-                        "high": highs[idx] if idx < len(highs) else None,
-                        "low": lows[idx] if idx < len(lows) else None,
-                        "close": closes[idx] if idx < len(closes) else None,
-                        "volume": volumes[idx] if idx < len(volumes) else None,
-                        "amount": amounts[idx] if idx < len(amounts) else None,
-                        "prev_close": prev_closes[idx] if idx < len(prev_closes) else None,
+                        # 这一支此前是**逐格照抄**，唯独它不过 `finite`——同一个函数
+                        # 的另外两支都过。而列式这一支正是 TickFlow 返回数组时走的那
+                        # 条，也就是主行情源的日线主路径。
+                        #
+                        # 漏的那一项是 NaN：下面只按 `close is not None` 过滤，NaN 不
+                        # 是 None，照样进 K 线序列。之后它不会报错——`dipbuy` 的
+                        # `float(high)` 收得下 NaN，真实波幅变成 NaN，ATR 跟着变成
+                        # NaN，而 NaN 的比较永远是 False，「跌破止损」就静默变成
+                        # 「没跌破」。这正是 `numeric.py` 开头那段说的那种坏法。
+                        "open": finite(_at(opens, idx)),
+                        "high": finite(_at(highs, idx)),
+                        "low": finite(_at(lows, idx)),
+                        "close": finite(_at(closes, idx)),
+                        "volume": finite(_at(volumes, idx)),
+                        "amount": finite(_at(amounts, idx)),
+                        "prev_close": finite(_at(prev_closes, idx)),
                     }
                 )
             return [row for row in compact if row.get("close") is not None]
@@ -667,13 +639,13 @@ class TickFlowAdapter(MarketDataAdapter):
                 {
                     "symbol": symbol or str(row.get("symbol") or row.get("code") or ""),
                     "timestamp": timestamp,
-                    "open": self._float(row, "open", "Open", "开盘"),
-                    "high": self._float(row, "high", "High", "最高"),
-                    "low": self._float(row, "low", "Low", "最低"),
-                    "close": self._float(row, "close", "Close", "收盘"),
-                    "volume": self._float(row, "volume", "Volume", "成交量"),
-                    "amount": self._float(row, "amount", "Amount", "成交额"),
-                    "prev_close": self._float(row, "prev_close", "prevClose", "pre_close", "preClose"),
+                    "open": first_finite(row, "open", "Open", "开盘"),
+                    "high": first_finite(row, "high", "High", "最高"),
+                    "low": first_finite(row, "low", "Low", "最低"),
+                    "close": first_finite(row, "close", "Close", "收盘"),
+                    "volume": first_finite(row, "volume", "Volume", "成交量"),
+                    "amount": first_finite(row, "amount", "Amount", "成交额"),
+                    "prev_close": first_finite(row, "prev_close", "prevClose", "pre_close", "preClose"),
                 }
             )
         return [row for row in compact_rows if row.get("close") is not None]
@@ -704,35 +676,24 @@ class TickFlowAdapter(MarketDataAdapter):
         except ValueError:
             return datetime.now()
 
-    def _minutes_since_open(self, dt: datetime) -> int:
-        morning_open = datetime.combine(dt.date(), time(9, 30))
-        afternoon_open = datetime.combine(dt.date(), time(13, 0))
-        if dt <= morning_open:
-            return 0
-        if dt < datetime.combine(dt.date(), time(11, 30)):
-            return int((dt - morning_open).total_seconds() // 60)
-        if dt < afternoon_open:
-            return 120
-        return 120 + int((dt - afternoon_open).total_seconds() // 60)
-
     def _volume_ratio(self, rows: list[dict]) -> float:
         if not rows:
             return 1.0
-        volumes = [self._float(row, "volume") for row in rows[:-1]]
+        volumes = [first_finite(row, "volume") for row in rows[:-1]]
         baseline = [value for value in volumes if value not in (None, 0)]
         if not baseline:
             return 1.0
         base = median(baseline[-20:])
         if base <= 0:
             return 1.0
-        latest = self._float(rows[-1], "volume") or 0.0
+        latest = first_finite(rows[-1], "volume") or 0.0
         return latest / base
 
     def _daily_volume_ratio(self, rows: list[dict]) -> float:
         if len(rows) < 2:
             return 1.0
-        latest = self._float(rows[-1], "volume") or 0.0
-        baseline = [self._float(row, "volume") or 0.0 for row in rows[-21:-1]]
+        latest = first_finite(rows[-1], "volume") or 0.0
+        baseline = [first_finite(row, "volume") or 0.0 for row in rows[-21:-1]]
         baseline = [value for value in baseline if value > 0]
         if not baseline:
             return 1.0
@@ -768,17 +729,6 @@ class TickFlowAdapter(MarketDataAdapter):
                 return multiplier, True
         return None, False
 
-    def _float(self, payload: dict, *keys: str) -> float | None:
-        for key in keys:
-            value = payload.get(key)
-            if value in (None, "", "-"):
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
     def _try_call(self, func: Any, *attempts: tuple[tuple, dict]) -> Any:
         """Call ``func`` trying successive signatures.
 
@@ -801,3 +751,13 @@ class TickFlowAdapter(MarketDataAdapter):
                 f"no supported call signature for {getattr(func, '__name__', func)!r}: {last_error}"
             ) from last_error
         raise TickFlowAdapterError("TickFlow call failed without an exception")
+
+
+def _at(values: Any, index: int) -> Any:
+    """列式载荷里按下标取值，越界返回 None。
+
+    各列不保证等长——`timestamp` 有 240 个而 `amount` 只有 238 个是可能的，
+    而列式这一支是按 `timestamp` 的长度在循环。越界直接抛会让整只标的的日线
+    消失，返回 None 只让那一格缺失，由 `finite` 统一收成「没有这个读数」。
+    """
+    return values[index] if index < len(values) else None

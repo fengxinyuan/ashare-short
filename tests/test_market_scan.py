@@ -11,13 +11,12 @@ import json
 import pytest
 
 from ashare_decision_support.adapters.market_scan import (
+    MarketRow,
     MarketScan,
     MarketScanAdapter,
-    MarketRow,
     _parse_row,
 )
 from ashare_decision_support.screens import LiquidityScreen
-
 
 # ---- http double ---------------------------------------------------------
 

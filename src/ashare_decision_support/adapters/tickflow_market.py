@@ -37,13 +37,14 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime
 from dataclasses import asdict, replace
+from datetime import datetime
 from typing import Any
 
 from ashare_decision_support.adapters.market_scan import MarketRow, MarketScan
 from ashare_decision_support.adapters.snapshot import OrderBookLevel, Snapshot
 from ashare_decision_support.adapters.validate import cross_check
+from ashare_decision_support.numeric import finite
 from ashare_decision_support.symbols import normalize_symbol
 
 # 全 A 标的池 id。TickFlow 的池名不是自解释的：`CN_Equity` / `CN_Equity_All`
@@ -57,10 +58,6 @@ DEPTH_BATCH = 500
 
 # 手 → 股。见模块头「单位口径」第 1 条。
 LOTS_TO_SHARES = 100.0
-
-
-class TickFlowMarketError(RuntimeError):
-    """一只都没取到时才抛。缺个别标的走 note，不打断链路。"""
 
 
 # ---- 全市场扫描 -----------------------------------------------------------
@@ -108,7 +105,7 @@ class TickFlowMarketScanAdapter:
                 rows[row.code] = row
 
         if not rows:
-            return MarketScan(notes=notes + ["TickFlow 全市场行情没有可解析的行"], ok=False)
+            return MarketScan(notes=[*notes, "TickFlow 全市场行情没有可解析的行"], ok=False)
 
         elapsed = time.monotonic() - started
         priced = sum(1 for row in rows.values() if row.float_cap is not None)
@@ -152,7 +149,7 @@ class TickFlowMarketScanAdapter:
 
 def _to_market_row(raw: dict, shares: dict[str, dict]) -> MarketRow | None:
     symbol = str(raw.get("symbol") or "").strip()
-    price = _float(raw.get("last_price"))
+    price = finite(raw.get("last_price"))
     if not symbol or price is None or price <= 0:
         # 停牌票返回 0 价。把 0.00 当价格发布出去，比报「这只没取到」更糟。
         return None
@@ -160,16 +157,16 @@ def _to_market_row(raw: dict, shares: dict[str, dict]) -> MarketRow | None:
     code = symbol.split(".")[0]
     name = str(ext.get("name") or "").strip()
 
-    volume_lots = _float(raw.get("volume"))
+    volume_lots = finite(raw.get("volume"))
     # 「手」→「股」。忘了换会让换手率与流通市值同时错 100 倍。
     volume = None if volume_lots is None else volume_lots * LOTS_TO_SHARES
 
-    turnover = _float(ext.get("turnover_rate"))
-    change = _float(ext.get("change_pct"))
+    turnover = finite(ext.get("turnover_rate"))
+    change = finite(ext.get("change_pct"))
 
     inst_ext = (shares.get(symbol) or {}).get("ext") or {}
-    float_shares = _float(inst_ext.get("float_shares"))
-    total_shares = _float(inst_ext.get("total_shares"))
+    float_shares = finite(inst_ext.get("float_shares"))
+    total_shares = finite(inst_ext.get("total_shares"))
     if not name:
         name = str((shares.get(symbol) or {}).get("name") or "").strip()
 
@@ -177,10 +174,10 @@ def _to_market_row(raw: dict, shares: dict[str, dict]) -> MarketRow | None:
         code=code,
         name=name or code,
         price=price,
-        prev_close=_float(raw.get("prev_close")),
+        prev_close=finite(raw.get("prev_close")),
         # 比值 → 百分数，对齐新浪 `changepercent` 的口径。
         change_pct=None if change is None else change * 100.0,
-        amount=_float(raw.get("amount")),
+        amount=finite(raw.get("amount")),
         volume=volume,
         turnover_ratio=None if turnover is None else turnover * 100.0,
         # PE/PB 需要 `financials.*`，Pro 档报「无公司财务数据查询权限」。
@@ -242,21 +239,6 @@ class TickFlowSnapshotAdapter:
             notes.append(f"以下标的未取到快照：{'、'.join(missing[:8])}")
         return parsed, notes
 
-    def get_limit_prices(
-        self, symbols: list[str]
-    ) -> tuple[dict[str, tuple[float, float]], list[str]]:
-        codes = [normalize_symbol(item) for item in symbols if normalize_symbol(item)]
-        if not codes:
-            return {}, []
-        instruments, notes = _fetch_instruments(self.client, codes)
-        out: dict[str, tuple[float, float]] = {}
-        for symbol, item in instruments.items():
-            ext = item.get("ext") if isinstance(item.get("ext"), dict) else {}
-            up, down = _float(ext.get("limit_up")), _float(ext.get("limit_down"))
-            if up is not None and down is not None:
-                out[symbol] = (up, down)
-        return out, notes
-
     def health_check(self) -> dict[str, Any]:
         started = time.monotonic()
         try:
@@ -296,11 +278,11 @@ def _to_snapshot(
     raw: dict, depth: dict[str, dict], instruments: dict[str, dict]
 ) -> Snapshot | None:
     symbol = str(raw.get("symbol") or "").strip()
-    last = _float(raw.get("last_price"))
+    last = finite(raw.get("last_price"))
     if not symbol or not last:
         return None
     ext = raw.get("ext") if isinstance(raw.get("ext"), dict) else {}
-    volume_lots = _float(raw.get("volume"))
+    volume_lots = finite(raw.get("volume"))
 
     book = depth.get(symbol) or {}
     bids = _levels(book.get("bid_prices"), book.get("bid_volumes"))
@@ -315,17 +297,17 @@ def _to_snapshot(
         symbol=symbol,
         name=name or None,
         last_price=last,
-        prev_close=_float(raw.get("prev_close")),
-        open_price=_float(raw.get("open")),
-        high=_float(raw.get("high")),
-        low=_float(raw.get("low")),
+        prev_close=finite(raw.get("prev_close")),
+        open_price=finite(raw.get("open")),
+        high=finite(raw.get("high")),
+        low=finite(raw.get("low")),
         volume=None if volume_lots is None else volume_lots * LOTS_TO_SHARES,
-        amount=_float(raw.get("amount")),
+        amount=finite(raw.get("amount")),
         as_of=_stamp(raw.get("timestamp")),
         bids=bids,
         asks=asks,
-        limit_up=_float(inst_ext.get("limit_up")),
-        limit_down=_float(inst_ext.get("limit_down")),
+        limit_up=finite(inst_ext.get("limit_up")),
+        limit_down=finite(inst_ext.get("limit_down")),
         source="tickflow",
     )
 
@@ -334,12 +316,13 @@ def _levels(prices: Any, volumes: Any) -> list[OrderBookLevel]:
     if not isinstance(prices, list) or not isinstance(volumes, list):
         return []
     out: list[OrderBookLevel] = []
-    for price, volume in zip(prices, volumes):
-        value = _float(price)
+    # 档位数不齐就按短的那边截断——半档挂单不是读数。
+    for price, volume in zip(prices, volumes, strict=False):
+        value = finite(price)
         if value is None or value <= 0:
             continue
         # 盘口量同样是「手」，换成股才能和新浪那路的读数并排看。
-        out.append(OrderBookLevel(price=value, volume=(_float(volume) or 0.0) * LOTS_TO_SHARES))
+        out.append(OrderBookLevel(price=value, volume=(finite(volume) or 0.0) * LOTS_TO_SHARES))
     return out
 
 
@@ -504,16 +487,6 @@ def _missing_note(wanted: list[str], got: dict[str, dict]) -> list[str]:
     if not missing:
         return []
     return [f"标的元数据缺 {missing} 只，这些标的没有真实涨跌停价"]
-
-
-def _float(value: Any) -> float | None:
-    if value in (None, "", "-", "null"):
-        return None
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result
 
 
 def _stamp(value: Any) -> datetime | None:

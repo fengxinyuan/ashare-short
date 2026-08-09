@@ -33,10 +33,10 @@ from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.jobs.progress import progress_reporter
 from ashare_decision_support.news import AkshareNewsSource
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
-from ashare_decision_support.notify.base import Notifier
+from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import advice_mandatory_block, render_advice_brief
 from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
-from ashare_decision_support.screens import EarningsScreen, StScreen
+from ashare_decision_support.screens import EarningsScreen
 from ashare_decision_support.signals.dipbuy import measure_dip
 from ashare_decision_support.signals.distribution import judge_distribution
 from ashare_decision_support.signals.intraday import IntradayAnalyzer
@@ -188,7 +188,6 @@ def run_advise(
     }
 
     # ---- assemble ---------------------------------------------------------
-    screen = StScreen()
     # 业绩层在这条链路上**只提示、不移除**。`morning` 是系统主动选票，所以否决；
     # `advise` 是你点名问一只票，答案必须是「它怎么样」而不是把它藏起来——「这只
     # 票我不给你看」正是最没用的回答。和上面 ST 的处理完全同一条理由，见下方
@@ -206,16 +205,13 @@ def run_advise(
             wyckoff=wyckoff.get(symbol),
             name=names.get(symbol),
             score=result.score if result else None,
+            score_components=result.components if result else None,
             book=books.get(symbol),
             instrument=master.get(symbol),
             match=matches.get(symbol),
         )
         if result:
             advice.warnings.extend(result.warnings)
-        verdict = screen.check(symbol, names.get(symbol))
-        if not verdict.passed:
-            # Asked about explicitly, so it is answered — loudly.
-            advice.warnings.insert(0, f"⚠️ {verdict.reason}")
         _apply_earnings(advice, earnings_verdicts.get(normalize_symbol(symbol)))
         vp = volume_price.get(symbol)
         intraday_read = intraday.get(symbol)
@@ -269,7 +265,7 @@ def run_advise(
     if output_dir is not None:
         file_notifier = FileNotifier(output_dir, slug="advice")
         channels = notifiers if notifiers is not None else [ConsoleNotifier(), file_notifier]
-        delivered = [c.capabilities.channel for c in channels if c.send(title, markdown)]
+        delivered = publish(channels, title, markdown)
         file_notifier.write_payload(facts, ADVICE_LATEST_NAME)
         # 调用方可能自带 FileNotifier，这时内部这个从未发送、last_path 为 None。
         # 报实际写出的那条路径，而不是在 "file" 已投递旁边放一个 null。
@@ -281,7 +277,7 @@ def run_advise(
         # No output directory still means "show me" — only an explicit empty
         # notifier list (the chat path) suppresses output.
         channels = notifiers if notifiers is not None else [ConsoleNotifier()]
-        delivered = [c.capabilities.channel for c in channels if c.send(title, markdown)]
+        delivered = publish(channels, title, markdown)
     _progress("③ 个股分析已完成")
 
     return {
@@ -370,6 +366,7 @@ def _facts(
                 "industry_path": (instruments.get(item.symbol) or {}).get("industry_path"),
                 "concepts": list((instruments.get(item.symbol) or {}).get("concepts") or []),
                 "score": item.score,
+                "score_components": item.score_components,
                 "last_price": item.last_price,
                 "session_date": item.session_date,
                 "is_current_session": item.is_current_session,

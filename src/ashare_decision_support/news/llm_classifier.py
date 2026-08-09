@@ -58,6 +58,29 @@ ANCHOR_CHARS = 8
 # 锚点归一化后的最短长度。太短会撞车（多条都以"央行"开头），宁可丢这一条。
 MIN_ANCHOR_CHARS = 4
 
+# 事件类型清单。**必须和 SYSTEM_PROMPT 里给模型的那份逐字一致**，因为下面要拿它
+# 做校验：清单外的值一律丢弃。
+#
+# 校验这一项的理由和校验板块名完全相同。2026-08-02 实测 314 条归因里有 17 条
+# （5.4%）带着清单外的自创类型——销量 10、事件 3、高管变动 / 组织调整 / 产品创新 /
+# 品牌建设各 1——而它们会原样印进简报的「关键词：技术突破、品牌建设、需求变化」。
+# 板块名和方向早就在校验了，事件类型漏了，于是它成了幻觉唯一还能走通的那条路。
+EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "政策",
+        "业绩",
+        "订单",
+        "产能",
+        "价格",
+        "资本运作",
+        "监管处罚",
+        "股东行为",
+        "技术突破",
+        "需求变化",
+        "其他",
+    }
+)
+
 SYSTEM_PROMPT = """你是 A 股新闻的分类器。你的输出被程序解析，不是给人读的。
 
 给你一份【板块清单】和一批【新闻标题】，对每条标题判断三件事：
@@ -71,8 +94,11 @@ SYSTEM_PROMPT = """你是 A 股新闻的分类器。你的输出被程序解析�
    sectors 为空时 why 也给空字符串。
 
 关于 sectors 的补充要求（这一条最容易做错）：
-- 只有当消息**直接作用于 A 股上市公司的经营或估值**时才归板块。
-- 海外灾害、国际时政、体育娱乐、纯宏观数据等，与具体 A 股板块没有直接传导链的，
+- 只有当消息对 A 股公司的经营或估值存在**明确传导链**时才归板块。
+- 行业产品价格、原材料价格、库存、供给收缩、停产检修、运价、能源成本等，
+  即使没有点名上市公司，只要能明确影响某个行业利润，也可以归到对应板块；
+  why 要写清楚传导机制，例如「纸浆下跌改善纸企成本」。
+- 海外灾害、国际时政、体育娱乐、纯宏观数据等，若无法落到具体行业传导链，
   一律给空数组 []，不要硬找关联。宁可漏，不要凑。
 
 严格要求：
@@ -268,7 +294,7 @@ class LlmNewsClassifier:
 
         mapping: dict[str, DocLabel] = {}
         unmatched = 0
-        for position, row in enumerate(rows):
+        for _position, row in enumerate(rows):
             if not isinstance(row, dict):
                 continue
             key = _match_anchor(row.get("t"), normalized)
@@ -288,10 +314,14 @@ class LlmNewsClassifier:
             # 归了板块却说不出机制的，按未归因处理：说不出理由的关联通常就是硬凑的。
             if picked and why is None:
                 picked = ()
+            # 事件类型同样必须原样命中清单，理由见 `EVENT_TYPES`。清单外的值置空
+            # 而不是丢掉整条——归属和方向仍然是可用的，只有这个标签不可信。
+            event = row.get("event")
+            event = event if isinstance(event, str) and event in EVENT_TYPES else None
             mapping[key] = DocLabel(
                 sectors=picked,
                 direction=direction if direction in DIRECTIONS else DIRECTION_NEUTRAL,
-                event=row.get("event") if isinstance(row.get("event"), str) else None,
+                event=event,
                 why=why,
             )
 
@@ -313,10 +343,13 @@ class LlmNewsClassifier:
         for row in payload:
             if not isinstance(row, dict) or not row.get("key"):
                 continue
+            # 缓存也要过一遍清单：昨天写进去的自创事件类型不该因为走了缓存这条路
+            # 就绕过校验。
+            event = row.get("event")
             labels[row["key"]] = DocLabel(
                 sectors=tuple(row.get("sectors") or ()),
                 direction=row.get("direction") or DIRECTION_NEUTRAL,
-                event=row.get("event"),
+                event=event if isinstance(event, str) and event in EVENT_TYPES else None,
                 why=row.get("why"),
             )
         return labels or None
@@ -415,7 +448,7 @@ class LabelBackedSentiment(SentimentAnalyzer):
 
 # ---- parsing -------------------------------------------------------------
 
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 def _parse_json_array(text: str) -> list:

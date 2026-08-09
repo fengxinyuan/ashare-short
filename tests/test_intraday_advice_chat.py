@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 
 from ashare_decision_support.adapters.freshness import check_intraday_freshness, in_session
 from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter, sina_symbol
@@ -14,7 +14,6 @@ from ashare_decision_support.chat.session import (
 from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, PriceLevel
 from ashare_decision_support.signals.intraday import IntradayAnalyzer, _minutes_since_open
-
 
 # ---- symbol normalization ------------------------------------------------
 
@@ -172,6 +171,213 @@ def test_volume_ratio_scales_the_baseline_for_a_partial_session() -> None:
     assert 0.9 <= snapshot.volume_ratio <= 1.1
 
 
+def front_loaded_rows(day: str, count: int, opening_share: float = 0.30) -> list[dict]:
+    """成交前置的一天：第一根吃掉 `opening_share`，其余均分。
+
+    这是 A 股分时最常见的形状，也是 2026-08-04 牧原股份当天的实际形状——
+    09:35 那一根 12.35 万手，占全天 64.8 万手的 19%。
+    """
+    rows = minute_rows(day, count)
+    total = 1000.0 * count
+    head = total * opening_share
+    rest = (total - head) / max(count - 1, 1)
+    for index, row in enumerate(rows):
+        row["volume"] = head if index == 0 else rest
+        row["amount"] = row["volume"] * row["close"]
+    return rows
+
+
+def test_volume_ratio_uses_the_baseline_at_the_same_point_of_day() -> None:
+    """节奏和基线日一模一样的半天，量比就该读 1.0——不管在哪个时点读。
+
+    原实现拿基线日的**全天**量按 `elapsed / 240` 线性折算，等于假设成交在一天里
+    均匀发生。A 股不是：开盘那一根经常单根占掉两成。于是同样的节奏在早盘会被读成
+    「放量」。2026-08-04 牧原实测 10:50 读 2.36，收盘实际 1.09。
+
+    这里用同一个前置形状造基线日和当日，**不变量是 1.0**：只要今天走的是常态节奏，
+    无论读几点，量比都不该偏离 1。线性折算在第一根上会读到 0.30/(5/240) = 14.4。
+    """
+    baseline = []
+    for day in ("2026-07-28", "2026-07-29", "2026-07-30"):
+        baseline.extend(front_loaded_rows(day, 48))
+
+    for bars_today, label in ((1, "开盘第一根"), (6, "半小时"), (24, "半天")):
+        rows = baseline + front_loaded_rows("2026-07-31", 48)[:bars_today]
+        snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(rows))
+
+        assert snapshot is not None, label
+        assert snapshot.volume_ratio is not None, label
+        assert 0.95 <= snapshot.volume_ratio <= 1.05, f"{label} 读到 {snapshot.volume_ratio}"
+
+
+def test_volume_ratio_still_flags_a_genuinely_heavy_open() -> None:
+    """修掉的是口径偏差，不是灵敏度：真的比常态放量一倍，就该读到约 2。"""
+    baseline = []
+    for day in ("2026-07-28", "2026-07-29", "2026-07-30"):
+        baseline.extend(front_loaded_rows(day, 48))
+    today = front_loaded_rows("2026-07-31", 48)[:6]
+    for row in today:
+        row["volume"] *= 2.0
+
+    snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(baseline + today))
+
+    assert snapshot is not None
+    assert snapshot.volume_ratio is not None
+    assert 1.9 <= snapshot.volume_ratio <= 2.1
+
+
+def test_volume_ratio_drops_a_baseline_day_with_no_volume_yet() -> None:
+    """基线日在该时点前没有成交（数据缺口/停牌半天）就整条丢掉。
+
+    留着它会让均值被 0 拖低，把量比放大成一个看起来很吓人的数——那正是这一层
+    最不该制造的东西。
+    """
+    baseline = front_loaded_rows("2026-07-29", 48) + front_loaded_rows("2026-07-30", 48)
+    gapped = front_loaded_rows("2026-07-28", 48)[12:]  # 当天上午的数据整段缺失
+    rows = gapped + baseline + front_loaded_rows("2026-07-31", 48)[:6]
+    snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(rows))
+
+    assert snapshot is not None
+    assert snapshot.volume_ratio is not None
+    assert 0.95 <= snapshot.volume_ratio <= 1.05
+
+
+# ---- 尾盘量能 -------------------------------------------------------------
+
+
+def session_rows(
+    day: str,
+    bars: int = 48,
+    start_price: float = 10.0,
+    step: float = 0.01,
+    tail_volume: float = 1.0,
+    midday_volume: float = 1.0,
+) -> list[dict]:
+    """真实作息的 5 分钟线：上午 24 根 + 下午 24 根，**跳过午休**。
+
+    `minute_rows` 从 09:30 一路加 5 分钟，48 根只走到 13:25——尾盘窗口测不到。这里
+    把下午那半天挪回 13:00 起，最后一根落在 14:55（elapsed=235），尾盘 30 分钟窗口
+    正好是最后 6 根。
+
+    `tail_volume` 缩放最后 6 根的量，`midday_volume` 缩放中间那段——两个旋钮用来
+    分别构造「尾盘放量」和「日内 U 形」。
+    """
+    rows = []
+    price = start_price
+    for index in range(bars):
+        if index < bars // 2:
+            moment = datetime.strptime(f"{day} 09:30:00", "%Y-%m-%d %H:%M:%S") + timedelta(
+                minutes=5 * index
+            )
+        else:
+            moment = datetime.strptime(f"{day} 13:00:00", "%Y-%m-%d %H:%M:%S") + timedelta(
+                minutes=5 * (index - bars // 2)
+            )
+        price += step
+        in_tail = index >= bars - 6
+        in_midday = bars // 4 <= index < bars - 6
+        volume = 1000.0
+        if in_tail:
+            volume *= tail_volume
+        elif in_midday:
+            volume *= midday_volume
+        rows.append(
+            {
+                "day": moment.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": round(price - step, 3),
+                "high": round(price + 0.02, 3),
+                "low": round(price - 0.02, 3),
+                "close": round(price, 3),
+                "volume": volume,
+                "amount": volume * price,
+            }
+        )
+    return rows
+
+
+def with_baseline(today_rows: list[dict], **baseline: float) -> list[dict]:
+    rows: list[dict] = []
+    for day in ("2026-07-28", "2026-07-29", "2026-07-30"):
+        rows.extend(session_rows(day, **baseline))
+    return rows + today_rows
+
+
+def tail_snapshot(today_rows: list[dict], **baseline: float):
+    return IntradayAnalyzer(today=date(2026, 7, 31)).analyze(
+        "600519.SH", bars_from(with_baseline(today_rows, **baseline))
+    )
+
+
+def test_closing_volume_ratio_reads_one_for_an_ordinary_tail() -> None:
+    """尾盘节奏和前几日一样，就该读 1.0。"""
+    snapshot = tail_snapshot(session_rows("2026-07-31"))
+
+    assert snapshot is not None
+    assert snapshot.closing_volume_ratio is not None
+    assert 0.95 <= snapshot.closing_volume_ratio <= 1.05
+
+
+def test_closing_volume_separates_a_bought_rally_from_a_painted_one() -> None:
+    """**这是本读数存在的理由。**
+
+    两天的价格序列完全相同，所以 `closing_drive_pct` 一模一样——单看涨幅，「尾盘
+    缓拉吸筹」和「尾盘急拉做 K 线」不可分。加上量能之后才分得开：一个尾盘放量到
+    2.5 倍（真金白银在买），一个萎缩到 0.4 倍（拉给人看的）。
+    """
+    bought = tail_snapshot(session_rows("2026-07-31", tail_volume=2.5))
+    painted = tail_snapshot(session_rows("2026-07-31", tail_volume=0.4))
+
+    assert bought is not None and painted is not None
+    # 涨幅相同——这正是问题所在。
+    assert bought.closing_drive_pct == painted.closing_drive_pct
+    # 量能把它们分开。
+    assert bought.closing_volume_ratio is not None
+    assert painted.closing_volume_ratio is not None
+    assert 2.4 <= bought.closing_volume_ratio <= 2.6
+    assert 0.35 <= painted.closing_volume_ratio <= 0.45
+
+
+def test_closing_volume_ratio_is_not_measured_against_the_daily_mean() -> None:
+    """日内 U 形不该被读成尾盘放量。
+
+    这一天（和基线日一样）中段缩量到 0.2、尾盘回到 1.0，是 A 股最常见的日内形状。
+    下面把「当日分钟均量」口径会读到的数当场算出来做反证——它是常态形状的产物，
+    不是资金行为。同一个错误的另一面见 `_volume_ratio` 弃用 `elapsed/240` 线性
+    折算那段。
+    """
+    shape = {"midday_volume": 0.2}
+    today = session_rows("2026-07-31", **shape)
+    snapshot = tail_snapshot(today, **shape)
+
+    # 反证：当日分钟均量做分母会读到 2.0，看着像「尾盘资金进场」。
+    tail_per_bar = sum(row["volume"] for row in today[-6:]) / 6
+    session_per_bar = sum(row["volume"] for row in today) / len(today)
+    assert tail_per_bar / session_per_bar == 2.0
+
+    # 同窗口口径读 1.0，因为这个形状本来就是常态。
+    assert snapshot is not None
+    assert snapshot.closing_volume_ratio is not None
+    assert 0.95 <= snapshot.closing_volume_ratio <= 1.05
+
+
+def test_closing_volume_ratio_declines_before_a_full_window_exists() -> None:
+    """开盘 25 分钟时「最近 30 分钟」并不存在，给数就是让它冒充尾盘读数。"""
+    snapshot = tail_snapshot(session_rows("2026-07-31")[:5])
+
+    assert snapshot is not None
+    assert snapshot.closing_volume_ratio is None
+
+
+def test_closing_volume_ratio_needs_a_baseline_session() -> None:
+    """只有当天、没有前几日，这个比值无从谈起。"""
+    snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze(
+        "600519.SH", bars_from(session_rows("2026-07-31"))
+    )
+
+    assert snapshot is not None
+    assert snapshot.closing_volume_ratio is None
+
+
 def test_snapshot_returns_none_without_usable_bars() -> None:
     assert IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", []) is None
 
@@ -308,7 +514,14 @@ ADVICE_FACTS = {
     "symbols": [
         {"symbol": "600519.SH", "name": "贵州茅台", "last_price": 1350.6,
          "entry_low": 1333.93, "entry_high": 1337.53, "stop": 1285.46,
-         "targets": [1355.72], "rrr": 4.08},
+         "targets": [1355.72], "rrr": 4.08,
+         "trade_context": {"turnover_ratio": 2.36, "session_amount": 12686185800.0},
+         "shortline": {
+             "action": "wait_trigger",
+             "score": 3,
+             "summary": "结构尚可，优先看回踩承接，突破再加速",
+             "reasons": ["现价位于分时均价上方 0.32%", "换手率 2.36%"],
+         }},
     ],
 }
 
@@ -375,6 +588,13 @@ def test_chat_without_a_key_points_at_the_offline_path() -> None:
     assert "/show" in answer
 
 
+def test_chat_defaults_to_facts_only_without_a_client() -> None:
+    answer, notes = ChatResponder().answer(session_with_facts(), "怎么样")
+
+    assert "## 买卖点" in answer
+    assert notes and "--llm" in notes[0]
+
+
 def test_chat_with_empty_context_asks_for_symbols() -> None:
     answer, _ = ChatResponder(FakeClient()).answer(ChatSession(), "怎么样")
     assert "/add" in answer
@@ -422,8 +642,57 @@ def test_show_renders_without_touching_the_llm() -> None:
     assert "600519.SH" in summary and "1285.46" in summary
 
 
+def test_show_surfaces_shortline_judgement_and_trade_context() -> None:
+    summary = render_facts_summary(session_with_facts())
+
+    assert "结构尚可" in summary
+    assert "换手率 2.36%" in summary
+    assert "成交额 126.86 亿" in summary
+
+
+def test_show_renders_a_sector_bundle_as_a_human_summary() -> None:
+    session = ChatSession()
+    session.set_facts(
+        "sectors",
+        {
+            "market_direction": "偏多",
+            "market_score": 79.8,
+            "position_factor": 0.68,
+            "sectors_selected": ["传媒", "计算机"],
+            "candidate_symbols": ["300588.SZ", "688621.SH"],
+            "limit_up": 99,
+            "blowups": 107,
+            "max_streak": 9,
+        },
+    )
+
+    summary = render_facts_summary(session)
+
+    assert "盘前主链路" in summary
+    assert "先看板块" in summary
+    assert "300588.SZ" in summary
+
+
 def test_unknown_command_is_reported_not_executed() -> None:
     assert "未知命令" in handle_command(ChatSession(), "/nope", lambda s: {}, dict)
+
+
+def test_debate_command_does_not_raise_on_an_empty_context() -> None:
+    """`/debate` 此前**每一次调用都抛 TypeError**。
+
+    `has_facts` 是 property，写成 `session.has_facts()` 等于去调用一个 bool。
+    上下文空不空都一样炸——空的时候 `not False` 先求值，`False()` 照样抛。
+
+    它活下来是因为这条命令一条测试都没有：辩论层本身测过（`test_automation.py`
+    里四条），但**从对话入口进去的那条路**没测过。加这条不是为了这一个 bug，
+    是为了那条路以后一直有人走。
+    """
+    assert "上下文为空" in handle_command(ChatSession(), "/debate", lambda s: {}, dict)
+
+
+def test_debate_command_reports_a_missing_key_instead_of_failing() -> None:
+    message = handle_command(session_with_facts(), "/debate", lambda s: {}, dict)
+    assert "未配置 LLM key" in message
 
 
 # ---- freshness probe -----------------------------------------------------

@@ -1,0 +1,375 @@
+"""按时刻装配上下文。
+
+这个模块只做一件事：决定「现在该把什么放进模型看得见的范围」，然后去把它们读
+出来。它**不做任何计算**——每一块都来自某个已经算好的地方（状态目录、台账、
+落盘的 facts），或者来自调用方传进来的现算函数。
+
+每一块都独立守卫。台账读不出来不该让板块排序也消失——这是 `agents/base.py` 那条
+「单个源挂了不能拖垮跑批」在问答这一侧的同一个要求。
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from datetime import time as clock_time
+from pathlib import Path
+from typing import Any
+
+from ashare_decision_support.advice.view import (
+    entry_band,
+    is_advice_like,
+    short,
+    sort_advice_items,
+    trade_context_parts_from_dict,
+)
+
+PHASE_PRE_OPEN = "pre_open"
+PHASE_INTRADAY = "intraday"
+PHASE_POST_CLOSE = "post_close"
+PHASE_OFF_HOURS = "off_hours"
+
+PHASE_LABELS = {
+    PHASE_PRE_OPEN: "开盘前",
+    PHASE_INTRADAY: "盘中",
+    PHASE_POST_CLOSE: "盘后",
+    PHASE_OFF_HOURS: "非交易时段",
+}
+
+# 时段边界。09:15 起算盘前是因为集合竞价从那一刻开始报价；15:00 收盘之后到
+# 次日 05:00 都算盘后，因为那段时间你问的仍然是「今天发生了什么」。
+PRE_OPEN_FROM = clock_time(5, 0)
+SESSION_OPEN = clock_time(9, 15)
+SESSION_CLOSE = clock_time(15, 0)
+
+MORNING_LATEST_NAME = "morning_latest.json"
+ADVICE_LATEST_NAME = "advice_latest.json"
+POST_CLOSE_LATEST_NAME = "post_close_latest.json"
+STRATEGY_SCREEN_LATEST_NAME = "strategy_screen_latest.json"
+
+
+@dataclass
+class AskContext:
+    """装配好的上下文，以及它是怎么装配出来的。"""
+
+    phase: str
+    as_of: str
+    symbols: list[str] = field(default_factory=list)
+    blocks: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    # 问题点名的那几只。空表示没点名，此时全部标的一视同仁。
+    focus: list[str] = field(default_factory=list)
+
+    @property
+    def phase_label(self) -> str:
+        return PHASE_LABELS.get(self.phase, self.phase)
+
+    def facts(self) -> dict[str, Any]:
+        return {
+            "时段": self.phase_label,
+            "时刻": self.as_of,
+            "标的": self.symbols,
+            **self.blocks,
+            "装配说明": self.notes,
+        }
+
+    def facts_text(self) -> str:
+        return json.dumps(self.facts(), ensure_ascii=False, indent=2, default=str)
+
+    def render(self) -> str:
+        """不经模型的原样呈现。没配 key 时这是全部功能。"""
+        lines = [f"【{self.phase_label}】{self.as_of}"]
+        if self.symbols:
+            lines.append(f"标的 {len(self.symbols)} 只：{'、'.join(self.symbols[:20])}")
+        for name, block in self.blocks.items():
+            lines.append("")
+            lines.append(f"[{name}]")
+            if is_advice_like(block):
+                lines.extend(_render_advice_like_block(block))
+                continue
+            lines.extend(_render_block(block))
+        if self.notes:
+            lines.append("")
+            lines.extend(f"（{note}）" for note in self.notes)
+        return "\n".join(lines)
+
+
+def current_phase(moment: datetime) -> str:
+    """现在算哪个时段。只看钟点，不判交易日——交易日历由调用方决定。"""
+    now = moment.time()
+    if now < PRE_OPEN_FROM:
+        return PHASE_OFF_HOURS
+    if now < SESSION_OPEN:
+        return PHASE_PRE_OPEN
+    if now < SESSION_CLOSE:
+        return PHASE_INTRADAY
+    return PHASE_POST_CLOSE
+
+
+def resolve_phase(moment: datetime, is_trading_day: bool | None = None) -> str:
+    """钟点与交易日历合并之后的时段。
+
+    单独抽出来是因为**装配和提问都要用它**：`plan.py` 得先知道现在是哪个时段
+    才能定默认关注点，而它不该为了拿这一个字符串把整份上下文先装配一遍。
+    两处各判一次早晚会分叉。
+    """
+    phase = current_phase(moment)
+    if is_trading_day is False and phase != PHASE_OFF_HOURS:
+        return PHASE_OFF_HOURS
+    return phase
+
+
+def load_known_names() -> dict[str, str]:
+    """简称 → 代码。只认自选股与候选池里的名字。
+
+    **不去全市场查名字**：那要么是一次网络往返，要么是一份会过期的本地表，
+    而这一层的作用只是让「丸美生物低开了怎么办」里的名字能对上一个代码。对不上
+    的名字由 `question.py` 明确报出来，比猜一个更有用。
+    """
+    try:
+        from ashare_decision_support.state import CandidatePool, Watchlist
+
+        entries = list(Watchlist().entries) + list(CandidatePool().entries)
+    except Exception:
+        return {}
+    return {
+        str(entry.name): entry.symbol
+        for entry in entries
+        if getattr(entry, "name", None) and entry.symbol
+    }
+
+
+def assemble(
+    moment: datetime,
+    symbols: list[str] | None = None,
+    output_dir: str | Path | None = None,
+    compute_symbols: Callable[[list[str]], dict] | None = None,
+    phase: str | None = None,
+    is_trading_day: bool | None = None,
+    focus: list[str] | None = None,
+) -> AskContext:
+    """把这个时刻该有的上下文全部读出来。
+
+    `compute_symbols` 是唯一会触发计算的入口（盘中的实时价位）。传 None 就只读
+    已经落盘的那份，问答仍然可用——只是价位是上一次跑出来的，这一点会写进
+    `notes`，不会假装是实时的。
+
+    `focus` 非空时，实时计算**只覆盖这几只**。问三只票就取三只票的分钟线，而不是
+    把整个自选池加候选池全算一遍——那是几十次 HTTP，而其中绝大多数不会出现在
+    答案里。装配好的上下文仍然包含全部标的列表，只是没有它们的实时价位。
+    """
+    resolved = phase or resolve_phase(moment, is_trading_day)
+
+    ctx = AskContext(phase=resolved, as_of=moment.isoformat(timespec="seconds"))
+    watch, candidates = _load_watchlist(ctx, moment.date())
+    ctx.symbols = list(dict.fromkeys((symbols or []) + watch + candidates))
+    ctx.focus = [symbol for symbol in (focus or []) if symbol]
+
+    # 盘前 / 非交易时段：读最近一次主链路的产出。
+    if resolved in (PHASE_PRE_OPEN, PHASE_OFF_HOURS, PHASE_POST_CLOSE):
+        _load_payload(ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路")
+        _load_payload(ctx, output_dir, STRATEGY_SCREEN_LATEST_NAME, "参数化策略扫描")
+
+    if resolved == PHASE_INTRADAY:
+        _load_payload(ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路")
+        _load_payload(ctx, output_dir, STRATEGY_SCREEN_LATEST_NAME, "参数化策略扫描")
+        _load_alerts(ctx, moment.date())
+        _load_live_levels(ctx, compute_symbols)
+    elif resolved == PHASE_POST_CLOSE:
+        _load_alerts(ctx, moment.date())
+        _load_payload(ctx, output_dir, POST_CLOSE_LATEST_NAME, "次日执行卡")
+    else:
+        # 盘前与非交易时段没有当日实时价位可谈，用最近一次算过的那份。
+        _load_payload(ctx, output_dir, ADVICE_LATEST_NAME, "最近一次买卖点")
+
+    _load_journal(ctx)
+
+    if resolved == PHASE_OFF_HOURS:
+        ctx.notes.append("非交易时段：以下全部是最近一次跑出来的旧数据，不是实时行情")
+    if resolved == PHASE_PRE_OPEN:
+        ctx.notes.append("开盘前：价位为昨收口径的结构位，开盘后需要用当日分时重算")
+    return ctx
+
+
+# ---- blocks --------------------------------------------------------------
+
+
+def _load_watchlist(ctx: AskContext, today: date) -> tuple[list[str], list[str]]:
+    try:
+        from ashare_decision_support.state import CandidatePool, Watchlist
+
+        book, pool = Watchlist(), CandidatePool(today=today)
+    except Exception as exc:
+        ctx.notes.append(f"自选股/候选池读取失败（{type(exc).__name__}），本次不含这一块")
+        return [], []
+
+    # 用 `Watchlist.holdings()` 而不是自己按属性过滤：字段叫 `holding`，
+    # `getattr(entry, "is_holding", False)` 这类猜名字的写法会**静默**恒为
+    # False——持仓数永远是 0，而盘中问「我该卖吗」时模型正是照着这个数答的。
+    holdings = book.holdings()
+    ctx.blocks["自选与候选"] = {
+        "自选": [entry.to_dict() for entry in book.entries],
+        "候选池": [entry.to_dict() for entry in pool.entries],
+        "候选池生成日": pool.trade_date,
+        "持仓数": len(holdings),
+        # 持仓单独摊平成几个短字段，不复用上面那份 `to_dict()`。原因在渲染那一侧：
+        # `_short` 会把超过 160 字的条目截断，而 `asdict` 的字段顺序把成本价、
+        # 计划止损、计划目标排在最后——正好是被截掉的那几个。没配 key 时
+        # `render()` 就是全部输出，于是「我该不该卖」最需要的三个数恰恰看不见。
+        "持仓": [
+            {
+                "symbol": entry.symbol,
+                "成本价": entry.cost_price,
+                "股数": entry.shares,
+                "建仓日": entry.opened_on,
+                "持有天数": entry.held_days,
+                "计划止损": entry.plan_stop,
+                "计划目标": entry.plan_target,
+            }
+            for entry in holdings
+        ],
+    }
+    if not book.entries and not pool.entries:
+        ctx.notes.append("自选股与候选池都是空的，用 `ashare-ds watchlist add <代码>` 加入标的")
+    return book.symbols(), pool.symbols()
+
+
+def _load_alerts(ctx: AskContext, today: date) -> None:
+    try:
+        from ashare_decision_support.state import AlertState
+
+        fired = AlertState.load(today).fired_summary()
+    except Exception as exc:
+        ctx.notes.append(f"当日告警读取失败（{type(exc).__name__}）")
+        return
+    ctx.blocks["当日告警"] = {"日期": str(today), "已触发": fired, "条数": len(fired)}
+
+    # 板块告警存在另一个文件里（个股与板块的 AlertState 不能共用一个路径），
+    # 所以要单独读一次。少了这一次，「今天板块有什么异动」会答「没有任何告警」。
+    try:
+        from ashare_decision_support.monitor.sector_triggers import fired_sectors_today
+
+        sectors = fired_sectors_today(today)
+    except Exception as exc:
+        ctx.notes.append(f"当日板块告警读取失败（{type(exc).__name__}）")
+        sectors = []
+    if sectors:
+        ctx.blocks["当日板块告警"] = {"日期": str(today), "已触发": sectors, "条数": len(sectors)}
+
+    if not fired and not sectors:
+        ctx.notes.append("今天还没有触发任何告警")
+
+
+def _load_journal(ctx: AskContext) -> None:
+    try:
+        from ashare_decision_support.journal import Journal, rolling_validation, summarize
+
+        outcomes = Journal().outcomes()
+        stats = summarize(outcomes)
+    except Exception as exc:
+        ctx.notes.append(f"台账统计读取失败（{type(exc).__name__}）")
+        return
+    ctx.blocks["台账统计"] = stats
+    ctx.blocks["近期验证"] = rolling_validation(outcomes)
+    if not stats.get("samples"):
+        ctx.notes.append("台账里还没有已兑现的记录，统计全为空是正常的")
+    else:
+        ctx.notes.append("近期验证按交易日切窗，只用于判断近期有效性，不自动改写策略")
+
+
+def _load_live_levels(
+    ctx: AskContext, compute_symbols: Callable[[list[str]], dict] | None
+) -> None:
+    targets = ctx.focus or ctx.symbols
+    if not targets:
+        return
+    if compute_symbols is None:
+        ctx.notes.append("未提供实时计算入口，盘中价位取最近一次落盘结果，可能已过时")
+        return
+    if ctx.focus and len(ctx.focus) < len(ctx.symbols):
+        ctx.notes.append(
+            f"实时价位只算问题点名的 {len(ctx.focus)} 只，其余 "
+            f"{len(ctx.symbols) - len(ctx.focus)} 只本次没有实时价位"
+        )
+    try:
+        ctx.blocks["实时买卖点"] = compute_symbols(targets)
+    except Exception as exc:
+        ctx.notes.append(f"实时买卖点计算失败（{type(exc).__name__}: {exc}），本次不含这一块")
+
+
+def _load_payload(
+    ctx: AskContext, output_dir: str | Path | None, name: str, label: str
+) -> None:
+    if output_dir is None:
+        return
+    path = Path(output_dir) / name
+    if not path.exists():
+        ctx.notes.append(f"{label}尚无落盘结果（{path}），本次不含这一块")
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        ctx.notes.append(f"{label}读取失败（{type(exc).__name__}）")
+        return
+    ctx.blocks[label] = payload
+    stamp = payload.get("trade_date") if isinstance(payload, dict) else None
+    if stamp:
+        ctx.notes.append(f"{label}的数据日期是 {stamp}")
+
+
+def _render_block(block: Any, indent: str = "  ") -> list[str]:
+    if isinstance(block, dict):
+        lines = []
+        for key, value in block.items():
+            if isinstance(value, (dict, list)) and value:
+                lines.append(f"{indent}{key}:")
+                lines.extend(_render_block(value, indent + "  "))
+            else:
+                lines.append(f"{indent}{key}: {short(value)}")
+        return lines
+    if isinstance(block, list):
+        return [f"{indent}- {short(item)}" for item in block[:12]] + (
+            [f"{indent}… 另有 {len(block) - 12} 条"] if len(block) > 12 else []
+        )
+    return [f"{indent}{short(block)}"]
+
+
+def _render_advice_like_block(block: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    items = sort_advice_items(block.get("symbols"))
+    for item in items[:10]:
+        symbol = item.get("symbol") or ""
+        name = item.get("name") or ""
+        title = f"  - {symbol} {name}".rstrip()
+        summary = _advice_summary(item)
+        lines.append(title + (f"：{summary}" if summary else ""))
+        reasons = (item.get("shortline") or {}).get("reasons") or []
+        if reasons:
+            lines.append("    依据：" + "；".join(str(reason) for reason in reasons[:4]))
+        warnings = item.get("warnings") or []
+        if warnings:
+            lines.append("    风险：" + "；".join(str(warning) for warning in warnings[:3]))
+    if not items:
+        lines.append("  - 暂无买卖点数据。")
+    return lines
+
+
+def _advice_summary(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    shortline = item.get("shortline") or {}
+    if shortline.get("summary"):
+        parts.append(str(shortline.get("summary")))
+    if item.get("trend_state"):
+        parts.append(f"趋势 {item.get('trend_state')}")
+    if item.get("last_price") is not None:
+        parts.append(f"现价 {item.get('last_price')}")
+    if item.get("entry_low") is not None:
+        parts.append(f"买入 {entry_band(item)}")
+    if item.get("stop") is not None:
+        parts.append(f"止损 {item.get('stop')}")
+    if item.get("targets"):
+        parts.append(f"目标 {item.get('targets')}")
+    parts.extend(trade_context_parts_from_dict(item))
+    return "；".join(parts)

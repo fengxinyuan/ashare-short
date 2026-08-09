@@ -1,11 +1,20 @@
 .pytest_cache/
 __pycache__/
+*.egg-info/
 *.pyc
 .venv/
+.mace_patch/
+# 测试与 lint 的缓存。`.ruff_cache/` 与 `.pytest_cache/` 自带 .gitignore，
+# `.coverage` 不带——不写在这里它每跑一次 pytest --cov 就冒到 git status 里。
+.coverage
+.coverage.*
+.ruff_cache/
+htmlcov/
 
-# 密钥：只有 .env.tickflow.example 进版本库
+# 密钥：只有 *.example 进版本库
 .env
 .env.tickflow
+.env.feishu
 
 # 运行产物：每次跑都会重生成，进版本库只会制造噪声
 briefs/
@@ -14,3 +23,7 @@ tickflow_charts/
 audit_*.json
 tickflow_daily_report.json
 tickflow_smoke.json
+
+# 运行状态：自选股、持仓、台账、告警、舆情语料库。这是**你的数据**，
+# 不是代码——进版本库既泄露持仓又会在每次跑批后制造 diff。
+.runtime_state/

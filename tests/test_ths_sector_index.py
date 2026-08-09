@@ -12,11 +12,9 @@ import json
 import pytest
 
 from ashare_decision_support.adapters.ths_sector_index import (
-    SectorIndexReading,
     ThsSectorIndexAdapter,
     _parse_line_js,
 )
-
 
 # ---- http double ---------------------------------------------------------
 
@@ -36,7 +34,7 @@ def _flat_series(n: int, close: float, amount: float = 1e9) -> list[tuple]:
 def _payload(code: str, name: str, rows: list[tuple]) -> bytes:
     body = json.dumps({"name": name, "total": str(len(rows)), "data": _bars(rows)},
                       ensure_ascii=False)
-    return f"quotebridge_v6_line_bk_{code}_01_last({body})".encode("utf-8")
+    return f"quotebridge_v6_line_bk_{code}_01_last({body})".encode()
 
 
 class _Resp:
@@ -70,9 +68,9 @@ class StubHttp:
 
 
 # 一根「高开冲高、收在当日最低」的日线，接在 26 根平盘之后。
-FADE_ROWS = _flat_series(26, 100.0) + [("20260731", 104.0, 106.0, 102.0, 102.0, 2e9)]
+FADE_ROWS = [*_flat_series(26, 100.0), ("20260731", 104.0, 106.0, 102.0, 102.0, 2000000000.0)]
 # 一根「稳步走高、收在当日最高」的日线。
-STRONG_ROWS = _flat_series(26, 100.0) + [("20260731", 100.5, 101.0, 100.2, 101.0, 1.2e9)]
+STRONG_ROWS = [*_flat_series(26, 100.0), ("20260731", 100.5, 101.0, 100.2, 101.0, 1200000000.0)]
 
 
 # ---- parsing -------------------------------------------------------------
@@ -134,7 +132,7 @@ def test_describe_calls_out_sectors_that_rose_but_closed_at_the_low() -> None:
 
 
 def test_volume_ratio_compares_the_recent_week_against_the_month() -> None:
-    rows = _flat_series(26, 100.0, amount=1e9) + [("20260731", 100.0, 101.0, 99.0, 100.0, 1e9)]
+    rows = [*_flat_series(26, 100.0, amount=1000000000.0), ("20260731", 100.0, 101.0, 99.0, 100.0, 1000000000.0)]
     http = StubHttp({"881101": ("测试", rows)})
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101"])
 
@@ -142,7 +140,7 @@ def test_volume_ratio_compares_the_recent_week_against_the_month() -> None:
 
 
 def test_a_flat_bar_does_not_divide_by_zero() -> None:
-    rows = _flat_series(26, 100.0) + [("20260731", 100.0, 100.0, 100.0, 100.0, 1e9)]
+    rows = [*_flat_series(26, 100.0), ("20260731", 100.0, 100.0, 100.0, 100.0, 1000000000.0)]
     http = StubHttp({"881101": ("测试", rows)})
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101"])
 
@@ -162,7 +160,7 @@ def test_too_short_a_history_is_dropped_instead_of_measured() -> None:
 
 def test_sectors_stuck_on_an_older_date_are_excluded_not_ranked() -> None:
     """不同交易日的读数排在一张榜上，名次就是假的。"""
-    stale = _flat_series(26, 100.0) + [("20260730", 100.0, 101.0, 99.0, 100.5, 1e9)]
+    stale = [*_flat_series(26, 100.0), ("20260730", 100.0, 101.0, 99.0, 100.5, 1000000000.0)]
     http = StubHttp({"881101": ("半导体", FADE_ROWS), "881102": ("停牌板块", stale)})
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
 

@@ -50,10 +50,10 @@ class FakeKlines:
         if self.boom:
             raise RuntimeError("klines down")
         if self.pages is None:
-            return {s: COMPACT for s in kwargs["symbols"]}
+            return dict.fromkeys(kwargs["symbols"], COMPACT)
         index = len(self.calls) - 1
         page = self.pages[index] if index < len(self.pages) else {}
-        return {s: page for s in kwargs["symbols"]}
+        return dict.fromkeys(kwargs["symbols"], page)
 
 
 class FakeClient:
@@ -315,3 +315,25 @@ def test_a_free_adapter_does_not_route_to_the_paid_endpoint() -> None:
 def test_no_adapter_at_all_still_returns_something_or_none_but_never_raises() -> None:
     """分钟线缺了链路仍要能跑（退化成只出日线结构判断），所以这里不许抛。"""
     build_intraday_adapter(None)
+
+
+def test_minute_bars_drop_non_finite_readings() -> None:
+    """NaN 不能进分钟线——`float(nan)` 不抛异常，`try/float` 挡不住它。
+
+    进去之后不会报错：`_px` 的 `round(nan, 4)` 还是 NaN，而
+    `signals/intraday.py` 里 `float(bar.get("volume") or 0.0)` 也收得下——NaN 是
+    真值，连那个 `or 0.0` 兜底都不触发，当日累计成交量整个变成 NaN，随后所有
+    量比比较静默变成 False。
+    """
+    from ashare_decision_support.adapters.tickflow_intraday import _at
+
+    nan = float("nan")
+    assert _at([1.0, nan, 3.0], 1) is None
+    assert _at([nan], 0) is None
+    assert _at([float("inf")], 0) is None
+    assert _at([], 0) is None
+    assert _at([None, ""], 0) is None
+    assert _at([None, ""], 1) is None
+    # 正常读数照常通过，字符串数字也仍然收得下。
+    assert _at([1.5], 0) == 1.5
+    assert _at(["2.5"], 0) == 2.5

@@ -101,3 +101,22 @@ def test_qmt_health_reports_not_ready_instead_of_raising() -> None:
         assert "xtquant" in payload["reason"]
     else:
         assert payload["ready"] is True
+
+
+def test_source_timestamp_rejects_non_numbers_instead_of_crashing() -> None:
+    """`isinstance(raw, (int, float))` 在这里有两个漏法，后果不同。
+
+    - `True` 通过后 `fromtimestamp(1.0)` 是 1970 年——一个看不出错的错时间戳，
+      而 `source_ts` 决定简报上那句「数据时点」。
+    - NaN 通过后 `fromtimestamp(nan)` 直接抛 ValueError，把一次取数变成一次崩溃。
+
+    两种都该退回「没有时间戳」，由调用方按缺失处理。
+    """
+    from datetime import datetime
+
+    adapter = QmtXtDataAdapter(xtdata_module=FakeXtData(), auto_connect=False)
+    before = datetime.now()
+    for bad in (float("nan"), float("inf"), True, "not-a-time"):
+        stamp = adapter._extract_source_dt({"sourceTs": bad})
+        # 退回 `datetime.now()`，而不是 1970 年、也不是抛异常。
+        assert stamp >= before.replace(microsecond=0)

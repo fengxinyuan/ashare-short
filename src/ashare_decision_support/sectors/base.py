@@ -74,6 +74,10 @@ class SectorOutlook:
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     headlines: list[str] = field(default_factory=list)
+    news_doc_count: int = 0
+    news_event_types: tuple[str, ...] = ()
+    news_hits: tuple[str, ...] = ()
+    news_risk_hits: tuple[str, ...] = ()
 
     @property
     def direction(self) -> str:

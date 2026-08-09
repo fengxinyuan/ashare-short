@@ -14,7 +14,8 @@ says so and refuses to guess.
 from __future__ import annotations
 
 import time
-from datetime import datetime, time as clock_time
+from datetime import datetime
+from datetime import time as clock_time
 from typing import Any
 
 MORNING_OPEN = clock_time(9, 30)

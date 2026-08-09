@@ -1,171 +1,26 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from ashare_decision_support.models.enums import (
     EffortResult,
-    ResearchTargetType,
-    RiskTag,
-    Route,
-    SignalMode,
     TrendState,
     WyckoffBias,
 )
 
 
-class Candidate(BaseModel):
-    symbol: str
-    route: Route
-    thesis: str
-    stop_bps: int = Field(gt=0)
-    rrr_min: float = Field(gt=0)
-    min_position_pct: float = Field(ge=0, le=1, default=0.05)
-    max_position_pct: float = Field(ge=0, le=1, default=0.15)
-    sector: str | None = None
-    priority_score: float | None = None
-    liquidity_score: float | None = Field(default=None, ge=0, le=1)
-    research_score: float | None = None
-    conviction_score: float | None = None
-    catalyst_score: float | None = None
-    risk_score: float | None = None
-    support_score: float | None = None
-    warnings: list[str] = Field(default_factory=list)
-    agent_notes: list[str] = Field(default_factory=list)
-
-    @field_validator("max_position_pct")
-    @classmethod
-    def validate_position_band(cls, value: float, info) -> float:
-        min_value = info.data.get("min_position_pct", 0.0)
-        if value < min_value:
-            raise ValueError("max_position_pct must be >= min_position_pct")
-        return value
-
-
-class DecisionMatrix(BaseModel):
-    model_config = ConfigDict(use_enum_values=False)
-
-    trade_date: date
-    strategy_version: str
-    market_regime: str
-    position_band_factor: float = Field(ge=0, le=1)
-    sector_whitelist: list[str] = Field(default_factory=list)
-    sector_hedge: list[str] = Field(default_factory=list)
-    candidates: list[Candidate] = Field(default_factory=list)
-    market_notes: list[str] = Field(default_factory=list)
-    agent_summary: list[str] = Field(default_factory=list)
-
-
-class NewsItem(BaseModel):
-    id: str | None = None
-    title: str
-    content: str | None = None
-    source: str | None = None
-    published_at: datetime | None = None
-    symbols: list[str] = Field(default_factory=list)
-    sectors: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
-    importance: float = Field(default=0.5, ge=0, le=1)
-
-
-class AnnouncementItem(BaseModel):
-    symbol: str
-    title: str
-    category: str | None = None
-    summary: str | None = None
-    published_at: datetime | None = None
-    severity: float = Field(default=0.5, ge=0, le=1)
-
-
-class CapitalFlowItem(BaseModel):
-    symbol: str | None = None
-    sector: str | None = None
-    net_inflow: float = 0.0
-    tail_inflow_ratio: float | None = Field(default=None, ge=0)
-    large_order_inflow: float | None = None
-    note: str | None = None
-
-
-class BlacklistEntry(BaseModel):
-    symbol: str
-    reason: str
-
-
-class MarketContext(BaseModel):
-    limit_down_count: int = Field(ge=0)
-    blowup_rate: float = Field(ge=0, le=1)
-    breadth_score: float = Field(ge=0, le=100)
-    style_decay_factor: float = Field(default=1.0, ge=0, le=1)
-    manual_position_factor: float | None = Field(default=None, ge=0, le=1)
-    market_regime_override: str | None = None
-
-
-class SectorBlueprint(BaseModel):
-    name: str
-    route: Route
-    policy_score: float = Field(ge=0)
-    policy_weight: float = Field(default=1.0, ge=0)
-    anchor_score: float = Field(default=0.0)
-    flow_score: float = Field(default=0.0)
-    fake_tail_penalty: float = Field(default=0.0, ge=0)
-    decay_factor: float = Field(default=1.0, ge=0, le=1)
-    priority: int = Field(default=0)
-
-
-class CandidateBlueprint(BaseModel):
-    symbol: str
-    sector: str
-    thesis: str
-    route: Route | None = None
-    stop_bps: int | None = Field(default=None, gt=0)
-    rrr_min: float | None = Field(default=None, gt=0)
-    min_position_pct: float | None = Field(default=None, ge=0, le=1)
-    max_position_pct: float | None = Field(default=None, ge=0, le=1)
-    priority_score: float = Field(default=0.0)
-    liquidity_score: float = Field(default=1.0, ge=0, le=1)
-
-    @field_validator("max_position_pct")
-    @classmethod
-    def validate_optional_position_band(cls, value: float | None, info) -> float | None:
-        min_value = info.data.get("min_position_pct")
-        if value is not None and min_value is not None and value < min_value:
-            raise ValueError("max_position_pct must be >= min_position_pct")
-        return value
-
-
-class ResearchInput(BaseModel):
-    trade_date: date
-    strategy_version: str
-    market_context: MarketContext
-    sectors: list[SectorBlueprint] = Field(default_factory=list)
-    candidates: list[CandidateBlueprint] = Field(default_factory=list)
-    blacklist: list[BlacklistEntry] = Field(default_factory=list)
-    news_items: list[NewsItem] = Field(default_factory=list)
-    announcements: list[AnnouncementItem] = Field(default_factory=list)
-    capital_flows: list[CapitalFlowItem] = Field(default_factory=list)
-    note: str | None = None
-
-
-class MatrixBuildConfig(BaseModel):
-    mainline_min_sector_score: float = 45.0
-    pulse_min_sector_score: float = 55.0
-    hedge_min_sector_score: float = 35.0
-    max_mainline_sectors: int = Field(default=2, ge=0)
-    max_pulse_sectors: int = Field(default=1, ge=0)
-    max_hedge_sectors: int = Field(default=1, ge=0)
-    max_candidates_per_sector: int = Field(default=3, ge=0)
-    min_liquidity_score: float = Field(default=0.4, ge=0, le=1)
-    mainline_min_position_pct: float = Field(default=0.10, ge=0, le=1)
-    mainline_max_position_pct: float = Field(default=0.15, ge=0, le=1)
-    pulse_min_position_pct: float = Field(default=0.05, ge=0, le=1)
-    pulse_max_position_pct: float = Field(default=0.10, ge=0, le=1)
-    hedge_min_position_pct: float = Field(default=0.05, ge=0, le=1)
-    hedge_max_position_pct: float = Field(default=0.08, ge=0, le=1)
-
-
 class AuctionFeatures(BaseModel):
+    """集合竞价读数。**这是适配器协议的一部分，不是策略层的输入。**
+
+    `adapters/base.py` 的 `get_auction_features` 与五个适配器实现都按它出参。策略
+    层目前不消费它——QMT 补不上撮合量与未匹配量（见 `docs/DECISIONS.md`），所以
+    竞价那条线还没建起来。留着是因为归一层（`adapters/mapping.py`）已经在用它当
+    券商字段的落点。
+    """
+
     symbol: str
     matched_qty: int = Field(ge=0)
     # None when the feed cannot observe auction microstructure at all. Engines
@@ -183,6 +38,8 @@ class AuctionFeatures(BaseModel):
 
 
 class OpenFeatures(BaseModel):
+    """开盘后前若干分钟的读数。与 `AuctionFeatures` 同属适配器协议。"""
+
     symbol: str
     minutes_since_open: int = Field(ge=0)
     price_vs_open_pct: float
@@ -191,24 +48,6 @@ class OpenFeatures(BaseModel):
     open_gap_pct: float
     data_stale: bool = False
     source_ts: datetime
-
-
-class DecisionCard(BaseModel):
-    model_config = ConfigDict(use_enum_values=False)
-
-    symbol: str
-    signal_mode: SignalMode
-    route: Route
-    confidence: float = Field(ge=0, le=1)
-    fill_difficulty: float = Field(ge=0, le=1)
-    expected_edge_bps: float
-    suggested_position_band: str
-    risk_tags: list[RiskTag] = Field(default_factory=list)
-    entry_window: str
-    fallback_window: str | None = None
-    explanation: str
-    source_ts: datetime
-    strategy_version: str
 
 
 class WyckoffSignal(BaseModel):

@@ -9,6 +9,10 @@ a real session is ~145 passes × N symbols). So instead of assuming it holds,
 the loop watches its own failure rate and steps the interval down rather than
 hammering a source that is already refusing — and it says so each time, so a
 silent degradation is impossible.
+
+板块截面挂在同一个循环上，每 `SECTOR_EVERY` 轮做一次。**同一个进程、同一套
+降频**：全市场扫描打的是同一个新浪域名，另起一个进程去打它，等于两边各自
+统计失败率、各降各的频，而谁都不知道对方在打。见 `monitor/sector_session.py`。
 """
 
 from __future__ import annotations
@@ -18,8 +22,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from datetime import time as clock_time
+from typing import Any
 
 from ashare_decision_support.adapters.freshness import in_session
+from ashare_decision_support.monitor.sector_session import publish_sector_alerts
 from ashare_decision_support.monitor.session import MonitorSession
 from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import (
@@ -49,6 +55,10 @@ MONITOR_END = clock_time(14, 55)
 # 15 passes at the fastest interval is half an hour.
 RISK_REFRESH_EVERY = 15
 
+# 每多少轮做一次板块截面。板块 pass 是一次全市场扫描（56 页并发），比个股那轮贵，
+# 而且板块排名在两分钟里的移动基本是噪声。默认见 `monitor/sector_session.py`。
+SECTOR_EVERY = 5
+
 
 @dataclass
 class LoopStats:
@@ -57,6 +67,8 @@ class LoopStats:
     bad_passes: int = 0
     suspensions: int = 0
     interval_seconds: int = INTERVAL_LADDER[0]
+    sector_passes: int = 0
+    sector_alerts: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -72,6 +84,8 @@ def run_monitor_loop(
     stop_when: Callable[[], bool] | None = None,
     refresh_risk: Callable[[], list[str]] | None = None,
     refresh_risk_every: int = RISK_REFRESH_EVERY,
+    sector_session: Any | None = None,
+    sector_every: int = SECTOR_EVERY,
 ) -> LoopStats:
     """Poll until `until`, or for `max_passes` passes (tests use the latter)."""
     stats = LoopStats()
@@ -133,6 +147,20 @@ def run_monitor_loop(
             suspended = True
             stats.suspensions += 1
 
+        # 板块 pass。**只在盘中做**：休市时全市场行情不动，落进序列的是一串重复
+        # 截面，会把「较上轮」那一列变成噪声。
+        #
+        # 它不受个股那条时效闸门（`result.health.usable`）约束，因为两者读的是
+        # 完全不同的源：个股走分钟线适配器，板块走新浪全市场快照。分钟线停更
+        # 不代表快照也停了，用前者去否决后者会在最该看板块的那天把它关掉。
+        if (
+            sector_session is not None
+            and sector_every > 0
+            and active
+            and (stats.passes % sector_every == 1 or sector_every == 1)
+        ):
+            _run_sector_pass(sector_session, notifiers, moment, stats)
+
         if result.health.failure_ratio >= BAD_PASS_FAILURE_RATIO:
             stats.bad_passes += 1
             bad_streak += 1
@@ -150,6 +178,24 @@ def run_monitor_loop(
 
     stats.interval_seconds = INTERVAL_LADDER[level]
     return stats
+
+
+def _run_sector_pass(
+    sector_session: Any, notifiers: list[Notifier], moment: datetime, stats: LoopStats
+) -> None:
+    """一次板块截面 + 投递。**任何失败都只记一条 note。**
+
+    板块是「先看哪里」，个股是「买卖点」。让前者有资格中断后者，等于用旁证
+    决定主线跑不跑——同 `notify/base.py:publish` 对投递通道的处置。
+    """
+    try:
+        outcome = sector_session.poll(moment)
+    except Exception as exc:
+        stats.notes.append(f"板块截面第 {stats.passes} 轮异常：{type(exc).__name__}: {exc}")
+        return
+    stats.sector_passes += 1
+    stats.notes.extend(outcome.notes or [])
+    stats.sector_alerts += publish_sector_alerts(notifiers, outcome)
 
 
 def _maybe_step_down(level: int, bad_streak: int, stats: LoopStats) -> tuple[int, int]:

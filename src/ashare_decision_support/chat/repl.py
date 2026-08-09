@@ -7,8 +7,9 @@ need a transport in front of it.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
-from typing import Any, Callable
+from typing import Any
 
 from ashare_decision_support.chat.session import (
     HELP_TEXT,
@@ -18,8 +19,8 @@ from ashare_decision_support.chat.session import (
     render_facts_summary,
 )
 
-BANNER = """A 股超短线助理 · 持续分析
-系统不下单、不接管账户；所有价位为结构位，非预测。
+BANNER = """A 股超短线助理 · 连续分析（趋势 / 股价 / 监控 / 买卖点）
+系统不下单、不接管账户；默认只输出事实包，显式 `--llm` 才会走模型回答。
 输入 /help 看命令，直接提问即可对话，/quit 退出。"""
 
 PROMPT = "\n> "
@@ -41,11 +42,12 @@ def run_chat(
     write(BANNER)
     if symbols:
         session.add_symbols(symbols)
-        write(f"\n正在计算 {'、'.join(symbols)} ...")
+        write(f"\n正在装配 {len(symbols)} 只标的的上下文 ...")
         session.set_facts("advice", compute_symbols(session.symbols))
+        write("已装配上下文，可以直接问趋势、买卖点、监控结果或如果跌破怎么办。")
         write(render_facts_summary(session))
     else:
-        write("\n上下文为空，用 /add <代码> 开始。")
+        write("\n上下文为空，先用 /watch 或 /add <代码> 加入标的。")
 
     while True:
         try:
