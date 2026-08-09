@@ -499,7 +499,7 @@ ashare-ds report show --last 5     # 看最近 5 份
 
 ## 7. 代码清理：主链路怎么变清晰
 
-> **2026-08-09 进度**：#1 #2 #3 #4 #6 已完成。剩 #5。
+> **2026-08-09 进度**：#1 #2 #3 #4 #6 #7 已完成。剩 #5。
 > 接线状态改查 `docs/INVENTORY.md`（那份现在由 `scripts/inventory_audit.py` 生成，
 > 不再是手写的）。
 
@@ -511,15 +511,23 @@ ashare-ds report show --last 5     # 看最近 5 份
 | 4 | `ruff` 的 `C901 / PLR0911 / PLR0912 / PLR0915` 从全局 ignore 改成 `per-file-ignores` | 三个历史长文件继续豁免，**新文件重新受约束** | 无 | **已完成**。且 `jobs/morning.py` 拆完后**自己过了闸**，豁免已摘掉 |
 | 5 | 加 `morning --explain`：打印漏斗计数 | 「板块 31 → 成分股 5446 → 筛后 3200 → 过闸 120 → 候选 15」现在散在 notes 字符串里 | 无，纯增量 | 未做 |
 | 6 | `docs/INTERFACE_INVENTORY.md` 并入 `DATA_SOURCES.md` 后删除 | 文档从 7 篇回到 6 篇，去掉一处重叠 | 无 | **已完成** 2026-08-08 |
+| 7 | 拆 `notify/render.py` / `monitor/triggers.py` / `advice/engine.py` | 三个文件摘掉 `per-file-ignores`，复杂度闸门恢复全仓生效 | 中——动的是判定顺序所在的文件 | **已完成** 2026-08-09 |
 
-**这一轮不动** `notify/render.py`（**1095**）、`monitor/triggers.py`（**808**）、
-`advice/engine.py`（**830**）。它们确实该拆，但拆它们要动**判定顺序**，
-和这一轮的功能改动混在一起会让 diff 无法审阅。留作单独一轮。
+**#7 怎么拆的**（原计划是「留作单独一轮」，因为拆它们要动判定顺序）：拆法是
+**按判定阶段切，不按行数切**，所以判定顺序一行没动——
 
-> 三个数字是 2026-08-09 重量的，比上次记的 878 / 804 / 793 各涨了一截——
-> `render.py` 一个文件就多了 217 行。**这三个文件仍在长**，`pyproject.toml`
-> 的 `per-file-ignores` 豁免正在被当成常态使用。拆分那一轮开始之前，
-> 至少不要再往这三个文件里加新分支。
+| 文件 | 最大复杂度 | 拆法 |
+|---|---|---|
+| `notify/render.py` | 41 → **≤10** | 每个 `## 小节` 各自成函数；`_alert_action_line` 的 13 层 if 阶梯换成两张查表（持仓表优先于通用表） |
+| `monitor/triggers.py` | 25 → **≤10** | `evaluate` 拆成买点 / 卖点 / 其余状态三段；十来个入参收成一个只读 `_Crossing` 上下文，子方法签名统一为 `(ctx, emit)` |
+| `advice/engine.py` | 40 → **≤10** | `_shortline` 拆成取位 → 打分 → 判定三段；判定再分「结构判定」与「分数兜底」，前者认领不到才退给后者 |
+
+`pyproject.toml` 里那三行 `per-file-ignores` 已删除，`C901 / PLR0911 / PLR0912 /
+PLR0915` **现在对全仓生效**。三个文件反而各长了一截（render 1095 → 1256、
+triggers 808 → 873、engine 830 → 948），因为拆出来的每个函数都带了自己的
+docstring——**行数不是这轮的指标，能不能过闸才是**。
+
+`ruff check .` 全过，1111 个测试全过，`scripts/inventory_audit.py` 干净。
 
 ---
 

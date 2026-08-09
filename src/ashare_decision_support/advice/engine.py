@@ -208,24 +208,7 @@ class AdviceEngine:
             score_components=dict(score_components or {}),
         )
         if match is not None:
-            advice.setup = match.to_dict()
-            primary = match.primary
-            advice.playbook = primary.value if primary else None
-            # 判据链的理由排在价位理由之前——它回答「为什么现在可以买」，价位只
-            # 回答「买在哪」。没有一条打法成立时，拒绝理由进 warnings 而不是
-            # reasons：那不是买入依据，是不买的依据。
-            if match.ok:
-                advice.reasons.extend(match.reasons)
-                advice.warnings.extend(match.warnings)
-            else:
-                advice.warnings.extend(
-                    f"无可用打法：{text}" for text in match.reject_reasons
-                )
-                blocked = advice.setup.get("blocked_by_regime") or []
-                if blocked:
-                    advice.warnings.append(
-                        f"{'、'.join(blocked)} 被今天的情绪周期挡掉"
-                    )
+            _apply_setup(advice, match)
         if daily is None and intraday is None:
             advice.warnings.append("既无日线也无分钟线数据，无法给出任何判断")
             return advice
@@ -465,32 +448,13 @@ class AdviceEngine:
         intraday: IntradaySnapshot,
         wyckoff: WyckoffSignal | None,
     ) -> None:
-        if daily is not None:
-            advice.reasons.append(f"日线趋势 {daily.trend_state.value}")
-            if daily.volume_ratio_20d is not None:
-                advice.reasons.append(f"日线量比 {daily.volume_ratio_20d:.2f}")
-            if daily.range_position_60d is not None:
-                advice.reasons.append(f"60日分位 {daily.range_position_60d:.2f}")
-        if wyckoff is not None:
-            advice.reasons.append(f"威科夫阶段 {wyckoff.bias.value}（结构分 {wyckoff.score:.0f}）")
-
-        if intraday.price_vs_vwap_pct is not None:
-            side = "上方" if intraday.price_vs_vwap_pct >= 0 else "下方"
-            advice.reasons.append(f"现价位于分时均价{side} {abs(intraday.price_vs_vwap_pct):.2%}")
-        if intraday.opening_drive_pct is not None:
-            advice.reasons.append(f"开盘 30 分钟 {intraday.opening_drive_pct:+.2%}")
-        if intraday.range_position is not None:
-            advice.reasons.append(f"日内位置 {intraday.range_position:.0%}（0=最低 1=最高）")
-        if intraday.volume_ratio is not None:
-            advice.reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}")
-            if intraday.volume_ratio > 3.0:
-                advice.warnings.append(f"成交量为近 5 日均量的 {intraday.volume_ratio:.2f} 倍，注意情绪透支")
-        trade = advice.trade_context
-        if trade is not None:
-            if trade.turnover_ratio is not None:
-                advice.reasons.append(f"换手率 {trade.turnover_ratio:.2f}%")
-            if trade.session_amount is not None:
-                advice.reasons.append(f"当日成交额 {trade.session_amount / 1e8:.2f} 亿")
+        advice.reasons.extend(_daily_reasons(daily, wyckoff))
+        advice.reasons.extend(_intraday_reasons(intraday))
+        if intraday.volume_ratio is not None and intraday.volume_ratio > 3.0:
+            advice.warnings.append(
+                f"成交量为近 5 日均量的 {intraday.volume_ratio:.2f} 倍，注意情绪透支"
+            )
+        advice.reasons.extend(_trade_reasons(advice.trade_context))
 
     def _shortline(
         self,
@@ -502,168 +466,322 @@ class AdviceEngine:
             session_volume=intraday.session_volume,
             session_amount=intraday.session_amount,
         )
-        reclaim_level = _nearest_above(
+        levels = _shortline_levels(advice, daily, intraday)
+
+        tally = _ShortlineTally()
+        _score_daily_trend(daily, tally)
+        _score_daily_volume(daily, tally)
+        _score_intraday(intraday, tally)
+        _describe_trade(trade, tally)
+
+        bias, action, summary = _shortline_verdict(advice, intraday, tally, levels)
+
+        advice.shortline = ShortlineView(
+            bias=bias,
+            action=action,
+            score=tally.score,
+            summary=summary,
+            reasons=_unique(tally.reasons)[:6],
+            reclaim_level=levels.reclaim,
+            support_level=levels.support,
+            pressure_level=levels.pressure,
+            defense_level=levels.defense,
+        )
+
+
+def _apply_setup(advice: StockAdvice, match: Any) -> None:
+    """把打法判据链的结论挂到这条建议上。
+
+    判据链的理由排在价位理由之前——它回答「为什么现在可以买」，价位只回答
+    「买在哪」。没有一条打法成立时，拒绝理由进 warnings 而不是 reasons：
+    那不是买入依据，是不买的依据。
+    """
+    advice.setup = match.to_dict()
+    primary = match.primary
+    advice.playbook = primary.value if primary else None
+    if match.ok:
+        advice.reasons.extend(match.reasons)
+        advice.warnings.extend(match.warnings)
+        return
+    advice.warnings.extend(f"无可用打法：{text}" for text in match.reject_reasons)
+    blocked = advice.setup.get("blocked_by_regime") or []
+    if blocked:
+        advice.warnings.append(f"{'、'.join(blocked)} 被今天的情绪周期挡掉")
+
+
+def _daily_reasons(
+    daily: DailyTechnicalSnapshot | None,
+    wyckoff: WyckoffSignal | None,
+) -> list[str]:
+    lines: list[str] = []
+    if daily is not None:
+        lines.append(f"日线趋势 {daily.trend_state.value}")
+        if daily.volume_ratio_20d is not None:
+            lines.append(f"日线量比 {daily.volume_ratio_20d:.2f}")
+        if daily.range_position_60d is not None:
+            lines.append(f"60日分位 {daily.range_position_60d:.2f}")
+    if wyckoff is not None:
+        lines.append(f"威科夫阶段 {wyckoff.bias.value}（结构分 {wyckoff.score:.0f}）")
+    return lines
+
+
+def _intraday_reasons(intraday: IntradaySnapshot) -> list[str]:
+    lines: list[str] = []
+    if intraday.price_vs_vwap_pct is not None:
+        side = "上方" if intraday.price_vs_vwap_pct >= 0 else "下方"
+        lines.append(f"现价位于分时均价{side} {abs(intraday.price_vs_vwap_pct):.2%}")
+    if intraday.opening_drive_pct is not None:
+        lines.append(f"开盘 30 分钟 {intraday.opening_drive_pct:+.2%}")
+    if intraday.range_position is not None:
+        lines.append(f"日内位置 {intraday.range_position:.0%}（0=最低 1=最高）")
+    if intraday.volume_ratio is not None:
+        lines.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}")
+    return lines
+
+
+def _trade_reasons(trade: TradeContext | None) -> list[str]:
+    if trade is None:
+        return []
+    lines: list[str] = []
+    if trade.turnover_ratio is not None:
+        lines.append(f"换手率 {trade.turnover_ratio:.2f}%")
+    if trade.session_amount is not None:
+        lines.append(f"当日成交额 {trade.session_amount / 1e8:.2f} 亿")
+    return lines
+
+
+@dataclass(frozen=True)
+class _ShortlineLevels:
+    """短线判断要引用的四个价位。它们只是**最近的那个结构位**，不是预测。"""
+
+    reclaim: float | None
+    support: float | None
+    pressure: float | None
+    defense: float | None
+
+
+@dataclass
+class _ShortlineTally:
+    """打分过程的累积量。
+
+    分数、理由、以及被判定语句复用的那几个布尔——`short_ma_weak` / `under_vwap`
+    这类既参与加减分、又参与最后的分支选择。分成两处各算一遍就会漂移，所以
+    只算一次，装在这里传下去。
+    """
+
+    score: int = 0
+    reasons: list[str] = field(default_factory=list)
+    short_ma_weak: int = 0
+    trend_up: bool = False
+    trend_down: bool = False
+    under_vwap: bool = False
+    above_vwap: bool = False
+    near_low: bool = False
+    near_high: bool = False
+
+
+def _shortline_levels(
+    advice: StockAdvice,
+    daily: DailyTechnicalSnapshot | None,
+    intraday: IntradaySnapshot,
+) -> _ShortlineLevels:
+    support = _nearest_below(
+        intraday.last_price,
+        advice.entry_low,
+        daily.stop_reference if daily else None,
+        intraday.session_low,
+    )
+    return _ShortlineLevels(
+        reclaim=_nearest_above(
             intraday.last_price,
             intraday.vwap,
             advice.entry_high,
             daily.ma5 if daily else None,
             daily.ma10 if daily else None,
-        )
-        support_level = _nearest_below(
-            intraday.last_price,
-            advice.entry_low,
-            daily.stop_reference if daily else None,
-            intraday.session_low,
-        )
-        pressure_level = _nearest_above(
+        ),
+        support=support,
+        pressure=_nearest_above(
             intraday.last_price,
             intraday.session_high,
             advice.targets[0] if advice.targets else None,
-        )
-        defense_level = round(advice.stop, 3) if advice.stop is not None else support_level
+        ),
+        defense=round(advice.stop, 3) if advice.stop is not None else support,
+    )
 
-        score = 0
-        reasons: list[str] = []
-        short_ma_weak = 0
-        trend_up = False
-        trend_down = False
 
-        if daily is not None:
-            trend_up = daily.trend_state in {TrendState.UPTREND, TrendState.REBOUND}
-            trend_down = daily.trend_state == TrendState.DOWNTREND
-            if daily.ma20 is not None and daily.ma60 is not None:
-                if daily.last_close > daily.ma20 > daily.ma60:
-                    score += 2
-                    reasons.append("日线仍在 MA20/MA60 上方，中期趋势未坏")
-                elif daily.last_close > daily.ma20 and daily.ma20 <= daily.ma60:
-                    score += 1
-                    reasons.append("日线处于反弹修复阶段")
-                elif daily.last_close < daily.ma20 < daily.ma60:
-                    score -= 2
-                    reasons.append("日线仍在 MA20/MA60 下方，中期偏弱")
-                elif daily.last_close < daily.ma20:
-                    score -= 1
-                    reasons.append("日线仍在 MA20 下方，修复未完成")
+def _score_daily_trend(daily: DailyTechnicalSnapshot | None, tally: _ShortlineTally) -> None:
+    """中期结构（MA20/MA60）与短期均线（MA5/MA10）。"""
+    if daily is None:
+        return
+    tally.trend_up = daily.trend_state in {TrendState.UPTREND, TrendState.REBOUND}
+    tally.trend_down = daily.trend_state == TrendState.DOWNTREND
+    _score_medium_term_ma(daily, tally)
+    _score_short_term_ma(daily, tally)
 
-            for _label, average in (("MA5", daily.ma5), ("MA10", daily.ma10)):
-                if average is None:
-                    continue
-                if daily.last_close >= average:
-                    score += 1
-                else:
-                    score -= 1
-                    short_ma_weak += 1
-            if short_ma_weak >= 2:
-                reasons.append("收盘压在 MA5/MA10 下方，短线主动性不足")
-            elif short_ma_weak == 0 and daily.ma5 is not None and daily.ma10 is not None:
-                reasons.append("收盘站在 MA5/MA10 上方，短线趋势尚可")
 
-            if daily.volume_ratio_20d is not None:
-                if daily.volume_ratio_20d >= 1.2:
-                    score += 1
-                    reasons.append(f"日线量比 {daily.volume_ratio_20d:.2f}，有增量配合")
-                elif daily.volume_ratio_20d < 0.9:
-                    score -= 1
-                    reasons.append(f"日线量比 {daily.volume_ratio_20d:.2f}，承接偏弱")
+def _score_medium_term_ma(daily: DailyTechnicalSnapshot, tally: _ShortlineTally) -> None:
+    if daily.ma20 is None or daily.ma60 is None:
+        return
+    if daily.last_close > daily.ma20 > daily.ma60:
+        tally.score += 2
+        tally.reasons.append("日线仍在 MA20/MA60 上方，中期趋势未坏")
+    elif daily.last_close > daily.ma20 and daily.ma20 <= daily.ma60:
+        tally.score += 1
+        tally.reasons.append("日线处于反弹修复阶段")
+    elif daily.last_close < daily.ma20 < daily.ma60:
+        tally.score -= 2
+        tally.reasons.append("日线仍在 MA20/MA60 下方，中期偏弱")
+    elif daily.last_close < daily.ma20:
+        tally.score -= 1
+        tally.reasons.append("日线仍在 MA20 下方，修复未完成")
 
-        under_vwap = intraday.price_vs_vwap_pct is not None and intraday.price_vs_vwap_pct <= -0.003
-        above_vwap = intraday.price_vs_vwap_pct is not None and intraday.price_vs_vwap_pct >= 0.003
-        near_low = intraday.range_position is not None and intraday.range_position <= 0.35
-        near_high = intraday.range_position is not None and intraday.range_position >= 0.7
 
-        if intraday.price_vs_vwap_pct is not None:
-            if above_vwap:
-                score += 1
-                reasons.append(f"现价位于分时均价上方 {intraday.price_vs_vwap_pct:.2%}")
-            elif under_vwap:
-                score -= 1
-                reasons.append(f"现价位于分时均价下方 {abs(intraday.price_vs_vwap_pct):.2%}")
-
-        if intraday.range_position is not None:
-            if near_high:
-                score += 1
-                reasons.append(f"日内位置 {intraday.range_position:.0%}，接近高位")
-            elif near_low:
-                score -= 1
-                reasons.append(f"日内位置 {intraday.range_position:.0%}，偏近低位")
-
-        if intraday.volume_ratio is not None:
-            if intraday.volume_ratio >= 1.2:
-                score += 1
-                reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}，资金参与偏强")
-            elif intraday.volume_ratio < 0.8:
-                score -= 1
-                reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}，跟随资金不足")
-
-        if trade.turnover_ratio is not None:
-            if 1.5 <= trade.turnover_ratio <= 12.0:
-                reasons.append(f"换手率 {trade.turnover_ratio:.2f}%，筹码交换较充分")
-            elif trade.turnover_ratio < 0.8:
-                reasons.append(f"换手率 {trade.turnover_ratio:.2f}%，换手偏低")
-            else:
-                reasons.append(f"换手率 {trade.turnover_ratio:.2f}%")
-        if trade.session_amount is not None:
-            reasons.append(f"成交额 {trade.session_amount / 1e8:.2f} 亿")
-
-        if short_ma_weak >= 2 and under_vwap and near_low:
-            bias = "谨慎"
-            action = "wait_reclaim"
-            summary = "短线偏弱，不宜追买"
-            if reclaim_level is not None:
-                summary += f"；先等收回 {reclaim_level:.2f} 再看修复"
-        elif trend_up and above_vwap and near_high and (intraday.volume_ratio or 0.0) >= 1.0:
-            bias = "偏多"
-            action = "breakout_follow"
-            summary = "强势延续"
-            if pressure_level is not None:
-                summary += f"，放量过 {pressure_level:.2f} 可跟随"
-            else:
-                summary += "，优先沿分时均价看承接"
-        elif trend_up and advice.entry_low is not None and advice.entry_high is not None and (
-            advice.entry_low * 0.995 <= intraday.last_price <= advice.entry_high * 1.01
-        ):
-            bias = "偏多"
-            action = "buy_pullback"
-            summary = (
-                f"趋势未坏，回踩 {advice.entry_low:.2f}-{advice.entry_high:.2f} "
-                "可观察承接，不必追价"
-            )
-        elif trend_down and under_vwap:
-            bias = "谨慎"
-            action = "reduce_risk"
-            summary = "趋势仍弱，反弹先按修复看，优先防守而不是抢反抽"
-            if reclaim_level is not None:
-                summary += f"；至少先看 {reclaim_level:.2f} 能否站回"
-        elif score >= 3:
-            bias = "中性偏多"
-            action = "wait_trigger"
-            summary = "结构尚可，优先看回踩承接，突破再加速"
-            if pressure_level is not None:
-                summary += f"；上破 {pressure_level:.2f} 更主动"
-        elif score <= -3:
-            bias = "谨慎"
-            action = "wait_reclaim"
-            summary = "信号偏弱，以等待确认或防守为主"
-            if reclaim_level is not None:
-                summary += f"；先看 {reclaim_level:.2f} 能否收回"
+def _score_short_term_ma(daily: DailyTechnicalSnapshot, tally: _ShortlineTally) -> None:
+    for average in (daily.ma5, daily.ma10):
+        if average is None:
+            continue
+        if daily.last_close >= average:
+            tally.score += 1
         else:
-            bias = "中性"
-            action = "wait_trigger"
-            summary = "信号不够集中，先等关键位触发"
-            if reclaim_level is not None and support_level is not None:
-                summary += f"；上看 {reclaim_level:.2f}，下看 {support_level:.2f}"
+            tally.score -= 1
+            tally.short_ma_weak += 1
+    if tally.short_ma_weak >= 2:
+        tally.reasons.append("收盘压在 MA5/MA10 下方，短线主动性不足")
+    elif tally.short_ma_weak == 0 and daily.ma5 is not None and daily.ma10 is not None:
+        tally.reasons.append("收盘站在 MA5/MA10 上方，短线趋势尚可")
 
-        advice.shortline = ShortlineView(
-            bias=bias,
-            action=action,
-            score=score,
-            summary=summary,
-            reasons=_unique(reasons)[:6],
-            reclaim_level=reclaim_level,
-            support_level=support_level,
-            pressure_level=pressure_level,
-            defense_level=defense_level,
+
+def _score_daily_volume(daily: DailyTechnicalSnapshot | None, tally: _ShortlineTally) -> None:
+    if daily is None or daily.volume_ratio_20d is None:
+        return
+    if daily.volume_ratio_20d >= 1.2:
+        tally.score += 1
+        tally.reasons.append(f"日线量比 {daily.volume_ratio_20d:.2f}，有增量配合")
+    elif daily.volume_ratio_20d < 0.9:
+        tally.score -= 1
+        tally.reasons.append(f"日线量比 {daily.volume_ratio_20d:.2f}，承接偏弱")
+
+
+def _score_intraday(intraday: IntradaySnapshot, tally: _ShortlineTally) -> None:
+    """盘中三件：相对分时均价、日内位置、分钟量能。"""
+    tally.under_vwap = intraday.price_vs_vwap_pct is not None and intraday.price_vs_vwap_pct <= -0.003
+    tally.above_vwap = intraday.price_vs_vwap_pct is not None and intraday.price_vs_vwap_pct >= 0.003
+    tally.near_low = intraday.range_position is not None and intraday.range_position <= 0.35
+    tally.near_high = intraday.range_position is not None and intraday.range_position >= 0.7
+
+    if tally.above_vwap:
+        tally.score += 1
+        tally.reasons.append(f"现价位于分时均价上方 {intraday.price_vs_vwap_pct:.2%}")
+    elif tally.under_vwap:
+        tally.score -= 1
+        tally.reasons.append(f"现价位于分时均价下方 {abs(intraday.price_vs_vwap_pct):.2%}")
+
+    if tally.near_high:
+        tally.score += 1
+        tally.reasons.append(f"日内位置 {intraday.range_position:.0%}，接近高位")
+    elif tally.near_low:
+        tally.score -= 1
+        tally.reasons.append(f"日内位置 {intraday.range_position:.0%}，偏近低位")
+
+    if intraday.volume_ratio is None:
+        return
+    if intraday.volume_ratio >= 1.2:
+        tally.score += 1
+        tally.reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}，资金参与偏强")
+    elif intraday.volume_ratio < 0.8:
+        tally.score -= 1
+        tally.reasons.append(f"分钟量能比前 5 日 {intraday.volume_ratio:.2f}，跟随资金不足")
+
+
+def _describe_trade(trade: TradeContext, tally: _ShortlineTally) -> None:
+    """换手与成交额只进理由，不加减分——它们说的是「有没有人在交易」，不是方向。"""
+    if trade.turnover_ratio is not None:
+        if 1.5 <= trade.turnover_ratio <= 12.0:
+            tally.reasons.append(f"换手率 {trade.turnover_ratio:.2f}%，筹码交换较充分")
+        elif trade.turnover_ratio < 0.8:
+            tally.reasons.append(f"换手率 {trade.turnover_ratio:.2f}%，换手偏低")
+        else:
+            tally.reasons.append(f"换手率 {trade.turnover_ratio:.2f}%")
+    if trade.session_amount is not None:
+        tally.reasons.append(f"成交额 {trade.session_amount / 1e8:.2f} 亿")
+
+
+def _shortline_verdict(
+    advice: StockAdvice,
+    intraday: IntradaySnapshot,
+    tally: _ShortlineTally,
+    levels: _ShortlineLevels,
+) -> tuple[str, str, str]:
+    """结构判定优先于分数判定。
+
+    分数是把散落的读数压成一个标量，压完就分不出「弱在哪」了。所以先让四条
+    **结构**上说得清的形态自己认领（压在均线下方、强势延续、回踩带内、趋势仍弱），
+    认领不到才退回分数阶梯——那一档本来就是「信号不够集中」的意思。
+    """
+    structural = _shortline_structural_verdict(advice, intraday, tally, levels)
+    if structural is not None:
+        return structural
+    return _shortline_score_verdict(tally, levels)
+
+
+def _shortline_structural_verdict(
+    advice: StockAdvice,
+    intraday: IntradaySnapshot,
+    tally: _ShortlineTally,
+    levels: _ShortlineLevels,
+) -> tuple[str, str, str] | None:
+    if tally.short_ma_weak >= 2 and tally.under_vwap and tally.near_low:
+        summary = "短线偏弱，不宜追买"
+        if levels.reclaim is not None:
+            summary += f"；先等收回 {levels.reclaim:.2f} 再看修复"
+        return "谨慎", "wait_reclaim", summary
+
+    if tally.trend_up and tally.above_vwap and tally.near_high and (intraday.volume_ratio or 0.0) >= 1.0:
+        if levels.pressure is not None:
+            return "偏多", "breakout_follow", f"强势延续，放量过 {levels.pressure:.2f} 可跟随"
+        return "偏多", "breakout_follow", "强势延续，优先沿分时均价看承接"
+
+    in_entry_band = (
+        advice.entry_low is not None
+        and advice.entry_high is not None
+        and advice.entry_low * 0.995 <= intraday.last_price <= advice.entry_high * 1.01
+    )
+    if tally.trend_up and in_entry_band:
+        return (
+            "偏多",
+            "buy_pullback",
+            f"趋势未坏，回踩 {advice.entry_low:.2f}-{advice.entry_high:.2f} 可观察承接，不必追价",
         )
+
+    if tally.trend_down and tally.under_vwap:
+        summary = "趋势仍弱，反弹先按修复看，优先防守而不是抢反抽"
+        if levels.reclaim is not None:
+            summary += f"；至少先看 {levels.reclaim:.2f} 能否站回"
+        return "谨慎", "reduce_risk", summary
+
+    return None
+
+
+def _shortline_score_verdict(
+    tally: _ShortlineTally,
+    levels: _ShortlineLevels,
+) -> tuple[str, str, str]:
+    if tally.score >= 3:
+        summary = "结构尚可，优先看回踩承接，突破再加速"
+        if levels.pressure is not None:
+            summary += f"；上破 {levels.pressure:.2f} 更主动"
+        return "中性偏多", "wait_trigger", summary
+
+    if tally.score <= -3:
+        summary = "信号偏弱，以等待确认或防守为主"
+        if levels.reclaim is not None:
+            summary += f"；先看 {levels.reclaim:.2f} 能否收回"
+        return "谨慎", "wait_reclaim", summary
+
+    summary = "信号不够集中，先等关键位触发"
+    if levels.reclaim is not None and levels.support is not None:
+        summary += f"；上看 {levels.reclaim:.2f}，下看 {levels.support:.2f}"
+    return "中性", "wait_trigger", summary
 
 
 def risk_reward(advice: StockAdvice) -> float | None:

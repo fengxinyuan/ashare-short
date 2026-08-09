@@ -179,6 +179,46 @@ class Alert:
         return POLICIES[self.trigger].label if self.trigger in POLICIES else self.trigger
 
 
+@dataclass(frozen=True)
+class _Crossing:
+    """一轮判定要用到的全部读数，只读。
+
+    `evaluate` 与 `_startup_alerts` 吃的是同一组十来个入参。把判定拆成子方法之后，
+    每个子方法都得把这组参数再抄一遍签名——那正是这类文件越拆越长的原因。收成
+    一个上下文对象后，子方法的签名统一是 `(ctx, emit)`，加一个读数只改这里一处。
+    """
+
+    advice: StockAdvice
+    intraday: IntradaySnapshot
+    current: dict
+    previous: dict
+    targets: list[float]
+    holding: HoldingView | None = None
+    giveback: Giveback | None = None
+    daily_support: float | None = None
+    stabilisation: Stabilisation | None = None
+    sealed_up: bool = False
+    risk_note: str | None = None
+
+    @property
+    def label(self) -> str:
+        return self.advice.name or self.advice.symbol
+
+    @property
+    def price(self) -> str:
+        return f"{self.intraday.last_price:.2f}"
+
+    def crossed(self, key: str) -> bool:
+        """这一轮才成立的布尔状态。上一轮就成立的不再报——见模块 docstring。"""
+        return bool(self.current.get(key)) and not self.previous.get(key)
+
+    def plan_detail(self) -> list[str]:
+        return [
+            *_entry_plan_detail(self.advice, self.holding, self.targets),
+            *_execution_guard_detail(self.advice),
+        ]
+
+
 class TriggerEngine:
     """Compares the current reading against the last one and emits crossings."""
 
@@ -213,34 +253,22 @@ class TriggerEngine:
         )
         state.set_state(symbol, current)
 
-        # 封涨停 = 买不进。**未知不算封板**：拿不到涨跌停价时 `at_limit_up` 是
-        # None，`bool(None)` 为 False，于是缺数据永远只会让这一层什么都不做，
-        # 不会凭空压掉一条本该发的买入告警。
-        sealed_up = bool(book is not None and getattr(book, "at_limit_up", None))
-
-        # First sighting of the day still establishes the baseline for noisy
-        # state changes. But *actionable* facts that already exist at startup
-        # must not be silent: a monitor launched after lunch should still tell
-        # you a watched name is already in a confirmed buy zone, or a holding is
-        # already below its stop.
-        if not previous:
-            return self._startup_alerts(
-                state=state,
-                now=now,
-                symbol=symbol,
-                advice=advice,
-                intraday=intraday,
-                watchlist=watchlist,
-                current=current,
-                risk_note=risk_note,
-                holding=holding,
-                daily_support=daily_support,
-                stabilisation=stabilisation,
-                book=book,
-                targets=targets,
-                giveback=giveback,
-                sealed_up=sealed_up,
-            )
+        ctx = _Crossing(
+            advice=advice,
+            intraday=intraday,
+            current=current,
+            previous=previous or {},
+            targets=targets,
+            holding=holding,
+            giveback=giveback,
+            daily_support=daily_support,
+            stabilisation=stabilisation,
+            # 封涨停 = 买不进。**未知不算封板**：拿不到涨跌停价时 `at_limit_up` 是
+            # None，`bool(None)` 为 False，于是缺数据永远只会让这一层什么都不做，
+            # 不会凭空压掉一条本该发的买入告警。
+            sealed_up=bool(book is not None and getattr(book, "at_limit_up", None)),
+            risk_note=risk_note,
+        )
 
         alerts: list[Alert] = []
 
@@ -252,22 +280,40 @@ class TriggerEngine:
                 )
             )
 
-        label = advice.name or symbol
-        price = f"{intraday.last_price:.2f}"
+        # First sighting of the day still establishes the baseline for noisy
+        # state changes. But *actionable* facts that already exist at startup
+        # must not be silent: a monitor launched after lunch should still tell
+        # you a watched name is already in a confirmed buy zone, or a holding is
+        # already below its stop.
+        if not previous:
+            self._startup_alerts(ctx, emit)
+            return alerts
+
+        self._entry_crossings(ctx, emit)
+        self._exit_crossings(ctx, emit)
+        self._context_crossings(ctx, emit)
+        return alerts
+
+    # ---- crossings -------------------------------------------------------
+
+    def _entry_crossings(self, ctx: _Crossing, emit: Any) -> None:
+        """买点那一路：进区间 → 止跌确认 → 收回观察线 → 突破确认。"""
+        advice, current, previous = ctx.advice, ctx.current, ctx.previous
+        label, price = ctx.label, ctx.price
         # 质量闸门对低吸和突破是同一条标准，只是原先只接在突破那一路上。
         quality_blocked = _entry_quality_blocked(advice)
+        stabilisation = ctx.stabilisation
 
         if current.get("vs_entry") == "inside" and previous.get("vs_entry") != "inside":
             detail = [f"价格 {price} 进入买入区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}"]
-            detail.extend(_entry_plan_detail(advice, holding, targets))
-            detail.extend(_execution_guard_detail(advice))
+            detail.extend(ctx.plan_detail())
 
             # 低吸的第三层：**进入区间不等于可以买。** 下跌途中的任何一点都
             # 「到位过」，接刀和低吸的区别只在于跌势有没有停。没有确认时降级
             # 成观察，而不是照发一条看起来像机会的 ACTION。
             if stabilisation is not None:
                 detail.append(stabilisation.describe())
-            if sealed_up:
+            if ctx.sealed_up:
                 # 买入区间和封板价重叠只有一种成因：当日振幅够大，回踩带的上沿
                 # 盖住了涨停价。区间是真的「进」了，所以不能不发；但这一刻买不
                 # 进，按 ACTION 发等于催人去做一件此刻做不成的事。
@@ -288,21 +334,25 @@ class TriggerEngine:
         # 质量不达标时同样不发：止跌确认是这条链路上唯一的 ACTION 买点，而
         # 「跌势停了」并不能把一只盈亏比不足或被业绩否决的票变成可买。
         if (
-            current.get("stabilised")
-            and not previous.get("stabilised")
+            ctx.crossed("stabilised")
             and current.get("vs_entry") == "inside"
-            and not sealed_up
+            and not ctx.sealed_up
             and not quality_blocked
         ):
             emit(
                 "entry_confirmed",
                 f"{label} 止跌确认，位于买入区间内",
-                [f"现价 {price}，区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}", stabilisation.describe() if stabilisation else "", "跌势停了才是低吸的进场点——进区间本身不是", *_entry_plan_detail(advice, holding, targets), *_execution_guard_detail(advice)],
+                [
+                    f"现价 {price}，区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}",
+                    stabilisation.describe() if stabilisation else "",
+                    "跌势停了才是低吸的进场点——进区间本身不是",
+                    *ctx.plan_detail(),
+                ],
             )
 
         reclaim = _reclaim_level(advice)
         if (
-            holding is None
+            ctx.holding is None
             and _shortline_action(advice) in RECLAIM_ACTIONS
             and reclaim is not None
             and current.get("vs_reclaim") == "above"
@@ -312,72 +362,81 @@ class TriggerEngine:
             emit(
                 "reclaim_confirmed",
                 f"{label} 收回观察线 {reclaim:.2f}",
-                [f"现价 {price}，已收回弱转修复观察线 {reclaim:.2f}", "这不是追高买点，只是从“先别碰”升级为“继续盯站稳”。", *_entry_plan_detail(advice, holding, targets), *_execution_guard_detail(advice)],
+                [
+                    f"现价 {price}，已收回弱转修复观察线 {reclaim:.2f}",
+                    "这不是追高买点，只是从“先别碰”升级为“继续盯站稳”。",
+                    *ctx.plan_detail(),
+                ],
             )
 
-        if holding is None and current.get("breakout_confirmed") and not previous.get("breakout_confirmed"):
-            volume = intraday.volume_ratio
-            detail = [
-                f"现价 {price}，贴近或刷新当日高点 {intraday.session_high:.2f}",
-                (
-                    f"分钟量能为近 5 日同期 {volume:.1f} 倍"
-                    if isinstance(volume, (int, float))
-                    else "量能确认缺失"
-                ),
-                "突破买法只适合质量过关的趋势票；跌回分时均价下方则突破失败。",
-            ]
+        if ctx.holding is None and ctx.crossed("breakout_confirmed"):
             emit(
                 "breakout_confirmed",
                 f"{label} 放量突破确认",
-                detail + _entry_plan_detail(advice, holding, targets) + _execution_guard_detail(advice),
+                [
+                    f"现价 {price}，贴近或刷新当日高点 {ctx.intraday.session_high:.2f}",
+                    _volume_confirm_line(ctx.intraday.volume_ratio),
+                    "突破买法只适合质量过关的趋势票；跌回分时均价下方则突破失败。",
+                    *ctx.plan_detail(),
+                ],
             )
 
-        if current.get("stop_broken") and not previous.get("stop_broken"):
+    def _exit_crossings(self, ctx: _Crossing, emit: Any) -> None:
+        """卖点那一路：止损 / 结构 / 期限 / 回吐 / 目标。后三条只对持仓成立。"""
+        advice, current = ctx.advice, ctx.current
+        label, price = ctx.label, ctx.price
+
+        if ctx.crossed("stop_broken"):
             # 报出来的必须是**实际生效的**那个止损。走 plan_stop 时 advice.stop
             # 可能是 None，直接格式化它会崩，而且报错的价位本身就是误导。
-            level = effective_stop(holding, advice.stop)
-            source = "（你设定的）" if holding is not None and holding.plan_stop else ""
+            level = effective_stop(ctx.holding, advice.stop)
+            source = "（你设定的）" if ctx.holding is not None and ctx.holding.plan_stop else ""
             emit(
                 "stop_break",
                 f"{label} 跌破止损{source} {level:.2f}",
                 [f"现价 {price}，当日结构破坏", "本日不再重复推送该标的止损"],
             )
 
-        # ---- 只对持仓的两条 -------------------------------------------------
-        if current.get("structure_broken") and not previous.get("structure_broken"):
+        if ctx.crossed("structure_broken"):
             emit(
                 "structure_break",
-                f"{label} 跌破结构支撑 {daily_support:.2f}",
+                f"{label} 跌破结构支撑 {ctx.daily_support:.2f}",
                 [
                     f"现价 {price}，买入时依据的日线支撑已失效",
                     "支撑没了持有理由就没了——不必等价格走到止损位再决定",
                 ],
             )
 
-        if current.get("time_stop_due") and not previous.get("time_stop_due"):
+        if ctx.crossed("time_stop_due"):
             emit(
                 "time_stop",
                 f"{label} 持有到期未兑现",
-                _time_stop_detail(holding, intraday.last_price),
+                _time_stop_detail(ctx.holding, ctx.intraday.last_price),
             )
 
         # 冲高又跌回来：止损没破、目标没到、支撑还在、期限没满——四条卖出触发
         # 一条都不响，而浮盈已经吐掉一半。这就是「坐电梯」的全过程。
-        if current.get("giveback_due") and not previous.get("giveback_due"):
-            emit("giveback", f"{label} 浮盈回吐过半", _giveback_detail(giveback))
+        if ctx.crossed("giveback_due"):
+            emit("giveback", f"{label} 浮盈回吐过半", _giveback_detail(ctx.giveback))
 
         hit_now = set(current.get("targets_hit") or [])
-        hit_before = set(previous.get("targets_hit") or [])
-        source = "（你设定的）" if _manual_targets(holding) else ""
+        hit_before = set(ctx.previous.get("targets_hit") or [])
+        source = "（你设定的）" if _manual_targets(ctx.holding) else ""
         for index in sorted(hit_now - hit_before):
-            if holding is None and current.get("breakout_confirmed"):
+            if ctx.holding is None and current.get("breakout_confirmed"):
                 continue
-            if index < len(targets):
+            if index < len(ctx.targets):
                 emit(
                     f"target_hit:{index}",
-                    f"{label} 触及目标{source} {targets[index]:.2f}",
+                    f"{label} 触及目标{source} {ctx.targets[index]:.2f}",
                     [f"现价 {price}，为第 {index + 1} 目标位"],
                 )
+
+    def _context_crossings(self, ctx: _Crossing, emit: Any) -> None:
+        """既不是买点也不是卖点的状态变化：均价、情景、量能、新高、风险公告。"""
+        current, previous = ctx.current, ctx.previous
+        label, price = ctx.label, ctx.price
+        intraday = ctx.intraday
 
         if current.get("vs_vwap") == "below" and previous.get("vs_vwap") == "above":
             detail = [f"现价 {price}，有效跌破分时均价 {intraday.vwap:.2f}"]
@@ -392,94 +451,78 @@ class TriggerEngine:
             emit(
                 "scenario_shift",
                 f"{label} 情景切换：{previous.get('scenario')} → {current['scenario']}",
-                _scenario_detail(advice, current["scenario"], intraday),
+                _scenario_detail(ctx.advice, current["scenario"], intraday),
             )
 
-        if current.get("volume_spike") and not previous.get("volume_spike"):
+        if ctx.crossed("volume_spike"):
             emit(
                 "volume_spike",
                 f"{label} 量比 {intraday.volume_ratio:.1f} 倍",
                 [f"成交量为近 5 日同期均量的 {intraday.volume_ratio:.1f} 倍，注意情绪透支"],
             )
 
-        if current.get("at_high") and not previous.get("at_high"):
+        if ctx.crossed("at_high"):
             emit("new_high", f"{label} 创当日新高 {intraday.session_high:.2f}", [f"现价 {price}"])
 
-        if risk_note:
-            emit("risk_notice", f"{label} 触发风险公告否决", [risk_note])
-
-        return alerts
+        if ctx.risk_note:
+            emit("risk_notice", f"{label} 触发风险公告否决", [ctx.risk_note])
 
     # ---- policy ----------------------------------------------------------
 
-    def _startup_alerts(
-        self,
-        state: AlertState,
-        now: datetime,
-        symbol: str,
-        advice: StockAdvice,
-        intraday: IntradaySnapshot,
-        watchlist: bool,
-        current: dict,
-        risk_note: str | None,
-        holding: HoldingView | None,
-        daily_support: float | None,
-        stabilisation: Stabilisation | None,
-        book: Any,
-        targets: list[float],
-        giveback: Giveback | None,
-        sealed_up: bool,
-    ) -> list[Alert]:
-        alerts: list[Alert] = []
-        label = advice.name or symbol
-        price = f"{intraday.last_price:.2f}"
+    def _startup_alerts(self, ctx: _Crossing, emit: Any) -> None:
+        """首轮补报：已经成立的**可执行**事实不能因为「没有跨越」而静默。"""
+        if ctx.risk_note:
+            emit("risk_notice", f"{ctx.label} 触发风险公告否决", [ctx.risk_note])
 
-        def emit(trigger: str, headline: str, detail: list[str]) -> None:
-            alerts.extend(
-                self._emit(
-                    state, now, symbol, advice, intraday, watchlist, trigger, headline,
-                    detail, holding=holding, book=book,
-                )
+        if ctx.holding is not None:
+            self._startup_holding_alerts(ctx, emit)
+            return
+        self._startup_entry_alerts(ctx, emit)
+
+    def _startup_holding_alerts(self, ctx: _Crossing, emit: Any) -> None:
+        current = ctx.current
+        label, price = ctx.label, ctx.price
+        holding = ctx.holding
+
+        if current.get("stop_broken"):
+            level = effective_stop(holding, ctx.advice.stop)
+            source = "（你设定的）" if holding.plan_stop else ""
+            emit(
+                "stop_break",
+                f"{label} 跌破止损{source} {level:.2f}",
+                [f"现价 {price}，启动监控时已低于止损", "本日不再重复推送该标的止损"],
             )
+        if current.get("structure_broken"):
+            emit(
+                "structure_break",
+                f"{label} 跌破结构支撑 {ctx.daily_support:.2f}",
+                [
+                    f"现价 {price}，启动监控时买入依据已失效",
+                    "支撑没了持有理由就没了——不必等价格走到止损位再决定",
+                ],
+            )
+        if current.get("time_stop_due"):
+            emit(
+                "time_stop",
+                f"{label} 持有到期未兑现",
+                _time_stop_detail(holding, ctx.intraday.last_price),
+            )
+        if current.get("giveback_due"):
+            emit("giveback", f"{label} 浮盈回吐过半", _giveback_detail(ctx.giveback))
 
-        if risk_note:
-            emit("risk_notice", f"{label} 触发风险公告否决", [risk_note])
+        source = "（你设定的）" if _manual_targets(holding) else ""
+        for index in sorted(current.get("targets_hit") or []):
+            if index < len(ctx.targets):
+                emit(
+                    f"target_hit:{index}",
+                    f"{label} 触及目标{source} {ctx.targets[index]:.2f}",
+                    [f"现价 {price}，启动监控时已在第 {index + 1} 目标位上方"],
+                )
 
-        if holding is not None:
-            if current.get("stop_broken"):
-                level = effective_stop(holding, advice.stop)
-                source = "（你设定的）" if holding.plan_stop else ""
-                emit(
-                    "stop_break",
-                    f"{label} 跌破止损{source} {level:.2f}",
-                    [f"现价 {price}，启动监控时已低于止损", "本日不再重复推送该标的止损"],
-                )
-            if current.get("structure_broken"):
-                emit(
-                    "structure_break",
-                    f"{label} 跌破结构支撑 {daily_support:.2f}",
-                    [
-                        f"现价 {price}，启动监控时买入依据已失效",
-                        "支撑没了持有理由就没了——不必等价格走到止损位再决定",
-                    ],
-                )
-            if current.get("time_stop_due"):
-                emit(
-                    "time_stop",
-                    f"{label} 持有到期未兑现",
-                    _time_stop_detail(holding, intraday.last_price),
-                )
-            if current.get("giveback_due"):
-                emit("giveback", f"{label} 浮盈回吐过半", _giveback_detail(giveback))
-            source = "（你设定的）" if _manual_targets(holding) else ""
-            for index in sorted(current.get("targets_hit") or []):
-                if index < len(targets):
-                    emit(
-                        f"target_hit:{index}",
-                        f"{label} 触及目标{source} {targets[index]:.2f}",
-                        [f"现价 {price}，启动监控时已在第 {index + 1} 目标位上方"],
-                    )
-            return alerts
+    def _startup_entry_alerts(self, ctx: _Crossing, emit: Any) -> None:
+        advice, current = ctx.advice, ctx.current
+        label, price = ctx.label, ctx.price
+        stabilisation = ctx.stabilisation
 
         reclaim = _reclaim_level(advice)
         if (
@@ -491,26 +534,37 @@ class TriggerEngine:
             emit(
                 "reclaim_confirmed",
                 f"{label} 已收回观察线 {reclaim:.2f}",
-                [f"现价 {price}，启动监控时已收回弱转修复观察线 {reclaim:.2f}", "这不是追高买点，只是从“先别碰”升级为“继续盯站稳”。", *_entry_plan_detail(advice, holding, targets), *_execution_guard_detail(advice)],
+                [
+                    f"现价 {price}，启动监控时已收回弱转修复观察线 {reclaim:.2f}",
+                    "这不是追高买点，只是从“先别碰”升级为“继续盯站稳”。",
+                    *ctx.plan_detail(),
+                ],
             )
 
         if current.get("breakout_confirmed"):
-            volume = intraday.volume_ratio
             emit(
                 "breakout_confirmed",
                 f"{label} 已放量突破确认",
-                [f"现价 {price}，启动监控时已贴近或刷新当日高点 {intraday.session_high:.2f}", f"分钟量能为近 5 日同期 {volume:.1f} 倍" if isinstance(volume, (int, float)) else "量能确认缺失", "突破买法只适合质量过关的趋势票；跌回分时均价下方则突破失败。", *_entry_plan_detail(advice, holding, targets), *_execution_guard_detail(advice)],
+                [
+                    f"现价 {price}，启动监控时已贴近或刷新当日高点 {ctx.intraday.session_high:.2f}",
+                    _volume_confirm_line(ctx.intraday.volume_ratio),
+                    "突破买法只适合质量过关的趋势票；跌回分时均价下方则突破失败。",
+                    *ctx.plan_detail(),
+                ],
             )
 
         # 未持仓首轮只补「买点相关」状态，不补均价/情景这类噪音状态。
         if current.get("vs_entry") != "inside":
-            return alerts
+            return
 
-        detail = [f"价格 {price} 已在买入区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}", *_entry_plan_detail(advice, holding, targets), *_execution_guard_detail(advice)]
+        detail = [
+            f"价格 {price} 已在买入区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}",
+            *ctx.plan_detail(),
+        ]
         if stabilisation is not None:
             detail.append(stabilisation.describe())
 
-        if sealed_up:
+        if ctx.sealed_up:
             emit("entry_sealed", f"{label} 已在买入区间，但封涨停买不进", detail)
         elif _entry_quality_blocked(advice):
             emit("entry_blocked", f"{label} 已在买入区间，但质量不达标", detail)
@@ -518,13 +572,17 @@ class TriggerEngine:
             emit(
                 "entry_confirmed",
                 f"{label} 止跌确认，位于买入区间内",
-                [f"现价 {price}，区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}", stabilisation.describe(), "启动监控时买点已经成立，本条用于补报当前可执行状态", *_entry_plan_detail(advice, holding, targets), *_execution_guard_detail(advice)],
+                [
+                    f"现价 {price}，区间 {advice.entry_low:.2f}-{advice.entry_high:.2f}",
+                    stabilisation.describe(),
+                    "启动监控时买点已经成立，本条用于补报当前可执行状态",
+                    *ctx.plan_detail(),
+                ],
             )
         elif stabilisation is not None:
             emit("entry_watch", f"{label} 已在买入区间（未见止跌）", detail)
         else:
             emit("entry_zone", f"{label} 已在买入区间", detail)
-        return alerts
 
     def _emit(
         self,
@@ -699,6 +757,13 @@ def _execution_guard_detail(advice: StockAdvice) -> list[str]:
     elif action == "breakout_follow":
         lines.append("执行纪律：只在放量突破时跟随，缩量冲高不追。")
     return lines
+
+
+def _volume_confirm_line(volume: Any) -> str:
+    """突破那条告警里的量能确认句。缺数据时明说缺，不静默略过。"""
+    if isinstance(volume, (int, float)):
+        return f"分钟量能为近 5 日同期 {volume:.1f} 倍"
+    return "量能确认缺失"
 
 
 def _giveback_detail(giveback: Giveback | None) -> list[str]:
