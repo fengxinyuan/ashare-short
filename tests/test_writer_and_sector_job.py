@@ -1230,9 +1230,9 @@ def test_market_state_carries_the_unscored_layers(tmp_path) -> None:
     日子里这套筛选的兑现率有没有差别」，于是它们也永远谈不上要不要拿权重——
     项目自己那条「先进简报与台账，等 review 能回答再谈给分」就断在第二步。
     """
-    from ashare_decision_support.jobs.morning import _market_state
+    from ashare_decision_support.jobs.morning_facts import market_state
 
-    state = _market_state(
+    state = market_state(
         SimpleNamespace(direction="偏多", score=88.85, breadth=0.7613),
         0.66,
         None,
@@ -1265,9 +1265,9 @@ def test_market_state_records_absence_instead_of_a_neutral_number(tmp_path) -> N
     0 会被事后统计当成「测出来是 0」，而那与「没测」是相反的两件事——同一条
     区分贯穿这套系统（见 `MarketOutlook` 的「数据不足」不给方向）。
     """
-    from ashare_decision_support.jobs.morning import _market_state
+    from ashare_decision_support.jobs.morning_facts import market_state
 
-    state = _market_state(SimpleNamespace(direction="偏多", score=80.0, breadth=0.6), 0.5, None, None)
+    state = market_state(SimpleNamespace(direction="偏多", score=80.0, breadth=0.6), 0.5, None, None)
 
     for key in (
         "rotation_switch",
@@ -1282,9 +1282,9 @@ def test_market_state_records_absence_instead_of_a_neutral_number(tmp_path) -> N
 def test_market_state_ignores_layers_that_reported_not_ok(tmp_path) -> None:
     """`ok=False` 的读数一律当没有。半成品读数进了台账比没有更糟——
     它看起来是一个可分组的维度，实际是噪声。"""
-    from ashare_decision_support.jobs.morning import _market_state
+    from ashare_decision_support.jobs.morning_facts import market_state
 
-    state = _market_state(
+    state = market_state(
         SimpleNamespace(direction="偏多", score=80.0, breadth=0.6),
         0.5,
         None,
@@ -1362,11 +1362,11 @@ def _sizing_state(**kw):
     刻意走 `resolve_position_sizing` 而不是手搓一个 SimpleNamespace：这条用例要
     钉的是「决策过程能不能被事后还原」，用假 plan 的话字段名一漂就测不出来。
     """
-    from ashare_decision_support.jobs.morning import _market_state
+    from ashare_decision_support.jobs.morning_facts import market_state
     from ashare_decision_support.strategy.positioning import resolve_position_sizing
 
     plan = resolve_position_sizing(**kw)
-    return _market_state(
+    return market_state(
         SimpleNamespace(direction="偏多", score=70.0, breadth=0.6),
         plan.effective_factor,
         None,
@@ -1408,9 +1408,9 @@ def test_journal_records_a_manual_override_as_such() -> None:
 
 def test_journal_stores_none_when_no_sizing_plan_was_passed() -> None:
     """拿不到 plan 时存 None，不存 0——同这份快照里其他读数的处置。"""
-    from ashare_decision_support.jobs.morning import _market_state
+    from ashare_decision_support.jobs.morning_facts import market_state
 
-    state = _market_state(SimpleNamespace(direction="偏多", score=70.0, breadth=0.6), 0.5, None)
+    state = market_state(SimpleNamespace(direction="偏多", score=70.0, breadth=0.6), 0.5, None)
 
     assert state["position_factor"] == 0.5
     assert state["suggested_factor"] is None
@@ -1423,9 +1423,9 @@ def test_journal_keeps_both_turnover_readings() -> None:
     只存块均值的话，事后分组会把「量能刚触底回升」的日子归进「存量博弈」——
     2026-08-07 实测这两个数是 -1.8% 与 +33.4%，反号。
     """
-    from ashare_decision_support.jobs.morning import _market_state
+    from ashare_decision_support.jobs.morning_facts import market_state
 
-    state = _market_state(
+    state = market_state(
         SimpleNamespace(direction="偏多", score=70.0, breadth=0.6),
         0.5,
         None,

@@ -512,3 +512,79 @@ def _setup_rank(
     }
     rank = 100.0 * (0.30 * liquidity + 0.30 * location + 0.25 * pullback_quality + 0.15 * close_quality)
     return round(rank, 2), components
+
+
+BATCH_SCHEMA = "ashare-strategy-screen-batch-v2"
+
+# 这两句跟着每一份筛选结果走。写成常量而不是在调用处各拼一遍：`_cmd_strategy_screen`
+# 原来把它拼了**两遍**（单策略分支一遍，末尾一个重复的 `if profile == "all"` 又
+# 一遍），两份字面量逐字相同——直到有人只改了其中一份。
+def screen_notes(days: int, taxonomy_notes: list[str] | None = None) -> list[str]:
+    return [
+        f"日线回溯区间约 {days} 个自然日，信号日为最近一根已取得日线",
+        "这是候选观察事实，不是订单、收益保证或模型预测",
+        *(taxonomy_notes or []),
+    ]
+
+
+def screen_all_profiles(
+    bars: dict[str, list[dict]],
+    *,
+    names: dict[str, str],
+    sectors: dict[str, str],
+    common: dict[str, Any],
+    limit: int,
+) -> dict[str, Any]:
+    """把每个 profile 各跑一遍，拼成批量产物。
+
+    从 `cli.py:_cmd_strategy_screen` 搬过来的。它原来是一个 98 行的命令处理器，
+    而同一个文件里其余命令处理器的中位长度是 11 行——**跨档次的那一个，装的通常
+    不是命令而是领域逻辑**：这里的跨策略重叠、每策略截断、综合短名单，没有一样
+    和「怎么解析命令行」有关，却全都在 `argparse` 那一层。
+
+    **先算全集再截断。** 每个 profile 用 `limit=0` 跑，重叠关系因此建立在完整的
+    命中集合上；反过来先截断再求交，重叠就变成了排序切点的产物——同一批数据，
+    把 `--limit` 从 30 改成 50 会「发现」新的重复命中，而那不是发现。
+    """
+    results = {
+        profile: screen_overnight(
+            bars,
+            names=names,
+            sectors=sectors,
+            config=StrategyScreenConfig(profile=profile, **{**common, "limit": 0}),
+        )
+        for profile in sorted(PROFILES)
+    }
+
+    memberships: dict[str, list[str]] = {}
+    for profile, result in results.items():
+        for item in result.candidates:
+            memberships.setdefault(item.symbol, []).append(profile)
+
+    payloads: dict[str, Any] = {}
+    for name, result in results.items():
+        item = result.to_dict()
+        # `matched_total` 是过闸的全部只数，`candidates` 是印出来的那几只。
+        # 两个数必须分开报：只印后者会让「筛出 30 只」和「命中 300 只里的前 30」
+        # 读起来一样。
+        item["summary"]["matched_total"] = len(item["candidates"])
+        item["config"]["limit"] = limit
+        item["candidates"] = item["candidates"][:limit]
+        item["summary"]["candidates"] = len(item["candidates"])
+        payloads[name] = item
+
+    return {
+        "schema": BATCH_SCHEMA,
+        "config": common | {"profile": "all"},
+        "profiles": payloads,
+        "diversified_shortlist": diversified_shortlist(results, limit),
+        "matched_by_multiple_profiles": {
+            symbol: sorted(profiles)
+            for symbol, profiles in sorted(memberships.items())
+            if len(profiles) > 1
+        },
+        "notes": [
+            "综合短名单按策略轮询取各自前列，不把不同策略的 setup_rank 当成同一尺度",
+            "策略位置区间可能互斥；多策略重复命中不代表更高胜率或收益率",
+        ],
+    }

@@ -99,8 +99,10 @@ def no_implicit_earnings_adapter(monkeypatch):
     是 `from ... import default_earnings_adapter`——那是一次值绑定，补原件补不到。
     与上面 `default_snapshot_adapter` 列两条目标是同一个道理。
     """
+    # `morning` 那一路的消费方 2026-08-10 从 `jobs.morning` 搬到了 `jobs.sources`
+    # （六路可选源收在一起）。这里跟着改的是**绑定点**，不是判据。
     for target in (
-        "ashare_decision_support.jobs.morning.default_earnings_adapter",
+        "ashare_decision_support.jobs.sources.default_earnings_adapter",
         "ashare_decision_support.jobs.advise.default_earnings_adapter",
     ):
         monkeypatch.setattr(target, lambda: None)
@@ -119,7 +121,7 @@ def no_implicit_broad_index_adapter(monkeypatch):
     要测取数与解析的传 `BroadIndexAdapter(opener=...)`，都不受这条影响。
     """
     monkeypatch.setattr(
-        "ashare_decision_support.jobs.morning.default_broad_index_adapter", lambda: None
+        "ashare_decision_support.jobs.sources.default_broad_index_adapter", lambda: None
     )
 
 

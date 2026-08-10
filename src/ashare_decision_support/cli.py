@@ -71,7 +71,8 @@ from ashare_decision_support.state import CandidatePool, Watchlist, state_home
 from ashare_decision_support.strategy.overnight import (
     PROFILES,
     StrategyScreenConfig,
-    diversified_shortlist,
+    screen_all_profiles,
+    screen_notes,
     screen_overnight,
 )
 from ashare_decision_support.symbols import normalize_symbol
@@ -1040,11 +1041,10 @@ def _cmd_strategy_screen(args) -> None:
     # 只要标的画像（名称与行业），不需要概念那一层，所以不走 `static_taxonomies`。
     taxonomy = ThsIndustryTaxonomy(level="SW1")
     profiles = taxonomy.snapshot.profiles
-    symbols = sorted(profiles)
-    adapter = _tickflow(args)
     end = beijing_today()
-    start = end - timedelta(days=max(90, args.days))
-    bars = fetch_daily_bars(adapter, symbols, start, end)
+    bars = fetch_daily_bars(
+        _tickflow(args), sorted(profiles), end - timedelta(days=max(90, args.days)), end
+    )
     names = {symbol: profile.name for symbol, profile in profiles.items()}
     sectors = {symbol: profile.industry("SW1") for symbol, profile in profiles.items()}
     common = {
@@ -1068,71 +1068,21 @@ def _cmd_strategy_screen(args) -> None:
         "min_close_position": args.min_close_position,
         "max_close_position": args.max_close_position,
     }
+
     if args.profile == "all":
-        results = {
-            profile: screen_overnight(
-                bars,
-                names=names,
-                sectors=sectors,
-                # Calculate the full accepted set before applying the display limit;
-                # otherwise cross-profile overlap would depend on ranking cutoffs.
-                config=StrategyScreenConfig(profile=profile, **{**common, "limit": 0}),
-            )
-            for profile in sorted(PROFILES)
-        }
-        candidate_sets = {name: {item.symbol for item in result.candidates} for name, result in results.items()}
-        memberships: dict[str, list[str]] = {}
-        for profile, symbols_for_profile in candidate_sets.items():
-            for symbol in symbols_for_profile:
-                memberships.setdefault(symbol, []).append(profile)
-        overlap = {
-            symbol: sorted(profiles_for_symbol)
-            for symbol, profiles_for_symbol in sorted(memberships.items())
-            if len(profiles_for_symbol) > 1
-        }
-        profile_payloads = {}
-        for name, result in results.items():
-            item = result.to_dict()
-            total = len(item["candidates"])
-            item["summary"]["matched_total"] = total
-            item["config"]["limit"] = args.limit
-            item["candidates"] = item["candidates"][: args.limit]
-            item["summary"]["candidates"] = len(item["candidates"])
-            profile_payloads[name] = item
-        payload = {
-            "schema": "ashare-strategy-screen-batch-v2",
-            "as_of": str(end),
-            "config": common | {"profile": "all"},
-            "profiles": profile_payloads,
-            "diversified_shortlist": diversified_shortlist(results, args.limit),
-            "matched_by_multiple_profiles": overlap,
-            "notes": [
-                "综合短名单按策略轮询取各自前列，不把不同策略的 setup_rank 当成同一尺度",
-                "策略位置区间可能互斥；多策略重复命中不代表更高胜率或收益率",
-            ],
-        }
+        payload = screen_all_profiles(
+            bars, names=names, sectors=sectors, common=common, limit=args.limit
+        )
     else:
-        result = screen_overnight(
+        payload = screen_overnight(
             bars,
             names=names,
             sectors=sectors,
             config=StrategyScreenConfig(profile=args.profile, **common),
-        )
-        payload = result.to_dict()
-        payload["as_of"] = str(end)
-        payload["data_notes"] = [
-            f"日线回溯区间约 {args.days} 个自然日，信号日为最近一根已取得日线",
-            "这是候选观察事实，不是订单、收益保证或模型预测",
-            *taxonomy.notes,
-        ]
-    if args.profile == "all":
-        payload["data_notes"] = [
-            f"日线回溯区间约 {args.days} 个自然日，信号日为最近一根已取得日线",
-            "这是候选观察事实，不是订单、收益保证或模型预测",
-            *taxonomy.notes,
-        ]
-    output = args.output or str(Path(args.output_dir) / "strategy_screen_latest.json")
-    _dump_json(payload, output)
+        ).to_dict()
+    payload["as_of"] = str(end)
+    payload["data_notes"] = screen_notes(args.days, list(taxonomy.notes))
+    _dump_json(payload, args.output or str(Path(args.output_dir) / "strategy_screen_latest.json"))
 
 
 def _cmd_sector_leaders(args) -> None:

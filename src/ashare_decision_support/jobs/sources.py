@@ -24,13 +24,31 @@
 
 from __future__ import annotations
 
+import contextlib
 from datetime import date
+from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.adapters.broad_index import default_broad_index_adapter
+from ashare_decision_support.adapters.earnings import default_earnings_adapter
 from ashare_decision_support.adapters.lhb_seats import LhbSeatAdapter
 from ashare_decision_support.adapters.limit_pool import LimitPoolAdapter
+from ashare_decision_support.adapters.market_scan import MarketScanAdapter
 from ashare_decision_support.adapters.tencent_detail import default_trade_flow_adapter
+from ashare_decision_support.adapters.ths_sector_index import ThsSectorIndexAdapter
+from ashare_decision_support.adapters.tickflow_market import (
+    CompositeMarketScanAdapter,
+    TickFlowMarketScanAdapter,
+)
 from ashare_decision_support.fanout import gather
+from ashare_decision_support.news import (
+    AkshareNewsSource,
+    CompositeNewsSource,
+    NewsCache,
+    OfficialNewsSource,
+    RssNewsSource,
+    WallstreetNewsSource,
+)
 
 
 def fetch_limit_pool(
@@ -147,3 +165,142 @@ def fetch_lhb_seats(
             "为盘后披露事实，不代表盘中实时资金方向"
         )
     return mapped
+
+
+# ---- 盘前独有的六路可选源 --------------------------------------------------
+#
+# 上面三个是 `morning` 与 `post_close` 共用的，下面六个只有 `morning` 用。放在
+# 同一个模块里而不是留在 `jobs/morning.py`，理由是**它们是同一个形状**：开关关了
+# / 适配器造不出来 / 适配器版本对不上 / 取数抛异常，四条路径都必须落到「这次没有
+# 这一项」而不是「这轮跑批没了」。
+#
+# 混在主链路里时，这个形状看不出来——六份各自散在两百行判定逻辑中间，谁也不会
+# 发现第七份漏写了一条。收在一起之后，加第七路源时照着抄就是对的。
+def fetch_broad_index(adapter: Any | None, enabled: bool, notes: list[str]) -> Any:
+    """宽基指数快照。取不到就没有市值加权口径，等权那一路照跑。
+
+    这一层唯一的失败模式是「静默地没有」——没有它时简报读起来完全正常，只是
+    少了一个方向性维度。所以关掉与取不到都必须留一句话。
+    """
+    if not enabled:
+        notes.append("已关闭宽基指数读数（--no-broad-index），本次无市值加权口径对照")
+        return None
+    source = adapter if adapter is not None else default_broad_index_adapter()
+    if source is None:
+        return None
+    try:
+        read = source.fetch()
+    except Exception as exc:
+        notes.append(f"宽基指数不可用（{type(exc).__name__}），本次无市值加权口径对照")
+        return None
+    notes.extend(read.notes)
+    if not read.ok:
+        notes.append("宽基指数没有可用读数，本次无市值加权口径对照")
+        return None
+    return read
+
+
+def fetch_market_scan(
+    adapter: Any | None, enabled: bool, notes: list[str], data_adapter: Any = None
+) -> Any:
+    """全市场扫描。取不到就退化成「没有可交易性过滤」，链路照跑。
+
+    这一层失败必须是**放行**而不是拦截：拿不到行情去否决标的，等于让数据缺失
+    冒充风险判断。`LiquidityScreen` 在 scan 为 None 时全部放行，并把「未经过滤」
+    写进 note。
+    """
+    if not enabled:
+        notes.append("已关闭全市场扫描（--no-market-scan），本次无可交易性过滤")
+        return None
+    source = adapter if adapter is not None else default_market_scan(data_adapter)
+    try:
+        scan = source.fetch()
+    except Exception as exc:
+        notes.append(f"全市场扫描不可用（{type(exc).__name__}），本次无可交易性过滤")
+        return None
+    notes.extend(scan.notes)
+    if scan.ok:
+        notes.extend(scan.describe())
+    return scan
+
+
+def default_market_scan(data_adapter: Any) -> Any:
+    """付费档就两路合并，免费档只有新浪一路。
+
+    合并而非替换：TickFlow 更快、带流通股本和真实涨跌停价，但 PE/PB 要
+    `financials.*`（Pro 档报「无公司财务数据查询权限」），那两个字段只有新浪有。
+    两路 2026-08-02 实测逐字段吻合到新浪的取整精度，可以互为校验。
+    """
+    sina = MarketScanAdapter()
+    client = getattr(data_adapter, "client", None)
+    if client is None or not getattr(data_adapter, "supports_realtime", False):
+        return sina
+    return CompositeMarketScanAdapter(TickFlowMarketScanAdapter(client), sina)
+
+
+def fetch_sector_index(adapter: Any | None, output_path: Path, enabled: bool, notes: list[str]) -> Any:
+    """同花顺行业指数，独立于申万聚合的第二套板块读数。
+
+    刻意**不参与打分**：同花顺 90 个行业 ≈ 申万二级粒度，硬映到申万一级 31 个
+    只会造出一个看起来精确的错数。它并列呈现，由人（或写稿层）去读两套读数的
+    分歧——指数涨而宽度弱，说的就是权重股在拉抬。
+    """
+    if not enabled:
+        notes.append("已关闭同花顺行业指数读数（--no-sector-index）")
+        return None
+    source = adapter if adapter is not None else ThsSectorIndexAdapter(cache_dir=output_path)
+    try:
+        snapshot = source.fetch()
+    except Exception as exc:
+        notes.append(f"同花顺行业指数不可用（{type(exc).__name__}），本次无板块日内位置读数")
+        return None
+    notes.extend(snapshot.notes)
+    if snapshot.ok:
+        notes.extend(snapshot.describe())
+    return snapshot
+
+
+def default_news_source(output_path: Path) -> Any | None:
+    """商业快讯 + 海外宏观 + 国内官方政策与监管发布。
+
+    分开列而不是合成一个源：akshare 那三路覆盖盘面与政策文件，华尔街见闻补的是
+    **数据发布**（PMI/CPI/社融）与海外流动性。实测 2026-08-02 全市场 200 条里
+    「PMI/统计局/制造业/美债/降准」命中全为 0——不是权重低，是压根没进来。
+
+    四路共用同一个 `NewsCache`：缓存按「交易日 + 源自己的键」分目录，四路的键互不
+    相同，所以共用一个实例只是共用一个根目录。此前只有 akshare 那一路收 cache，
+    另外三路每次重跑都重新打网络——而盘前本来就会跑好几次，拿到的是几批不同的
+    快讯流，板块舆情分也跟着变，简报上还看不出来是哪一次。
+    """
+    cache = NewsCache(output_path)
+    sources: list[Any] = []
+    with contextlib.suppress(RuntimeError):
+        sources.append(AkshareNewsSource(cache=cache))
+    sources.append(WallstreetNewsSource(cache=cache))
+    sources.append(OfficialNewsSource(cache=cache))
+    sources.append(RssNewsSource(cache=cache))
+    return CompositeNewsSource(*sources) if sources else None
+
+
+def fetch_earnings(adapter: Any | None, today: date, enabled: bool, notes: list[str]) -> Any:
+    """业绩预告/快报。取不到就退化成「没有业绩过滤」，链路照跑。
+
+    和 `fetch_market_scan` 完全同一条纪律：这一层失败必须是**放行**而不是拦截。
+    拿不到业绩去否决标的，等于让数据缺失冒充风险判断。
+    """
+    if not enabled:
+        notes.append("已关闭业绩读数（--no-earnings），本次无业绩否决与业绩催化标注")
+        return None
+    source = adapter if adapter is not None else default_earnings_adapter()
+    if source is None:
+        notes.append("业绩数据源不可用，本次无业绩否决与业绩催化标注")
+        return None
+    try:
+        snapshot = source.fetch(today)
+    except Exception as exc:
+        notes.append(f"业绩预告不可用（{type(exc).__name__}），本次无业绩否决")
+        return None
+    notes.extend(snapshot.notes)
+    if snapshot.ok:
+        notes.extend(snapshot.describe())
+    return snapshot
