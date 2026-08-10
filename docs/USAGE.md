@@ -28,10 +28,13 @@
 ashare-ds watchlist add 600519.SH 000001.SZ --note "核心仓"
 ashare-ds morning
 ashare-ds morning --explain   # 同时打印筛选漏斗
+ashare-ds morning --top-sectors 5 --top-concepts 3  # 行业、概念分开取名额
 ```
 
 这一步关注的是大盘、板块和候选池，不是逐票追问。
 运行时会先打印几行阶段进度，再输出完整晨报。
+行业和概念默认并排计算、各自排名；概念不会参与全市场宽度，避免一只股票因多个
+题材标签被重复计权。只想看行业时使用 `--no-concepts`。
 
 晨报里有四节是**只出读数、不进打分**的（打分权重未经回测，这几层连权重都还没有）：
 

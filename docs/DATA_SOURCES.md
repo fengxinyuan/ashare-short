@@ -498,11 +498,11 @@ QMT 是**执行侧**通道，第三方 API 是研究侧。即使接上 QMT，系
 1. 在跑这套系统的机器上安装并登录 `MiniQMT` 或 `QMT`
 2. 确认本地 Python 能 `import xtquant.xtdata`
 3. `ashare-ds qmt-health` —— 验证所需 `xtdata` 函数可见，并报告缺什么
-4. 券商字段名不同时改 `examples/custom_mapping_profile.json`，
-   归一层（`adapters/mapping.py`）在策略层看到数据之前解析别名
 
-字段归一契约：每个规范字段接受一个别名列表，按序尝试，用第一个在原始 payload 里
-出现的。缺必需字段抛归一错误；可选字段默认 `None`。**策略引擎从不直接读券商原始字段名。**
+**券商字段别名归一层已删除**（2026-08-09，见 `docs/DECISIONS.md` §12）。它只服务
+`get_auction_features` / `get_open_features` 这两个出参，而那两个方法在 `src/` 里
+一个消费者都没有——竞价那条线按 §一 就没建。QMT 的 K 线与快照走各适配器自己的
+字段兜底，不经过归一层。
 
 QMT 会补上：五档盘口（券商侧）、逐笔委托/成交、低延迟实时快照。
 QMT **补不上**集合竞价撮合量与未匹配量——见 [`DECISIONS.md`](DECISIONS.md)。
