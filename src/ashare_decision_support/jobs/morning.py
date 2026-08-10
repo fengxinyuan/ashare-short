@@ -111,7 +111,9 @@ from ashare_decision_support.sectors import (
     SectorPredictor,
     SectorRotationStore,
     TickFlowSwTaxonomy,
+    explain_today,
     read_rotation,
+    read_seesaw,
     read_turnover,
     reverse_index,
 )
@@ -258,6 +260,7 @@ class _Fusion:
     sector_index: Any
     rotation_price: Any
     turnover_migration: Any
+    seesaw: Any
     market_scan: Any
     earnings: Any
     outlooks: list
@@ -595,7 +598,7 @@ def _stage_fuse(
     # 与下面 `SectorRotationStore` 的分工：那个记的是**系统自己的排名**稳不稳，
     # 要连续跑若干天才有答案；这个读的是**指数真实价格**，第一次跑就有当年 140 根，
     # 所以「过去一周到一个月轮动到哪了」当天就能回答。
-    rotation_price, turnover_migration = _rotation_from_series(today, notes)
+    rotation_price, turnover_migration, seesaw = _rotation_from_series(today, notes)
 
     # 全市场扫描：给候选池提供可交易性门槛（流通市值/成交额），顺带一个比申万
     # 成分股样本更硬的宽度读数。
@@ -686,6 +689,7 @@ def _stage_fuse(
         sector_index=sector_index,
         rotation_price=rotation_price,
         turnover_migration=turnover_migration,
+        seesaw=seesaw,
         market_scan=market_scan,
         earnings=earnings,
         outlooks=outlooks,
@@ -846,6 +850,7 @@ def _stage_record(
         fusion.rotation_price,
         fusion.earnings,
         turnover_migration=fusion.turnover_migration,
+        seesaw=fusion.seesaw,
         market_source_counts=collected.market_source_counts,
         news_coverage=collected.coverage,
         news_targets=collected.news_targets,
@@ -1512,12 +1517,13 @@ def _earnings(adapter: Any | None, today: date, enabled: bool, notes: list[str])
     return snapshot
 
 
-def _rotation_from_series(today: date, notes: list[str]) -> tuple[Any, Any]:
+def _rotation_from_series(today: date, notes: list[str]) -> tuple[Any, Any, Any]:
     """价格序列口径的板块轮动**与成交额迁移**。读的是 `_sector_index` 落盘的那批日线。
 
-    两个读数共用一次磁盘读：输入是同一批序列（`rotation` 用其中的 `close`，
-    `turnover` 用 `amount`），分开读会把 90 个文件读两遍，还会让「序列截止到
-    哪一天」这句话在两处各报一次。
+    三个读数共用一次磁盘读：输入是同一批序列（`rotation` 用其中的 `close` 读
+    「谁在涨」，`turnover` 用 `amount` 读「谁在被交易」，`seesaw` 用 `close` 的
+    逐日收益读「哪两个反着走」），分开读会把 90 个文件读三遍，还会让「序列截止到
+    哪一天」这句话在三处各报一次。
 
     **刻意不受 `--no-sector-index` 约束。** 那个开关关掉的是一次网络取数，而这里
     只是一次磁盘读——把两者绑在一起，等于逼人为了拿轮动读数而必须付那 10 秒，
@@ -1531,13 +1537,13 @@ def _rotation_from_series(today: date, notes: list[str]) -> tuple[Any, Any]:
         series = load_all_series()
     except Exception as exc:
         notes.append(f"板块指数序列读取失败（{type(exc).__name__}），本次无价格口径轮动读数")
-        return None, None
+        return None, None, None
     if not series:
         notes.append(
             "板块指数序列尚未落盘，本次无价格口径轮动读数"
             "（首次运行属预期；跑完一次即有当年全部日线）"
         )
-        return None, None
+        return None, None, None
 
     read = read_rotation(series)
     notes.extend(read.notes)
@@ -1545,8 +1551,14 @@ def _rotation_from_series(today: date, notes: list[str]) -> tuple[Any, Any]:
     turnover = read_turnover(series)
     notes.extend(turnover.notes)
 
+    # 跷跷板要 61 根（60 个日收益），比轮动的 26 根长得多，所以它常常是三者里
+    # 最先算不出来的那个。`trusted` 为假时照样返回对象——它的 `notes` 里写着
+    # 为什么，而「没有跷跷板」和「算不出来」在简报里必须长得不一样。
+    seesaw = read_seesaw(series)
+    notes.extend(seesaw.notes)
+
     if not read.ok:
-        return read, (turnover if turnover.ok else None)
+        return read, (turnover if turnover.ok else None), seesaw
 
     stamp = str(read.trade_date)
     expected = today.strftime("%Y%m%d")
@@ -1558,7 +1570,12 @@ def _rotation_from_series(today: date, notes: list[str]) -> tuple[Any, Any]:
     notes.extend(read.observations)
     if turnover.ok:
         notes.extend(turnover.observations)
-    return read, (turnover if turnover.ok else None)
+    notes.extend(seesaw.observations)
+    # 榜上今天真的背着走的那几对。这是跷跷板这一层唯一的用途——把「今天银行涨、
+    # 电子跌」这件已经发生的事，和它们近 60 日的关系对一次账。**它不外推明天**，
+    # 每一句里都带着这句话本身。
+    notes.extend(explain_today(seesaw))
+    return read, (turnover if turnover.ok else None), seesaw
 
 
 def _risk_for(risks: dict, symbol: str):
@@ -2052,6 +2069,7 @@ def _facts(
     rotation_price: Any = None,
     earnings: Any = None,
     turnover_migration: Any = None,
+    seesaw: Any = None,
     market_source_counts: dict[str, Any] | None = None,
     news_coverage: dict[str, int] | None = None,
     news_targets: list[Any] | None = None,
@@ -2088,6 +2106,15 @@ def _facts(
             if turnover_migration is not None and getattr(turnover_migration, "ok", False)
             else None
         ),
+        # 跷跷板。第三个从同一批序列算出来的读数，回答的是**两两之间**的关系，
+        # 而上面两个都是「全场一个数」的横截面读数——「今天银行涨、电子跌」这种
+        # 分歧，只有这一层答得了「这是结构性的还是偶然的」。
+        #
+        # **`trusted` 为假时也带出去**，与上面两个的处置刻意不同：那两个用 `ok`
+        # 过滤是因为算不出来时它们没什么可说的；这一层算不出来时 `notes` 里写着
+        # 原因（序列不够 61 根、板块数不够），而「没有跷跷板」本身是一条结论，
+        # 空 `pairs` 加一句 observation 正是它的表达方式。
+        "seesaw": seesaw.to_dict() if seesaw is not None else None,
         # 业绩层。只带聚合读数与被否决/被标注的名单，不带全市场那 1874 家——
         # facts 要进写稿层的 prompt，塞全量会把上下文挤爆而没有额外信息。
         "earnings": (

@@ -20,6 +20,9 @@ A 股超短线事实采集与分析辅助系统。只做采集、整理、提醒
 | 股价分析 | `ashare-ds advise 600519.SH` / `ashare-ds ask "600519 现在怎么看"` | 单票结构、分时、成交量、盘口、买卖点 |
 | 自选股监控 | `ashare-ds monitor --once` | 盘中轮询、跃迁告警、持仓卖点 |
 | facts 导出 | `ashare-ds facts` | 导出当前事实、宏观联动和近期验证窗口，供 Codex / Claude 使用 |
+| 外部 AI 工具 | `ashare-ds-mcp` | 通过 MCP 向 Codex / Claude Code 提供只读事实与研究资料包 |
+| 全板块龙头 | `ashare-ds sector-leaders --refresh` | 每个行业/概念的量价龙头候选，不等同产业龙头或上涨预测 |
+| 月度研究包 | `ashare-ds monthly-context` | 本地事实 + 历史记录 + 事件核验任务，交给外部 AI 做月度推演 |
 | facts 对话 | `ashare-ds chat` | 多轮查看同一份事实包；默认不调模型 |
 | 显式模型分析 | `ashare-ds ask --llm "600519 现在怎么看"` | 把事实包交给模型组织语言，数字仍过校验闸门 |
 | 买卖点裁决 | `ashare-ds advise --adjudicate --writer llm 600519.SH` | 在规则候选里做取舍，可弃权；仅在显式开启时调用模型 |
@@ -74,6 +77,7 @@ ashare-ds strategy-screen --profile all --all-a --price-max 40
 |---|---|
 | [`docs/USAGE.md`](docs/USAGE.md) | 场景到命令的对应表，优先看这个 |
 | [`docs/CODEX_WORKFLOW.md`](docs/CODEX_WORKFLOW.md) | Codex 做链路、板块与个股分析的事实包工作流与边界 |
+| [`docs/EXTERNAL_AI_TOOLS.md`](docs/EXTERNAL_AI_TOOLS.md) | Codex / Claude Code 的 MCP 接入、月度展望与全板块龙头工具 |
 | [`docs/DAILY_PREOPEN_PROMPT.md`](docs/DAILY_PREOPEN_PROMPT.md) | 每日盘前研报提示词：外盘、政策、舆情、题材与先手条件 |
 | [`docs/SOLUTION.md`](docs/SOLUTION.md) | 总览 · 需求拆解 · 运行链路 · 设计约束 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图 · 调度 · 状态 · 失败模式 |

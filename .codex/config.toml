@@ -1,0 +1,10 @@
+[mcp_servers.ashare_analysis]
+command = "python3"
+args = ["-m", "ashare_decision_support.mcp_server"]
+cwd = "/root/a-share-ultra-short-ai-system"
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+default_tools_approval_mode = "writes"
+
+[mcp_servers.ashare_analysis.env]
+PYTHONPATH = "src"

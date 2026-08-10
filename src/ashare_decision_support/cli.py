@@ -61,6 +61,8 @@ from ashare_decision_support.monitor import (
 from ashare_decision_support.monitor.sector_triggers import fired_sectors_today
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.feishu import FeishuNotifier
+from ashare_decision_support.research import build_monthly_context, refresh_sector_leaders
+from ashare_decision_support.research.leaders import LEADERS_LATEST_NAME
 from ashare_decision_support.schedule import TradingCalendar
 from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_now, beijing_today
 from ashare_decision_support.sectors import ThsIndustryTaxonomy, static_taxonomies
@@ -453,6 +455,31 @@ def _parser_strategy_screen(subparsers) -> None:
     _add_tickflow_args(screen)
 
 
+def _parser_external_research(subparsers) -> None:
+    leaders = subparsers.add_parser(
+        "sector-leaders", help="每个行业/概念的量价龙头候选事实（供外部 AI 研究）"
+    )
+    leaders.add_argument("--output-dir", default="briefs")
+    leaders.add_argument("--refresh", action="store_true", help="重新取全市场日线；默认只读缓存")
+    leaders.add_argument(
+        "--level", choices=["industry", "concept", "all"], default="all"
+    )
+    leaders.add_argument("--industry-level", choices=["SW1", "SW2", "SW3"], default="SW1")
+    leaders.add_argument("--top", type=int, default=3, help="每个板块保留几只")
+    leaders.add_argument("--days", type=int, default=180, help="日线回溯自然日")
+    leaders.add_argument("--min-history-bars", type=int, default=65)
+    leaders.add_argument("--output", help="另写一份 JSON")
+    _add_tickflow_args(leaders)
+
+    monthly = subparsers.add_parser(
+        "monthly-context", help="给 Codex/Claude 的月度展望事实与外部研究任务包"
+    )
+    monthly.add_argument("--output-dir", default="briefs")
+    monthly.add_argument("--horizon-days", type=int, default=31)
+    monthly.add_argument("--symbols", nargs="*")
+    monthly.add_argument("--output")
+
+
 def _parser_diagnostics(subparsers) -> None:
     tick_health = subparsers.add_parser("tick-health", help="诊断：TickFlow 连通性与能力边界")
     _add_tickflow_args(tick_health)
@@ -513,6 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     _parser_pre_open(subparsers)
     _parser_wyckoff_scan(subparsers)
     _parser_strategy_screen(subparsers)
+    _parser_external_research(subparsers)
     # 诊断
     _parser_diagnostics(subparsers)
     return parser
@@ -1107,6 +1135,35 @@ def _cmd_strategy_screen(args) -> None:
     _dump_json(payload, output)
 
 
+def _cmd_sector_leaders(args) -> None:
+    if args.refresh:
+        levels = ("industry", "concept") if args.level == "all" else (args.level,)
+        payload = refresh_sector_leaders(
+            output_dir=args.output_dir,
+            levels=levels,
+            industry_level=args.industry_level,
+            top_per_sector=args.top,
+            lookback_days=args.days,
+            min_bars=args.min_history_bars,
+            adapter=_tickflow(args),
+        )
+    else:
+        path = Path(args.output_dir) / LEADERS_LATEST_NAME
+        if not path.is_file():
+            raise SystemExit(f"未找到 {path}；先加 --refresh 生成全板块龙头事实包")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    _dump_json(payload, args.output)
+
+
+def _cmd_monthly_context(args) -> None:
+    payload = build_monthly_context(
+        output_dir=args.output_dir,
+        horizon_days=args.horizon_days,
+        symbols=args.symbols,
+    )
+    _dump_json(payload, args.output)
+
+
 def _cmd_tick_health(args) -> None:
     _dump_json(_tickflow(args).health_check())
 
@@ -1186,6 +1243,8 @@ COMMANDS = {
     "pre-open-brief": _cmd_pre_open,
     "wyckoff-scan": _cmd_wyckoff_scan,
     "strategy-screen": _cmd_strategy_screen,
+    "sector-leaders": _cmd_sector_leaders,
+    "monthly-context": _cmd_monthly_context,
     "tick-health": _cmd_tick_health,
     "intraday-check": _cmd_intraday_check,
     "qmt-health": _cmd_qmt_health,

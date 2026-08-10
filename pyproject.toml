@@ -36,6 +36,7 @@ dev = [
 
 [project.scripts]
 ashare-ds = "ashare_decision_support.cli:main"
+ashare-ds-mcp = "ashare_decision_support.mcp_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -3,7 +3,7 @@
 That document's whole value is that its answer is a **checkable fact**, not an
 impression. 五条口径，粒度从粗到细——后四条都是在上一条的盲区里发现死码之后补的：
 
-- **可达性** — 从 `cli.py` 出发，import 图能不能走到这个模块
+- **可达性** — 从所有项目入口（CLI 与 MCP）出发，import 图能不能走到这个模块
 - **符号引用** — 模块里的公开符号有没有人真的用；只被 `__init__.py` 转出口、
   再没有第二个引用点的，算未接线
 - **字段读取** — dataclass 的公开字段有没有人读；算了没人读的，等于没算
@@ -89,10 +89,16 @@ def _imports_of(path: pathlib.Path) -> set[str]:
     return {m for m in found if m.startswith("ashare_decision_support")}
 
 
-def reachable_from_cli() -> set[str]:
+ENTRYPOINTS = (
+    "ashare_decision_support.cli",
+    "ashare_decision_support.mcp_server",
+)
+
+
+def reachable_from_entrypoints() -> set[str]:
     by_name = {_module_name(p): p for p in _py_files(SRC)}
     seen: set[str] = set()
-    queue = ["ashare_decision_support.cli"]
+    queue = list(ENTRYPOINTS)
     while queue:
         name = queue.pop()
         if name in seen or name not in by_name:
@@ -104,16 +110,23 @@ def reachable_from_cli() -> set[str]:
     return seen
 
 
+# 兼容已有的外部脚本调用；新口径包含 MCP 入口。
+reachable_from_cli = reachable_from_entrypoints
+
+
 def check_modules() -> list[str]:
     by_name = {_module_name(p): p for p in _py_files(SRC)}
-    reached = reachable_from_cli()
+    reached = reachable_from_entrypoints()
     # `__init__.py` 与包根本身不单独判定：它们是转出口，不是功能模块。
     orphans = sorted(
         name
         for name in by_name
         if name not in reached and not name.endswith("__init__") and name != "ashare_decision_support"
     )
-    print(f"[模块] {len(by_name)} 个，{len(reached & set(by_name))} 个从 cli.py 可达")
+    print(
+        f"[模块] {len(by_name)} 个，{len(reached & set(by_name))} 个从"
+        f" {len(ENTRYPOINTS)} 个入口可达"
+    )
     for name in orphans:
         print(f"  未接线  {name}")
     return orphans

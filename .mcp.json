@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ashare-analysis": {
+      "command": "python3",
+      "args": ["-m", "ashare_decision_support.mcp_server"],
+      "cwd": "/root/a-share-ultra-short-ai-system",
+      "env": {
+        "PYTHONPATH": "src"
+      }
+    }
+  }
+}

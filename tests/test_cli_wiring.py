@@ -73,6 +73,9 @@ OWN_CASES = {"calendar-refresh"}
 COVERED_ELSEWHERE = {
     # tests/test_ask.py::_cmd_strategy_screen
     "strategy-screen",
+    # tests/test_external_tools.py 覆盖纯计算、MCP 调用与两条命令的解析
+    "sector-leaders",
+    "monthly-context",
     # tests/test_external_adjudication.py 走的是同一对函数的完整用例
     "codex-adjudication-packet",
     "codex-adjudication-validate",
