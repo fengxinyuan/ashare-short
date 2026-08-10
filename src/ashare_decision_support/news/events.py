@@ -1,73 +1,18 @@
-"""Deterministic event evidence extracted from industry and company headlines."""
+"""Deterministic event evidence extracted from industry and company headlines.
+
+词表本身不在这里，在 `news/lexicon.py`——打分层（`scoring/context.py`）读的是
+同一份。这两层曾经各存一份 `RISK_TERMS`，交集只有 4 个词，「退市 / 风险警示 /
+财务造假」只在本层有，于是同一条公告在简报里是风险、在打分里是 0 分。
+"""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-EVENT_TERMS: dict[str, tuple[str, ...]] = {
-    "政策": (
-        "政策支持",
-        "政策利好",
-        "专项规划",
-        "专项债",
-        "补贴",
-        "试点",
-        "产业规划",
-        "设备更新",
-        "以旧换新",
-        "国产替代",
-    ),
-    "价格": (
-        "涨价",
-        "提价",
-        "价格上调",
-        "报价上调",
-        "降价",
-        "价格回落",
-        "价格上涨",
-        "纸价",
-        "浆价",
-    ),
-    "供给": (
-        "供给收缩",
-        "产能受限",
-        "停产",
-        "停机",
-        "检修",
-        "减产",
-        "库存下降",
-        "库存拐点",
-        "供不应求",
-        "产能置换",
-    ),
-    "订单": ("订单", "中标", "签约", "合同", "客户导入", "批量供货"),
-    "业绩": (
-        "业绩预增",
-        "业绩增长",
-        "净利润增长",
-        "扭亏",
-        "超预期",
-        "预告上修",
-        "预亏",
-        "净利润下降",
-        "低于预期",
-    ),
-    "资本运作": ("回购", "增持", "并购", "重组", "资产注入", "定增", "股权激励"),
-}
+from ashare_decision_support.news.lexicon import EVENT_TERMS, RISK_TERMS
 
-RISK_TERMS: tuple[str, ...] = (
-    "立案",
-    "财务造假",
-    "退市",
-    "风险警示",
-    "减持",
-    "问询函",
-    "行政处罚",
-    "诉讼",
-    "商誉减值",
-    "停牌",
-)
+__all__ = ["EVENT_TERMS", "RISK_TERMS", "EventEvidence", "detect_events"]
 
 
 @dataclass(frozen=True)
@@ -75,12 +20,14 @@ class EventEvidence:
     event_types: tuple[str, ...] = ()
     hits: tuple[str, ...] = ()
     risk_hits: tuple[str, ...] = ()
+    risk_types: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, list[str]]:
         return {
             "event_types": list(self.event_types),
             "hits": list(self.hits),
             "risk_hits": list(self.risk_hits),
+            "risk_types": list(self.risk_types),
         }
 
 
@@ -90,15 +37,17 @@ def detect_events(texts: Iterable[str] | None) -> EventEvidence:
     if not text:
         return EventEvidence()
 
-    matched: list[tuple[str, str]] = []
-    for event_type, terms in EVENT_TERMS.items():
-        for term in terms:
-            if term in text:
-                matched.append((event_type, term))
-
-    risk_hits = tuple(term for term in RISK_TERMS if term in text)
+    matched = _match(EVENT_TERMS, text)
+    risks = _match(RISK_TERMS, text)
     return EventEvidence(
         event_types=tuple(dict.fromkeys(event_type for event_type, _ in matched)),
         hits=tuple(dict.fromkeys(term for _, term in matched)),
-        risk_hits=risk_hits,
+        risk_hits=tuple(dict.fromkeys(term for _, term in risks)),
+        risk_types=tuple(dict.fromkeys(risk_type for risk_type, _ in risks)),
     )
+
+
+def _match(table: dict[str, tuple[str, ...]], text: str) -> list[tuple[str, str]]:
+    return [
+        (category, term) for category, terms in table.items() for term in terms if term in text
+    ]

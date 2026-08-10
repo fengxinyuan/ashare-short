@@ -130,32 +130,6 @@ class FakeFreeTickFlowModule:
     TickFlow = FakeFreeClient
 
 
-def test_tickflow_adapter_health_and_open_features() -> None:
-    adapter = TickFlowAdapter(api_key="key", tickflow_module=FakeTickFlowModule())
-    health = adapter.health_check()
-    features = adapter.get_open_features(["300001.SZ"])
-
-    assert health["mode"] == "full"
-    assert health["capabilities"]["supports_intraday"] is True
-    item = features["300001.SZ"]
-    assert item.data_stale is False
-    assert item.minutes_since_open == 5
-    assert round(item.open_gap_pct, 4) == round((12.2 / 12.0 - 1.0) * 100.0, 4)
-    assert item.volume_ratio > 0
-
-
-def test_tickflow_adapter_auction_features_are_degraded_without_depth_precision() -> None:
-    adapter = TickFlowAdapter(api_key="key", tickflow_module=FakeTickFlowModule())
-    features = adapter.get_auction_features(["300001.SZ"])
-    item = features["300001.SZ"]
-
-    assert item.symbol == "300001.SZ"
-    assert item.matched_qty == 100000
-    assert item.matched_amount == 1250000
-    assert item.unmatched_qty >= 0
-    assert item.indicative_match_price == 12.5
-
-
 def test_tickflow_adapter_historical_bars() -> None:
     adapter = TickFlowAdapter(api_key="key", tickflow_module=FakeTickFlowModule())
     bars = adapter.get_historical_bars(["300001.SZ"], date(2026, 7, 30), date(2026, 7, 31))
@@ -193,27 +167,6 @@ class RecordingFreeModule:
     TickFlow = RecordingFreeClient
 
 
-def test_daily_proxy_lookback_survives_the_first_of_the_month() -> None:
-    """The proxy window used to collapse to month-to-date, yielding 0-2 bars on the 1st."""
-    adapter = TickFlowAdapter(api_key=None, tickflow_module=RecordingFreeModule())
-    adapter.get_open_features(["603983.SH"])
-
-    call = adapter.client.klines.calls[-1]
-    span_days = (call["end_time"] - call["start_time"]) / 86_400_000
-    # Must comfortably exceed the 21-bar baseline the volume-ratio helpers need,
-    # on every calendar day including the 1st.
-    assert span_days > 120
-    assert call["adjust"] == "forward"
-
-
-def test_free_mode_daily_proxy_returns_enough_bars_for_the_volume_baseline() -> None:
-    adapter = TickFlowAdapter(api_key=None, tickflow_module=FakeFreeTickFlowModule())
-    rows = adapter._daily_proxy_rows("603983.SH")
-
-    assert rows, "degraded daily proxy must not come back empty"
-    assert rows[-1]["close"] == 28.67
-
-
 def test_free_mode_tests_are_not_silently_upgraded_by_an_exported_key() -> None:
     """A guard on the guard: `..._free_mode_...` tests must really run free mode.
 
@@ -233,32 +186,6 @@ def test_free_mode_tests_are_not_silently_upgraded_by_an_exported_key() -> None:
     assert adapter.supports_realtime is False
     assert adapter.supports_intraday is False
     assert adapter.supports_depth is False
-
-
-def test_tickflow_free_mode_daily_proxy_has_reasonable_vwap_and_gap() -> None:
-    adapter = TickFlowAdapter(api_key=None, tickflow_module=FakeFreeTickFlowModule())
-    feature = adapter.get_open_features(["603983.SH"])["603983.SH"]
-
-    assert feature.data_stale is True
-    assert feature.open_gap_pct > 0
-    # The daily feed reports volume in lots and amount in yuan; deriving VWAP
-    # without reconciling the two used to yield price_vs_vwap_pct = -99%.
-    assert abs(feature.price_vs_vwap_pct) < 5
-
-
-def test_tickflow_free_mode_publishes_no_auction_microstructure() -> None:
-    """Free mode has no depth feed, so auction fields must be null, not daily totals."""
-    adapter = TickFlowAdapter(api_key=None, tickflow_module=FakeFreeTickFlowModule())
-    auction = adapter.get_auction_features(["603983.SH"])["603983.SH"]
-
-    assert auction.data_stale is True
-    assert auction.matched_amount is None
-    assert auction.matched_qty == 0
-    assert auction.unmatched_qty == 0
-    assert auction.unmatched_side == "N"
-    assert auction.seal_ratio is None
-    # A real reference price is still available and still useful.
-    assert auction.indicative_match_price > 0
 
 
 # ---- 批次大小护栏 ---------------------------------------------------------

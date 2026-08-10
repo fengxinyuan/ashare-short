@@ -16,10 +16,10 @@ on exactly that.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.tabular import records
 
@@ -71,32 +71,26 @@ class SinaIntradayAdapter:
             return {}, []
 
         workers = min(max(1, int(max_workers or self.max_workers)), len(symbols))
-        result: dict[str, list[dict]] = {}
-        failed: list[str] = []
 
-        def fetch(symbol: str) -> tuple[str, list[dict] | None]:
-            try:
-                table = self.ak.stock_zh_a_minute(
-                    symbol=sina_symbol(symbol), period=period, adjust=""
-                )
-            except Exception:
-                return symbol, None
+        def fetch(symbol: str) -> list[dict]:
+            table = self.ak.stock_zh_a_minute(symbol=sina_symbol(symbol), period=period, adjust="")
             bars = _to_bars(table, symbol)
-            return symbol, bars[-max_bars:] if max_bars is not None else bars
+            return bars[-max_bars:] if max_bars is not None else bars
 
-        if workers == 1:
-            pairs = [fetch(symbol) for symbol in symbols]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                pairs = list(pool.map(fetch, symbols))
+        done, failed = gather(symbols, fetch, max_workers=workers)
 
-        for symbol, bars in pairs:
-            if bars:
-                result[symbol] = bars
-            else:
-                failed.append(symbol)
+        # 「取不到」和「今天没有分时」是两件事：前者要报出原因，后者只是这只票
+        # 今天没成交。原先两种都并进一句「拉取失败」，排查时看不出该查网络还是
+        # 查标的。
+        result = {symbol: bars for symbol, bars in done if bars}
+        empty = [symbol for symbol, bars in done if not bars]
 
-        notes = [f"以下标的分钟线拉取失败：{'、'.join(failed)}"] if failed else []
+        notes: list[str] = []
+        if failed:
+            reasons = "、".join(f"{symbol}（{type(exc).__name__}）" for symbol, exc in failed[:8])
+            notes.append(f"以下标的分钟线拉取失败：{reasons}")
+        if empty:
+            notes.append(f"以下标的分钟线为空：{'、'.join(empty[:8])}")
         return result, notes
 
     def health_check(self) -> dict[str, Any]:

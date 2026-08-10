@@ -36,6 +36,7 @@ from ashare_decision_support.advice.candidates import (
 )
 from ashare_decision_support.models.enums import Playbook, TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, WyckoffSignal
+from ashare_decision_support.numeric import finite
 from ashare_decision_support.signals.intraday import IntradaySnapshot
 
 # Fraction of the session range used as a buffer under a stop, so a level is
@@ -162,11 +163,6 @@ class StockAdvice:
     @property
     def has_actionable_levels(self) -> bool:
         return self.entry_low is not None and self.stop is not None
-
-    @property
-    def has_playbook(self) -> bool:
-        """今天有没有一条成立的打法。价位算得出来 ≠ 现在该买。"""
-        return bool(self.setup.get("matched"))
 
     @property
     def abstained(self) -> bool:
@@ -813,6 +809,10 @@ def _intraday_facts(intraday: IntradaySnapshot) -> dict[str, Any]:
         # 今开相对**昨收**的跳空。它一直算着却没被带出来，于是「今天低开了怎么看」
         # 这类问题在下游只能拿现价对今开去凑——那是开盘之后走了多少，不是跳空。
         "open_gap_pct": intraday.open_gap_pct,
+        # 现价相对昨收，也就是行情软件上那个「涨幅」。**必须自己带出来，不能让
+        # 下游拿上面两个数去凑**：凑出来的数不在事实里，`unverified_numbers` 会把
+        # 整段论证丢掉——于是模型写一句「今天涨了 3.3%」就等于这段白写了。
+        "day_change_pct": intraday.day_change_pct,
         "price_vs_vwap_pct": intraday.price_vs_vwap_pct,
         "price_vs_open_pct": intraday.price_vs_open_pct,
         "opening_drive_pct": intraday.opening_drive_pct,
@@ -823,6 +823,10 @@ def _intraday_facts(intraday: IntradaySnapshot) -> dict[str, Any]:
         "range_position": intraday.range_position,
         "volume_ratio": intraday.volume_ratio,
         "bar_count": intraday.bar_count,
+        # 开盘以来走了多少**交易**分钟（午休不计）。它一直算着却没被带出来，而
+        # 上面几个比率的可信度全取决于它：10:00 的量比 1.8 和 14:50 的量比 1.8
+        # 是两回事，只给比率等于把「才走了 30 分钟」这件事藏起来。
+        "minutes_since_open": intraday.minutes_since_open,
         "last_timestamp": (
             intraday.last_timestamp.isoformat(timespec="seconds")
             if intraday.last_timestamp is not None
@@ -881,18 +885,19 @@ def _nested_number(payload: Any, *paths: tuple[str, ...]) -> float | None:
 
 
 def _to_number(value: Any) -> float | None:
-    if value in (None, "", "-"):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace(",", "")
-    if not text:
-        return None
-    text = text.removesuffix("%")
-    try:
-        return float(text)
-    except ValueError:
-        return None
+    """收成有限 float。比 `numeric.finite` 只多认两种**写法**：千分位逗号与
+    百分号后缀——这条路读的是 akshare 交出来的展示用字段（`换手率` 给
+    `"3.52%"`、股本给 `"1,234.5"`）。
+
+    判据本身仍然只有 `finite` 那一条。原实现自己写了 try/float，于是
+    `"nan"` 收成 NaN、`True` 收成 1.0，两者都会一路流进换手率与流通股本，
+    再从那里进打分——而 NaN 的比较永远是 False，不会有任何一处报错。
+
+    百分号只脱不除：`"3.52%"` 是 3.52，因为上游这一格的单位本来就是「个百分点」。
+    """
+    if isinstance(value, str):
+        value = value.strip().replace(",", "").removesuffix("%")
+    return finite(value)
 
 
 def _nearest_above(last_price: float, *levels: float | None) -> float | None:

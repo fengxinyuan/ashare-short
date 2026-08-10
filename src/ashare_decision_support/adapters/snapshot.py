@@ -31,11 +31,11 @@ from __future__ import annotations
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import positive
 from ashare_decision_support.symbols import normalize_symbol
 
@@ -151,18 +151,18 @@ class SnapshotAdapter:
 
         fetch = self._fetch_sina if self.prefer == "sina" else self._fetch_tencent
         batches = [codes[index : index + BATCH_SIZE] for index in range(0, len(codes), BATCH_SIZE)]
-        workers = min(self.max_workers, len(batches))
 
         results: dict[str, Snapshot] = {}
         notes: list[str] = []
-        if workers == 1:
-            pairs = [fetch(batch) for batch in batches]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                pairs = list(pool.map(fetch, batches))
-        for parsed, batch_notes in pairs:
+        done, failed = gather(batches, fetch, max_workers=self.max_workers)
+        for _batch, (parsed, batch_notes) in done:
             results.update(parsed)
             notes.extend(batch_notes)
+        # `_fetch_sina` / `_fetch_tencent` 自己兜住了请求异常，走到这里的是解析
+        # 阶段的意外。这一批整批缺失，但别的批次照常——类名要留下，否则「未取到
+        # 快照」那条 note 读起来像是服务端少回了几行。
+        for batch, exc in failed:
+            notes.append(f"快照批次（{len(batch)} 只）解析失败（{type(exc).__name__}）")
 
         missing = [code for code in codes if code not in results]
         if missing:

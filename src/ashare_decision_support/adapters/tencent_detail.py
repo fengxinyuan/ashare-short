@@ -18,10 +18,10 @@ from __future__ import annotations
 import ast
 import math
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import as_int, finite, positive
 from ashare_decision_support.symbols import normalize_symbol
 
@@ -139,21 +139,10 @@ class TencentDetailAdapter:
             return results, notes
 
         fetched: dict[str, tuple[TradeFlowSummary | None, Exception | None]] = {}
-        if self.max_workers > 1 and len(ordered) > 1:
-            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(ordered))) as pool:
-                futures = {pool.submit(self.fetch_summary, symbol): symbol for symbol in ordered}
-                for future, symbol in futures.items():
-                    # 单只失败不该拖垮整批：错误存起来，按入参顺序统一转成说明。
-                    try:
-                        fetched[symbol] = (future.result(), None)
-                    except Exception as exc:
-                        fetched[symbol] = (None, exc)
-        else:
-            for symbol in ordered:
-                try:
-                    fetched[symbol] = (self.fetch_summary(symbol), None)
-                except Exception as exc:
-                    fetched[symbol] = (None, exc)
+        done, errors = gather(ordered, self.fetch_summary, max_workers=self.max_workers)
+        # 单只失败不该拖垮整批：错误存起来，按入参顺序统一转成说明。
+        fetched.update({symbol: (summary, None) for symbol, summary in done})
+        fetched.update({symbol: (None, exc) for symbol, exc in errors})
 
         for symbol in ordered:
             summary, error = fetched.get(symbol, (None, None))

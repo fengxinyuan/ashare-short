@@ -300,6 +300,7 @@ class SectorPredictor:
                     name=definition.name,
                     score=round(clamp(score, 0.0, 100.0), 2),
                     metrics=metric,
+                    level=definition.level,
                     sentiment_polarity=sentiment.polarity,
                     sentiment_intensity=sentiment.intensity,
                     net_inflow=inflow,

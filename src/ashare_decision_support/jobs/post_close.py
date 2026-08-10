@@ -29,6 +29,7 @@ from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.jobs.sources import fetch_lhb_seats, fetch_limit_pool, fetch_trade_flow
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_post_close_brief
 from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.scoring import (
     RuleBasedScoreProvider,
     ScoreProvider,
@@ -63,7 +64,7 @@ def run_post_close(
     use_lhb_seats: bool = True,
 ) -> dict[str, Any]:
     provider = score_provider or RuleBasedScoreProvider()
-    end = trade_date or date.today()
+    end = trade_date or beijing_today()
     start = end - timedelta(days=max(days, 1))
 
     bars_by_symbol = adapter.get_historical_bars(symbols, start, end)
@@ -232,7 +233,7 @@ def _latest_bar_date(usable: dict[str, list[dict]], fallback: date | None = None
             continue
         if latest is None or candidate > latest:
             latest = candidate
-    return latest or fallback or date.today()
+    return latest or fallback or beijing_today()
 
 
 def _data_notes(
@@ -242,7 +243,7 @@ def _data_notes(
     today: date | None = None,
 ) -> list[str]:
     notes: list[str] = []
-    reference = today or date.today()
+    reference = today or beijing_today()
     try:
         health = adapter.health_check()
     except Exception:

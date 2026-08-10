@@ -20,7 +20,6 @@ a note in the brief, never the whole run.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from typing import Any
 
@@ -216,12 +215,9 @@ class AkshareNewsSource(NewsSource):
         if not symbols:
             return {}, []
 
-        def fetch(symbol: str) -> tuple[str, list[NewsDoc] | None]:
-            try:
-                table = self.ak.stock_news_em(symbol=_bare_code(symbol))
-            except Exception:
-                return symbol, None
-            return symbol, [
+        def fetch(symbol: str) -> list[NewsDoc]:
+            table = self.ak.stock_news_em(symbol=_bare_code(symbol))
+            return [
                 NewsDoc(
                     title=text(row, "新闻标题"),
                     summary=text(row, "新闻内容")[:500],
@@ -234,16 +230,13 @@ class AkshareNewsSource(NewsSource):
                 if text(row, "新闻标题")
             ]
 
-        workers = max(1, min(int(max_workers), len(symbols)))
-        if workers == 1:
-            pairs = [fetch(symbol) for symbol in symbols]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                pairs = list(pool.map(fetch, symbols))
+        done, errors = gather(symbols, fetch, max_workers=max_workers)
 
-        result = {symbol: docs for symbol, docs in pairs if docs is not None}
-        failed = [symbol for symbol, docs in pairs if docs is None]
-        notes = [f"以下标的个股新闻拉取失败：{'、'.join(failed[:8])}"] if failed else []
+        result = dict(done)
+        notes: list[str] = []
+        if errors:
+            reasons = "、".join(f"{symbol}（{type(exc).__name__}）" for symbol, exc in errors[:8])
+            notes.append(f"以下标的个股新闻拉取失败：{reasons}")
         return result, notes
 
     # ---- announcements ---------------------------------------------------

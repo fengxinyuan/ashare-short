@@ -13,12 +13,11 @@ which case you are in, and every consumer is expected to check it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime
 from statistics import fmean
 
-# A-share session boundaries.
-MORNING_OPEN = time(9, 30)
-SESSION_CLOSE = time(15, 0)
+from ashare_decision_support.schedule.clock import SESSION_MINUTES, minutes_since_open
+from ashare_decision_support.schedule.timezone import beijing_today
 
 # Minutes after the open that define the "opening drive" window. The first half
 # hour is where an ultra-short entry either works or does not.
@@ -28,8 +27,11 @@ CLOSING_WINDOW_MINUTES = 30
 # Prior sessions used as the volume baseline.
 VOLUME_BASELINE_SESSIONS = 5
 
-# 一个完整交易日的分钟数（上午 120 + 下午 120）。`_minutes_since_open` 的上界。
-FULL_SESSION_MINUTES = 240
+# 一个完整交易日的分钟数（上午 120 + 下午 120），也就是 `_minutes_since_open`
+# 的上界。取 `schedule/clock.py` 那一份而不是本地再写一遍 240：本模块已经从那里
+# 拿了 `minutes_since_open`，上界却曾经自己存了一份——同一个数在两个互相依赖的
+# 模块里各有一份定义，改其中一个不会有任何东西报错。
+FULL_SESSION_MINUTES = SESSION_MINUTES
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,7 @@ class IntradayAnalyzer:
         lows = [bar["low"] for bar in session if bar.get("low")] or closes
         opens = [bar["open"] for bar in session if bar.get("open")] or closes
 
-        today = self.today or date.today()
+        today = self.today or beijing_today()
         notes: list[str] = []
         is_current = session_date == today
         if not is_current:
@@ -122,6 +124,7 @@ class IntradayAnalyzer:
             price_vs_open_pct=_pct(open_price, last_price),
             price_vs_vwap_pct=_pct(vwap, last_price) if vwap else None,
             open_gap_pct=_pct(prev_close, open_price) if prev_close else None,
+            day_change_pct=_pct(prev_close, last_price) if prev_close else None,
             opening_drive_pct=_window_return(session, OPENING_WINDOW_MINUTES, from_start=True),
             closing_drive_pct=_window_return(session, CLOSING_WINDOW_MINUTES, from_start=False),
             closing_volume_ratio=_closing_volume_ratio(sessions, session_date),
@@ -296,23 +299,17 @@ def _closing_volume_ratio(sessions: dict[date, list[dict]], session_date: date) 
 
 
 def _minutes_since_open(timestamp: datetime) -> int:
-    """Trading minutes elapsed, skipping the 11:30-13:00 break."""
+    """K 线时间戳对应的交易分钟数，**上界钳到一个完整交易日**。
 
-    moment = timestamp.time()
-    if moment <= MORNING_OPEN:
-        return 0
-    morning_end = time(11, 30)
-    afternoon_start = time(13, 0)
-    if moment <= morning_end:
-        return int((_seconds(moment) - _seconds(MORNING_OPEN)) // 60)
-    if moment <= afternoon_start:
-        return 120
-    capped = min(moment, SESSION_CLOSE)
-    return 120 + int((_seconds(capped) - _seconds(afternoon_start)) // 60)
+    算法本身在 `schedule/clock.py`——它是市场规则（午休那 90 分钟要挖掉），
+    不是某个源的解析细节。这里只补一件本地的事：**钳顶**。
 
-
-def _seconds(moment: time) -> int:
-    return moment.hour * 3600 + moment.minute * 60 + moment.second
+    两边的差别只有这一条，而且是刻意的。`clock` 那份收盘后继续累加，因为它答的是
+    「现在几点了、数据还该不该更新」，15:30 和 15:00 必须能区分。这里的入参是**K
+    线时间戳**，答的是「这根 bar 落在交易日的第几分钟」，那个量按定义不超过 240；
+    某些源会把收盘那根戳成 15:00:30，不钳就会算出 241 分钟的交易日。
+    """
+    return min(minutes_since_open(timestamp), FULL_SESSION_MINUTES)
 
 
 def _pct(base: float | None, value: float) -> float | None:

@@ -15,6 +15,7 @@ from ashare_decision_support.agents.base import (
     AgentContext,
     Finding,
     run_agents,
+    timing_note,
 )
 from ashare_decision_support.agents.collectors import (
     BenchmarkDailyAgent,
@@ -42,4 +43,5 @@ __all__ = [
     "SymbolIntradayAgent",
     "SymbolNewsAgent",
     "run_agents",
+    "timing_note",
 ]

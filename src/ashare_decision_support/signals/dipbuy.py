@@ -176,12 +176,9 @@ def _atr_pct(bars: list[dict]) -> float | None:
     ranges: list[float] = []
     previous_close: float | None = None
     for bar in bars or []:
-        high, low, close = bar.get("high"), bar.get("low"), bar.get("close")
+        high, low = finite(bar.get("high")), finite(bar.get("low"))
+        close = finite(bar.get("close"))
         if high is None or low is None or close is None:
-            continue
-        try:
-            high, low, close = float(high), float(low), float(close)
-        except (TypeError, ValueError):
             continue
         true_range = high - low
         if previous_close is not None:

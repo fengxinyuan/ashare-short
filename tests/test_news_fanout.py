@@ -180,3 +180,26 @@ def test_composite_health_rolls_up_and_admits_what_it_did_not_probe() -> None:
     assert report["reachable"] is True
     assert report["unprobed"] == ["乙"]
     assert set(report["sources"]) == {"甲"}
+
+
+def test_the_thread_pool_has_exactly_one_home() -> None:
+    """`fanout.py` 是仓库里唯一允许 import ThreadPoolExecutor 的模块。
+
+    上面三条钉的是行为，这条钉的是**结构**。收口之前仓库里有十份手写线程池，
+    它们的差别从来不在并发上，而在保序与失败语义上——而那两样只在盘前跑批时
+    表现出来，且不报错。谁再手写一个池子，这条会先红。
+    """
+    import ast
+    import pathlib
+
+    from ashare_decision_support import fanout
+
+    src = pathlib.Path(fanout.__file__).parent
+    importers = sorted(
+        path.relative_to(src).as_posix()
+        for path in src.rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.ImportFrom) and node.module == "concurrent.futures"
+        if any(alias.name == "ThreadPoolExecutor" for alias in node.names)
+    )
+    assert importers == ["fanout.py"]

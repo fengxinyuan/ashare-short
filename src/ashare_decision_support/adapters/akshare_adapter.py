@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date
 from typing import Any
 
 from ashare_decision_support.adapters.base import MarketDataAdapter
-from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
-from ashare_decision_support.numeric import first_finite
 from ashare_decision_support.schedule.calendar import parse_trade_date
-from ashare_decision_support.schedule.clock import minutes_since_open
 
 
 class AkshareAdapterError(RuntimeError):
@@ -67,106 +64,6 @@ class AkshareAdapter(MarketDataAdapter):
             return result
         return []
 
-    def get_auction_features(self, symbols: list[str]) -> dict[str, AuctionFeatures]:
-        rows_by_code = self._spot_rows_by_code(symbols)
-        now = datetime.now()
-        features: dict[str, AuctionFeatures] = {}
-        for symbol in symbols:
-            row = rows_by_code.get(self._code(symbol))
-            if row is None:
-                raise AkshareAdapterError(f"symbol {symbol} not found in ak.stock_zh_a_spot_em() output")
-            latest = first_finite(row, "最新价")
-            open_price = first_finite(row, "今开")
-            prev_close = first_finite(row, "昨收")
-            amount = first_finite(row, "成交额")
-            volume_hand = first_finite(row, "成交量")
-            matched_qty = int(volume_hand * 100) if volume_hand is not None else 0
-            open_gap_pct = 0.0
-            if open_price is not None and prev_close not in (None, 0):
-                open_gap_pct = (open_price / prev_close - 1.0) * 100.0
-
-            features[symbol] = AuctionFeatures(
-                symbol=symbol,
-                matched_qty=matched_qty,
-                matched_amount=amount or 0.0,
-                unmatched_qty=0,
-                unmatched_side="N",
-                indicative_match_price=latest or open_price or prev_close or 0.01,
-                open_gap_pct=open_gap_pct,
-                cancel_pre920_ratio=None,
-                seal_ratio=None,
-                tail_flow_distortion=False,
-                data_stale=True,
-                source_ts=now,
-            )
-        return features
-
-    def get_open_features(self, symbols: list[str]) -> dict[str, OpenFeatures]:
-        rows_by_code = self._spot_rows_by_code(symbols)
-        features: dict[str, OpenFeatures] = {}
-        end_dt = datetime.now()
-        start_dt = datetime.combine(end_dt.date(), time(9, 30))
-
-        hist_min_fn = getattr(self.ak, "stock_zh_a_hist_min_em", None)
-        if not callable(hist_min_fn):
-            raise AkshareAdapterError("ak.stock_zh_a_hist_min_em is not available")
-
-        for symbol in symbols:
-            code = self._code(symbol)
-            row = rows_by_code.get(code)
-            if row is None:
-                raise AkshareAdapterError(f"symbol {symbol} not found in ak.stock_zh_a_spot_em() output")
-
-            minute_df = hist_min_fn(
-                symbol=code,
-                start_date=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                end_date=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                period="1",
-                adjust="",
-            )
-            minute_rows = self._rows(minute_df)
-            minute_rows = [item for item in minute_rows if item]
-
-            latest_price = first_finite(row, "最新价")
-            open_price = first_finite(row, "今开")
-            prev_close = first_finite(row, "昨收")
-            volume_ratio = first_finite(row, "量比") or 1.0
-
-            last_bar = minute_rows[-1] if minute_rows else {}
-            bar_close = first_finite(last_bar, "收盘")
-            current_price = bar_close or latest_price or open_price or prev_close
-            if current_price is None:
-                raise AkshareAdapterError(f"cannot determine current price for symbol {symbol}")
-
-            vwap = first_finite(last_bar, "均价")
-            if vwap is None:
-                amount = first_finite(last_bar, "成交额")
-                volume_hand = first_finite(last_bar, "成交量")
-                if amount is not None and volume_hand not in (None, 0):
-                    vwap = amount / (volume_hand * 100)
-                else:
-                    vwap = current_price
-
-            bar_time_value = last_bar.get("时间")
-            bar_dt = self._parse_datetime(bar_time_value) if bar_time_value else end_dt
-            open_gap_pct = 0.0
-            if open_price is not None and prev_close not in (None, 0):
-                open_gap_pct = (open_price / prev_close - 1.0) * 100.0
-            elif prev_close not in (None, 0):
-                open_gap_pct = (current_price / prev_close - 1.0) * 100.0
-
-            features[symbol] = OpenFeatures(
-                symbol=symbol,
-                minutes_since_open=minutes_since_open(bar_dt),
-                price_vs_open_pct=((current_price / open_price - 1.0) * 100.0) if open_price not in (None, 0) else 0.0,
-                price_vs_vwap_pct=((current_price / vwap - 1.0) * 100.0) if vwap not in (None, 0) else 0.0,
-                volume_ratio=volume_ratio,
-                open_gap_pct=open_gap_pct,
-                data_stale=False,
-                source_ts=bar_dt,
-            )
-        return features
-
     def health_check(self) -> dict[str, Any]:
         return {
             "adapter": "AkshareAdapter",
@@ -178,34 +75,6 @@ class AkshareAdapter(MarketDataAdapter):
                 "has_stock_board_concept_name_em": callable(getattr(self.ak, "stock_board_concept_name_em", None)),
             },
         }
-
-    def dump_snapshot(self, symbols: list[str]) -> dict[str, Any]:
-        rows_by_code = self._spot_rows_by_code(symbols)
-        snapshot = {
-            "generated_at": datetime.now().isoformat(),
-            "symbols": symbols,
-            "spot": {},
-            "minute": {},
-        }
-        for symbol in symbols:
-            code = self._code(symbol)
-            row = rows_by_code.get(code)
-            if row is not None:
-                snapshot["spot"][symbol] = row
-            try:
-                minute_rows = self._rows(
-                    self.ak.stock_zh_a_hist_min_em(
-                        symbol=code,
-                        start_date=datetime.combine(datetime.now().date(), time(9, 30)).strftime("%Y-%m-%d %H:%M:%S"),
-                        end_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        period="1",
-                        adjust="",
-                    )
-                )
-                snapshot["minute"][symbol] = minute_rows[-5:]
-            except Exception as exc:
-                snapshot["minute"][symbol] = {"error": str(exc)}
-        return snapshot
 
     def _spot_rows_by_code(self, symbols: list[str]) -> dict[str, dict]:
         spot_fn = getattr(self.ak, "stock_zh_a_spot_em", None)
@@ -243,13 +112,3 @@ class AkshareAdapter(MarketDataAdapter):
     def _code(self, symbol: str) -> str:
         base = symbol.split(".", maxsplit=1)[0]
         return base.zfill(6)
-
-    def _parse_datetime(self, value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value
-        text = str(value)
-        if len(text) == 19:
-            return datetime.fromisoformat(text)
-        if len(text) == 16:
-            return datetime.fromisoformat(f"{text}:00")
-        return datetime.now()

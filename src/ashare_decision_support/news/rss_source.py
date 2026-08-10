@@ -7,7 +7,7 @@ import urllib.request
 import xml.etree.ElementTree as element_tree
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Any
 
 from ashare_decision_support.fanout import gather
@@ -15,12 +15,12 @@ from ashare_decision_support.news.balance import retain_market_docs
 from ashare_decision_support.news.base import NewsDoc, NewsSource
 from ashare_decision_support.news.cache import NewsCache
 from ashare_decision_support.news.health import probe_feeds
+from ashare_decision_support.schedule.timezone import to_beijing_naive
 
 USER_AGENT = "Mozilla/5.0"
 TIMEOUT_SECONDS = 15
 PER_FEED_LIMIT = 30
 MAX_RESPONSE_BYTES = 1_000_000
-CN_TZ = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True)
@@ -162,4 +162,4 @@ def _rss_stamp(value: str) -> str:
             return value[:19]
     if parsed.tzinfo is None:
         return parsed.strftime("%Y-%m-%d %H:%M:%S")
-    return parsed.astimezone(CN_TZ).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    return to_beijing_naive(parsed).strftime("%Y-%m-%d %H:%M:%S")

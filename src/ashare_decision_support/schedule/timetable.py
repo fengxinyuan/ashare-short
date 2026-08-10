@@ -21,6 +21,7 @@ from datetime import time as clock_time
 from typing import Any
 
 from ashare_decision_support.schedule.daemon import ScheduledTask
+from ashare_decision_support.schedule.timezone import beijing_today
 
 TASK_NEWS = "news"
 TASK_MORNING = "morning"
@@ -70,6 +71,6 @@ def build_timetable(
 
 
 def describe(tasks: list[ScheduledTask], day: date | None = None) -> str:
-    header = f"交易日 {day or date.today()} 时间表"
+    header = f"交易日 {day or beijing_today()} 时间表"
     rows = [f"  {task.at:%H:%M}  {task.key:<10} {task.label}" for task in sorted(tasks, key=lambda t: t.at)]
     return "\n".join([header, *rows])

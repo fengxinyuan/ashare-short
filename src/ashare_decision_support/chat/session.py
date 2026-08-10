@@ -25,6 +25,7 @@ from ashare_decision_support.advice.view import (
     sort_advice_items,
     trade_context_parts_from_dict,
 )
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.writer.llm import LlmClient, unverified_numbers
 
 SYSTEM_PROMPT = """你是一名 A 股短线分析助手，服务于一位自己做超短线的交易者。
@@ -476,12 +477,11 @@ def _load_watchlist(session: ChatSession, compute_symbols: Callable[[list[str]],
 
 
 def _load_alerts(session: ChatSession) -> str:
-    from datetime import date
 
     from ashare_decision_support.monitor.sector_triggers import fired_sectors_today
     from ashare_decision_support.state import AlertState
 
-    today = date.today()
+    today = beijing_today()
     fired = AlertState.load(today).fired_summary()
     # 板块告警是另一个状态文件，不读它的话「今天板块有什么异动」永远答「没有」。
     sectors = fired_sectors_today(today)

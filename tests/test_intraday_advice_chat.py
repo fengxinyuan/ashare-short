@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta
 
 from ashare_decision_support.adapters.freshness import check_intraday_freshness, in_session
@@ -13,6 +14,7 @@ from ashare_decision_support.chat.session import (
 )
 from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, PriceLevel
+from ashare_decision_support.schedule.clock import minutes_since_open
 from ashare_decision_support.signals.intraday import IntradayAnalyzer, _minutes_since_open
 
 # ---- symbol normalization ------------------------------------------------
@@ -114,6 +116,24 @@ def test_minutes_since_open_skips_the_lunch_break() -> None:
     assert _minutes_since_open(datetime(2026, 7, 31, 15, 0)) == 240
 
 
+def test_the_bar_clock_caps_at_a_full_session_and_the_wall_clock_does_not() -> None:
+    """两份实现收成一份之后，唯一保留的差别是**钳顶**，而它是刻意的。
+
+    `schedule/clock.minutes_since_open` 答的是「现在几点了、数据还该不该更新」，
+    收盘后必须继续走——15:30 和 15:00 要能区分。`signals/intraday` 这份答的是
+    「这根 bar 落在交易日的第几分钟」，那个量按定义不超过 240；有些源把收盘那根
+    戳成 15:00:30，不钳就会算出一个 241 分钟的交易日。
+    """
+    from ashare_decision_support.signals.intraday import FULL_SESSION_MINUTES
+
+    late = datetime(2026, 7, 31, 15, 30)
+
+    assert minutes_since_open(late) == 270
+    assert _minutes_since_open(late) == FULL_SESSION_MINUTES == 240
+    # 收盘那根被戳晚半分钟也不该多算出一分钟。
+    assert _minutes_since_open(datetime(2026, 7, 31, 15, 0, 30)) == 240
+
+
 def test_snapshot_flags_a_session_that_is_not_today() -> None:
     """Treating the previous close as live is the dangerous failure here."""
     snapshot = IntradayAnalyzer(today=date(2026, 8, 1)).analyze(
@@ -147,6 +167,41 @@ def test_snapshot_computes_vwap_and_position() -> None:
     # Steady uptrend closes at the high.
     assert snapshot.range_position is not None and snapshot.range_position > 0.9
     assert snapshot.price_vs_open_pct is not None and snapshot.price_vs_open_pct > 0
+
+
+def test_day_change_is_given_directly_not_left_for_the_reader_to_compose() -> None:
+    """行情软件上那个「涨幅」必须自己是一个字段。
+
+    它此前**声明了但从未被赋值**，注释却写着「尾盘打法的第一道筛直接读它」——
+    于是永远是 None。代价不只是少一个数：事实包里只有跳空与开盘后涨幅两截，
+    模型要说「今天涨了 3.3%」就得自己乘出来，而乘出来的数不在事实里，
+    `unverified_numbers` 会把**整段论证**丢掉。
+    """
+    from ashare_decision_support.writer.llm import unverified_numbers
+
+    rows = minute_rows("2026-07-31", 48, start_price=10.0)
+    snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze(
+        "600519.SH", bars_from(rows), prev_close=9.5
+    )
+
+    assert snapshot is not None
+    assert snapshot.day_change_pct is not None
+    # 是「相对昨收」，不是「相对今开」——两者只有在平开时才相等。
+    assert snapshot.day_change_pct == round(snapshot.last_price / 9.5 - 1.0, 6)
+    assert snapshot.day_change_pct != snapshot.price_vs_open_pct
+
+    # 闸门那一头：两截数在手也拼不出合计，所以合计必须自己进事实包。
+    pieces = json.dumps(
+        {
+            "open_gap_pct": snapshot.open_gap_pct,
+            "price_vs_open_pct": snapshot.price_vs_open_pct,
+        },
+        ensure_ascii=False,
+    )
+    composed = f"{snapshot.day_change_pct:.6f}"
+    assert unverified_numbers(f"今日涨幅 {composed}", pieces) == [composed]
+    whole = json.dumps({"day_change_pct": snapshot.day_change_pct}, ensure_ascii=False)
+    assert unverified_numbers(f"今日涨幅 {composed}", whole) == []
 
 
 def test_snapshot_uses_only_the_latest_session() -> None:

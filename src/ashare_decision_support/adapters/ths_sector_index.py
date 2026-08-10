@@ -28,12 +28,14 @@ import json
 import re
 import urllib.request
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import fmean
 from typing import Any
 
+from ashare_decision_support.fanout import gather
+from ashare_decision_support.jsoncache import read_stamped, write_stamped
+from ashare_decision_support.numeric import finite
 from ashare_decision_support.state.paths import state_home
 
 BASE_URL = "https://d.10jqka.com.cn/v6/line/bk_{code}/01/last.js"
@@ -71,7 +73,17 @@ HIGH_WINDOW = 20
 VOLUME_WINDOW = 5
 MIN_BARS = 25
 
+# 收盘位置的高低分界（收盘落在当日区间的百分位）。收在上沿 = 尾盘有承接，
+# 收在下沿 = 卖压在兑现。`shape` 与 `describe()` 两处都要用，写死两遍必然漂。
+HIGH_CLOSE = 80.0
+LOW_CLOSE = 20.0
+
 _CALLBACK = re.compile(r"\((.*)\)\s*;?\s*$", re.DOTALL)
+
+
+def _yi(amount: float | None) -> str:
+    """成交额 → 「日均 N 亿」。取不到就明说，不印一个 0 亿冒充读数。"""
+    return "日均额缺失" if amount is None else f"日均 {amount / 1e8:.0f} 亿"
 
 
 @dataclass(frozen=True)
@@ -98,13 +110,13 @@ class SectorIndexReading:
         """一句话形态。只用于措辞，不参与任何打分。"""
         if self.close_position is None or self.ret_1d is None:
             return "数据不足"
-        if self.ret_1d > 0 and self.close_position <= 20:
+        if self.ret_1d > 0 and self.close_position <= LOW_CLOSE:
             return "涨但收在日内低位（冲高回落，卖压在兑现）"
-        if self.ret_1d > 0 and self.close_position >= 80:
+        if self.ret_1d > 0 and self.close_position >= HIGH_CLOSE:
             return "涨且收在日内高位（有承接）"
-        if self.ret_1d < 0 and self.close_position >= 80:
+        if self.ret_1d < 0 and self.close_position >= HIGH_CLOSE:
             return "跌但收在日内高位（尾盘有买盘）"
-        if self.ret_1d < 0 and self.close_position <= 20:
+        if self.ret_1d < 0 and self.close_position <= LOW_CLOSE:
             return "跌且收在日内低位（无承接）"
         return "日内震荡"
 
@@ -143,21 +155,90 @@ class SectorIndexSnapshot:
                 + "、".join(f"{r.name} {r.ret_1d:+.2%}" for r in losers)
             )
         # 「涨了但收在最低」是这一层独有的读数，单独点名。
-        faded = [
+        lines.extend(self._close_position_lines(n))
+        lines.extend(self._volume_position_lines(n))
+        return lines
+
+    # ---- describe 的两条独有读数 ------------------------------------------
+
+    def _close_position_lines(self, n: int) -> list[str]:
+        """收盘位置的横截面分布。
+
+        **原来只在出现冲高回落时才有一行**，于是最强的那种收盘反而是沉默的：
+        2026-08-07 实测 90 个板块涨了 78 个、冲高回落 **0 个**，简报上一个字都没有。
+        沉默在这里不是中性的——读的人会把「没写」读成「没测出什么」，而当天的事实
+        是全场尾盘承接极强，这正是本层 docstring 说它独有、别处拿不到的那个读数。
+
+        所以分布**总是**报：分母（有收位读数的板块数）跟着出，读的人才能自己判断
+        「0 个冲高回落」是全场强，还是当天压根没几个板块在涨。
+        """
+        scored = [r for r in self.readings if r.close_position is not None]
+        if not scored:
+            return []
+        risers = [r for r in scored if r.ret_1d is not None and r.ret_1d > 0]
+        held = [r for r in scored if (r.close_position or 0.0) >= HIGH_CLOSE]
+        faded = sorted(
+            (r for r in risers if (r.close_position or 0.0) <= LOW_CLOSE),
+            key=lambda r: r.close_position or 0.0,
+        )
+        line = (
+            f"收盘位置：{len(held)}/{len(scored)} 个板块收在日内高位"
+            f"（收位 ≥{HIGH_CLOSE:.0f}%）；当日上涨的 {len(risers)} 个里"
+            f"有 {len(faded)} 个收在日内低位"
+        )
+        if faded:
+            line += "（冲高回落，卖压在兑现）：" + "、".join(
+                f"{r.name}（{r.ret_1d:+.2%}，收位 {r.close_position:.0f}%）"
+                for r in faded[:n]
+            )
+        elif risers:
+            line += "——**没有一个冲高回落**，尾盘承接强。"
+        else:
+            line += "。"
+        return [line]
+
+    def _volume_position_lines(self, n: int) -> list[str]:
+        """上涨板块按量能位置分两组，每一组都带上量级。
+
+        `volume_ratio`（近 5 日均额 / 近 20 日均额）此前**算了但没有任何人读**——
+        它是这一层第二个独有读数，而且是分辨「反弹有没有钱」的那一个：
+        2026-08-07 实测同为大涨，小金属 1.29、贵金属 1.19 是放量，半导体 0.85、
+        军工电子 0.94 是缩量。只报涨幅，这两类在简报上长得一模一样。
+
+        **比值必须配量级，否则会读出一个反过来的结论。** 同日教育量能 1.68 排在
+        放量榜首，但它日均只有 43 亿；半导体量能 0.85 垫底，日均却有 3835 亿。
+        只看比值会得出「教育是最大的流入方向」，而当天真正的资金事实是**半导体
+        那一侧在失血，且失的血比教育的全部成交额还多一个数量级**。
+        `sectors/turnover.py:by_amount_delta` 早就写下过同一条理由（占比答「钱挪去
+        哪了」，绝对额答「哪里的钱最多地消失了」）——这一层此前漏了后半句，而
+        `amount_5d` 一直就在手边。
+        """
+        risers = [
             r
             for r in self.readings
-            if r.ret_1d is not None
-            and r.ret_1d > 0
-            and r.close_position is not None
-            and r.close_position <= 20
+            if r.ret_1d is not None and r.ret_1d > 0 and r.volume_ratio is not None
         ]
-        if faded:
-            faded.sort(key=lambda r: r.close_position or 0)
+        if not risers:
+            return []
+        expanding = sorted(risers, key=lambda r: -(r.volume_ratio or 0.0))
+        shrinking = [r for r in risers if (r.volume_ratio or 0.0) < 1.0]
+        lines = [
+            f"上涨板块的量能位置（近 5 日均额 / 近 20 日均额，括号内为日均额）：放量 "
+            f"{len(risers) - len(shrinking)}/{len(risers)} 个，"
+            + "、".join(
+                f"{r.name} {r.volume_ratio:.2f}（{_yi(r.amount_5d)}）"
+                for r in expanding[:n]
+                if (r.volume_ratio or 0.0) >= 1.0
+            )
+        ]
+        if shrinking:
+            shrinking.sort(key=lambda r: r.volume_ratio or 0.0)
             lines.append(
-                f"{len(faded)} 个板块当日上涨却收在日内低位（冲高回落）："
+                "⚠️ 涨但缩量（涨幅在榜、量能没跟上，更像空头回补而不是新钱进场）："
                 + "、".join(
-                    f"{r.name}（{r.ret_1d:+.2%}，收位 {r.close_position:.0f}%）"
-                    for r in faded[:n]
+                    f"{r.name}（{r.ret_1d:+.2%}，量能 {r.volume_ratio:.2f}，"
+                    f"{_yi(r.amount_5d)}）"
+                    for r in shrinking[:n]
                 )
             )
         return lines
@@ -194,22 +275,24 @@ class ThsSectorIndexAdapter:
             return SectorIndexSnapshot(notes=[*notes, "同花顺行业指数：没有可用板块代码"], ok=False)
 
         parsed: list[tuple[str, str, list[dict]]] = []
-        failures = 0
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            for code, result in zip(wanted, pool.map(self._safe_fetch_one, wanted), strict=True):
-                if result is None:
-                    failures += 1
-                    continue
-                name, bars = result
-                if name and bars:
-                    parsed.append((code, name, bars))
+        done, errors = gather(wanted, self._fetch_one, max_workers=self.max_workers)
+        failures = len(errors)
+        for code, result in done:
+            if result is None:
+                continue
+            name, bars = result
+            if name and bars:
+                parsed.append((code, name, bars))
 
         readings = [r for r in (_measure(c, n, b) for c, n, b in parsed) if r is not None]
         # 落盘在 `_measure` 之后、闸门之前：即使某个板块的最新交易日对不齐、
         # 当日读数被排除，它的历史序列仍然是好的，没有理由跟着丢。
         self._persist_history(parsed)
         if failures:
-            notes.append(f"同花顺行业指数 {failures}/{len(wanted)} 个板块取数失败，其余照常")
+            kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors}))
+            notes.append(
+                f"同花顺行业指数 {failures}/{len(wanted)} 个板块取数失败（{kinds}），其余照常"
+            )
         if not readings:
             return SectorIndexSnapshot(notes=[*notes, "同花顺行业指数全部取数失败"], ok=False)
 
@@ -243,24 +326,15 @@ class ThsSectorIndexAdapter:
     def _discover(self, notes: list[str]) -> list[str]:
         """扫一遍代码区间，留下有数据的。只在没有缓存时发生。"""
         candidates = [str(c) for c in range(CODE_START, CODE_END + 1)]
-        alive: list[str] = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            for code, result in zip(
-                candidates, pool.map(self._safe_fetch_one, candidates), strict=True
-            ):
-                if result is not None and result[0] and result[1]:
-                    alive.append(code)
+        done, _errors = gather(candidates, self._fetch_one, max_workers=self.max_workers)
+        # 探测阶段没有「失败」这回事：这个区间里本来就大部分代码不存在，取不到
+        # 就是不存在。所以只看取到了什么，不记 note。
+        alive = [code for code, result in done if result is not None and result[0] and result[1]]
         notes.append(
             f"同花顺行业代码首次探测：{CODE_START}..{CODE_END} 共 {len(candidates)} 个，"
             f"{len(alive)} 个有数据，已缓存"
         )
         return alive
-
-    def _safe_fetch_one(self, code: str) -> tuple[str, list[dict]] | None:
-        try:
-            return self._fetch_one(code)
-        except Exception:
-            return None
 
     def _fetch_one(self, code: str) -> tuple[str, list[dict]] | None:
         request = urllib.request.Request(
@@ -295,31 +369,16 @@ class ThsSectorIndexAdapter:
         return written
 
     def _read_cache(self) -> list[str]:
-        path = self._cache_path()
-        if path is None:
-            return []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        if not isinstance(payload, dict) or payload.get("schema") != CACHE_SCHEMA:
+        payload = read_stamped(self._cache_path(), CACHE_SCHEMA)
+        if payload is None:
             return []
         codes = payload.get("codes")
         return [str(c) for c in codes] if isinstance(codes, list) else []
 
     def _write_cache(self, codes: list[str]) -> bool:
-        path = self._cache_path()
-        if path is None or not codes:
+        if not codes:
             return False
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({"schema": CACHE_SCHEMA, "codes": codes}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except OSError:
-            return False
-        return True
+        return write_stamped(self._cache_path(), {"codes": codes}, CACHE_SCHEMA)
 
 
 # ---- 日线序列的读写 -------------------------------------------------------
@@ -334,20 +393,13 @@ def _write_series(root: Path, code: str, name: str, bars: list[dict]) -> bool:
         return False
     merged = {str(bar["date"]): bar for bar in load_series(code, root)}
     merged.update({str(bar["date"]): bar for bar in bars})
-    payload = {
-        "schema": HISTORY_SCHEMA,
-        "code": code,
-        "name": name,
-        "bars": [merged[key] for key in sorted(merged)],
-    }
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        _series_path(root, code).write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
-    except OSError:
-        return False
-    return True
+    # 原子写在这里格外要紧：这一步是**整份重写**（旧序列并上新的），写到一半
+    # 断掉丢的不是今天这根，是这个板块攒下来的整条历史。
+    return write_stamped(
+        _series_path(root, code),
+        {"code": code, "name": name, "bars": [merged[key] for key in sorted(merged)]},
+        HISTORY_SCHEMA,
+    )
 
 
 def load_series(code: str, root: str | Path | None = None) -> list[dict]:
@@ -356,14 +408,16 @@ def load_series(code: str, root: str | Path | None = None) -> list[dict]:
     这是板块轮动那一层（主线持续度、跷跷板相关性、相对强弱排名）唯一的输入口。
     """
     directory = Path(root) if root is not None else state_home() / HISTORY_DIR_NAME
-    try:
-        payload = json.loads(_series_path(directory, str(code)).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    payload = read_stamped(_series_path(directory, str(code)), HISTORY_SCHEMA)
+    return _usable_bars(payload)
+
+
+def _usable_bars(payload: dict[str, Any] | None) -> list[dict]:
+    """序列文件里能用的那些根。没有 `date` 的行丢掉——它排不进序，也对不上前一天。"""
+    bars = (payload or {}).get("bars")
+    if not isinstance(bars, list):
         return []
-    if not isinstance(payload, dict) or payload.get("schema") != HISTORY_SCHEMA:
-        return []
-    bars = payload.get("bars")
-    return [bar for bar in bars if isinstance(bar, dict) and bar.get("date")] if isinstance(bars, list) else []
+    return [bar for bar in bars if isinstance(bar, dict) and bar.get("date")]
 
 
 def load_all_series(root: str | Path | None = None) -> dict[str, tuple[str, list[dict]]]:
@@ -383,17 +437,9 @@ def load_all_series(root: str | Path | None = None) -> dict[str, tuple[str, list
     except OSError:
         return result
     for path in paths:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict) or payload.get("schema") != HISTORY_SCHEMA:
-            continue
-        bars = payload.get("bars")
-        if not isinstance(bars, list):
-            continue
-        usable = [bar for bar in bars if isinstance(bar, dict) and bar.get("date")]
-        if not usable:
+        payload = read_stamped(path, HISTORY_SCHEMA)
+        usable = _usable_bars(payload)
+        if not payload or not usable:
             continue
         code = str(payload.get("code") or path.stem)
         result[code] = (str(payload.get("name") or code), usable)
@@ -428,20 +474,23 @@ def _parse_line_js(text: str) -> tuple[str, list[dict]] | None:
         cells = row.split(",")
         if len(cells) < 7:
             continue
-        try:
-            bars.append(
-                {
-                    "date": cells[0],
-                    "open": float(cells[1]),
-                    "high": float(cells[2]),
-                    "low": float(cells[3]),
-                    "close": float(cells[4]),
-                    "volume": float(cells[5]),
-                    "amount": float(cells[6]),
-                }
-            )
-        except ValueError:
+        # 一格收不住就整根丢掉。半根日线（有收盘没成交额）比没有这根更糟——
+        # 它会让 `_measure` 的窗口计数够了，而算出来的量比少一天的分母。
+        values = [finite(cell) for cell in cells[1:7]]
+        if any(value is None for value in values):
             continue
+        open_, high, low, close, volume, amount = values
+        bars.append(
+            {
+                "date": cells[0],
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "amount": amount,
+            }
+        )
     return name, bars
 
 

@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from datetime import time as dtime
 from typing import Any
 
 CALL_TIMEOUT_SECONDS = 45
@@ -112,7 +113,7 @@ def parse_ts(value: Any) -> datetime | None:
             today = date.today()
             parsed = parsed.replace(year=today.year, month=parsed.month or today.month, day=parsed.day or today.day)
             if fmt in {"%H:%M:%S", "%H:%M"}:
-                parsed = datetime.combine(today, parsed.time())
+                parsed = anchor_bare_time(parsed.time(), datetime.now())
         return parsed
     try:
         return datetime.fromisoformat(text)
@@ -167,6 +168,27 @@ def last_session_close(now: datetime) -> datetime:
         day -= timedelta(days=1)
         if day.weekday() < 5:
             return datetime.combine(day, datetime.min.time()) + timedelta(minutes=SESSION_CLOSE)
+
+
+def anchor_bare_time(clock: dtime, now: datetime) -> datetime:
+    """把只有 `HH:MM(:SS)` 的时间戳锚到它**真正属于**的那个交易日。
+
+    锚到 `date.today()` 是错的，而且错得恰好**看起来最新鲜**——而时效正是这份
+    脚本要测的三个数之一。2026-08-10（周一）08:22 实测：腾讯逐笔的「成交时间」
+    只有 `15:13:19`，源根本不给日期，于是上周五的数据被标成「今天 15:13」，一个
+    **还没发生的时刻**，lag 算出来是负的，读起来是「这一路最新」。
+
+    规则：今天是交易日、且这个时刻已经过了，才算今天；否则算上一个交易日。
+    三种情形都对——盘中（10:23 已过 → 今天）、周一盘前（15:13 未到 → 上周五）、
+    周末（不是交易日 → 上周五）。
+
+    节假日仍未建模，同 `last_session_close`：那需要交易日历，而这份脚本刻意不依赖
+    项目内部模块，好在链路整体坏掉时它还能跑。
+    """
+    candidate = datetime.combine(now.date(), clock)
+    if now.weekday() < 5 and candidate <= now:
+        return candidate
+    return datetime.combine(last_session_close(now).date(), clock)
 
 
 def in_session(now: datetime) -> bool:

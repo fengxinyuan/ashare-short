@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from datetime import time as clock_time
 from typing import Any
 
-MORNING_OPEN = clock_time(9, 30)
-MORNING_CLOSE = clock_time(11, 30)
-AFTERNOON_OPEN = clock_time(13, 0)
-SESSION_CLOSE = clock_time(15, 0)
+from ashare_decision_support.schedule.clock import (
+    AFTERNOON_CLOSE,
+    AFTERNOON_OPEN,
+    MORNING_CLOSE,
+    MORNING_OPEN,
+)
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 
 # Two samples this far apart. Long enough that a live feed must have produced a
 # new 1-minute bar, short enough to run while you watch.
@@ -35,7 +37,9 @@ def in_session(moment: datetime) -> bool:
     current = moment.time()
     if moment.weekday() >= 5:
         return False
-    return (MORNING_OPEN <= current <= MORNING_CLOSE) or (AFTERNOON_OPEN <= current <= SESSION_CLOSE)
+    return (MORNING_OPEN <= current <= MORNING_CLOSE) or (
+        AFTERNOON_OPEN <= current <= AFTERNOON_CLOSE
+    )
 
 
 def check_intraday_freshness(
@@ -47,7 +51,7 @@ def check_intraday_freshness(
     sleep: Any = time.sleep,
 ) -> dict[str, Any]:
     """Sample the feed twice and report lag plus whether it advanced."""
-    moment = now or datetime.now()
+    moment = now or beijing_naive_now()
     session_active = in_session(moment)
 
     first, notes = intraday_adapter.get_minute_bars(symbols, period=period)

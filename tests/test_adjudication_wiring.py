@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 from ashare_decision_support.advice import AdviceEngine, LevelAdjudicator
 from ashare_decision_support.journal.records import Recommendation
@@ -258,6 +258,169 @@ def test_the_order_book_agent_reaches_the_advice_when_a_stub_is_injected() -> No
     assert entry["order_book"]["bid_wall_price"] == 100.5
     bases = [item["basis"] for item in entry["candidates"]["entries"]]
     assert "五档买盘墙" in bases
+
+
+# ---- 主链路：落台账 --------------------------------------------------------
+#
+# 上面两节钉的是「记录格式对不对」和「统计算得对不对」，两半都绿——而**中间那根
+# 线一直是断的**：`advise` 从头到尾没引用过 `journal`，于是 `adjudication` 在生产
+# 里永远是空，`adjudication_edge` 永远返回 `available: False`。两半各自有测试、
+# 各自通过，正是这个缺口能活下来的原因。所以这一节测的是**接缝**，不是两端。
+
+
+def _run_advise(journal=None, symbols=("600519.SH",)):
+    from ashare_decision_support.jobs import run_advise
+    from tests.test_automation import RISE, SESSION, StubDaily, minute_bars
+
+    class StubIntraday:
+        def get_minute_bars(self, symbols, period="5", **kwargs):
+            return {symbol: minute_bars(RISE) for symbol in symbols}, []
+
+    return run_advise(
+        adapter=StubDaily(),
+        symbols=list(symbols),
+        intraday_adapter=StubIntraday(),
+        use_news=False,
+        use_order_book=False,
+        notifiers=[],
+        trade_date=SESSION,
+        journal=journal,
+    )
+
+
+class _ForwardBars:
+    """建议日那根，加上其后 7 根一路走高的前复权日线。"""
+
+    def __init__(self, anchor: date, base: float = 100.0) -> None:
+        self.anchor = anchor
+        self.base = base
+
+    def get_historical_bars(self, symbols, start, end):
+        rows = []
+        for offset in range(8):
+            close = self.base * (1.0 + 0.01 * offset)
+            rows.append(
+                {
+                    "date": self.anchor + timedelta(days=offset),
+                    "open": close,
+                    "high": close * 1.02,
+                    "low": close * 0.99,
+                    "close": close,
+                }
+            )
+        return {symbol: list(rows) for symbol in symbols}
+
+
+def test_advise_writes_its_verdict_into_the_journal(tmp_path) -> None:
+    """`advise` 是**唯一**经过裁决层的链路——`morning` 跑在盘前，那时没有分时。
+
+    它不落台账，这个字段在生产里就永远是空的。
+    """
+    from ashare_decision_support.journal import Journal
+
+    journal = Journal(root=tmp_path / "journal")
+    summary = _run_advise(journal=journal)
+
+    assert summary["journal_records"] == 1
+    rows = journal.recommendations()
+    assert [row["source"] for row in rows] == ["advise"]
+
+    # 统计只读这几个键（`journal/stats.py:_adjudication_edge`）。写入侧与读取侧
+    # 一旦对不上，两边的单测照样全绿，而那个数永远算不出来。
+    verdict = rows[0]["adjudication"]
+    assert verdict["used_fallback"] is True
+    assert verdict["overrode_rule"] is False
+    assert verdict["chosen_entry"]["basis"]
+    assert verdict["rule_entry"]["price"] is not None
+
+
+def test_running_advise_twice_in_a_day_leaves_one_row(tmp_path) -> None:
+    """`record_many` 是无脑追加，而 `advise` 是随时能再跑的命令。
+
+    不挡一道，一天跑五次就是五条同源记录，`stats` 会当成五个独立样本。
+    """
+    from ashare_decision_support.journal import Journal
+
+    journal = Journal(root=tmp_path / "journal")
+    first = _run_advise(journal=journal)
+    second = _run_advise(journal=journal)
+
+    assert (first["journal_records"], second["journal_records"]) == (1, 0)
+    assert len(journal.recommendations()) == 1
+
+
+def test_the_lookup_paths_record_nothing(tmp_path) -> None:
+    """`ask` / `facts` / `chat` 也调 `run_advise`，但它们是**查**，不是发建议。
+
+    把一次随口问到的标的记成「系统当天的建议」，事后统计就分不清哪些是系统
+    主动给的了。
+    """
+    from ashare_decision_support.journal import Journal
+
+    journal = Journal(root=tmp_path / "journal")
+    summary = _run_advise(journal=None)
+
+    assert summary["journal_records"] == 0
+    assert journal.recommendations() == []
+
+
+def test_a_recorded_verdict_reaches_the_stats_as_rule_default(tmp_path) -> None:
+    """整条链走一遍：建议 → 核对 → 统计。
+
+    这一条是前面三条的理由。`by_decider` 从前只可能得到「未记录」——不是因为
+    裁决层没跑，而是因为它的结论没有出口。
+    """
+    from ashare_decision_support.journal import Journal
+    from ashare_decision_support.journal.stats import summarize
+    from ashare_decision_support.journal.verify import verify_pending
+    from tests.test_automation import SESSION
+
+    journal = Journal(root=tmp_path / "journal")
+    _run_advise(journal=journal)
+
+    verify_pending(journal, _ForwardBars(SESSION), today=SESSION + timedelta(days=8))
+    stats = summarize(journal.outcomes())
+
+    assert {row["bucket"] for row in stats["by_decider"]} == {"规则默认"}
+    assert stats["adjudication_edge"]["default_samples"] == 1
+
+
+def test_hand_asked_symbols_stay_out_of_the_selection_comparison() -> None:
+    """`advise` 的标的是**人手点名**的，不能算进「这套筛选有没有用」的分子。
+
+    `_selection_edge` 与 `_veto_cost` 的差值都建立在「同日、同筛选流程、只差
+    最后一刀排序」之上。按 `rec_kind` 取入选组会把 `advise` 记的行一并算进去，
+    而那些票从来没进过板块排序和业绩闸门——差值的分子里于是混进了一批不是这套
+    筛选选出来的票，`picked_samples` 也会虚高。
+
+    分组照旧按 `kind`（入选/对照/否决是三个**组**），围栏按 `source`
+    （记录由**哪条链路**产生）。两者是不同的维度。
+    """
+    from ashare_decision_support.journal.stats import summarize
+
+    def row(source: str, rec_kind: str, ret: float) -> dict:
+        return {
+            "kind": "outcome",
+            "source": source,
+            "rec_kind": rec_kind,
+            "mfe_pct": ret,
+            "close_pct": ret,
+            "next_open_pct": ret,
+            "next_close_pct": ret,
+        }
+
+    screened = [row("morning", "recommendation", 0.02), row("morning", "control", 0.01)]
+    # 手点的这批全给一个夸张的收益：混进去的话 picked 的中位数会被它们改写。
+    hand_asked = [row("advise", "recommendation", 0.50) for _ in range(5)]
+
+    baseline = summarize(screened)["selection_edge"]
+    with_advise = summarize(screened + hand_asked)["selection_edge"]
+
+    assert with_advise["picked_samples"] == baseline["picked_samples"] == 1
+    assert with_advise["close_gap"] == baseline["close_gap"]
+
+    # 但它们仍然进总体统计与按打法分组——围栏只挡这两个**对照差值**。
+    assert summarize(screened + hand_asked)["samples"] == 7
 
 
 # ---- 业绩层在 advise 上的语义：提示，不移除 --------------------------------

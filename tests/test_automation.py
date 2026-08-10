@@ -599,6 +599,30 @@ def test_one_failing_agent_does_not_take_down_the_others() -> None:
     assert "ValueError" in findings["boom"].error
 
 
+def test_agent_timings_reach_the_notes_slowest_first() -> None:
+    """`elapsed_ms` 此前量了但从没被带出来——「盘前哪一段慢」在生产里没有答案。
+
+    并行跑批里**最慢那条腿决定整轮墙钟时间**，所以顺序不是装饰：读的人要先看到
+    那条腿。失败的 agent 也要计时，一路超时挂掉正是最该看见耗时的情况。
+    """
+    from ashare_decision_support.agents import timing_note
+    from ashare_decision_support.agents.base import Finding
+
+    note = timing_note(
+        {
+            "fast": Finding(agent="fast", ok=True, elapsed_ms=200),
+            "slow": Finding(agent="slow", ok=True, elapsed_ms=3400),
+            "dead": Finding(agent="dead", ok=False, elapsed_ms=1100),
+        }
+    )
+
+    assert note is not None
+    assert note.index("slow 3.4s") < note.index("dead 1.1s") < note.index("fast 0.2s")
+    # 没有任何计时读数时不硬凑一行出来。
+    assert timing_note({"x": Finding(agent="x", ok=True)}) is None
+    assert timing_note({}) is None
+
+
 class FakeLlm:
     configured = True
 
@@ -1971,6 +1995,29 @@ def test_a_batch_that_cannot_be_aligned_is_discarded_whole() -> None:
 
     assert result.labels == {}
     assert result.ok is False
+    # 「答了但对不上」和「没打通」必须分别措辞：前者查提示词与 max_tokens，
+    # 后者查网络与配额。合成一句「N 批失败」的话排查时两边都得翻一遍。
+    assert any("整批作废" in note for note in result.notes)
+    assert not any("调用失败" in note for note in result.notes)
+
+
+def test_a_failed_call_is_reported_as_a_call_failure_not_as_a_bad_answer() -> None:
+    from ashare_decision_support.news.llm_classifier import LlmNewsClassifier
+
+    class Exploding:
+        configured = True
+
+        def chat(self, messages):
+            raise RuntimeError("429")
+
+    result = LlmNewsClassifier(Exploding()).classify(
+        [_doc("央行开展5000亿元逆回购", "2026-08-01 08:00:00")], NEWS_SECTORS
+    )
+
+    assert result.labels == {}
+    # 异常类名是排查时唯一的线索，不能在这一层被吞掉。
+    assert any("调用失败（RuntimeError）" in note for note in result.notes)
+    assert not any("整批作废" in note for note in result.notes)
 
 
 def test_an_invented_sector_name_is_dropped_not_fuzzy_matched() -> None:

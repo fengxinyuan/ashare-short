@@ -63,6 +63,11 @@ PRIOR_WINDOW = 15
 # 每天都会在「进场」和「撤离」之间翻面。
 SHARE_MOVE = 0.05
 
+# 近端窗口内部的量能走向要多大才值得单独说一句。合计成交额是 90 个板块的和，
+# 日间 ±5% 是常态噪声；低于这个幅度时「窗口内在放量」和「窗口内基本没动」
+# 讲的是同一件事，多印一行只会稀释上面那行的信息。见 `TurnoverMigration.total_trend`。
+TREND_MOVE = 0.05
+
 # 低于这个板块数不给结论。占比是横截面量，样本太小时一个板块的异动就能改写
 # 所有其他板块的占比。与 `rotation.py:MIN_SECTORS` 同一条理由、同一个值。
 MIN_SECTORS = 20
@@ -137,6 +142,19 @@ class TurnoverMigration:
     total_recent: float | None = None
     total_prior: float | None = None
     total_change: float | None = None
+    # 近端窗口**内部**的量能走向，以及最新一日的水位。
+    #
+    # `total_change` 比的是两个块的**均值**，它答的是「这一周的水位比上个月高
+    # 还是低」。它答不了「水位正在涨还是在退」——而在 V 形拐点那一周，这两个
+    # 答案会相反。2026-08-07 实测：近 5 日均 24301 亿对前 15 日均 24737 亿是
+    # -1.8%，措辞落在「萎缩」；而这 5 天自己从 20111 亿一路放到 26834 亿，是
+    # +33%，最新一日还比前段常态高 8.5%。
+    #
+    # 只报块均值，读简报的人会按「存量腾挪」处理一个量能刚触底回升的市场——正是
+    # 本模块开头那句「存量博弈还是增量入场，同样的高低切换含义完全不同」要防的
+    # 错，只不过错在拐点上而不是错在水位上。
+    total_latest: float | None = None
+    total_trend: float | None = None
     entries: list[SectorTurnover] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -178,6 +196,8 @@ class TurnoverMigration:
             "total_recent": self.total_recent,
             "total_prior": self.total_prior,
             "total_change": self.total_change,
+            "total_latest": self.total_latest,
+            "total_trend": self.total_trend,
             "rising": [item.to_dict() for item in self.rising()],
             "falling": [item.to_dict() for item in self.falling()],
             "distribution": [item.to_dict() for item in self.by_quadrant(QUADRANT_DISTRIBUTION)],
@@ -253,6 +273,12 @@ def read_turnover(
     read.total_prior = panel.rounded(_mean(totals[:prior_window]), 2)
     if read.total_prior:
         read.total_change = panel.rounded(read.total_recent / read.total_prior - 1.0)
+    # 近端窗口内部的走向。取首末两根而不是拟合斜率：这一层要答的是「这一周结束时
+    # 的水位比开始时高还是低」，首末差就是它，斜率还要再解释一遍单位。
+    read.total_latest = panel.rounded(totals[-1], 2)
+    window_open = totals[-recent_window]
+    if window_open > 0:
+        read.total_trend = panel.rounded(totals[-1] / window_open - 1.0)
     read.trusted = True
     read.observations = _observations(read, recent_window, prior_window)
     return read
@@ -294,6 +320,36 @@ def _quadrant(change: float | None, ret: float | None) -> str:
     return QUADRANT_DRY_RALLY if ret > 0 else QUADRANT_NEGLECT
 
 
+def _rebounding(read: TurnoverMigration) -> bool:
+    """近端窗口内部在放量。只用来压住「存量腾挪」那句断言，不单独出读数。"""
+    return read.total_trend is not None and read.total_trend >= TREND_MOVE
+
+
+def _trend_line(read: TurnoverMigration, recent_window: int) -> str:
+    """近端窗口内部的量能走向。块均值对比看不见拐点，这一行专门补它。
+
+    只在幅度过 `TREND_MOVE` 时出声；两个读数反号时额外点明该按哪个读，因为那正是
+    「萎缩 1.8%」与「放量 33%」同时成立、而只看前者会得出相反结论的那种日子。
+    """
+    if read.total_trend is None or read.total_latest is None:
+        return ""
+    if abs(read.total_trend) < TREND_MOVE:
+        return ""
+    direction = "放量" if read.total_trend > 0 else "缩量"
+    line = (
+        f"近 {recent_window} 日**内部**{direction} {abs(read.total_trend):.1%}"
+        f"（窗口首日 → 末日），最新一日 {read.total_latest / 1e8:.0f} 亿"
+    )
+    if read.total_change is not None and read.total_trend * read.total_change < 0:
+        line += (
+            "——与上一行的块均值对比**指向相反**，拐点落在窗口内部，"
+            "量能水位按最新一日读，不按窗口均值读。"
+        )
+    else:
+        line += "。"
+    return line
+
+
 def _observations(
     read: TurnoverMigration, recent_window: int, prior_window: int
 ) -> list[str]:
@@ -309,11 +365,18 @@ def _observations(
             f"（近 {recent_window} 日）对 {read.total_prior / 1e8:.0f} 亿"
             f"（其前 {prior_window} 日），{direction} {abs(read.total_change):.1%}"
         )
-        if read.total_change <= -SHARE_MOVE:
+        # 「存量腾挪」是一句**断言**，不是读数，所以它要同时过块均值和窗口内走向
+        # 两道闸：块均值在下、但窗口内在放量，说明这一周的水位是从窗口头几天的
+        # 低位爬上来的——那不是存量市场，那是刚回来的增量。
+        if read.total_change <= -SHARE_MOVE and not _rebounding(read):
             line += "——总量在收缩，下面的迁移是存量腾挪，不是增量入场。"
         else:
             line += "。"
         lines.append(line)
+
+    trend_line = _trend_line(read, recent_window)
+    if trend_line:
+        lines.append(trend_line)
 
     rising = read.rising(5)
     if rising:

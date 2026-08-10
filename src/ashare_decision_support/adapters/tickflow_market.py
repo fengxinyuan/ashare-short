@@ -45,6 +45,7 @@ from ashare_decision_support.adapters.market_scan import MarketRow, MarketScan
 from ashare_decision_support.adapters.snapshot import OrderBookLevel, Snapshot
 from ashare_decision_support.adapters.validate import cross_check
 from ashare_decision_support.numeric import finite
+from ashare_decision_support.schedule.timezone import beijing_from_epoch
 from ashare_decision_support.symbols import normalize_symbol
 
 # 全 A 标的池 id。TickFlow 的池名不是自解释的：`CN_Equity` / `CN_Equity_All`
@@ -492,6 +493,6 @@ def _missing_note(wanted: list[str], got: dict[str, dict]) -> list[str]:
 def _stamp(value: Any) -> datetime | None:
     """毫秒时间戳 → 本地 datetime。"""
     try:
-        return datetime.fromtimestamp(int(value) / 1000.0)
+        return beijing_from_epoch(int(value) / 1000.0)
     except (TypeError, ValueError, OSError, OverflowError):
         return None

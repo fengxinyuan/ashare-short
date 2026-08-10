@@ -4,11 +4,7 @@ from datetime import date, datetime
 from typing import Any
 
 from ashare_decision_support.adapters.base import MarketDataAdapter
-from ashare_decision_support.adapters.mapping import MappingProfile, PayloadNormalizer
-from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
-from ashare_decision_support.numeric import finite
 from ashare_decision_support.schedule.calendar import parse_trade_date
-from ashare_decision_support.schedule.clock import minutes_since_open
 
 
 class QmtAdapterError(RuntimeError):
@@ -20,7 +16,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
 
     def __init__(
         self,
-        profile: MappingProfile | None = None,
         xtdata_module: Any | None = None,
         auto_connect: bool = True,
         calendar_market: str = "SH",
@@ -35,7 +30,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
                 ) from exc
 
         self.xtdata = xtdata_module
-        self.normalizer = PayloadNormalizer(profile)
         self.calendar_market = calendar_market
 
         if auto_connect:
@@ -87,77 +81,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
             return []
         return [parse_trade_date(item) for item in raw]
 
-    def get_auction_features(self, symbols: list[str]) -> dict[str, AuctionFeatures]:
-        full_tick = self.get_full_tick_raw(symbols)
-        l2_quote = self.get_l2_quote_raw(symbols)
-        result: dict[str, AuctionFeatures] = {}
-        for symbol in symbols:
-            raw_payload = self._build_auction_payload(
-                symbol=symbol,
-                full_tick=self._to_plain(full_tick.get(symbol)),
-                l2_quote=self._to_plain(l2_quote.get(symbol)),
-            )
-            result[symbol] = self.normalizer.normalize_auction(raw_payload)
-        return result
-
-    def get_open_features(self, symbols: list[str]) -> dict[str, OpenFeatures]:
-        full_tick = self.get_full_tick_raw(symbols)
-        result: dict[str, OpenFeatures] = {}
-        for symbol in symbols:
-            raw_payload = self._build_open_payload(
-                symbol=symbol,
-                full_tick=self._to_plain(full_tick.get(symbol)),
-            )
-            result[symbol] = self.normalizer.normalize_open(raw_payload)
-        return result
-
-    def get_full_tick_raw(self, symbols: list[str]) -> dict[str, Any]:
-        get_full_tick = getattr(self.xtdata, "get_full_tick", None)
-        if not callable(get_full_tick):
-            raise QmtAdapterError("xtdata.get_full_tick is not available")
-        raw = self._try_call(get_full_tick, ((symbols,), {}), ((tuple(symbols),), {}))
-        if not isinstance(raw, dict):
-            raise QmtAdapterError("xtdata.get_full_tick returned an unsupported payload")
-        return raw
-
-    def get_l2_quote_raw(self, symbols: list[str]) -> dict[str, Any]:
-        get_l2_quote = getattr(self.xtdata, "get_l2_quote", None)
-        if not callable(get_l2_quote):
-            return {}
-        result: dict[str, Any] = {}
-        for symbol in symbols:
-            payload = self._call_optional(
-                get_l2_quote,
-                ((symbol,), {}),
-                ((symbol, "", "", 1), {}),
-                (([symbol],), {}),
-            )
-            if payload is not None:
-                result[symbol] = payload
-        return result
-
-    def dump_snapshot(self, symbols: list[str]) -> dict[str, Any]:
-        snapshot: dict[str, Any] = {
-            "generated_at": datetime.now().isoformat(),
-            "symbols": symbols,
-            "full_tick": {},
-            "l2_quote": {},
-            "instrument_detail": {},
-        }
-        try:
-            snapshot["full_tick"] = {symbol: self._to_plain(payload) for symbol, payload in self.get_full_tick_raw(symbols).items()}
-        except Exception as exc:
-            snapshot["full_tick_error"] = str(exc)
-        try:
-            snapshot["l2_quote"] = {symbol: self._to_plain(payload) for symbol, payload in self.get_l2_quote_raw(symbols).items()}
-        except Exception as exc:
-            snapshot["l2_quote_error"] = str(exc)
-        try:
-            snapshot["instrument_detail"] = self.get_security_master(symbols)
-        except Exception as exc:
-            snapshot["instrument_detail_error"] = str(exc)
-        return snapshot
-
     def health_check(self) -> dict[str, Any]:
         capabilities = {
             "has_connect": callable(getattr(self.xtdata, "connect", None)),
@@ -173,168 +96,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
             "connected": True,
             "calendar_market": self.calendar_market,
             "capabilities": capabilities,
-        }
-
-    def _build_auction_payload(self, symbol: str, full_tick: dict[str, Any], l2_quote: dict[str, Any]) -> dict[str, Any]:
-        merged = {**full_tick, **l2_quote}
-        source_dt = self._extract_source_dt(merged)
-        price = self._first_float(
-            merged,
-            "IndicativeMatchPrice",
-            "indicativeMatchPrice",
-            "lastPrice",
-            "last_price",
-            "BidPrice1",
-            "bidPrice1",
-            "price",
-        )
-        if price is None or price <= 0:
-            raise QmtAdapterError(
-                f"QMT auction payload for {symbol} is missing a usable price field. "
-                "Run `qmt-dump` on your local machine and inspect the raw field names."
-            )
-
-        matched_qty = self._first_int(
-            merged,
-            "MatchedQty",
-            "matchedQty",
-            "matched_qty",
-            "volume",
-            "Volume",
-            "totalVolumeTrade",
-            "totalVolume",
-        )
-        if matched_qty is None:
-            raise QmtAdapterError(
-                f"QMT auction payload for {symbol} is missing a usable matched quantity field. "
-                "Run `qmt-dump` and update the mapping profile if needed."
-            )
-
-        matched_amount = self._first_float(
-            merged,
-            "MatchedAmount",
-            "matchedAmount",
-            "matched_amount",
-            "amount",
-            "Amount",
-            "turnover",
-        )
-        prev_close = self._first_float(merged, "PrevClose", "prevClose", "preClose", "pre_close", "lastClose")
-        unmatched_qty = self._first_int(
-            merged,
-            "UnmatchedQty",
-            "unmatchedQty",
-            "unmatched_qty",
-            "auctionUnmatchedQty",
-            "AuctionUnmatchedQty",
-        )
-        data_stale = unmatched_qty is None
-        if unmatched_qty is None:
-            unmatched_qty = 0
-
-        raw_payload = {
-            "symbol": symbol,
-            "MatchedQty": matched_qty,
-            "MatchedAmount": matched_amount if matched_amount is not None else matched_qty * price,
-            "UnmatchedQty": unmatched_qty,
-            "UnmatchedSide": self._first_str(
-                merged,
-                "UnmatchedSide",
-                "unmatchedSide",
-                "unmatched_side",
-                "auctionUnmatchedSide",
-                "AuctionUnmatchedSide",
-                default="N",
-            ),
-            "IndicativeMatchPrice": price,
-            "sourceTs": source_dt.isoformat(),
-            "dataStale": data_stale,
-        }
-
-        open_gap = self._first_float(merged, "OpenGapPct", "openGapPct", "open_gap_pct")
-        if open_gap is not None:
-            raw_payload["OpenGapPct"] = open_gap
-        elif prev_close is not None and prev_close > 0:
-            raw_payload["PrevClose"] = prev_close
-
-        cancel_ratio = self._first_float(
-            merged,
-            "CancelPre920Ratio",
-            "cancelPre920Ratio",
-            "cancel_pre920_ratio",
-            "R_cancel_pre920",
-        )
-        if cancel_ratio is not None:
-            raw_payload["CancelPre920Ratio"] = cancel_ratio
-
-        bid_vol_1 = self._first_float(merged, "bidVol1", "BidVol1", "bidVolume1", "BidVolume1")
-        if bid_vol_1 is not None and matched_qty > 0:
-            raw_payload["SealRatio"] = bid_vol_1 / matched_qty
-
-        tail_flow = merged.get("tailFlowDistortion", merged.get("TailFlowDistortion"))
-        if tail_flow is not None:
-            raw_payload["tailFlowDistortion"] = bool(tail_flow)
-
-        return raw_payload
-
-    def _build_open_payload(self, symbol: str, full_tick: dict[str, Any]) -> dict[str, Any]:
-        source_dt = self._extract_source_dt(full_tick)
-        current_price = self._first_float(
-            full_tick,
-            "lastPrice",
-            "LastPrice",
-            "price",
-            "Price",
-            "close",
-            "Close",
-        )
-        if current_price is None or current_price <= 0:
-            raise QmtAdapterError(
-                f"QMT open payload for {symbol} is missing a usable price field. "
-                "Run `qmt-dump` and inspect the raw field names."
-            )
-
-        open_price = self._first_float(full_tick, "open", "Open", "openPrice", "OpenPrice")
-        open_gap = self._first_float(full_tick, "openGapPct", "OpenGapPct", "open_gap_pct")
-        prev_close = self._first_float(full_tick, "preClose", "PrevClose", "prevClose", "pre_close")
-        if open_price is None:
-            if open_gap is not None:
-                open_price = current_price / (1.0 + open_gap / 100.0)
-            elif prev_close is not None and prev_close > 0:
-                open_price = prev_close
-            else:
-                open_price = current_price
-
-        if open_gap is None:
-            if prev_close is not None and prev_close > 0:
-                open_gap = (open_price / prev_close - 1.0) * 100.0
-            else:
-                open_gap = 0.0
-
-        volume = self._first_float(full_tick, "volume", "Volume", "totalVolumeTrade", "totalVolume")
-        amount = self._first_float(full_tick, "amount", "Amount", "turnover")
-        if amount is not None and volume is not None and volume > 0:
-            vwap = amount / volume
-        else:
-            vwap = current_price
-
-        elapsed = minutes_since_open(source_dt)
-        volume_ratio = 1.0
-        if volume is not None and elapsed > 0:
-            volume_ratio = max(0.1, min(5.0, volume / max(elapsed, 1)))
-
-        price_vs_open_pct = (current_price / open_price - 1.0) * 100.0 if open_price > 0 else 0.0
-        price_vs_vwap_pct = (current_price / vwap - 1.0) * 100.0 if vwap > 0 else 0.0
-
-        return {
-            "symbol": symbol,
-            "minutesSinceOpen": elapsed,
-            "priceVsOpenPct": price_vs_open_pct,
-            "priceVsVwapPct": price_vs_vwap_pct,
-            "volumeRatio": volume_ratio,
-            "openGapPct": open_gap,
-            "sourceTs": source_dt.isoformat(),
-            "dataStale": False,
         }
 
     def _get_market_data(self, **kwargs) -> Any:
@@ -386,62 +147,6 @@ class QmtXtDataAdapter(MarketDataAdapter):
         if isinstance(field_payload, list):
             return [self._to_plain(item) for item in field_payload]
         return [self._to_plain(field_payload)]
-
-    def _extract_source_dt(self, payload: dict[str, Any]) -> datetime:
-        raw = self._first_value(payload, "sourceTs", "SourceTs", "source_ts", "time", "Time", "timestamp")
-        if raw is None:
-            return datetime.now()
-        if isinstance(raw, datetime):
-            return raw
-        # 走 `finite` 而不是 `isinstance(raw, (int, float))`：后者放 `True` 过去
-        # （`fromtimestamp(1.0)` 是 1970 年，一个看不出错的错时间戳），也放 NaN
-        # 过去（`fromtimestamp(nan)` 直接抛 ValueError，把一次取数变成一次崩溃）。
-        stamp = finite(raw)
-        if stamp is not None:
-            if stamp > 1e12:
-                stamp /= 1000.0
-            return datetime.fromtimestamp(stamp)
-        if isinstance(raw, str):
-            try:
-                return datetime.fromisoformat(raw)
-            except ValueError:
-                if raw.isdigit():
-                    ts = float(raw)
-                    if ts > 1e12:
-                        ts /= 1000.0
-                    return datetime.fromtimestamp(ts)
-        return datetime.now()
-
-    def _first_value(self, payload: dict[str, Any], *keys: str) -> Any:
-        for key in keys:
-            if key in payload:
-                return payload[key]
-        return None
-
-    def _first_float(self, payload: dict[str, Any], *keys: str) -> float | None:
-        value = self._first_value(payload, *keys)
-        return finite(value)
-
-    def _first_int(self, payload: dict[str, Any], *keys: str) -> int | None:
-        value = self._first_value(payload, *keys)
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _first_str(self, payload: dict[str, Any], *keys: str, default: str = "") -> str:
-        value = self._first_value(payload, *keys)
-        if value is None:
-            return default
-        return str(value)
-
-    def _call_optional(self, func: Any, *attempts: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
-        try:
-            return self._try_call(func, *attempts)
-        except QmtAdapterError:
-            return None
 
     def _try_call(self, func: Any, *attempts: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
         last_error: Exception | None = None

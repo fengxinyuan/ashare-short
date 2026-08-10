@@ -56,6 +56,7 @@ from statistics import median
 from typing import Any
 
 from ashare_decision_support.numeric import finite
+from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_today
 from ashare_decision_support.sectors.base import SectorDefinition
 from ashare_decision_support.sectors.taxonomy import SectorTaxonomyError
 from ashare_decision_support.state.paths import state_path
@@ -136,23 +137,33 @@ class SectorRead:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> SectorRead | None:
         """读回一行历史。**缺字段返回 None 而不是补默认值**——补出来的 0 会被
-        当成真读数参与「较上轮」的差分，凭空造出一次跃迁。"""
+        当成真读数参与「较上轮」的差分，凭空造出一次跃迁。
+
+        NaN 走同一条退路，理由也是同一条：`json.loads` 认 `NaN` 字面量，收进来
+        的不是「读数是 NaN」而是「这行坏了」。它和 0 的区别在于连报错都不会——
+        NaN 参与差分得到 NaN，比较永远是 False，于是这个板块**再也不会跃迁**。
+        """
+        readings = {
+            key: finite(payload.get(key))
+            for key in ("median_pct", "excess_pct", "advance_ratio", "amount_yi")
+        }
+        if any(value is None for value in readings.values()):
+            return None
         try:
             return cls(
                 name=str(payload["name"]),
                 level=str(payload.get("level") or LEVEL_INDUSTRY),
-                median_pct=float(payload["median_pct"]),
-                excess_pct=float(payload["excess_pct"]),
-                advance_ratio=float(payload["advance_ratio"]),
-                amount_yi=float(payload["amount_yi"]),
-                amount_share=float(payload.get("amount_share") or 0.0),
+                **readings,  # type: ignore[arg-type]
+                amount_share=finite(payload.get("amount_share")) or 0.0,
                 covered=int(payload["covered"]),
                 total=int(payload["total"]),
                 limit_up=int(payload.get("limit_up") or 0),
                 leaders=tuple(
-                    (str(item[0]), float(item[1]))
+                    (str(item[0]), value)
                     for item in payload.get("leaders") or []
-                    if isinstance(item, (list, tuple)) and len(item) >= 2
+                    if isinstance(item, (list, tuple))
+                    and len(item) >= 2
+                    and (value := finite(item[1])) is not None
                 ),
                 watch_hits=tuple(
                     (str(item[0]), str(item[1]))
@@ -352,7 +363,7 @@ def take_snapshot(
     **一个分类挂了不影响另一个。** 概念文件不可用时行业排名照出，反之亦然——
     把两者绑成一次成败，等于让次要的那个否决主要的。同 `adapters/ths_taxonomy.py`。
     """
-    moment = now or datetime.now()
+    moment = now or beijing_naive_now()
     scan = (adapter or _default_adapter()).fetch()
     rows = scan.rows
     notes = list(scan.notes or [])
@@ -469,7 +480,7 @@ def prune_history(keep_days: int = HISTORY_KEEP_DAYS, root: Path | None = None) 
     base = Path(root) if root is not None else state_path("market", "x").parent
     if not base.is_dir():
         return []
-    cutoff = date.today() - timedelta(days=max(0, keep_days))
+    cutoff = beijing_today() - timedelta(days=max(0, keep_days))
     removed: list[str] = []
     for path in base.glob("intraday_sector_*.jsonl"):
         stamp = path.stem.rsplit("_", 1)[-1]

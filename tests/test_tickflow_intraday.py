@@ -25,6 +25,7 @@ from ashare_decision_support.adapters.tickflow_intraday import (
     fetch_minute_history,
     to_bars,
 )
+from ashare_decision_support.schedule.timezone import BEIJING_TZ
 
 # 600519.SH 2026-07-31 尾盘三根，取自实测响应。
 COMPACT = {
@@ -253,7 +254,9 @@ def test_history_stops_once_the_requested_start_is_covered() -> None:
 
 def test_history_trims_to_the_requested_window() -> None:
     """翻页是按整页回来的，落在窗口外的部分不该混进结果。"""
-    page = _page(int(datetime(2026, 7, 30, 9, 30).timestamp() * 1000), 3)
+    # 时间戳按北京折算——接口给的毫秒本来就是交易所时钟，用宿主机时区造这个值
+    # 会让这条用例只在 Asia/Shanghai 的机器上成立。
+    page = _page(int(datetime(2026, 7, 30, 9, 30, tzinfo=BEIJING_TZ).timestamp() * 1000), 3)
     client = FakeClient(FakeKlines(pages=[page, {}]))
 
     bars, _ = fetch_minute_history(

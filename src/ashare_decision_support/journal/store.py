@@ -13,6 +13,7 @@ from ashare_decision_support.journal.records import (
     Outcome,
     Recommendation,
 )
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_path
 from ashare_decision_support.state.store import append_jsonl, read_jsonl
 
@@ -34,7 +35,7 @@ class Journal:
     # ---- 写 ---------------------------------------------------------------
 
     def record(self, item: Recommendation | Outcome) -> None:
-        day = _parse_date(item.trade_date) or date.today()
+        day = _parse_date(item.trade_date) or beijing_today()
         append_jsonl(self._file(day), item.to_dict())
 
     def record_many(self, items: list[Recommendation | Outcome]) -> int:
@@ -46,7 +47,7 @@ class Journal:
 
     def rows(self, since: date | None = None, until: date | None = None) -> list[dict]:
         """区间内的全部记录。跨月自动读多个文件。"""
-        end = until or date.today()
+        end = until or beijing_today()
         start = since or (end - timedelta(days=365))
         rows: list[dict] = []
         for path in sorted(self.root.glob("*.jsonl")):

@@ -30,10 +30,10 @@ from __future__ import annotations
 import json
 import urllib.request
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import finite
 
 BASE_URL = (
@@ -167,17 +167,13 @@ class MarketScanAdapter:
     def fetch(self, max_pages: int = MAX_PAGES) -> MarketScan:
         notes: list[str] = []
         rows: dict[str, MarketRow] = {}
-        failures = 0
 
         pages = list(range(1, max_pages + 1))
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            results = list(pool.map(self._safe_page, pages))
+        done, errors = gather(pages, self._page, max_workers=self.max_workers)
+        failures = len(errors)
 
         empty_streak = 0
-        for _page, payload in zip(pages, results, strict=True):
-            if payload is None:
-                failures += 1
-                continue
+        for _page, payload in done:
             if not payload:
                 empty_streak += 1
                 continue
@@ -188,7 +184,10 @@ class MarketScanAdapter:
                     rows.setdefault(row.code, row)
 
         if failures:
-            notes.append(f"全市场扫描 {failures}/{len(pages)} 页取数失败，宽度读数按已取到的算")
+            kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors}))
+            notes.append(
+                f"全市场扫描 {failures}/{len(pages)} 页取数失败（{kinds}），宽度读数按已取到的算"
+            )
         if not rows:
             return MarketScan(notes=[*notes, "全市场扫描没有取到任何数据"], ok=False)
 
@@ -199,11 +198,6 @@ class MarketScanAdapter:
 
     # ---- internals -------------------------------------------------------
 
-    def _safe_page(self, page: int) -> list[dict] | None:
-        try:
-            return self._page(page)
-        except Exception:
-            return None
 
     def _page(self, page: int) -> list[dict]:
         url = BASE_URL.format(page=page, size=PAGE_SIZE, node=self.node)

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, time, timedelta, timezone
-from statistics import median
 from typing import Any
 
 from ashare_decision_support.adapters.base import MarketDataAdapter
 from ashare_decision_support.adapters.ratelimit import wrap_client
-from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
 from ashare_decision_support.numeric import finite, first_finite
-from ashare_decision_support.schedule.clock import minutes_since_open
+from ashare_decision_support.schedule.timezone import (
+    beijing_from_epoch,
+    beijing_naive_now,
+)
 
 # Exchange timezone. Epoch-millisecond windows must be anchored to it explicitly,
 # otherwise a host running in UTC shifts the request window by 8 hours and
@@ -181,147 +182,6 @@ class TickFlowAdapter(MarketDataAdapter):
     def get_trading_calendar(self) -> list[date]:
         return []
 
-    def get_auction_features(self, symbols: list[str]) -> dict[str, AuctionFeatures]:
-        features: dict[str, AuctionFeatures] = {}
-        for raw_symbol, normalized_symbol in self._normalized_symbol_map(symbols).items():
-            source = self._quote_or_daily(normalized_symbol) if self.supports_realtime else self._daily_proxy_rows(normalized_symbol)
-            depth = self._depth_payload(normalized_symbol) if self.supports_depth else None
-            source_rows = self._rows_only(source)
-            quote = source_rows[-1] if source_rows else self._first_row(source)
-            if quote is None:
-                raise TickFlowAdapterError(f"no TickFlow payload found for symbol {raw_symbol} (normalized: {normalized_symbol})")
-
-            bid_total, ask_total = self._depth_totals(depth)
-            last_price = first_finite(quote, "last_price", "lastPrice", "price", "close")
-            open_price = first_finite(quote, "open", "open_price", "openPrice")
-            prev_close = first_finite(quote, "prev_close", "prevClose", "pre_close", "preClose")
-            if prev_close is None and len(source_rows) >= 2:
-                prev_close = first_finite(source_rows[-2], "close", "last_price", "lastPrice", "price")
-            volume = first_finite(quote, "volume", "vol", "matched_qty")
-            amount = first_finite(quote, "amount", "turnover")
-            source_ts = self._source_datetime(quote)
-
-            if last_price is None:
-                last_price = open_price or prev_close or 0.01
-            if volume is None:
-                volume = 0.0
-            if amount is None:
-                amount = volume * last_price
-            adjusted_volume = self._normalize_volume(volume, amount, last_price)
-
-            open_gap_pct = 0.0
-            if open_price is not None and prev_close not in (None, 0):
-                open_gap_pct = (open_price / prev_close - 1.0) * 100.0
-            elif last_price is not None and prev_close not in (None, 0):
-                open_gap_pct = (last_price / prev_close - 1.0) * 100.0
-
-            matched_qty = int(adjusted_volume or 0)
-            unmatched_qty = abs(bid_total - ask_total) if bid_total or ask_total else 0
-            unmatched_side = "N"
-            if bid_total > ask_total:
-                unmatched_side = "B"
-            elif ask_total > bid_total:
-                unmatched_side = "S"
-
-            seal_ratio = None
-            if matched_qty > 0 and bid_total > 0:
-                seal_ratio = bid_total / matched_qty
-
-            # Without a depth/auction feed there is no such thing as a matched or
-            # unmatched auction quantity. Emitting whole-day turnover in those
-            # fields would let daily numbers clear thresholds that were designed
-            # for the 09:25 auction, so publish nulls instead of plausible lies.
-            auction_capable = self.supports_realtime and self.supports_depth
-            if not auction_capable:
-                matched_qty = 0
-                matched_amount = None
-                unmatched_qty = 0
-                unmatched_side = "N"
-                seal_ratio = None
-            else:
-                matched_amount = amount
-
-            features[raw_symbol] = AuctionFeatures(
-                symbol=raw_symbol,
-                matched_qty=matched_qty,
-                matched_amount=matched_amount,
-                unmatched_qty=unmatched_qty,
-                unmatched_side=unmatched_side,
-                indicative_match_price=last_price,
-                open_gap_pct=open_gap_pct,
-                cancel_pre920_ratio=None,
-                seal_ratio=seal_ratio,
-                tail_flow_distortion=False,
-                data_stale=not auction_capable,
-                source_ts=source_ts,
-            )
-        return features
-
-    def get_open_features(self, symbols: list[str]) -> dict[str, OpenFeatures]:
-        features: dict[str, OpenFeatures] = {}
-        for raw_symbol, normalized_symbol in self._normalized_symbol_map(symbols).items():
-            if self.supports_intraday:
-                intraday_rows = self._intraday_rows(normalized_symbol)
-                quote_rows = self._quote_rows(normalized_symbol)
-                rows = intraday_rows or quote_rows
-                data_stale = not bool(intraday_rows)
-            else:
-                rows = self._daily_proxy_rows(normalized_symbol)
-                quote_rows = rows
-                data_stale = True
-
-            row = rows[-1] if rows else None
-            if row is None:
-                raise TickFlowAdapterError(f"no TickFlow payload found for symbol {raw_symbol} (normalized: {normalized_symbol})")
-
-            reference_row = quote_rows[-1] if quote_rows else row
-
-            current_price = first_finite(row, "close", "last_price", "lastPrice", "price")
-            open_price = first_finite(reference_row, "open", "open_price", "openPrice")
-            prev_close = first_finite(reference_row, "prev_close", "prevClose", "pre_close", "preClose")
-            if prev_close is None and len(rows) >= 2:
-                prev_close = first_finite(rows[-2], "close", "last_price", "lastPrice", "price")
-            source_ts = self._source_datetime(row)
-
-            if current_price is None:
-                current_price = open_price or prev_close or 0.01
-
-            vwap = first_finite(row, "vwap", "vWap", "weighted_avg_price")
-            amount = first_finite(row, "amount", "turnover")
-            volume = first_finite(row, "volume", "vol")
-            volume_multiplier, volume_unit_known = self._volume_multiplier(volume, amount, current_price)
-            adjusted_volume = volume if volume_multiplier is None else volume * volume_multiplier
-            # Deriving VWAP from amount/volume while the volume unit is unknown is
-            # what produces price_vs_vwap_pct = -99%, which makes every name look
-            # permanently below VWAP and turns the open-follow engine into a
-            # blanket BLOCK. Fall back to the last price instead.
-            if vwap is None and volume_unit_known and amount is not None and adjusted_volume not in (None, 0):
-                vwap = amount / adjusted_volume
-            if vwap is None:
-                vwap = current_price
-
-            minute_volume_ratio = self._volume_ratio(self._rows_only(rows))
-            if not self.supports_intraday:
-                minute_volume_ratio = first_finite(row, "volume_ratio", "volumeRatio") or self._daily_volume_ratio(rows)
-
-            open_gap_pct = 0.0
-            if open_price is not None and prev_close not in (None, 0):
-                open_gap_pct = (open_price / prev_close - 1.0) * 100.0
-            elif prev_close not in (None, 0):
-                open_gap_pct = (current_price / prev_close - 1.0) * 100.0
-
-            features[raw_symbol] = OpenFeatures(
-                symbol=raw_symbol,
-                minutes_since_open=minutes_since_open(source_ts),
-                price_vs_open_pct=((current_price / open_price - 1.0) * 100.0) if open_price not in (None, 0) else 0.0,
-                price_vs_vwap_pct=((current_price / vwap - 1.0) * 100.0) if vwap not in (None, 0) else 0.0,
-                volume_ratio=minute_volume_ratio,
-                open_gap_pct=open_gap_pct,
-                data_stale=data_stale,
-                source_ts=source_ts,
-            )
-        return features
-
     def health_check(self) -> dict[str, Any]:
         return {
             "adapter": "TickFlowAdapter",
@@ -338,42 +198,6 @@ class TickFlowAdapter(MarketDataAdapter):
             },
         }
 
-    def dump_snapshot(self, symbols: list[str]) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "generated_at": datetime.now().isoformat(),
-            "symbols": symbols,
-            "base_url": self.base_url,
-            "mode": self.mode,
-            "quotes": {},
-            "depth": {},
-            "intraday": {},
-            "daily": {},
-            "instruments": {},
-        }
-        for symbol in symbols:
-            normalized_symbol = self._normalize_symbol(symbol)
-            try:
-                payload["quotes"][symbol] = self._first_row(self._quote_rows(normalized_symbol))
-            except Exception as exc:
-                payload["quotes"][symbol] = {"error": str(exc)}
-            try:
-                payload["depth"][symbol] = self._depth_summary(self._depth_payload(normalized_symbol)) if self.supports_depth else {"stale": True}
-            except Exception as exc:
-                payload["depth"][symbol] = {"error": str(exc)}
-            try:
-                payload["intraday"][symbol] = self._compact_kline_rows(self._intraday_payload(normalized_symbol), normalized_symbol)[-20:]
-            except Exception as exc:
-                payload["intraday"][symbol] = {"error": str(exc)}
-            try:
-                payload["daily"][symbol] = self._compact_kline_rows(self._daily_payload(normalized_symbol, date.today(), date.today()), normalized_symbol)[-10:]
-            except Exception as exc:
-                payload["daily"][symbol] = {"error": str(exc)}
-            try:
-                payload["instruments"][symbol] = self.get_security_master([symbol]).get(symbol, {"symbol": symbol})
-            except Exception as exc:
-                payload["instruments"][symbol] = {"error": str(exc)}
-        return payload
-
     def _connect(self) -> None:
         connect_fn = getattr(self.client, "connect", None)
         if callable(connect_fn):
@@ -384,69 +208,6 @@ class TickFlowAdapter(MarketDataAdapter):
 
     def _default_base_url(self) -> str:
         return "https://api.tickflow.org" if self.api_key else "https://free-api.tickflow.org"
-
-    def _quote_rows(self, symbol: str) -> list[dict]:
-        if not self.supports_realtime:
-            return self._daily_rows(symbol)
-        quotes = getattr(self.client, "quotes", None)
-        if quotes is None:
-            return []
-        get_fn = getattr(quotes, "get", None) or getattr(quotes, "batch", None)
-        if not callable(get_fn):
-            return []
-        payload = self._try_call(
-            get_fn,
-            ((symbol,), {}),
-            ((), {"symbol": symbol}),
-            ((), {"symbols": [symbol]}),
-        )
-        return self._rows(payload)
-
-    def _depth_payload(self, symbol: str) -> Any:
-        depth = getattr(self.client, "depth", None)
-        if depth is None:
-            return None
-        get_fn = getattr(depth, "get", None)
-        if not callable(get_fn):
-            return None
-        return self._try_call(
-            get_fn,
-            ((symbol,), {}),
-            ((), {"symbol": symbol}),
-            ((), {"symbols": [symbol]}),
-        )
-
-    def _intraday_rows(self, symbol: str) -> list[dict]:
-        if not self.supports_intraday:
-            return []
-        return self._compact_kline_rows(self._intraday_payload(symbol), symbol)
-
-    def _intraday_payload(self, symbol: str) -> Any:
-        klines = getattr(self.client, "klines", None)
-        if klines is None:
-            return None
-        intraday_fn = getattr(klines, "intraday", None) or getattr(klines, "get", None)
-        if not callable(intraday_fn):
-            return None
-        return self._try_call(
-            intraday_fn,
-            ((symbol,), {"period": "1m", "count": 240}),
-            ((symbol,), {"period": "1m", "count": 240, "as_dataframe": False}),
-            ((symbol,), {"period": "1m"}),
-            ((), {"symbol": symbol, "period": "1m", "count": 240}),
-        )
-
-    def _daily_rows(self, symbol: str) -> list[dict]:
-        return self._compact_kline_rows(self._daily_payload(symbol, date.today(), date.today()), symbol)
-
-    def _daily_proxy_rows(self, symbol: str) -> list[dict]:
-        # The first day of the current month is always more recent than
-        # "40 days ago", so the previous max(...) collapsed the window to
-        # month-to-date and returned 0-2 bars at the start of every month.
-        end = date.today()
-        start = end - timedelta(days=DAILY_PROXY_LOOKBACK_DAYS)
-        rows = self._compact_kline_rows(self._daily_payload(symbol, start, end), symbol)
-        return rows[-DAILY_PROXY_MAX_ROWS:]
 
     def _daily_payload(self, symbol: str, start: date, end: date) -> Any:
         klines = getattr(self.client, "klines", None)
@@ -469,12 +230,6 @@ class TickFlowAdapter(MarketDataAdapter):
             ((symbol,), {"period": "1d", "count": count}),
             ((), {"symbol": symbol, "period": "1d", "start_time": start_time, "end_time": end_time, "count": count}),
         )
-
-    def _quote_or_daily(self, symbol: str) -> Any:
-        quote_rows = self._quote_rows(symbol)
-        if quote_rows:
-            return quote_rows
-        return self._daily_rows(symbol)
 
     def _instruments_rows(self, symbols: list[str]) -> dict[str, dict]:
         instruments = getattr(self.client, "instruments", None)
@@ -515,34 +270,6 @@ class TickFlowAdapter(MarketDataAdapter):
         if text.startswith(("430", "440", "830", "831", "832", "833", "834", "835", "836", "837", "838", "839", "870", "871", "872", "873", "920")):
             return f"{text}.BJ"
         return f"{text}.SH"
-
-    def _depth_totals(self, payload: Any) -> tuple[int, int]:
-        rows = self._rows(payload)
-        if not rows:
-            return 0, 0
-        first = rows[0]
-        bid_total = 0
-        ask_total = 0
-        for index in range(1, 11):
-            bid_total += int(first_finite(first, f"bidVol{index}", f"BidVol{index}", f"bid_volume_{index}") or 0)
-            ask_total += int(first_finite(first, f"askVol{index}", f"AskVol{index}", f"ask_volume_{index}") or 0)
-        return bid_total, ask_total
-
-    def _depth_summary(self, payload: Any) -> dict[str, Any]:
-        bid_total, ask_total = self._depth_totals(payload)
-        return {
-            "bid_total": bid_total,
-            "ask_total": ask_total,
-            "imbalance": bid_total - ask_total,
-            "imbalance_ratio": round(bid_total / ask_total, 4) if ask_total > 0 else None,
-        }
-
-    def _first_row(self, payload: Any) -> dict | None:
-        rows = self._rows(payload)
-        return rows[0] if rows else None
-
-    def _rows_only(self, payload: Any) -> list[dict]:
-        return self._rows(payload)
 
     def _rows(self, payload: Any) -> list[dict]:
         if payload is None:
@@ -655,7 +382,7 @@ class TickFlowAdapter(MarketDataAdapter):
             value = payload.get(key)
             if value not in (None, ""):
                 return self._parse_datetime(value)
-        return datetime.now()
+        return beijing_naive_now()
 
     def _parse_datetime(self, value: Any) -> datetime:
         if isinstance(value, datetime):
@@ -664,7 +391,7 @@ class TickFlowAdapter(MarketDataAdapter):
             ts = float(value)
             if ts > 1e12:
                 ts /= 1000.0
-            return datetime.fromtimestamp(ts)
+            return beijing_from_epoch(ts)
         text = str(value)
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
             try:
@@ -674,60 +401,7 @@ class TickFlowAdapter(MarketDataAdapter):
         try:
             return datetime.fromisoformat(text)
         except ValueError:
-            return datetime.now()
-
-    def _volume_ratio(self, rows: list[dict]) -> float:
-        if not rows:
-            return 1.0
-        volumes = [first_finite(row, "volume") for row in rows[:-1]]
-        baseline = [value for value in volumes if value not in (None, 0)]
-        if not baseline:
-            return 1.0
-        base = median(baseline[-20:])
-        if base <= 0:
-            return 1.0
-        latest = first_finite(rows[-1], "volume") or 0.0
-        return latest / base
-
-    def _daily_volume_ratio(self, rows: list[dict]) -> float:
-        if len(rows) < 2:
-            return 1.0
-        latest = first_finite(rows[-1], "volume") or 0.0
-        baseline = [first_finite(row, "volume") or 0.0 for row in rows[-21:-1]]
-        baseline = [value for value in baseline if value > 0]
-        if not baseline:
-            return 1.0
-        return latest / median(baseline)
-
-    def _normalize_volume(self, volume: float | None, amount: float | None, price: float | None) -> float | None:
-        multiplier, _ = self._volume_multiplier(volume, amount, price)
-        if multiplier is None:
-            return volume
-        return volume * multiplier
-
-    def _volume_multiplier(
-        self,
-        volume: float | None,
-        amount: float | None,
-        price: float | None,
-    ) -> tuple[float | None, bool]:
-        """Resolve the share multiplier for a raw volume field.
-
-        Returns ``(multiplier, confident)``. ``confident`` is False when the unit
-        could not be established, so callers must not derive VWAP or any other
-        amount/volume ratio from it.
-        """
-        if volume in (None, 0):
-            return None, True
-        if self.volume_unit != "auto":
-            return VOLUME_UNIT_MULTIPLIERS[self.volume_unit], True
-        if amount in (None, 0) or price in (None, 0):
-            return None, False
-        implied_lot = amount / (volume * price)
-        for low, high, multiplier in VOLUME_UNIT_BANDS:
-            if low <= implied_lot <= high:
-                return multiplier, True
-        return None, False
+            return beijing_naive_now()
 
     def _try_call(self, func: Any, *attempts: tuple[tuple, dict]) -> Any:
         """Call ``func`` trying successive signatures.

@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import date
 from typing import Any
 
-from ashare_decision_support.models.schemas import AuctionFeatures, OpenFeatures
+from ashare_decision_support.numeric import positive
 from ashare_decision_support.symbols import normalize_symbol
 
 SECURITY_LIST_FIELDS = ("industries", "concepts")
@@ -23,15 +23,6 @@ class MarketDataAdapter(ABC):
     @abstractmethod
     def get_trading_calendar(self) -> list[date]:
         """Fetch trading days."""
-
-    @abstractmethod
-    def get_auction_features(self, symbols: list[str]) -> dict[str, AuctionFeatures]:
-        """Fetch normalized auction-stage features."""
-
-    @abstractmethod
-    def get_open_features(self, symbols: list[str]) -> dict[str, OpenFeatures]:
-        """Fetch normalized open-follow features."""
-
 
 def security_names(adapter: Any, symbols: list[str]) -> dict[str, str | None]:
     """代码 → 简称。拿不到就返回空表。
@@ -167,12 +158,8 @@ def float_shares(adapter: Any, symbols: list[str]) -> dict[str, float]:
             continue
         ext = row.get("ext") if isinstance(row.get("ext"), dict) else {}
         for key in ("float_shares", "流通股本", "circulating_shares"):
-            value = row.get(key, ext.get(key))
-            try:
-                shares = float(value)
-            except (TypeError, ValueError):
-                continue
-            if shares > 0:
+            shares = positive(row.get(key, ext.get(key)))
+            if shares is not None:
                 result[symbol] = shares
                 break
     return result

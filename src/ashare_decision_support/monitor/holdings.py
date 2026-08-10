@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from ashare_decision_support.schedule.timezone import beijing_today
+
 # 低吸的自然持有期是 2–5 个交易日（等回调结束 → 反弹到前高）。超过这个窗口还没
 # 有像样的反弹，说明当初的判断没兑现——继续持有是在等一个已经没有依据的结果。
 #
@@ -230,4 +232,4 @@ def _held_days(opened_on: Any, today: date | None) -> int | None:
         opened = date.fromisoformat(str(opened_on)[:10])
     except (TypeError, ValueError):
         return None
-    return max(0, ((today or date.today()) - opened).days)
+    return max(0, ((today or beijing_today()) - opened).days)

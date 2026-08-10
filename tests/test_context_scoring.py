@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
+from ashare_decision_support.news.events import detect_events
 from ashare_decision_support.scoring import (
     RuleBasedScoreProvider,
     ScoreInput,
@@ -294,3 +295,111 @@ def test_sector_catalyst_treats_supply_shutdown_as_industry_support() -> None:
     assert reading.supply_score > 0
     assert reading.risk_score == 0
     assert "停机" in reading.hits
+
+
+def test_delisting_warning_reaches_the_scorer_not_only_the_brief() -> None:
+    """打分层和舆情层必须读同一份风险词表。
+
+    这两层曾经各存一份 `RISK_TERMS`，交集只有 4 个词，「退市 / 风险警示 /
+    财务造假 / 行政处罚 / 停牌」只在舆情那份里。后果不是风格不一致：一条
+    「被实施退市风险警示」的公告会在简报里记成风险证据、在候选打分里拿 0 分，
+    而这正是 A 股最不该漏的一类。钉住的是**同一条文本在两层得到同一组类别**，
+    不是某个具体分值——分值可以调，两层分家不行。
+    """
+    text = "关于公司股票被实施退市风险警示的公告"
+
+    reading = read_catalysts((text,))
+    evidence = detect_events([text])
+
+    assert reading.risk_score < 0
+    assert reading.risk_types == evidence.risk_types == ("退市风险",)
+
+
+def test_risk_score_counts_categories_so_one_event_is_not_punished_twice() -> None:
+    """「退市风险警示」里同时有「退市」和「风险警示」，说的是同一件事。
+
+    按词数扣分会把它罚成两件事，和「既被立案又要退市」拿一样的分。计数单位
+    是类别，词只用来解释命中了什么。
+    """
+    one_event = read_catalysts(("关于公司股票被实施退市风险警示的公告",))
+    two_events = read_catalysts(("公司因涉嫌财务造假被立案调查",))
+
+    assert one_event.risk_hits == ("退市", "风险警示")  # 词报两个
+    assert one_event.risk_types == ("退市风险",)  # 类只算一个
+    assert two_events.risk_score < one_event.risk_score
+
+
+def test_the_risk_vocabulary_has_exactly_one_home() -> None:
+    """词表只能有一个定义点，别的模块只准转引用。
+
+    上面两条钉的是行为，这条钉的是**结构**——两层分家最初就是从「各写一份同名
+    常量」开始的，行为用例只有在有人恰好想到那个词的时候才会发现漂移。
+    """
+    import ast
+    import pathlib
+
+    from ashare_decision_support.news import events, lexicon
+
+    assert events.RISK_TERMS is lexicon.RISK_TERMS
+
+    src = pathlib.Path(lexicon.__file__).parent.parent
+    definitions = [
+        path.relative_to(src).as_posix()
+        for path in src.rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Assign | ast.AnnAssign)
+        for target in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
+        if isinstance(target, ast.Name) and target.id in {"RISK_TERMS", "SUPPLY_TERMS"}
+    ]
+    assert definitions == ["news/lexicon.py", "news/lexicon.py"]
+
+
+
+
+# ---- 板块反向索引 ----------------------------------------------------------
+#
+# 这张表决定每只票在打分时继承**哪个**板块的热度、资金与排名
+# （`build_factor_contexts` 的 `sector_of` 入参）。一只票同属两个入选板块时，
+# 归给谁不是无关紧要的实现细节：两个板块的热度可以差一档。
+
+
+def test_a_symbol_in_two_sectors_is_attributed_to_the_stronger_one() -> None:
+    """**并列时留第一个**，而调用方传进来的板块是按强弱排好序的。
+
+    这条曾经有两份实现、而且是反的：`SectorTaxonomy.sector_of` 写了 `setdefault`
+    并把理由写进了 docstring，但一个调用方都没有；真正在跑的 `jobs/morning.py`
+    是字典生成式，**留最后一个**——也就是把这只票归给它所属板块里最弱的那个。
+    没写下理由的那一半才是生产行为，而它跑的正好是反的。
+    """
+    from ashare_decision_support.sectors import SectorDefinition, reverse_index
+
+    strong = SectorDefinition(name="半导体", level="l1", symbols=("300588.SZ", "600000.SH"))
+    weak = SectorDefinition(name="消费电子", level="l1", symbols=("300588.SZ",))
+
+    assert reverse_index([strong, weak])["300588.SZ"] == "半导体"
+    # 顺序反过来结论也跟着反——它认的就是入参顺序，不是板块名。
+    assert reverse_index([weak, strong])["300588.SZ"] == "消费电子"
+
+
+def test_nothing_builds_the_reverse_index_inline() -> None:
+    """结构守卫，理由同 `test_the_risk_vocabulary_has_exactly_one_home`。
+
+    行为用例只有在有人恰好想到「一只票同属两个板块」的时候才会发现漂移，而漂移
+    的形状是固定的：一个直接推平 `definition.symbols` 的字典生成式。那种写法没有
+    并列规则可言——`dict` 的后写覆盖先写，规则是语言给的，不是作者选的。
+    """
+    import ast
+    import pathlib
+
+    from ashare_decision_support import sectors
+
+    src = pathlib.Path(sectors.__file__).parent.parent
+    inline = [
+        f"{path.relative_to(src).as_posix()}:{node.lineno}"
+        for path in src.rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.DictComp)
+        for generator in node.generators
+        if isinstance(generator.iter, ast.Attribute) and generator.iter.attr == "symbols"
+    ]
+    assert inline == []

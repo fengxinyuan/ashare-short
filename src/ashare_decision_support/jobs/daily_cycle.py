@@ -17,6 +17,7 @@ from ashare_decision_support.jobs.monitor import run_monitor
 from ashare_decision_support.jobs.morning import MorningConfig, Sources, run_morning
 from ashare_decision_support.jobs.post_close import run_post_close
 from ashare_decision_support.jobs.review import run_review
+from ashare_decision_support.journal import Journal
 from ashare_decision_support.monitor import DEFAULT_LEVELS, SECTOR_EVERY
 from ashare_decision_support.news import AkshareNewsSource, NewsCache
 from ashare_decision_support.schedule import (
@@ -32,7 +33,7 @@ from ashare_decision_support.schedule import (
     run_daemon,
 )
 from ashare_decision_support.schedule.timezone import beijing_today
-from ashare_decision_support.sectors import ThsIndustryTaxonomy
+from ashare_decision_support.sectors import static_taxonomies
 from ashare_decision_support.state import CandidatePool, Watchlist
 
 
@@ -80,13 +81,15 @@ def run_daily_cycle(
             return None
 
     def morning_task() -> dict:
+        industry, concept = static_taxonomies()
         return run_morning(
             Sources(
                 adapter=adapter_factory(),
                 writer=writer(),
                 debate=debate(),
                 notifiers=notifiers("morning"),
-                industry_taxonomy=ThsIndustryTaxonomy(),
+                industry_taxonomy=industry,
+                concept_taxonomy=concept,
             ),
             output,
             config=MorningConfig(
@@ -111,6 +114,8 @@ def run_daily_cycle(
             news_source=_cached_news(),
             notifiers=notifiers("preopen"),
             security_master_adapter=SecurityMasterAdapter(),
+            # 09:15 这一轮和 CLI 的 `advise` 同源同口径，一样要落台账。
+            journal=Journal(),
             progress=progress,
         )
 

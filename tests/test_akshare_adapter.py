@@ -68,24 +68,3 @@ def test_akshare_adapter_health_and_calendar() -> None:
 
     assert health["capabilities"]["has_stock_zh_a_spot_em"] is True
     assert calendar == [date(2026, 7, 31)]
-
-
-def test_akshare_adapter_builds_open_features() -> None:
-    adapter = AkshareAdapter(ak_module=FakeAkshare())
-    features = adapter.get_open_features(["300001.SZ"])
-    item = features["300001.SZ"]
-
-    assert item.minutes_since_open == 3
-    assert round(item.open_gap_pct, 4) == round((12.2 / 12.0 - 1.0) * 100.0, 4)
-    assert item.volume_ratio == 1.4
-    assert item.price_vs_vwap_pct > 0
-
-
-def test_akshare_adapter_degrades_auction_features() -> None:
-    adapter = AkshareAdapter(ak_module=FakeAkshare())
-    features = adapter.get_auction_features(["300001.SZ"])
-    item = features["300001.SZ"]
-
-    assert item.data_stale is True
-    assert item.unmatched_qty == 0
-    assert item.matched_amount == 125000.0

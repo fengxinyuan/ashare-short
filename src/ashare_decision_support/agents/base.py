@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Protocol
+
+from ashare_decision_support.fanout import gather
 
 DEFAULT_WORKERS = 6
 
@@ -92,10 +93,29 @@ def run_agents(
                 elapsed_ms=int((clock() - started) * 1000),
             )
 
-    workers = min(max(1, max_workers), len(agents))
-    if workers == 1:
-        results = [execute(agent) for agent in agents]
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(execute, agents))
-    return {finding.agent: finding for finding in results}
+    # `gather` 的失败列表在这里恒为空，这是**故意**的：agent 的失败不是「少一路」，
+    # 是一份 `ok=False` 的 Finding——带着错误类名和它跑了多久，而耗时只有在
+    # `execute` 内部才量得到。所以异常在 `execute` 里就落成了产出，不往上抛。
+    done, _ = gather(agents, execute, max_workers=max_workers)
+    return {finding.agent: finding for _agent, finding in done}
+
+
+def timing_note(findings: dict[str, Finding]) -> str | None:
+    """一句话说清这一波里哪条腿慢。取不到就返回 None。
+
+    `elapsed_ms` 此前**量了但从没被带出来过**：每个 Finding 都记着自己跑了多久，
+    而调用方只 `extend(finding.notes)`，于是「盘前哪一段慢」这个问题在生产环境里
+    没有答案——只能靠临时加计时器重跑一遍。
+
+    不设阈值、不判「慢」：并行跑批里最慢那条腿决定整轮墙钟时间，把耗时按降序原样
+    列出来就够了，哪个数值算异常由读的人定。
+    """
+    timed = sorted(
+        (finding for finding in findings.values() if finding.elapsed_ms > 0),
+        key=lambda finding: finding.elapsed_ms,
+        reverse=True,
+    )
+    if not timed:
+        return None
+    parts = "、".join(f"{finding.agent} {finding.elapsed_ms / 1000:.1f}s" for finding in timed)
+    return f"本波并行取数耗时（最慢的决定整轮）：{parts}"

@@ -64,29 +64,6 @@ def test_qmt_adapter_health_check_and_calendar() -> None:
     assert calendar == [date(2026, 7, 31)]
 
 
-def test_qmt_adapter_builds_auction_and_open_features() -> None:
-    adapter = QmtXtDataAdapter(xtdata_module=FakeXtData())
-    auction = adapter.get_auction_features(["300001.SZ"])["300001.SZ"]
-    open_feature = adapter.get_open_features(["300001.SZ"])["300001.SZ"]
-
-    assert auction.matched_qty == 1000
-    assert auction.unmatched_qty == 100
-    assert auction.data_stale is False
-    assert open_feature.minutes_since_open == 3
-    assert open_feature.open_gap_pct == 1.6666666666666607
-    assert open_feature.volume_ratio > 1.0
-
-
-def test_qmt_adapter_marks_missing_l2_auction_data_as_stale() -> None:
-    adapter = QmtXtDataAdapter(xtdata_module=FakeXtDataNoL2())
-    auction = adapter.get_auction_features(["300001.SZ"])["300001.SZ"]
-    dump_payload = adapter.dump_snapshot(["300001.SZ"])
-
-    assert auction.unmatched_qty == 0
-    assert auction.data_stale is True
-    assert "full_tick" in dump_payload
-
-
 def test_qmt_health_reports_not_ready_instead_of_raising() -> None:
     """xtquant 未安装是预期状态；诊断命令必须给出结构化答案而不是抛栈。"""
     import importlib.util
@@ -101,22 +78,3 @@ def test_qmt_health_reports_not_ready_instead_of_raising() -> None:
         assert "xtquant" in payload["reason"]
     else:
         assert payload["ready"] is True
-
-
-def test_source_timestamp_rejects_non_numbers_instead_of_crashing() -> None:
-    """`isinstance(raw, (int, float))` 在这里有两个漏法，后果不同。
-
-    - `True` 通过后 `fromtimestamp(1.0)` 是 1970 年——一个看不出错的错时间戳，
-      而 `source_ts` 决定简报上那句「数据时点」。
-    - NaN 通过后 `fromtimestamp(nan)` 直接抛 ValueError，把一次取数变成一次崩溃。
-
-    两种都该退回「没有时间戳」，由调用方按缺失处理。
-    """
-    from datetime import datetime
-
-    adapter = QmtXtDataAdapter(xtdata_module=FakeXtData(), auto_connect=False)
-    before = datetime.now()
-    for bad in (float("nan"), float("inf"), True, "not-a-time"):
-        stamp = adapter._extract_source_dt({"sourceTs": bad})
-        # 退回 `datetime.now()`，而不是 1970 年、也不是抛异常。
-        assert stamp >= before.replace(microsecond=0)

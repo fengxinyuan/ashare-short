@@ -17,6 +17,7 @@ from ashare_decision_support.jobs.post_close import POST_CLOSE_LATEST_NAME, SNAP
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_pre_open_brief
 from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.schedule.timezone import beijing_today
 
 
 def run_pre_open(
@@ -76,14 +77,14 @@ def _load_snapshots(
     if adapter is None:
         return {}, "未找到盘后快照且未提供行情源，本次不展示价位参考"
 
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     from ashare_decision_support.signals import DailyTechnicalAnalyzer
 
     symbols = [row["symbol"] for row in rows if row.get("symbol")]
     if not symbols:
         return {}, None
-    end = date.today()
+    end = beijing_today()
     bars = adapter.get_historical_bars(symbols, end - timedelta(days=180), end)
     usable = {symbol: rows_ for symbol, rows_ in bars.items() if rows_}
     return DailyTechnicalAnalyzer().analyze_many(usable), "价位为盘前实时重算"

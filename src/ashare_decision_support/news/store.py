@@ -44,6 +44,7 @@ from typing import Any
 
 from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.dedup import dedup_key, parse_published
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.state.paths import state_path
 
 # 语料库的 schema 版本。和 `sectors/taxonomy.py` 的缓存戳同一个理由——结构变了之后，
@@ -210,7 +211,7 @@ class NewsStore:
         if not docs:
             return result
 
-        stamp = (now or datetime.now()).replace(microsecond=0)
+        stamp = (now or beijing_naive_now()).replace(microsecond=0)
         day = str(trade_date) if trade_date else ""
 
         try:
@@ -301,7 +302,7 @@ class NewsStore:
         if not self.ok:
             return []
         column = "last_seen_at" if by == "last_seen" else "first_seen_at"
-        stamp = now or datetime.now()
+        stamp = now or beijing_naive_now()
         floor = (stamp - timedelta(hours=within_hours)).isoformat(timespec="seconds")
 
         sql = ["SELECT d.* FROM docs d"]
@@ -338,7 +339,7 @@ class NewsStore:
         """
         if not self.ok:
             return []
-        stamp = now or datetime.now()
+        stamp = now or beijing_naive_now()
         bucket = max(1, int(bucket_hours))
         floor = stamp - timedelta(hours=within_hours)
 
@@ -403,7 +404,7 @@ class NewsStore:
         """
         if not self.ok or not docs:
             return docs, []
-        stamp = now or datetime.now()
+        stamp = now or beijing_naive_now()
         brand_new = 0
         stale = 0
         for doc in docs:

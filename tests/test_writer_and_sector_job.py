@@ -13,6 +13,7 @@ from ashare_decision_support.jobs.morning import (
     run_morning,
 )
 from ashare_decision_support.news import NewsDoc
+from ashare_decision_support.sectors import CONCEPT_LEVEL
 from ashare_decision_support.sectors.base import SectorDefinition
 from ashare_decision_support.writer import (
     LlmBriefWriter,
@@ -112,6 +113,41 @@ def test_gate_reads_thousands_separators_as_one_number() -> None:
 def test_gate_still_fires_on_a_grouped_number_that_is_invented() -> None:
     facts = json.dumps({"net_inflow": 12198154.379999977}, ensure_ascii=False)
     assert unverified_numbers("净流入99,888,777.00元", facts) == ["99,888,777.00"]
+
+
+def test_the_three_number_gates_share_one_definition_of_a_free_ordinal() -> None:
+    """三道闸门严格程度不同是**有意**的，但「多小的整数算序号」必须是同一个数。
+
+    上面几条钉的是行为，这条钉的是结构。收口前 `ORDINAL_CEILING = 20` 有两份
+    定义，而 `advice/external.py` 从两个不同模块分别拿这道闸门的两个常量——两份
+    20 漂成 20 和 15 不会让任何用例变红，只会让同一个「第 18 档」在简报里放行、
+    在裁决里作废。
+    """
+    import ast
+    import pathlib
+
+    from ashare_decision_support import factcheck
+    from ashare_decision_support.advice import adjudicate, external
+    from ashare_decision_support.writer import llm
+
+    assert (
+        llm.ORDINAL_CEILING
+        is adjudicate.ORDINAL_CEILING
+        is external.ORDINAL_CEILING
+        is factcheck.ORDINAL_CEILING
+    )
+
+    src = pathlib.Path(factcheck.__file__).parent
+    definitions = [
+        path.relative_to(src).as_posix()
+        for path in src.rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Assign | ast.AnnAssign)
+        for target in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
+        if isinstance(target, ast.Name)
+        and target.id in {"ORDINAL_CEILING", "NUMBER_PATTERN", "UNIT_SCALES"}
+    ]
+    assert sorted(definitions) == ["factcheck.py"] * 3
 
 
 # ---- writers -------------------------------------------------------------
@@ -396,6 +432,11 @@ class FakeStaticTaxonomy:
         ]
 
 
+class FakeConceptTaxonomy:
+    def list_sectors(self):
+        return [SectorDefinition(name="AI芯片", level=CONCEPT_LEVEL, symbols=STRONG)]
+
+
 class FakeNewsSource:
     def __init__(self) -> None:
         self.announcements: list[dict] = []
@@ -511,6 +552,31 @@ def test_morning_ranks_sectors_then_picks_stocks_inside_them(tmp_path) -> None:
     payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
     # Every candidate must belong to a sector that was actually selected.
     assert {item["sector"] for item in payload["candidates"]} == {"电子"}
+
+
+def test_morning_ranks_concepts_separately_without_double_counting_market(tmp_path) -> None:
+    """概念有独立名额；重叠成分不重复进漏斗，也不污染全市场宽度。"""
+    summary = _run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=FakeNewsSource(),
+        concept_taxonomy=FakeConceptTaxonomy(),
+        top_sectors=1,
+        top_concepts=1,
+        candidates_per_sector=2,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+    )
+
+    payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
+    assert summary["industry_sectors_selected"] == ["电子"]
+    assert summary["concept_sectors_selected"] == ["AI芯片"]
+    assert payload["market"]["sectors_total"] == 2  # 两个行业；概念不重复计算大盘
+    assert summary["funnel"]["selected_sector_constituents"] == len(STRONG)
+    assert {item["level"] for item in payload["sectors"]} == {"SW1", CONCEPT_LEVEL}
 
 
 def test_morning_keeps_st_names_for_the_normal_candidate_flow(tmp_path) -> None:
@@ -1231,3 +1297,245 @@ def test_market_state_ignores_layers_that_reported_not_ok(tmp_path) -> None:
     assert state["rotation_switch"] is None
     assert state["turnover_total_change"] is None
     assert state["index_median_ret"] is None
+
+
+# ---- 简报里的成交额标题行 --------------------------------------------------
+
+
+def _turnover_headline(turnover: dict) -> str:
+    """跑一遍简报，把成交额那节的加粗标题行取出来。"""
+    from ashare_decision_support.notify.render import render_sector_brief
+
+    markdown = render_sector_brief(
+        date(2026, 8, 7),
+        [],
+        [],
+        SimpleNamespace(direction="偏多", score=60.0, breadth=0.5, reasons=[]),
+        0.5,
+        turnover=turnover,
+    )
+    return next(line for line in markdown.splitlines() if line.startswith("**全场日均成交额"))
+
+
+def test_turnover_headline_carries_the_turn_when_the_two_reads_disagree() -> None:
+    """块均值与窗口内走向反号时，两个数都要出现在标题行里。
+
+    标题行是这一节唯一会被扫一眼就走的行。2026-08-07 实盘：块均值 -1.8%、窗口内
+    +33.4%——只印前者，量能刚触底回升的那一周，最显眼的一行印的是「萎缩」。
+    """
+    headline = _turnover_headline(
+        {
+            "sectors": 90,
+            "trade_date": "20260807",
+            "total_change": -0.0176,
+            "total_trend": 0.3343,
+            "observations": ["近 5 日**内部**放量 33.4%"],
+        }
+    )
+
+    assert "-1.8%" in headline
+    assert "+33.4%" in headline
+
+
+def test_turnover_headline_stays_short_when_the_two_reads_agree() -> None:
+    """同号时不加那半句——没有拐点要提示，多印一个数只会挤掉块均值本身。"""
+    headline = _turnover_headline(
+        {
+            "sectors": 90,
+            "trade_date": "20260807",
+            "total_change": -0.144,
+            "total_trend": -0.21,
+            "observations": ["近 5 日**内部**缩量 21.0%"],
+        }
+    )
+
+    assert "-14.4%" in headline
+    assert "窗口内" not in headline
+
+
+# ---- 台账里的仓位决策过程 --------------------------------------------------
+
+
+def _sizing_state(**kw):
+    """跑一次真实的仓位决策，把结果原样喂给台账快照。
+
+    刻意走 `resolve_position_sizing` 而不是手搓一个 SimpleNamespace：这条用例要
+    钉的是「决策过程能不能被事后还原」，用假 plan 的话字段名一漂就测不出来。
+    """
+    from ashare_decision_support.jobs.morning import _market_state
+    from ashare_decision_support.strategy.positioning import resolve_position_sizing
+
+    plan = resolve_position_sizing(**kw)
+    return _market_state(
+        SimpleNamespace(direction="偏多", score=70.0, breadth=0.6),
+        plan.effective_factor,
+        None,
+        sizing=plan,
+    )
+
+
+def test_journal_can_tell_a_capped_suggestion_from_a_naturally_low_one() -> None:
+    """两种决策的 `position_factor` **完全一样**，只有过程分得开。
+
+    系统自己就建议 0.5，和系统建议 0.9 被周期上限压到 0.5，对「仓位上限这条规则
+    有没有救过我们」是相反的证据。只存最终值的话，这个问题永远没有样本——而那是
+    仓位这一层唯一能被 `review` 验证的方式。
+    """
+    capped = _sizing_state(cycle_label="退潮", cycle_cap=0.5, suggested_factor=0.9)
+    naturally_low = _sizing_state(cycle_label="退潮", cycle_cap=0.5, suggested_factor=0.5)
+
+    # 最终值相同——这正是问题所在。
+    assert capped["position_factor"] == naturally_low["position_factor"] == 0.5
+
+    # 过程不同，且台账分得开。
+    assert capped["suggested_factor"] == 0.9
+    assert capped["capped_suggested_factor"] == 0.5
+    assert naturally_low["suggested_factor"] == 0.5
+    assert naturally_low["capped_suggested_factor"] == 0.5
+
+
+def test_journal_records_a_manual_override_as_such() -> None:
+    """人接管过的那一天要留痕，否则事后会被算成规则的战绩（或锅）。"""
+    state = _sizing_state(
+        cycle_label="启动", cycle_cap=0.5, suggested_factor=0.4, manual_factor=0.8
+    )
+
+    assert state["position_factor"] == 0.8      # 手工值优先
+    assert state["manual_factor"] == 0.8
+    assert state["capped_suggested_factor"] == 0.4  # 系统本来想给的
+    assert state["suggested_factor"] == 0.4
+
+
+def test_journal_stores_none_when_no_sizing_plan_was_passed() -> None:
+    """拿不到 plan 时存 None，不存 0——同这份快照里其他读数的处置。"""
+    from ashare_decision_support.jobs.morning import _market_state
+
+    state = _market_state(SimpleNamespace(direction="偏多", score=70.0, breadth=0.6), 0.5, None)
+
+    assert state["position_factor"] == 0.5
+    assert state["suggested_factor"] is None
+    assert state["manual_factor"] is None
+
+
+def test_journal_keeps_both_turnover_readings() -> None:
+    """块均值与窗口内走向都要存。
+
+    只存块均值的话，事后分组会把「量能刚触底回升」的日子归进「存量博弈」——
+    2026-08-07 实测这两个数是 -1.8% 与 +33.4%，反号。
+    """
+    from ashare_decision_support.jobs.morning import _market_state
+
+    state = _market_state(
+        SimpleNamespace(direction="偏多", score=70.0, breadth=0.6),
+        0.5,
+        None,
+        turnover=SimpleNamespace(ok=True, total_change=-0.0176, total_trend=0.3343),
+    )
+
+    assert state["turnover_total_change"] == -0.0176
+    assert state["turnover_total_trend"] == 0.3343
+
+
+# ---- 概念层的两处边界 ------------------------------------------------------
+
+
+class ClashingConceptTaxonomy:
+    """概念名与行业名撞车。实测 31 个 SW1 与 346 个概念只撞「家用电器」一个。"""
+
+    def list_sectors(self):
+        return [
+            SectorDefinition(name="电子", level=CONCEPT_LEVEL, symbols=WEAK),
+            SectorDefinition(name="AI芯片", level=CONCEPT_LEVEL, symbols=STRONG),
+        ]
+
+
+class BrokenConceptTaxonomy:
+    def list_sectors(self):
+        raise RuntimeError("static file unreachable")
+
+
+def test_a_concept_named_like_an_industry_is_dropped_not_merged(tmp_path) -> None:
+    """板块的各层读数全部按 `name` 索引，重名会让两层互相覆盖。
+
+    覆盖的方向取决于字典写入顺序——那是一个没人声明过、也没法从代码里读出来的
+    规则，而被覆盖的那一层会拿到另一层的动量与舆情。丢掉重名的那个概念，代价
+    远小于让一层读数静默错位。
+    """
+    summary = _run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=FakeNewsSource(),
+        concept_taxonomy=ClashingConceptTaxonomy(),
+        top_sectors=1,
+        top_concepts=2,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+    )
+
+    # 「电子」只作为行业出现一次，不会同时出现在概念名额里。
+    assert summary["concept_sectors_selected"] == ["AI芯片"]
+    assert summary["industry_sectors_selected"] == ["电子"]
+    assert any("重名已跳过" in note for note in summary["data_notes"])
+
+
+def test_a_broken_concept_source_leaves_the_industry_ranking_alone(tmp_path) -> None:
+    """概念是第二个维度，不是必需项——静态文件挂掉时盘前照样要出得来一份排序。
+
+    对照 `_industry_taxonomy`：那条取不到是要抛的，因为没有行业分类这条链路
+    根本无从开始。两者的失败处置刻意不同。
+    """
+    summary = _run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=FakeNewsSource(),
+        concept_taxonomy=BrokenConceptTaxonomy(),
+        top_sectors=1,
+        top_concepts=3,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+    )
+
+    assert summary["industry_sectors_selected"] == ["电子"]
+    assert summary["concept_sectors_selected"] == []
+    assert any("概念板块不可用" in note for note in summary["data_notes"])
+
+
+def test_the_daemon_ranks_concepts_too(tmp_path) -> None:
+    """**daemon 才是这套系统真正在跑的那条路。**
+
+    手工 `morning` 有概念维度、无人值守跑没有，是同一套分类下两条链路看到的板块
+    集合不一样——`docs/INVENTORY.md` §1.1 记的正是这种分叉。结构守卫而非行为
+    用例：真跑一次 daemon 要连全部外部源。
+    """
+    import ast
+    import inspect
+
+    from ashare_decision_support.jobs import daily_cycle
+
+    tree = ast.parse(inspect.getsource(daily_cycle))
+    morning = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "morning_task"
+    )
+    passed = {
+        keyword.arg
+        for node in ast.walk(morning)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+    }
+    assert {"industry_taxonomy", "concept_taxonomy"} <= passed
+
+    # 两层必须共用一个 source，否则上游 08:00 刷新时行业按昨天算、概念按今天算。
+    called = {
+        node.func.id
+        for node in ast.walk(morning)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "static_taxonomies" in called

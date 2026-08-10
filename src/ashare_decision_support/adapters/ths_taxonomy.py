@@ -48,6 +48,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.jsoncache import read_stamped, write_stamped
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_home
 from ashare_decision_support.symbols import normalize_symbol
 
@@ -182,7 +184,7 @@ class ThsTaxonomySnapshot:
         if not self.fetched_on:
             return None
         try:
-            return (date.today() - date.fromisoformat(self.fetched_on)).days
+            return (beijing_today() - date.fromisoformat(self.fetched_on)).days
         except ValueError:
             return None
 
@@ -249,21 +251,30 @@ class ThsTaxonomySource:
         self._opener = opener or urllib.request.urlopen
         self.timeout = timeout
         self.max_age_days = max_age_days
+        # 行业与概念 taxonomy 共用同一个 source。磁盘缓存解决跨任务重复下载；
+        # 这一层解决同一任务内连续 `load()` 两次仍重复读盘/出网的问题，并保证
+        # 两个维度看到的是同一份快照。
+        self._loaded: ThsTaxonomySnapshot | None = None
 
     # ---- public ----------------------------------------------------------
 
     def load(self, force_refresh: bool = False) -> ThsTaxonomySnapshot:
         """缓存够新就用缓存，否则重取；重取失败继续用旧的并报出年龄。"""
+        if not force_refresh and self._loaded is not None:
+            return self._loaded
+
         cached = self._read_cache()
         if not force_refresh and cached is not None and _is_fresh(cached, self.max_age_days):
             cached.notes.append(cached.coverage_note())
-            return cached
+            self._loaded = cached
+            return self._loaded
 
         fetched, errors = self._fetch()
         if fetched is not None:
             self._write_cache(fetched)
             fetched.notes.append(fetched.coverage_note())
-            return fetched
+            self._loaded = fetched
+            return self._loaded
 
         if cached is not None:
             age = cached.age_days
@@ -274,12 +285,14 @@ class ThsTaxonomySource:
                 + "——新上市、摘帽、行业调整的标的可能归错板块"
             )
             cached.notes.append(cached.coverage_note())
-            return cached
+            self._loaded = cached
+            return self._loaded
 
-        return ThsTaxonomySnapshot(
+        self._loaded = ThsTaxonomySnapshot(
             ok=False,
             notes=[f"同花顺静态分类不可用且无缓存：{'；'.join(errors)}"],
         )
+        return self._loaded
 
     # ---- io --------------------------------------------------------------
 
@@ -332,7 +345,7 @@ class ThsTaxonomySource:
         return (
             ThsTaxonomySnapshot(
                 profiles=profiles,
-                fetched_on=str(date.today()),
+                fetched_on=str(beijing_today()),
                 from_cache=False,
                 ok=True,
                 notes=notes,
@@ -359,11 +372,8 @@ class ThsTaxonomySource:
         return root / CACHE_NAME
 
     def _read_cache(self) -> ThsTaxonomySnapshot | None:
-        try:
-            payload = json.loads(self._cache_path().read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict) or payload.get("schema") != CACHE_SCHEMA:
+        payload = read_stamped(self._cache_path(), CACHE_SCHEMA)
+        if payload is None:
             return None
         rows = payload.get("profiles")
         if not isinstance(rows, list) or not rows:
@@ -392,27 +402,23 @@ class ThsTaxonomySource:
         )
 
     def _write_cache(self, snapshot: ThsTaxonomySnapshot) -> bool:
-        path = self._cache_path()
-        payload = {
-            "schema": CACHE_SCHEMA,
-            "fetched_on": snapshot.fetched_on,
-            "profiles": [
-                {
-                    "symbol": profile.symbol,
-                    "name": profile.name,
-                    "industries": list(profile.industries),
-                    "concepts": list(profile.concepts),
-                }
-                for profile in snapshot.profiles.values()
-            ],
-        }
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            # 落盘失败只降速，不影响正确性——调用方此时已经拿到了数据。
-            return False
-        return True
+        # 落盘失败只降速，不影响正确性——调用方此时已经拿到了数据。
+        return write_stamped(
+            self._cache_path(),
+            {
+                "fetched_on": snapshot.fetched_on,
+                "profiles": [
+                    {
+                        "symbol": profile.symbol,
+                        "name": profile.name,
+                        "industries": list(profile.industries),
+                        "concepts": list(profile.concepts),
+                    }
+                    for profile in snapshot.profiles.values()
+                ],
+            },
+            CACHE_SCHEMA,
+        )
 
 
 def _index_rows(rows: Any, tag_key: str) -> dict[str, tuple[str, tuple[str, ...]]]:
@@ -442,4 +448,4 @@ def _is_fresh(snapshot: ThsTaxonomySnapshot, max_age_days: int) -> bool:
         fetched = date.fromisoformat(snapshot.fetched_on)
     except ValueError:
         return False
-    return fetched > date.today() - timedelta(days=max_age_days + 1)
+    return fetched > beijing_today() - timedelta(days=max_age_days + 1)

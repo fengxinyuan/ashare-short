@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.jsoncache import read_stamped, write_stamped
 from ashare_decision_support.state.paths import state_path
 from ashare_decision_support.symbols import normalize_symbol
 
@@ -335,11 +336,8 @@ class SecurityMasterAdapter:
         return (time.time() - master.fetched_at) < max_age_seconds
 
     def _read_cache(self) -> SecurityMaster | None:
-        try:
-            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+        payload = read_stamped(self.cache_path, SCHEMA_VERSION)
+        if payload is None:
             return None
         rows = payload.get("entries")
         if not isinstance(rows, list):
@@ -367,22 +365,17 @@ class SecurityMasterAdapter:
         )
 
     def _write_cache(self, master: SecurityMaster) -> None:
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "fetched_at": master.fetched_at,
-            "source": master.source,
-            "entries": [info.to_dict() for info in master.entries.values()],
-        }
-        try:
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            # 原子写：半份缓存比没有缓存更糟，它看起来是完整的。
-            temporary = self.cache_path.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-            )
-            temporary.replace(self.cache_path)
-        except OSError as exc:
-            master.notes.append(f"元数据缓存写入失败（{type(exc).__name__}），下次仍会重新拉取")
+        written = write_stamped(
+            self.cache_path,
+            {
+                "fetched_at": master.fetched_at,
+                "source": master.source,
+                "entries": [info.to_dict() for info in master.entries.values()],
+            },
+            SCHEMA_VERSION,
+        )
+        if not written:
+            master.notes.append("元数据缓存写入失败，下次仍会重新拉取")
 
 
 def _parse_row(row: Any, key: str) -> SecurityInfo | None:

@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.news.base import NewsDoc, SentimentAnalyzer, SentimentScore
 from ashare_decision_support.news.dedup import dedup_key
 
@@ -222,25 +222,31 @@ class LlmNewsClassifier:
         ]
 
         allowed = set(sectors)
-        workers = max(1, min(self.max_workers, len(batches)))
-        if workers == 1:
-            outcomes = [self._classify_batch(batch, sectors, allowed) for batch in batches]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                outcomes = list(
-                    pool.map(lambda batch: self._classify_batch(batch, sectors, allowed), batches)
-                )
+        done, errors = gather(
+            batches,
+            lambda batch: self._classify_batch(batch, sectors, allowed),
+            max_workers=self.max_workers,
+        )
 
         labels: dict[str, DocLabel] = {}
-        failed = 0
-        for mapping, ok in outcomes:
+        for _batch, mapping in done:
             labels.update(mapping)
-            failed += 0 if ok else 1
+
+        # 「没打通」和「答了但没法用」分成两条 note。合成一句「N 批失败」的话，
+        # 排查时两边都得翻一遍：前者查网络与配额，后者查提示词与 max_tokens。
+        voided = sum(1 for _batch, mapping in done if not mapping)
 
         notes: list[str] = []
-        if failed:
+        if errors:
+            kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors}))
             notes.append(
-                f"舆情归因 {failed}/{len(batches)} 批调用失败，这部分退回关键词词典"
+                f"舆情归因 {len(errors)}/{len(batches)} 批调用失败（{kinds}），"
+                "这部分退回关键词词典"
+            )
+        if voided:
+            notes.append(
+                f"舆情归因 {voided}/{len(batches)} 批输出无法对齐或解析，整批作废，"
+                "这部分退回关键词词典"
             )
         if labels:
             directional = sum(1 for label in labels.values() if label.is_directional)
@@ -262,7 +268,9 @@ class LlmNewsClassifier:
         batch: list[tuple[str, NewsDoc]],
         sectors: list[str],
         allowed: set[str],
-    ) -> tuple[dict[str, DocLabel], bool]:
+    ) -> dict[str, DocLabel]:
+        """这一批的标签。**调用失败直接抛**，由 `gather` 交还给上面写 note；
+        返回空字典是另一回事——模型答了，但答的东西对不上，整批作废。"""
         listing = "\n".join(
             f"{index}. {doc.title[:TITLE_LIMIT]}" for index, (_, doc) in enumerate(batch)
         )
@@ -271,19 +279,16 @@ class LlmNewsClassifier:
             f"【新闻标题】共 {len(batch)} 条\n{listing}\n\n"
             f"输出长度为 {len(batch)} 的 JSON 数组。"
         )
-        try:
-            raw = self.client.chat(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user},
-                ]
-            )
-        except Exception:
-            return {}, False
+        raw = self.client.chat(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ]
+        )
 
         rows = _parse_json_array(raw or "")
         if not rows:
-            return {}, False
+            return {}
 
         # 对齐靠**回抄的标题前缀**，不靠模型自报的序号。
         #
@@ -327,8 +332,8 @@ class LlmNewsClassifier:
 
         # 半数以上对不上说明模型没按格式回抄，这批的对齐整体不可信，整批作废。
         if unmatched * 2 >= len(rows):
-            return {}, False
-        return mapping, bool(mapping)
+            return {}
+        return mapping
 
     def _read_cache(self, trade_date: Any) -> dict[str, DocLabel] | None:
         if self.cache is None or trade_date is None:

@@ -13,6 +13,7 @@ from ashare_decision_support.sectors.turnover import (
     QUADRANT_INFLOW,
     QUADRANT_NEGLECT,
     SHARE_MOVE,
+    TREND_MOVE,
     read_turnover,
 )
 
@@ -114,6 +115,75 @@ def test_total_turnover_is_reported_separately_from_share() -> None:
     assert any("总量在收缩" in line for line in read.observations)
     # 每个板块都同步腰斩，占比因此**一点没动**——占比单独看会说「什么也没发生」。
     assert all(abs(item.share_change) < 1e-6 for item in read.entries)
+    # 一路腰斩到底，窗口内没有拐点，那一行不该出声。
+    assert not any("指向相反" in line for line in read.observations)
+
+
+# ---- 拐点：块均值与窗口内走向反号 -----------------------------------------
+
+
+def _uniform(daily_yi: list[float]) -> dict[str, tuple[list[float], list[float]]]:
+    """把一条全市场合计额曲线摊给 MIN_SECTORS 个等份板块，价格恒定。
+
+    价格恒定是刻意的：这几条用例考的只有总量那两行，占比与象限全部落在中性带里，
+    不该有第二个变量参与。
+    """
+    per_sector = [value * 1e8 / MIN_SECTORS for value in daily_yi]
+    return {f"陪衬{i:02d}": (per_sector, flat(100.0)) for i in range(MIN_SECTORS)}
+
+
+def test_v_shaped_week_reports_the_turn_the_block_means_hide() -> None:
+    """块均值说「萎缩」，窗口内首末说「放量」——2026-08-07 实盘就是这个形状。
+
+    近 5 日均 24301 亿对前 15 日均 24737 亿是 -1.8%，措辞落在「萎缩」；而这 5 天
+    自己从 20111 亿放到 26834 亿，是 +33%。只报前者，读的人会按「量能在退」处理
+    一个刚触底回升的市场，而这两件事对仓位的含义相反。
+    """
+    read = read_turnover(
+        series_from(
+            _uniform(
+                [
+                    # 前 15 日：一路退潮。
+                    28347, 27195, 25874, 24189, 26716, 27181, 29742, 26686,
+                    22095, 19445, 20887, 20391, 23117, 23584, 25599,
+                    # 近 5 日：触底回升。
+                    20111, 22284, 26799, 25475, 26834,
+                ]
+            )
+        )
+    )
+
+    assert read.trusted
+    # 两个读数都成立，而且反号——这正是只报其中一个会读反的日子。
+    assert read.total_change is not None and read.total_change < 0
+    assert read.total_trend is not None and read.total_trend > 0.3
+    assert read.total_latest is not None and read.total_latest > read.total_prior
+    assert any("萎缩" in line for line in read.observations)
+    assert any("指向相反" in line for line in read.observations)
+
+
+def test_a_rebounding_window_is_not_called_existing_money() -> None:
+    """「存量腾挪」是断言不是读数，窗口内在放量时它必须闭嘴。
+
+    块均值跌 23%（远过 SHARE_MOVE），但这 5 天从 20000 亿爬到 26000 亿。水位是从
+    窗口头几天的低位涨上来的，那不是存量市场，是刚回来的增量。
+    """
+    read = read_turnover(
+        series_from(_uniform([30000.0] * 15 + [20000, 21000, 23000, 25000, 26000]))
+    )
+
+    assert read.total_change is not None and read.total_change <= -SHARE_MOVE
+    assert read.total_trend is not None and read.total_trend >= TREND_MOVE
+    assert not any("存量腾挪" in line for line in read.observations)
+    assert any("指向相反" in line for line in read.observations)
+
+
+def test_a_flat_window_says_nothing_about_its_internal_trend() -> None:
+    """窗口内没动就不多印一行——合计额日间 ±5% 是噪声，说了会稀释上面那行。"""
+    read = read_turnover(series_from(_uniform(flat(25000.0))))
+
+    assert read.total_trend == 0.0
+    assert not any("内部" in line for line in read.observations)
 
 
 def test_absolute_amount_surfaces_what_share_hides() -> None:

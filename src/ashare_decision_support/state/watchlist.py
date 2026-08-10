@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_path
 from ashare_decision_support.state.store import read_json, write_json
 from ashare_decision_support.symbols import normalize_symbol
@@ -92,7 +93,7 @@ class WatchEntry:
         if not self.holding or not self.opened_on:
             return None
         try:
-            return (date.today() - date.fromisoformat(str(self.opened_on))).days
+            return (beijing_today() - date.fromisoformat(str(self.opened_on))).days
         except (TypeError, ValueError):
             return None
 
@@ -189,7 +190,7 @@ class Watchlist(_EntryList):
             source=source,
             note=note,
             score=score,
-            added_on=str(today or date.today()),
+            added_on=str(today or beijing_today()),
         )
         self.entries.append(entry)
         self.save()
@@ -220,7 +221,7 @@ class Watchlist(_EntryList):
         entry.holding = True
         entry.cost_price = float(cost_price)
         entry.shares = shares if shares is None else int(shares)
-        entry.opened_on = str(opened_on or today or date.today())
+        entry.opened_on = str(opened_on or today or beijing_today())
         if plan_stop is not None:
             entry.plan_stop = float(plan_stop)
         if plan_target is not None:
@@ -269,7 +270,7 @@ class CandidatePool(_EntryList):
         # Stale pools are not silently served. Yesterday's candidates carry
         # yesterday's levels, and an automated loop cannot tell the difference
         # unless the store refuses to hand them over.
-        self.stale = bool(self.trade_date) and self.trade_date != str(today or date.today())
+        self.stale = bool(self.trade_date) and self.trade_date != str(today or beijing_today())
         super().__init__(path=resolved, entries=[] if self.stale else entries)
 
     def replace(self, entries: list[WatchEntry], trade_date: date) -> None:

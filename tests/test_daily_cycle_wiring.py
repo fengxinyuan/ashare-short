@@ -93,8 +93,9 @@ def test_every_daemon_task_calls_its_chain_with_a_valid_signature(
     for key, target in TASK_TARGET.items():
         real = getattr(daily_cycle, target)
         monkeypatch.setattr(daily_cycle, target, _bind_recorder(real, sink, key))
-    # 这两个会去读真实的状态目录，指到 tmp 下免得依赖开发机上的自选股。
-    monkeypatch.setenv("ASHARE_DS_STATE_DIR", str(tmp_path / "state"))
+    # 状态目录的隔离由 conftest 的 autouse fixture 统一做（`ASHARE_DS_HOME`）。
+    # 这里原来另设了一个 `ASHARE_DS_STATE_DIR`——那个变量不存在，读它的代码一行
+    # 也没有，于是这三行看着像在做隔离，实际什么都没做；真正兜住的一直是 conftest。
 
     captured = _tasks(monkeypatch, tmp_path)
     result = captured["tasks"][task_key].run()
@@ -115,7 +116,6 @@ def test_every_task_passes_the_same_trade_date_it_was_built_for(monkeypatch, tmp
         monkeypatch.setattr(
             daily_cycle, target, _bind_recorder(getattr(daily_cycle, target), sink, key)
         )
-    monkeypatch.setenv("ASHARE_DS_STATE_DIR", str(tmp_path / "state"))
 
     captured = _tasks(monkeypatch, tmp_path)
     for key in TASK_TARGET:
@@ -137,7 +137,6 @@ def test_adapters_are_built_at_run_time_not_at_schedule_time(monkeypatch, tmp_pa
         monkeypatch.setattr(
             daily_cycle, target, _bind_recorder(getattr(daily_cycle, target), sink, key)
         )
-    monkeypatch.setenv("ASHARE_DS_STATE_DIR", str(tmp_path / "state"))
 
     def factory():
         built.append(1)

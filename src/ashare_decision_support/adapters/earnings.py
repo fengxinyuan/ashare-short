@@ -193,9 +193,6 @@ class EarningsSnapshot:
     def get(self, symbol: str) -> EarningsForecast | None:
         return self.forecasts.get(normalize_symbol(symbol))
 
-    def by_direction(self, direction: str) -> list[EarningsForecast]:
-        return [item for item in self.forecasts.values() if item.direction == direction]
-
     def describe(self, n: int = 5) -> list[str]:
         """给简报用的两三行摘要。"""
         if not self.forecasts:

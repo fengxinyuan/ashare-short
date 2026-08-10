@@ -25,6 +25,7 @@ from ashare_decision_support.advice.view import (
     sort_advice_items,
     trade_context_parts_from_dict,
 )
+from ashare_decision_support.schedule.clock import AFTERNOON_CLOSE
 
 PHASE_PRE_OPEN = "pre_open"
 PHASE_INTRADAY = "intraday"
@@ -42,7 +43,12 @@ PHASE_LABELS = {
 # 次日 05:00 都算盘后，因为那段时间你问的仍然是「今天发生了什么」。
 PRE_OPEN_FROM = clock_time(5, 0)
 SESSION_OPEN = clock_time(9, 15)
-SESSION_CLOSE = clock_time(15, 0)
+# 收盘时刻取 `schedule/clock.py` 那一份，不在这里再写一遍 `time(15, 0)`。
+#
+# 09:15 那个开盘时刻是**本层特有**的（集合竞价起算，不是 clock 的 09:30），所以
+# 它留在本地；收盘时刻则和全仓一致，没有第二种口径。共用的是取值，不是叫法——
+# 本层的时段判断读作 `SESSION_CLOSE` 更顺，别名保留这个词。
+SESSION_CLOSE = AFTERNOON_CLOSE
 
 MORNING_LATEST_NAME = "morning_latest.json"
 ADVICE_LATEST_NAME = "advice_latest.json"

@@ -15,10 +15,10 @@ whole sector chain workable without a data subscription.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.jsoncache import read_stamped, write_stamped
 from ashare_decision_support.sectors.base import SectorDefinition, SectorTaxonomy
 
 LEVEL_PREFIXES: dict[str, str] = {
@@ -199,19 +199,11 @@ class TickFlowSwTaxonomy(SectorTaxonomy):
         return self.cache_dir / TAXONOMY_CACHE_NAME.format(level=self.level.lower())
 
     def _read_cache(self) -> list[SectorDefinition] | None:
-        path = self._cache_path()
-        if path is None:
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict):
-            return None
         # 无戳的缓存是 `complete` 语义生效之前写下的，可能缺片——2026-08-01 现场那
         # 份 SW1 缓存少了 469/4430 只成分股，而文件本身完全正常，肉眼与代码都看不
         # 出来。缓存是永久的，所以宁可重建一次，也不能继续用一份不知道完不完整的。
-        if payload.get("schema") != TAXONOMY_SCHEMA:
+        payload = read_stamped(self._cache_path(), TAXONOMY_SCHEMA)
+        if payload is None:
             return None
         sectors = payload.get("sectors")
         if not isinstance(sectors, list) or not sectors:
@@ -228,20 +220,17 @@ class TickFlowSwTaxonomy(SectorTaxonomy):
         return definitions or None
 
     def _write_cache(self, definitions: list[SectorDefinition]) -> bool:
-        path = self._cache_path()
-        if path is None or not definitions:
+        if not definitions:
             return False
-        payload = {
+        return write_stamped(
+            self._cache_path(),
+            {
+                "level": self.level,
+                "sectors": [
+                    {"name": item.name, "symbols": list(item.symbols)} for item in definitions
+                ],
+            },
             # 只有走完整性检查、一个分片都没失败的结果才配带这个戳。
-            "schema": TAXONOMY_SCHEMA,
-            "level": self.level,
-            "sectors": [
-                {"name": item.name, "symbols": list(item.symbols)} for item in definitions
-            ],
-        }
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            return False
-        return True
+            TAXONOMY_SCHEMA,
+            indent=2,
+        )

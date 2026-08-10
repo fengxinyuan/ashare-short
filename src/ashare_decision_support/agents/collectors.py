@@ -20,6 +20,7 @@ from ashare_decision_support.news.discovery import matching_docs
 from ashare_decision_support.news.events import EventEvidence, detect_events
 from ashare_decision_support.news.relevance import filter_company_news
 from ashare_decision_support.news.sentiment import LexiconSentiment
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.sectors import SectorMomentum
 from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
 from ashare_decision_support.signals.intraday import IntradayAnalyzer
@@ -102,7 +103,7 @@ class NewsAgent:
 
         as_of = freshest(docs)
         weighted, weigh_notes = weigh_docs(
-            docs, self.now or datetime.now(), self.half_life_hours
+            docs, self.now or beijing_naive_now(), self.half_life_hours
         )
         notes.extend(weigh_notes)
         stats = getattr(source, "last_market_stats", {})
@@ -163,7 +164,7 @@ class NewsAgent:
         existing_keys = {_doc_key(doc) for doc in (existing_docs or [])}
         selected = [doc for doc in selected if _doc_key(doc) not in existing_keys]
         weighted, weigh_notes = weigh_docs(
-            selected, self.now or datetime.now(), self.half_life_hours
+            selected, self.now or beijing_naive_now(), self.half_life_hours
         )
         notes = list(fetch_notes) + list(weigh_notes)
         notes.append(
@@ -185,7 +186,7 @@ class NewsAgent:
         """
         if self.store is None or not docs:
             return []
-        stamp = self.now or datetime.now()
+        stamp = self.now or beijing_naive_now()
         result = self.store.ingest(docs, ctx.trade_date, now=stamp)
         _, fresh_notes = self.store.annotate_freshness(docs, now=stamp)
         return result.notes + fresh_notes
@@ -251,7 +252,7 @@ class SymbolNewsAgent:
             else:
                 announcements = []
         notices = _announcement_docs(announcements or [], symbols)
-        moment = self.now or datetime.now()
+        moment = self.now or beijing_naive_now()
 
         sentiment: dict[str, SymbolSentiment] = {}
         events: dict[str, EventEvidence] = {}

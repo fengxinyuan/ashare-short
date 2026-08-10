@@ -49,12 +49,11 @@ TickFlow `volume=369`。所以本模块输出的 bar 一律换算成**股**，�
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Any
 
 from ashare_decision_support.numeric import finite
-
-CN_TZ = timezone(timedelta(hours=8))
+from ashare_decision_support.schedule.timezone import BEIJING_TZ, beijing_from_epoch
 
 # 仓内沿用的周期写法（"1"/"5"/…）到 TickFlow 写法（"1m"/"5m"/…）。
 PERIOD_SUFFIX = "m"
@@ -333,11 +332,11 @@ def _to_dt(value: Any) -> datetime | None:
     except (TypeError, ValueError):
         return None
     # 交易所本地时间，与新浪那路保持一致的 naive datetime。
-    return datetime.fromtimestamp(stamp / 1000.0, CN_TZ).replace(tzinfo=None)
+    return beijing_from_epoch(stamp / 1000.0)
 
 
 def _day_start_ms(day: date) -> int:
-    return int(datetime.combine(day, datetime.min.time(), tzinfo=CN_TZ).timestamp() * 1000)
+    return int(datetime.combine(day, datetime.min.time(), tzinfo=BEIJING_TZ).timestamp() * 1000)
 
 
 def _day_end_ms(day: date) -> int:
@@ -345,7 +344,7 @@ def _day_end_ms(day: date) -> int:
 
 
 def _fmt(stamp_ms: int) -> str:
-    return _fmt_dt(datetime.fromtimestamp(stamp_ms / 1000.0, CN_TZ).replace(tzinfo=None))
+    return _fmt_dt(beijing_from_epoch(stamp_ms / 1000.0))
 
 
 def _fmt_dt(when: datetime) -> str:

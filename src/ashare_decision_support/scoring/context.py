@@ -15,6 +15,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ashare_decision_support.news.lexicon import RISK_TERMS, SUPPLY_TERMS
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.symbols import normalize_symbol
 
@@ -45,18 +46,10 @@ PRICE_TERMS = (
     "库存下降",
     "供不应求",
 )
-SECTOR_SUPPLY_TERMS = (
-    "供给收缩",
-    "产能受限",
-    "停产",
-    "停机",
-    "检修",
-    "减产",
-    "库存下降",
-    "库存拐点",
-    "供不应求",
-)
-EVENT_TERMS = (
+# 催化事件词表：比 `lexicon.EVENT_TERMS` 窄，只留**能在两只技术形态相近的票之间
+# 打破平局**的硬事件。名字带 CATALYST_ 前缀是为了不和那张表重名——它们是两件事，
+# 曾经同名同姓地各存一份，读代码的人 grep 一个名字会拿到两个答案。
+CATALYST_EVENT_TERMS = (
     "中标",
     "订单",
     "签约",
@@ -67,17 +60,6 @@ EVENT_TERMS = (
     "投产",
     "突破",
     "并购",
-)
-RISK_TERMS = (
-    "减持",
-    "立案",
-    "问询",
-    "诉讼",
-    "预亏",
-    "首亏",
-    "增亏",
-    "停产",
-    "商誉减值",
 )
 
 
@@ -92,6 +74,7 @@ class CatalystReading:
     risk_score: float = 0.0
     hits: tuple[str, ...] = ()
     risk_hits: tuple[str, ...] = ()
+    risk_types: tuple[str, ...] = ()
 
     @property
     def net_score(self) -> float:
@@ -200,22 +183,29 @@ def read_catalysts(
 
     policy = hits(POLICY_TERMS)
     price = hits(PRICE_TERMS)
-    event = hits(EVENT_TERMS)
-    supply = hits(SECTOR_SUPPLY_TERMS) if sector else ()
-    risk_terms = (
-        tuple(term for term in RISK_TERMS if term not in SECTOR_SUPPLY_TERMS)
-        if sector
-        else RISK_TERMS
-    )
-    risk = tuple(term for term in risk_terms if term in text)
+    event = hits(CATALYST_EVENT_TERMS)
+    supply = hits(SUPPLY_TERMS) if sector else ()
+    # 「停产 / 停机」在个股口径下是经营中断，在板块口径下是供给收缩——同一个词
+    # 方向相反。按板块看时把它从风险侧减掉，否则一条利好会同时加供给分、扣风险分。
+    risk_matched = [
+        (category, term)
+        for category, terms in RISK_TERMS.items()
+        for term in terms
+        if term in text and not (sector and term in SUPPLY_TERMS)
+    ]
+    risk = tuple(dict.fromkeys(term for _, term in risk_matched))
+    risk_types = tuple(dict.fromkeys(category for category, _ in risk_matched))
     return CatalystReading(
         policy_score=min(2.0, len(policy) * 0.8),
         price_score=min(2.5, len(price) * 1.0),
         event_score=min(2.5, len(event) * 0.8),
         supply_score=min(2.5, len(supply) * 0.8),
-        risk_score=max(-3.5, -len(risk) * 1.2),
+        # 按**类**扣分而不是按词：「关于公司股票被实施退市风险警示的公告」一句里
+        # 有「退市」和「风险警示」两个词，说的是同一件事，罚一次。
+        risk_score=max(-3.5, -len(risk_types) * 1.2),
         hits=tuple(dict.fromkeys((*policy, *price, *event, *supply))),
         risk_hits=risk,
+        risk_types=risk_types,
     )
 
 

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ashare_decision_support.numeric import finite, positive
+
 # 近端窗口：用最后这么多根分钟线判断「现在」的状态。
 RECENT_BARS = 10
 
@@ -65,8 +67,22 @@ class Stabilisation:
         if self.insufficient:
             return "分时数据不足，无法判断是否止跌"
         if self.confirmed:
-            return f"{self.pattern}：{self.reason}"
+            return f"{self.pattern}：{self.reason}{self._age()}"
         return f"尚未出现止跌信号（{self.reason}）" if self.reason else "尚未出现止跌信号"
+
+    def _age(self) -> str:
+        """距当日最低点过了几根分时。
+
+        止跌信号的**成色随时间变**：低点后第 2 根就确认，和第 15 根才确认，是两种
+        强度——前者很可能只是下跌途中的一次反抽。而三种形态里，此前只有最弱的
+        「缩量止跌」把这个数写进了自己的 reason，**放量反包与二次探底不破一个字都
+        没有**，恰恰是这两个会被拿去当买点。
+
+        所以收在这里统一给：`bars_since_low` 本来就三种形态都算了，只是没说出口。
+        """
+        if self.bars_since_low is None:
+            return ""
+        return f"（距当日最低 {self.bars_since_low} 根分时）"
 
 
 def assess_stabilisation(bars: list[dict]) -> Stabilisation:
@@ -104,7 +120,7 @@ def assess_stabilisation(bars: list[dict]) -> Stabilisation:
         return Stabilisation(
             confirmed=True,
             pattern=PATTERN_CONTRACTION,
-            reason=f"近端均量降至基线的 {contraction:.0%}，且 {since_low} 根未创新低",
+            reason=f"近端均量降至基线的 {contraction:.0%}",
             volume_contraction=contraction,
             bars_since_low=since_low,
         )
@@ -178,17 +194,13 @@ def _bars_since_low(rows: list[dict]) -> int | None:
 def _clean(bars: list[dict]) -> list[dict]:
     rows: list[dict] = []
     for bar in bars or []:
-        try:
-            row = {
-                "high": float(bar["high"]),
-                "low": float(bar["low"]),
-                "close": float(bar["close"]),
-                "volume": float(bar.get("volume") or 0.0),
-            }
-        except (KeyError, TypeError, ValueError):
+        close = positive(bar.get("close"))
+        high, low = finite(bar.get("high")), finite(bar.get("low"))
+        if close is None or high is None or low is None:
             continue
-        if row["close"] > 0:
-            rows.append(row)
+        rows.append(
+            {"high": high, "low": low, "close": close, "volume": finite(bar.get("volume")) or 0.0}
+        )
     return rows
 
 

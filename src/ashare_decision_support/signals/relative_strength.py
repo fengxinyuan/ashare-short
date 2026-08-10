@@ -41,6 +41,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.numeric import positive
+
 # 超额收益的档位切点（单位：小数，0.005 = 0.5 个百分点）。
 # 0.5% 以内算「同步」——留一条中性带，否则指数与个股都在 ±0.1% 抖动时，
 # 标签会天天翻面。
@@ -225,14 +227,8 @@ def _closes_by_date(bars: list[dict]) -> dict[str, float]:
     result: dict[str, float] = {}
     for bar in bars or []:
         day = bar.get("date") or bar.get("day") or bar.get("trade_date")
-        close = bar.get("close")
-        if day is None or close is None:
-            continue
-        try:
-            value = float(close)
-        except (TypeError, ValueError):
-            continue
-        if value <= 0:
+        value = positive(bar.get("close"))
+        if day is None or value is None:
             continue
         result[str(day)[:10]] = value
     return result

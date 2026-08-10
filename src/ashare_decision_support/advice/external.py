@@ -13,13 +13,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from math import isfinite
 from typing import Any
-from zoneinfo import ZoneInfo
 
-from ashare_decision_support.advice.adjudicate import ORDINAL_CEILING
-from ashare_decision_support.writer.llm import NUMBER_PATTERN
+from ashare_decision_support.factcheck import NUMBER_PATTERN, ORDINAL_CEILING
+from ashare_decision_support.schedule.timezone import beijing_naive_now, to_beijing_naive
 
 PACKET_SCHEMA = "ashare-codex-adjudication-v1"
-BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -99,7 +97,7 @@ def validate_external_decisions(
     if packet.get("schema") != PACKET_SCHEMA:
         reasons.append("不是有效的 Codex 裁决包")
         return ExternalDecisionCheck(False, reasons=reasons)
-    if not _is_fresh(packet, now or datetime.now(), max_age_minutes, reasons):
+    if not _is_fresh(packet, now or beijing_naive_now(), max_age_minutes, reasons):
         return ExternalDecisionCheck(False, reasons=reasons)
 
     if not isinstance(response, dict):
@@ -282,7 +280,7 @@ def _parse_datetime(value: Any) -> datetime | None:
             text = text[:-1] + "+00:00"
         parsed = datetime.fromisoformat(text)
         if parsed.tzinfo is not None:
-            return parsed.astimezone(BEIJING_TZ).replace(tzinfo=None)
+            return to_beijing_naive(parsed)
         return parsed
     except (TypeError, ValueError):
         return None

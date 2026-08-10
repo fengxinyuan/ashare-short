@@ -371,6 +371,55 @@ def test_a_volume_reversal_bar_confirms_immediately() -> None:
     assert reading.pattern == PATTERN_REVERSAL
 
 
+def test_a_confirmed_signal_says_how_long_since_the_low() -> None:
+    """止跌信号的成色随时间变，而三种形态里只有最弱的那个说过这件事。
+
+    低点后第 2 根就确认，和第 15 根才确认，是两种强度——前者很可能只是下跌途中
+    的一次反抽。`bars_since_low` 三种形态本来都算了，此前只有「缩量止跌」把它写
+    进自己的 reason，**放量反包与二次探底不破一个字都没有**，而恰恰是这两个会被
+    拿去当买点。
+    """
+    from ashare_decision_support.signals.stabilise import (
+        PATTERN_REVERSAL,
+        assess_stabilisation,
+    )
+
+    prices = [100.0 - i * 0.2 for i in range(34)] + [98.0]
+    vols = [1000.0] * 34 + [5000.0]
+    reading = assess_stabilisation(minutes(prices, vols))
+
+    assert reading.pattern == PATTERN_REVERSAL
+    assert reading.bars_since_low is not None
+    assert f"距当日最低 {reading.bars_since_low} 根分时" in reading.describe()
+
+
+def test_the_age_is_not_printed_twice_for_the_weakest_pattern() -> None:
+    """缩量止跌的 reason 原来自带「N 根未创新低」，收口后不能变成印两遍。"""
+    from ashare_decision_support.signals.stabilise import (
+        PATTERN_CONTRACTION,
+        assess_stabilisation,
+    )
+
+    prices = [100.0 - i * 0.4 for i in range(20)] + [92.2 + i * 0.01 for i in range(15)]
+    vols = [3000.0] * 20 + [600.0] * 15
+    reading = assess_stabilisation(minutes(prices, vols))
+
+    assert reading.pattern == PATTERN_CONTRACTION
+    assert reading.describe().count("根分时") == 1
+    assert "未创新低" not in reading.reason
+
+
+def test_an_unconfirmed_reading_does_not_claim_an_age() -> None:
+    """还没止跌时不追加「距最低 N 根」——那会读成一个已经站住的信号。"""
+    from ashare_decision_support.signals.stabilise import assess_stabilisation
+
+    falling = [100.0 - i * 0.3 for i in range(40)]
+    reading = assess_stabilisation(minutes(falling))
+
+    assert reading.confirmed is False
+    assert "距当日最低" not in reading.describe()
+
+
 def test_insufficient_data_is_not_reported_as_no_signal() -> None:
     """把「不知道」当成「没有」，会在数据源出问题时静默地不再产生任何买点。"""
     from ashare_decision_support.signals.stabilise import assess_stabilisation

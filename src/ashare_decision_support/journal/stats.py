@@ -232,14 +232,31 @@ def _adjudication_edge(rows: list[dict]) -> dict[str, Any]:
     }
 
 
+def _screened(rows: list[dict]) -> list[dict]:
+    """走过盘前筛选的那些行。`_selection_edge` 与 `_veto_cost` 的入选组用它。
+
+    两个函数的差值都建立在「同日、同筛选流程、只差最后一刀排序」之上，而台账里
+    并非每条记录都满足这个前提：`advise` 那条链路记的是**人手点名**的标的，它们
+    从来没进过板块排序和业绩闸门。按 `rec_kind` 取会把它们一并算进入选组，于是
+    「这套筛选有没有用」的分子里混进了一批不是这套筛选选出来的票。
+
+    按 `source` 而不是 `kind` 分：`kind` 分的是入选/对照/否决三个**组**，
+    `source` 分的是这条记录由**哪条链路**产生的——这里要的是后者。
+    """
+    return [row for row in rows if (row.get("source") or "morning") == "morning"]
+
+
 def _selection_edge(rows: list[dict]) -> dict[str, Any]:
     """入选组减对照组。**这个差值才是这套规则的真实价值。**
 
     单看入选组的绝对收益毫无意义——普涨的日子里随便选都赚。两组同日、同筛选
     流程、只差最后一刀排序，差值才把市场本身的涨跌消掉了。
     """
-    picked = [row for row in rows if (row.get("rec_kind") or "recommendation") == "recommendation"]
-    control = [row for row in rows if row.get("rec_kind") == "control"]
+    screened = _screened(rows)
+    picked = [
+        row for row in screened if (row.get("rec_kind") or "recommendation") == "recommendation"
+    ]
+    control = [row for row in screened if row.get("rec_kind") == "control"]
     if not picked or not control:
         return {"available": False, "reason": "两组都有样本才能算差值"}
 
@@ -272,8 +289,11 @@ def _veto_cost(rows: list[dict]) -> dict[str, Any]:
     在样本够之前它只是被记录，不驱动任何自动调整——和别处一样，先落台账，等
     数据说话。
     """
-    picked = [row for row in rows if (row.get("rec_kind") or "recommendation") == "recommendation"]
-    vetoed = [row for row in rows if row.get("rec_kind") == "vetoed"]
+    screened = _screened(rows)
+    picked = [
+        row for row in screened if (row.get("rec_kind") or "recommendation") == "recommendation"
+    ]
+    vetoed = [row for row in screened if row.get("rec_kind") == "vetoed"]
     if not picked or not vetoed:
         return {"available": False, "reason": "入选组与否决组都有样本才能算差值"}
 

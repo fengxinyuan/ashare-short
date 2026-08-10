@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
 from statistics import median
 
 from ashare_decision_support.models.enums import EffortResult, WyckoffBias
 from ashare_decision_support.models.schemas import WyckoffSignal
 from ashare_decision_support.numeric import clamp
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.signals.series import normalize_bars
 
 
@@ -30,7 +30,7 @@ class WyckoffAnalyzer:
     def analyze(self, symbol: str, bars: list[dict]) -> WyckoffSignal:
         normalized = self._normalize_rows(bars)
         if len(normalized) < max(self.signal_window + 2, self.trend_window + 1):
-            source_ts = normalized[-1]["timestamp"] if normalized else datetime.now()
+            source_ts = normalized[-1]["timestamp"] if normalized else beijing_naive_now()
             return WyckoffSignal(
                 symbol=symbol,
                 bias=WyckoffBias.NEUTRAL,

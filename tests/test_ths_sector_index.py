@@ -222,3 +222,93 @@ def test_a_cache_without_the_schema_stamp_is_rescanned(tmp_path) -> None:
 
     assert [r.name for r in snap.readings] == ["半导体"]
     assert len(http.asked) > 300
+
+
+# ---- describe 的两条独有读数 ----------------------------------------------
+
+# 与 STRONG_ROWS 的价格形态完全相同（稳步走高、收在当日最高），只有成交额不同：
+# 近端量能萎缩。两者的区别**只有 volume_ratio 分得开**，涨幅和收位都分不开。
+DRY_ROWS = [
+    *_flat_series(26, 100.0, amount=2000000000.0),
+    ("20260731", 100.5, 101.0, 100.2, 101.0, 500000000.0),
+]
+
+
+def test_describe_reports_close_position_even_when_nothing_faded() -> None:
+    """一个冲高回落都没有，是这一层能给的最强收盘读数——不能因此沉默。
+
+    原来只在 faded 非空时才有一行，于是 2026-08-07 那种「90 个板块涨了 78 个、
+    冲高回落 0 个」的日子，简报上一个字都没有。读的人会把「没写」读成「没测出
+    什么」，而当天的事实是全场尾盘承接极强。
+    """
+    http = StubHttp({"881101": ("白酒", STRONG_ROWS), "881102": ("元件", STRONG_ROWS)})
+    snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
+
+    line = next(line for line in snap.describe() if line.startswith("收盘位置"))
+    assert "2/2" in line                      # 分母跟着出，读的人才能自己判断
+    assert "没有一个冲高回落" in line
+
+
+def test_describe_still_names_the_faded_sectors() -> None:
+    """分布总是报，但出现冲高回落时仍要点名——这是原来就有的行为，不能回退。"""
+    http = StubHttp({"881101": ("半导体", FADE_ROWS), "881102": ("白酒", STRONG_ROWS)})
+    snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
+
+    line = next(line for line in snap.describe() if line.startswith("收盘位置"))
+    assert "冲高回落" in line
+    assert "半导体" in line
+    assert "白酒" not in line
+
+
+def test_describe_splits_risers_by_volume_position() -> None:
+    """`volume_ratio` 此前算了但没人读——涨幅一样的两个板块在简报上长得一模一样。
+
+    2026-08-07 实测：同为大涨，小金属 1.29 是放量、半导体 0.85 是缩量。分不开这两
+    类，「反弹有没有钱」这个问题在简报上就没有答案。
+    """
+    http = StubHttp({"881101": ("小金属", STRONG_ROWS), "881102": ("半导体", DRY_ROWS)})
+    snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
+
+    by_name = snap.by_name()
+    # 两者涨幅与收位都相同，只有量能位置不同。
+    assert by_name["小金属"].ret_1d == pytest.approx(by_name["半导体"].ret_1d)
+    assert by_name["小金属"].close_position == by_name["半导体"].close_position
+    assert by_name["小金属"].volume_ratio >= 1.0
+    assert by_name["半导体"].volume_ratio < 1.0
+
+    lines = snap.describe()
+    volume_line = next(line for line in lines if line.startswith("上涨板块的量能位置"))
+    assert "小金属" in volume_line
+    dry_line = next(line for line in lines if "涨但缩量" in line)
+    assert "半导体" in dry_line
+    assert "小金属" not in dry_line
+
+
+def test_describe_says_nothing_about_volume_when_nothing_rose() -> None:
+    """全场下跌时不印「上涨板块的量能位置」——那一行的分母是 0。"""
+    falling = [*_flat_series(26, 100.0), ("20260731", 99.5, 99.6, 98.0, 98.5, 1000000000.0)]
+    http = StubHttp({"881101": ("半导体", falling)})
+    snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101"])
+
+    assert snap.readings[0].ret_1d < 0
+    assert not any(line.startswith("上涨板块的量能位置") for line in snap.describe())
+
+
+def test_volume_position_carries_the_scale_not_just_the_ratio() -> None:
+    """比值必须配量级，否则会读出一个反过来的结论。
+
+    2026-08-07 实测：教育量能 1.68 排放量榜首但日均只有 42 亿，半导体量能 0.85
+    垫底、日均却有 3661 亿。只看比值会得出「教育是最大的流入方向」，而当天真正的
+    资金事实是半导体那一侧在失血，且失的血比教育的全部成交额还多一个数量级。
+    """
+    http = StubHttp({"881101": ("小金属", STRONG_ROWS), "881102": ("半导体", DRY_ROWS)})
+    snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
+
+    lines = snap.describe()
+    expanding = next(line for line in lines if line.startswith("上涨板块的量能位置"))
+    shrinking = next(line for line in lines if "涨但缩量" in line)
+    # 两条线都要能看出「这个比值是多大一摊钱算出来的」。
+    assert "日均" in expanding
+    assert "日均" in shrinking
+    # 缩量的那个基数更大——这正是只看比值会漏掉的事实。
+    assert snap.by_name()["半导体"].amount_5d > snap.by_name()["小金属"].amount_5d

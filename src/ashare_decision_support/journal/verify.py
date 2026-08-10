@@ -15,6 +15,8 @@ from typing import Any
 from ashare_decision_support.adapters.base import fetch_daily_bars
 from ashare_decision_support.journal.records import KIND_RECOMMENDATION, Outcome
 from ashare_decision_support.journal.store import Journal
+from ashare_decision_support.numeric import finite
+from ashare_decision_support.schedule.timezone import beijing_today
 
 DEFAULT_HORIZON_SESSIONS = 5
 
@@ -30,7 +32,7 @@ def verify_pending(
     min_age_days: int = 1,
 ) -> dict[str, Any]:
     """核对所有待兑现的建议，把结果写回台账。"""
-    now = today or date.today()
+    now = today or beijing_today()
     pending = journal.pending(now, min_age_days=min_age_days)
     if not pending:
         return {"checked": 0, "resolved": 0, "outcomes": [], "notes": ["没有待核对的建议"]}
@@ -167,21 +169,15 @@ def _resolve(row: dict, bars: list[dict], today: date, horizon: int) -> Outcome 
 
 
 def _relative(value: Any, base: float) -> float | None:
-    if value is None or not base:
+    number = finite(value)
+    if number is None or not base:
         return None
-    try:
-        return round(float(value) / base - 1.0, 6)
-    except (TypeError, ValueError, ZeroDivisionError):
-        return None
+    return round(number / base - 1.0, 6)
 
 
 def _level(pct: Any, base: float) -> float | None:
-    if pct is None:
-        return None
-    try:
-        return base * (1.0 + float(pct))
-    except (TypeError, ValueError):
-        return None
+    number = finite(pct)
+    return None if number is None else base * (1.0 + number)
 
 
 def _as_date(value: Any) -> date | None:

@@ -23,7 +23,6 @@ from ashare_decision_support.adapters.akshare_adapter import AkshareAdapter
 from ashare_decision_support.adapters.base import fetch_daily_bars
 from ashare_decision_support.adapters.freshness import check_intraday_freshness
 from ashare_decision_support.adapters.global_market import GlobalMarketAdapter
-from ashare_decision_support.adapters.mapping import get_profile, load_profile_from_path
 from ashare_decision_support.adapters.qmt_xtdata import QmtAdapterError, QmtXtDataAdapter
 from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
 from ashare_decision_support.adapters.sina_intraday import SUPPORTED_PERIODS, SinaIntradayAdapter
@@ -63,8 +62,8 @@ from ashare_decision_support.monitor.sector_triggers import fired_sectors_today
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.feishu import FeishuNotifier
 from ashare_decision_support.schedule import TradingCalendar
-from ashare_decision_support.schedule.timezone import beijing_now, beijing_today
-from ashare_decision_support.sectors import ThsIndustryTaxonomy
+from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_now, beijing_today
+from ashare_decision_support.sectors import ThsIndustryTaxonomy, static_taxonomies
 from ashare_decision_support.signals import WyckoffAnalyzer
 from ashare_decision_support.state import CandidatePool, Watchlist, state_home
 from ashare_decision_support.strategy.overnight import (
@@ -164,6 +163,7 @@ def _parser_morning(subparsers) -> None:
     morning.add_argument("--output-dir", default="briefs")
     morning.add_argument("--level", default="SW1", choices=["SW1", "SW2", "SW3"])
     morning.add_argument("--top-sectors", type=int, default=5)
+    morning.add_argument("--top-concepts", type=int, default=3)
     morning.add_argument("--per-sector", type=int, default=3)
     morning.add_argument(
         "--position-factor", type=float, help="手工仓位系数 (0-1)，省略用系统建议值"
@@ -173,6 +173,7 @@ def _parser_morning(subparsers) -> None:
         "--no-llm-news", action="store_true", help="舆情归因只用关键词词典，不调大模型"
     )
     morning.add_argument("--no-limit-pool", action="store_true", help="跳过涨停池情绪读数")
+    morning.add_argument("--no-concepts", action="store_true", help="只排行业，跳过概念板块")
     morning.add_argument(
         "--no-sector-index", action="store_true", help="跳过同花顺行业指数（板块日内位置读数）"
     )
@@ -412,7 +413,6 @@ def _parser_wyckoff_scan(subparsers) -> None:
     wyckoff_scan.add_argument("--end")
     wyckoff_scan.add_argument("--output")
     wyckoff_scan.add_argument("--calendar-market", default="SH")
-    wyckoff_scan.add_argument("--profile-file")
     _add_tickflow_args(wyckoff_scan)
 
 
@@ -475,6 +475,15 @@ def _parser_diagnostics(subparsers) -> None:
 
     subparsers.add_parser("qmt-health", help="诊断：本地 QMT / xtdata 是否就绪")
     subparsers.add_parser("state", help="诊断：状态目录、自选股、候选池、任务完成情况")
+
+    calendar_refresh = subparsers.add_parser(
+        "calendar-refresh", help="从行情源刷新本地节假日表（holidays.json）"
+    )
+    calendar_refresh.add_argument("--year", type=int, default=None, help="默认当年")
+    calendar_refresh.add_argument(
+        "--source", default="akshare", choices=["akshare", "tickflow"]
+    )
+    _add_tickflow_args(calendar_refresh)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -612,12 +621,7 @@ def _source_adapter(args):
         return _tickflow(args)
     if args.source == "akshare":
         return AkshareAdapter()
-    profile = (
-        load_profile_from_path(args.profile_file)
-        if args.profile_file
-        else get_profile("generic-qmt")
-    )
-    return QmtXtDataAdapter(profile=profile, calendar_market=args.calendar_market)
+    return QmtXtDataAdapter(calendar_market=args.calendar_market)
 
 
 def _optional_date(value: str | None, fallback: date) -> date:
@@ -627,7 +631,7 @@ def _optional_date(value: str | None, fallback: date) -> date:
 def _qmt_health() -> dict:
     """QMT 未开通是预期状态，诊断命令要如实报告而不是抛栈。"""
     try:
-        payload = QmtXtDataAdapter(profile=get_profile("generic-qmt")).health_check()
+        payload = QmtXtDataAdapter().health_check()
     except QmtAdapterError as exc:
         return {
             "adapter": "QmtXtDataAdapter",
@@ -644,21 +648,19 @@ def _morning_facts(adapter) -> dict:
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
+        industry_taxonomy, concept_taxonomy = static_taxonomies("SW1")
         run_morning(
             Sources(
                 adapter=adapter,
                 notifiers=[],
                 journal=Journal(root=Path(tmp) / "journal"),
-                industry_taxonomy=_industry_taxonomy("SW1"),
+                industry_taxonomy=industry_taxonomy,
+                concept_taxonomy=concept_taxonomy,
             ),
             Path(tmp),
             config=MorningConfig(top_sectors=8, candidates_per_sector=2),
         )
         return json.loads((Path(tmp) / "morning_latest.json").read_text(encoding="utf-8"))
-
-
-def _industry_taxonomy(level: str) -> ThsIndustryTaxonomy:
-    return ThsIndustryTaxonomy(level=level)
 
 
 def _security_master_reference() -> SecurityMasterAdapter:
@@ -693,18 +695,21 @@ def _cmd_daemon(args) -> None:
 
 
 def _cmd_morning(args) -> None:
+    industry_taxonomy, concept_taxonomy = static_taxonomies(args.level)
     summary = run_morning(
         Sources(
             adapter=_tickflow(args),
             writer=_writer(args),
             debate=_debate(args),
             notifiers=_notifiers(args, args.output_dir, "morning"),
-            industry_taxonomy=_industry_taxonomy(args.level),
+            industry_taxonomy=industry_taxonomy,
+            concept_taxonomy=concept_taxonomy,
         ),
         args.output_dir,
         config=MorningConfig(
             sector_level=args.level,
             top_sectors=args.top_sectors,
+            top_concepts=args.top_concepts,
             candidates_per_sector=args.per_sector,
             position_factor=args.position_factor,
             max_constituents=args.max_constituents,
@@ -716,6 +721,7 @@ def _cmd_morning(args) -> None:
             use_earnings=not args.no_earnings,
             use_broad_index=not args.no_broad_index,
             use_trade_flow=not args.no_trade_flow,
+            use_concepts=not args.no_concepts,
             explain=args.explain,
         ),
         progress=_progress(args),
@@ -763,6 +769,10 @@ def _cmd_advise(args) -> None:
         writer=_writer(args),
         notifiers=_notifiers(args, args.output_dir, "advice"),
         security_master_adapter=_security_master_reference(),
+        # 只有 `advise` 这条命令落台账。`ask` / `facts` / `chat` 也调 `run_advise`，
+        # 但它们是**查**，不是发建议——把一次随口问的标的记成「系统当天的建议」，
+        # 事后统计就分不清哪些是系统主动给的了。
+        journal=Journal(),
         progress=_progress(args),
     )
     _dump_json(_trim(summary))
@@ -957,7 +967,7 @@ def _cmd_codex_adjudication_validate(args) -> None:
     result = validate_external_decisions(
         packet,
         decision,
-        now=beijing_now().replace(tzinfo=None),
+        now=beijing_naive_now(),
         max_age_minutes=args.max_age_minutes,
     )
     _dump_json(result.to_dict(), args.output)
@@ -999,6 +1009,7 @@ def _cmd_wyckoff_scan(args) -> None:
 
 def _cmd_strategy_screen(args) -> None:
     """Run the deterministic full-universe strategy scanner for AI consumption."""
+    # 只要标的画像（名称与行业），不需要概念那一层，所以不走 `static_taxonomies`。
     taxonomy = ThsIndustryTaxonomy(level="SW1")
     profiles = taxonomy.snapshot.profiles
     symbols = sorted(profiles)
@@ -1125,6 +1136,38 @@ def _cmd_state(args) -> None:
     _dump_json(_state_report())
 
 
+def _cmd_calendar_refresh(args) -> None:
+    """把行情源的交易日历刷进 `holidays.json`。
+
+    这条命令此前**不存在**，而 `TradingCalendar.refresh_from` 是唯一能写这张表的
+    代码——于是表永远是空的，判定退化成「周末以外都算交易日」。它不是静默错误
+    （`explain()` 会老实说「未经假期校验」，`is_trading_day` 也刻意偏向「跑」），
+    但那张表除了手工编辑之外没有任何补上的办法。
+    """
+    calendar = TradingCalendar()
+    year = args.year or beijing_today().year
+    adapter = _tickflow(args) if args.source == "tickflow" else AkshareAdapter()
+    trading_days = calendar.refresh_from(adapter, year)
+    _dump_json(
+        {
+            "year": year,
+            "source": args.source,
+            "path": str(calendar.path),
+            # 0 = 这个源给不出日历（免费档常见）。这时**保持原状**，不会把已有的
+            # 表清空——半张表比没有表更危险，它看起来是校验过的。
+            "trading_days": trading_days,
+            "holidays": len(calendar.holidays),
+            "workdays": len(calendar.workdays),
+            "note": (
+                f"{year} 年共 {trading_days} 个交易日，节假日表已更新"
+                if trading_days
+                else f"{args.source} 给不出交易日历，节假日表保持原状（当前 "
+                f"{len(calendar.holidays)} 个假日）"
+            ),
+        }
+    )
+
+
 COMMANDS = {
     "daemon": _cmd_daemon,
     "morning": _cmd_morning,
@@ -1147,6 +1190,7 @@ COMMANDS = {
     "intraday-check": _cmd_intraday_check,
     "qmt-health": _cmd_qmt_health,
     "state": _cmd_state,
+    "calendar-refresh": _cmd_calendar_refresh,
 }
 
 

@@ -202,3 +202,23 @@ def reconcile(
             + "、".join(missing_names[:sample_limit])
         )
     return notes
+
+
+def static_taxonomies(
+    level: str = "SW1",
+    source: ThsTaxonomySource | None = None,
+) -> tuple[ThsIndustryTaxonomy, ThsConceptTaxonomy]:
+    """行业 + 概念两层，**共用同一个 `ThsTaxonomySource`**。
+
+    共用不只是省一次 HTTP：source 的进程内缓存保证两层看到的是**同一份快照**。
+    各建一个的话，两次 `load()` 之间上游刷新（实测每天北京 08:00 一次，而盘前
+    跑批就在 08:30 前后）会让行业按昨天的成分股算、概念按今天的算——这种错位
+    在产出里看不出来，只会表现为某个板块的成分数对不上。
+
+    收成一个函数是因为构造这一对的地方有三处（`cli.py` 的 `morning` 与 chat
+    上下文、`jobs/daily_cycle.py` 的 daemon），而**daemon 那处此前只建了行业**。
+    于是同一套分类，手工跑 `morning` 有概念维度、无人值守跑没有，而 daemon 才是
+    这套系统真正在跑的那条路。
+    """
+    shared = source or ThsTaxonomySource()
+    return ThsIndustryTaxonomy(source=shared, level=level), ThsConceptTaxonomy(source=shared)

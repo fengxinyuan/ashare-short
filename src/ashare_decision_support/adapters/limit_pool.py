@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import json
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import as_int, finite
 
 BASE_URL = (
@@ -57,6 +57,16 @@ STREAK_WEAK = 2
 # 炸板率分档，同样只用于措辞。
 BLOWUP_HEALTHY = 0.25
 BLOWUP_STRESSED = 0.45
+
+# 首封时间的早/晚分界。10:00 前封住 = 开盘半小时内就有资金把它按在板上，
+# 主动性买盘；尾盘才封的多是偷袭或跟风，次日的接力意愿是两回事。
+#
+# 这条线和下面的占比分档只用于措辞，同 STREAK / BLOWUP 两组，不参与打分。
+EARLY_SEAL_BEFORE = "10:00"
+EARLY_SEAL_STRONG = 0.5
+
+# 涨停行业分布取前几名。
+SECTOR_TOP = 5
 
 # 价格字段是"分"的整数（16920 = 16.92 元）。
 PRICE_SCALE = 1000.0
@@ -128,6 +138,67 @@ class LimitPoolSnapshot:
                 counts[item.streak] = counts.get(item.streak, 0) + 1
         return dict(sorted(counts.items()))
 
+    # ---- 封板质量 ---------------------------------------------------------
+    #
+    # 下面四个读数用的是 `LimitStock` 里**一直解析着、但此前没有任何调用方**的四个
+    # 字段：`first_seal`（首封时间）、`seal_fund`（封单金额）、`turnover`（换手率）、
+    # `sector`（东财行业）。2026-08-07 实测 74 只涨停四项全有值。
+    #
+    # 少了它们，涨停池只能回答「今天有多少只涨停」，回答不了超短线真正要问的两件
+    # 事：**这些板封得结不结实**（封单薄、换手高的次日容易被砸开），**它们扎堆在
+    # 哪**（这是「主线在哪」最直接的一个读数，比连板高度更早给出方向）。
+
+    @property
+    def early_seal_ratio(self) -> float | None:
+        """首封早于 `EARLY_SEAL_BEFORE` 的涨停占比。没有首封时间返回 None。
+
+        返回 None 而不是 0.0：「没有一只早盘封板」和「拿不到首封时间」是两件事，
+        同 `blowup_rate` 分母为 0 的处置。
+        """
+        stamped = [item for item in self.limit_up if item.first_seal]
+        if not stamped:
+            return None
+        early = sum(1 for item in stamped if item.first_seal < EARLY_SEAL_BEFORE)
+        return round(early / len(stamped), 4)
+
+    @property
+    def median_seal_fund(self) -> float | None:
+        """封单金额中位数。
+
+        用中位数不用均值：封单金额是长尾分布，2026-08-07 实测最大 6.51 亿、
+        中位只有 0.72 亿——均值会被那一两只独苗拉起来，把「全场封板普遍很薄」
+        这个事实盖掉，而薄不薄才是次日会不会被砸开的那个量。
+        """
+        funds = sorted(item.seal_fund for item in self.limit_up if item.seal_fund is not None)
+        if not funds:
+            return None
+        return funds[len(funds) // 2]
+
+    @property
+    def median_turnover(self) -> float | None:
+        """涨停板换手率中位数（百分数，7.89 = 7.89%）。
+
+        和 `median_seal_fund` 是同一个问题的两面，必须一起读：封单答「有多少钱
+        压在买一」，换手答「有多少筹码今天换了手」。**两个都差才是真的不牢**——
+        2026-08-07 实测封单中位 0.72 亿、换手中位 7.89%，而当天换手最低的宝鼎科技
+        只有 1.21%（封单 2.20 亿、4 板），换手最高的红板科技 24.12%。
+
+        同样用中位数：换手率的上下限差了 20 倍（1.21% ~ 24.12%），均值说不出
+        「大多数板是什么样」。
+        """
+        rates = sorted(item.turnover for item in self.limit_up if item.turnover is not None)
+        if not rates:
+            return None
+        return rates[len(rates) // 2]
+
+    def sector_distribution(self, top: int = SECTOR_TOP) -> list[tuple[str, int]]:
+        """涨停按东财行业分组，只数从多到少。并列时按行业名排序，保证可 diff。"""
+        counts: dict[str, int] = {}
+        for item in self.limit_up:
+            if item.sector:
+                counts[item.sector] = counts.get(item.sector, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top]
+
     def describe(self) -> list[str]:
         """给简报用的人话描述。每一句都挂在一个实际读数上。"""
         if not self.ok:
@@ -153,6 +224,38 @@ class LimitPoolSnapshot:
             else:
                 verdict = "接力一般"
             lines.append(f"最高连板 {self.max_streak} 板（{verdict}）")
+        lines.extend(self._seal_quality_lines())
+        return lines
+
+    def _seal_quality_lines(self) -> list[str]:
+        """封板质量与扎堆方向。四个读数各自缺数据时单独跳过，不互相拖累。"""
+        lines: list[str] = []
+        early = self.early_seal_ratio
+        if early is not None:
+            verdict = (
+                "主动性买盘为主" if early >= EARLY_SEAL_STRONG else "多数是盘中或尾盘才封上"
+            )
+            lines.append(f"早盘封板占比 {early:.0%}（首封早于 {EARLY_SEAL_BEFORE}，{verdict}）")
+        # 封单与换手写在同一行：它们是「这些板牢不牢」的两面，拆成两行会让读的人
+        # 分别去判断，而单看任何一个都得不出结论——封单薄但换手也低是惜售，
+        # 封单薄且换手高才是随时会开板。
+        strength = [
+            text
+            for text in (
+                None if self.median_seal_fund is None else f"封单中位 {self.median_seal_fund / 1e8:.2f} 亿",
+                None if self.median_turnover is None else f"换手中位 {self.median_turnover:.1f}%",
+            )
+            if text
+        ]
+        if strength:
+            # 只报数不下判断：封单多厚、换手多高算牢，都没有校准过的阈值，
+            # 给一个会是编的。分档留给读的人和 `review` 攒够样本之后。
+            lines.append("封板强度：" + "，".join(strength))
+        sectors = self.sector_distribution()
+        if sectors:
+            lines.append(
+                "涨停扎堆的行业：" + "、".join(f"{name} {count} 只" for name, count in sectors)
+            )
         return lines
 
 
@@ -175,21 +278,16 @@ class LimitPoolAdapter:
         stamp = trade_date.strftime("%Y%m%d")
         pools = (POOL_LIMIT_UP, POOL_BLOWUP, POOL_LIMIT_DOWN)
 
-        def load(pool: str) -> tuple[str, tuple[list[LimitStock], date | None] | None]:
-            try:
-                return pool, self._fetch_pool(pool, stamp)
-            except Exception:
-                return pool, None
-
-        with ThreadPoolExecutor(max_workers=len(pools)) as executor:
-            results = dict(executor.map(load, pools))
+        done, errors = gather(pools, lambda pool: self._fetch_pool(pool, stamp))
+        results = dict(done)
 
         notes: list[str] = []
-        failed = [pool for pool, rows in results.items() if rows is None]
+        failed = [pool for pool, _ in errors]
         if failed:
-            notes.append(
-                f"涨停池取数失败：{'、'.join(_POOL_LABELS[p] for p in failed)}，相关读数本次缺失"
+            reasons = "、".join(
+                f"{_POOL_LABELS[pool]}（{type(exc).__name__}）" for pool, exc in errors
             )
+            notes.append(f"涨停池取数失败：{reasons}，相关读数本次缺失")
 
         def rows(pool: str) -> list[LimitStock]:
             entry = results.get(pool)

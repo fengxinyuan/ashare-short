@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 
 from ashare_decision_support.notify.base import Notifier, NotifierCapabilities
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 
 
 class ConsoleNotifier(Notifier):
@@ -31,7 +31,7 @@ class FileNotifier(Notifier):
     def __init__(self, output_dir: str | Path, slug: str = "brief", stamp: str | None = None) -> None:
         self.output_dir = Path(output_dir)
         self.slug = slug
-        self.stamp = stamp or datetime.now().strftime("%Y%m%d")
+        self.stamp = stamp or beijing_naive_now().strftime("%Y%m%d")
         self.last_path: Path | None = None
 
     def send(self, title: str, content: str) -> bool:

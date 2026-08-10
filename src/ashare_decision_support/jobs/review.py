@@ -15,6 +15,7 @@ from ashare_decision_support.journal.stats import MIN_BUCKET, MODEL_READY_SAMPLE
 from ashare_decision_support.notify import ConsoleNotifier
 from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import DISCLAIMER
+from ashare_decision_support.schedule.timezone import beijing_today
 
 
 def run_review(
@@ -24,7 +25,7 @@ def run_review(
     notifiers: list[Notifier] | None = None,
     trade_date: date | None = None,
 ) -> dict[str, Any]:
-    today = trade_date or date.today()
+    today = trade_date or beijing_today()
     book = journal or Journal()
     channels = notifiers if notifiers is not None else [ConsoleNotifier()]
 

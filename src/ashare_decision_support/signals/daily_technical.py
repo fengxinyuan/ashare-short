@@ -8,6 +8,7 @@ from statistics import fmean
 from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, PriceLevel
 from ashare_decision_support.numeric import clamp
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.signals.series import normalize_bars
 
 # 止损距离的上下限，单位是标的自身的 ATR。低于下限的止损是随机噪声（必被打掉），
@@ -44,7 +45,7 @@ class DailyTechnicalAnalyzer:
     def analyze(self, symbol: str, bars: list[dict]) -> DailyTechnicalSnapshot:
         rows = self._normalize_rows(bars)
         if not rows:
-            now = datetime.now()
+            now = beijing_naive_now()
             return DailyTechnicalSnapshot(
                 symbol=symbol,
                 bar_count=0,

@@ -48,6 +48,7 @@ from ashare_decision_support.agents import (
     SectorMetricsAgent,
     SymbolNewsAgent,
     run_agents,
+    timing_note,
 )
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.jobs.progress import progress_reporter
@@ -106,11 +107,13 @@ from ashare_decision_support.screens import (
     LiquidityScreen,
 )
 from ashare_decision_support.sectors import (
+    CONCEPT_LEVEL,
     SectorPredictor,
     SectorRotationStore,
     TickFlowSwTaxonomy,
     read_rotation,
     read_turnover,
+    reverse_index,
 )
 from ashare_decision_support.state import SOURCE_SCAN, CandidatePool, WatchEntry
 from ashare_decision_support.strategy.positioning import resolve_position_sizing
@@ -156,6 +159,10 @@ class MorningConfig:
     """
 
     top_sectors: int = 5
+    # 概念板块单独取几个。**和 `top_sectors` 分开数**，因为两层是分开排名的：
+    # 合成一个名额会让 346 个概念把 31 个行业整体挤出去（概念数量多，出极值的
+    # 机会也多），而行业回答的「这是什么生意」并不因此变得不重要。
+    top_concepts: int = 3
     candidates_per_sector: int = 3
     sector_level: str = "SW1"
     position_factor: float | None = None
@@ -173,6 +180,10 @@ class MorningConfig:
     use_earnings: bool = True
     use_broad_index: bool = True
     use_trade_flow: bool = True
+    # 概念板块进不进盘前排序。盘中监控（`sectors/intraday.py`）从 2026-08-09 起
+    # 就是行业+概念两层，盘前一直只有行业——同一天同一套分类，两条链路看到的
+    # 板块集合不一样，这本身就是一处口径分叉。
+    use_concepts: bool = True
     explain: bool = False
 
 
@@ -202,6 +213,7 @@ class Sources:
     broad_index_adapter: Any | None = None
     trade_flow_adapter: Any | None = None
     industry_taxonomy: Any | None = None
+    concept_taxonomy: Any | None = None
 
 
 # 下面五个 `_Stage*` 是**阶段之间的交接单**，不是领域模型：字段就是下一阶段真正
@@ -253,6 +265,10 @@ class _Fusion:
     broad_index: Any
     index_verdict: Any
     effective_factor: float
+    # 仓位决策的**完整**过程，不只是最终值。台账要能分辨「系统就建议 0.5」与
+    # 「系统建议 0.9、被周期上限压到 0.5」——两者的 `effective_factor` 相同，
+    # 而它们对「仓位上限这条规则有没有救过我们」是相反的证据。
+    sizing: Any
     selected: list
     rotation: Any
     theme_radar: list[Any]
@@ -319,14 +335,26 @@ def _stage_universe(
     """① 板块与成分股。"""
     taxonomy, taxonomy_notes = _industry_taxonomy(sources, cfg, output_path)
     notes.extend(taxonomy_notes)
-    definitions = taxonomy.list_sectors()
-    if not definitions:
+    industries = taxonomy.list_sectors()
+    if not industries:
         raise RuntimeError(f"行情源未返回 {cfg.sector_level} 板块分类，无法执行盘前扫描")
-    report(f"① 已读取 {len(definitions)} 个 {cfg.sector_level} 板块，正在并行采集舆情和板块动量")
 
+    concepts = _concept_definitions(sources, cfg, taxonomy, industries, notes)
+    definitions = [*industries, *concepts]
+    report(
+        f"① 已读取 {len(industries)} 个 {cfg.sector_level} 板块"
+        + (f" + {len(concepts)} 个概念" if concepts else "")
+        + "，正在并行采集舆情和板块动量"
+    )
+
+    # 成分股取**两层的并集**。概念文件比行业文件多覆盖上百只票（华银电力、
+    # 华大智造这类不是还没归类的新股），只按行业循环会让它们整只消失——连概念
+    # 板块都进不去，简报里也查不到画像。理由同 `docs/ROADMAP.md` §3.1。
     all_symbols = list(dict.fromkeys(symbol for item in definitions for symbol in item.symbols))
     if cfg.max_constituents is not None:
-        all_symbols = _sample_across_sectors(definitions, cfg.max_constituents)
+        # **抽样只按行业分层。** 概念之间成分股大量重叠，拿它们做分层会让重叠区
+        # 的票被反复抽中，而抽样存在的意义正是「板块间可比」。
+        all_symbols = _sample_across_sectors(industries, cfg.max_constituents)
         notes.append(
             f"本次按板块均匀抽样 {len(all_symbols)} 只成分股（--max-constituents），"
             "板块间可比但读数弱于全量扫描"
@@ -336,6 +364,58 @@ def _stage_universe(
         all_symbols=all_symbols,
         metadata=_taxonomy_metadata(taxonomy, all_symbols),
     )
+
+
+def _concept_definitions(
+    sources: Sources,
+    cfg: MorningConfig,
+    industry_taxonomy: Any,
+    industries: list,
+    notes: list[str],
+) -> list:
+    """概念板块的定义表。取不到就返回空表，**不拖垮行业那条主路**。
+
+    概念这一路是加进来的第二个维度，不是必需项：静态文件挂掉时盘前照样要出得来
+    一份只有行业的排序。所以这里吞掉异常并留 note，而 `_industry_taxonomy` 那条
+    取不到是要抛的——没有行业分类，这条链路根本无从开始。
+
+    **同名的概念直接丢掉。** 板块的各层读数（动量、舆情、龙虎榜净额）全部按
+    `name` 索引，重名会让两层的数据互相覆盖，而覆盖的方向取决于字典写入顺序——
+    那是一个没人声明过、也没法从代码里读出来的规则。2026-08-10 实测 31 个 SW1
+    行业与 346 个概念只撞了「家用电器」一个，丢掉它的代价远小于让一层读数错位。
+    """
+    if not cfg.use_concepts:
+        notes.append("已关闭概念板块（--no-concepts），本次只排行业")
+        return []
+    taxonomy = sources.concept_taxonomy
+    if taxonomy is None:
+        # 默认两层来自同一份同花顺画像。复用 source 后，adapter 的实例缓存保证
+        # 两边看到同一快照且只下载一次；自定义 taxonomy 没有 source 时仍保持
+        # 行业单层，不凭空替换用户提供的数据口径。
+        shared_source = getattr(industry_taxonomy, "source", None)
+        if shared_source is None:
+            notes.append("概念分类未提供，本次只排行业")
+            return []
+        from ashare_decision_support.sectors import ThsConceptTaxonomy
+
+        taxonomy = ThsConceptTaxonomy(shared_source)
+    try:
+        concepts = taxonomy.list_sectors()
+    except Exception as exc:
+        notes.append(f"概念板块不可用，本次板块排序只有行业维度（{type(exc).__name__}）")
+        return []
+
+    taken = {item.name for item in industries}
+    kept = [item for item in concepts if item.name not in taken]
+    if len(kept) != len(concepts):
+        clashed = sorted({item.name for item in concepts} & taken)
+        notes.append(
+            f"{len(concepts) - len(kept)} 个概念与行业重名已跳过（{'、'.join(clashed)}）："
+            "板块读数按名字索引，重名会让两层互相覆盖"
+        )
+    if kept:
+        notes.append(f"概念板块已进入盘前排序：{len(kept)} 个，与行业分开排名、分开取名额")
+    return kept
 
 
 def _stage_collect(
@@ -373,6 +453,9 @@ def _stage_collect(
     )
     for finding in findings.values():
         notes.extend(finding.notes)
+    _timing = timing_note(findings)
+    if _timing:
+        notes.append(_timing)
     report("② 舆情与板块读数已到位，开始融合大盘方向、涨停池和行业指数")
 
     sector_finding = findings["sector_metrics"]
@@ -532,7 +615,14 @@ def _stage_fuse(
         attribution=labels.attribution(),
         fallback_empty_labels=True,
     )
-    market = predictor.market_outlook(market_docs, collected.metrics, limit_pool=limit_snapshot)
+    # 概念彼此重叠，一只股票可能同时属于十几个概念。拿概念指标计算全市场宽度会
+    # 重复计权，并让 300 多个概念淹没 31 个行业；大盘口径因此只使用行业指标。
+    industry_metrics = {
+        item.name: collected.metrics[item.name]
+        for item in definitions
+        if item.level != CONCEPT_LEVEL and item.name in collected.metrics
+    }
+    market = predictor.market_outlook(market_docs, industry_metrics, limit_pool=limit_snapshot)
     notes.extend(market.warnings)
 
     # 宽基指数（市值加权）。**放在 market_outlook 之后、且只往它的 reasons/warnings
@@ -563,7 +653,7 @@ def _stage_fuse(
     notes.extend(sizing.notes)
     effective_factor = sizing.effective_factor
 
-    selected = [item for item in outlooks if item.trusted][: max(cfg.top_sectors, 0)]
+    selected = _select_sectors(outlooks, cfg, notes)
     untrusted = [item for item in outlooks if not item.trusted]
     if untrusted:
         notes.append(
@@ -578,7 +668,7 @@ def _stage_fuse(
     rotation = SectorRotationStore().remember(
         today,
         cfg.sector_level,
-        outlooks,
+        [item for item in outlooks if item.level != CONCEPT_LEVEL],
         lookback_days=ROTATION_LOOKBACK_DAYS,
         leader_count=max(cfg.top_sectors, 1),
     )
@@ -603,6 +693,7 @@ def _stage_fuse(
         broad_index=broad_index,
         index_verdict=index_verdict,
         effective_factor=effective_factor,
+        sizing=sizing,
         selected=selected,
         rotation=rotation,
         theme_radar=theme_radar,
@@ -622,12 +713,16 @@ def _stage_select(
     """④ 板块内选股。"""
     by_name = {item.name: item for item in universe.definitions}
     selected = fusion.selected
-    shortlist = [
-        symbol
-        for outlook in selected
-        for symbol in by_name[outlook.name].symbols
-        if collected.metric_bars.get(symbol)
-    ]
+    # 行业与概念、概念与概念之间天然重叠。先去重再取长历史和跑筛选，避免同一只票
+    # 命中多个板块时重复取数、重复进入漏斗。
+    shortlist = list(
+        dict.fromkeys(
+            symbol
+            for outlook in selected
+            for symbol in by_name[outlook.name].symbols
+            if collected.metric_bars.get(symbol)
+        )
+    )
     kept, earnings_verdicts, screen_notes = _apply_screens(
         shortlist,
         collected.announcements,
@@ -636,9 +731,9 @@ def _stage_select(
     )
     notes.extend(screen_notes)
 
-    selected_sector_of = {
-        symbol: outlook.name for outlook in selected for symbol in by_name[outlook.name].symbols
-    }
+    # `selected` 已按板块强弱排好序，所以这里的并列规则「留第一个」= 一只票同时
+    # 属于两个入选板块时，归给更强的那个。规则与理由都在 `reverse_index`。
+    selected_sector_of = reverse_index(by_name[outlook.name] for outlook in selected)
     factor_contexts = build_factor_contexts(
         selected,
         selected_sector_of,
@@ -767,6 +862,7 @@ def _stage_record(
         turnover=fusion.turnover_migration,
         broad_index=fusion.broad_index,
         index_verdict=fusion.index_verdict,
+        sizing=fusion.sizing,
     )
     journal = sources.journal or Journal()
     macro_context = macro_context_of(fusion.macro_links)
@@ -931,6 +1027,12 @@ def _stage_publish(
         "news_read_items": fusion.daily_read.item_count,
         "sectors_ranked": len(fusion.outlooks),
         "sectors_selected": [item.name for item in fusion.selected],
+        "industry_sectors_selected": [
+            item.name for item in fusion.selected if item.level != CONCEPT_LEVEL
+        ],
+        "concept_sectors_selected": [
+            item.name for item in fusion.selected if item.level == CONCEPT_LEVEL
+        ],
         "candidates": len(candidates),
         "candidate_symbols": [item["symbol"] for item in candidates],
         "funnel": dict(selection.funnel),
@@ -1579,6 +1681,33 @@ def _rank_candidates(
     )
 
 
+def _select_sectors(outlooks: list, cfg: MorningConfig, notes: list[str]) -> list:
+    """选主攻板块。**行业与概念各自排名、各取各的名额。**
+
+    并成一张榜是错的，理由与 `sectors/intraday.py` 开头那条一样：346 个概念和
+    31 个行业放进同一张榜，前者仅凭数量就能包揽前几名——出极值的机会多得多，
+    而那不代表它们更值得做。分开取之后，「今天最强的生意」和「今天最强的题材」
+    是两个各自成立的答案，简报里也能并排读。
+
+    `level` 为空的当行业算：单层调用方（老测试、只传 `industry_taxonomy` 的
+    路径）行为一字不变。
+    """
+    trusted = [item for item in outlooks if item.trusted]
+    concepts = [item for item in trusted if item.level == CONCEPT_LEVEL]
+    industries = [item for item in trusted if item.level != CONCEPT_LEVEL]
+
+    picked = industries[: max(cfg.top_sectors, 0)]
+    if concepts:
+        picked = [*picked, *concepts[: max(cfg.top_concepts, 0)]]
+        notes.append(
+            f"主攻板块 {len(picked)} 个：行业 {len(picked) - min(len(concepts), max(cfg.top_concepts, 0))} 个"
+            f" + 概念 {min(len(concepts), max(cfg.top_concepts, 0))} 个（两层分开排名）"
+        )
+    # 合并之后再按分数排一次，只为让下游拿到的顺序仍然是「强的在前」——
+    # `sectors/base.py:reverse_index` 靠这个顺序决定一只票归给哪个板块。
+    return sorted(picked, key=lambda item: item.score, reverse=True)
+
+
 def _industry_taxonomy(
     sources: Sources,
     cfg: MorningConfig,
@@ -1687,6 +1816,7 @@ def _market_state(
     turnover: Any = None,
     broad_index: Any = None,
     index_verdict: str | None = None,
+    sizing: Any = None,
 ) -> dict[str, Any]:
     """建议发出当时的大盘快照，原样存进每一条台账记录。
 
@@ -1706,6 +1836,18 @@ def _market_state(
         "score": getattr(market, "score", None),
         "breadth": getattr(market, "breadth", None),
         "position_factor": position_factor,
+        # 仓位是**怎么得到**这个数的，不只是这个数本身。三条记录下来，事后才分得开
+        # 三种截然不同的决策——它们的 `position_factor` 可以完全一样：
+        #
+        #   系统建议 0.5、上限 0.5        → 规则没起作用，是系统自己就保守
+        #   系统建议 0.9、被上限压到 0.5  → **上限救了这一次**
+        #   系统建议 0.5、手工设成 0.5    → 人接管了，规则只是恰好同值
+        #
+        # 只存最终值的话，「仓位上限这条规则到底有没有用」永远没有样本，而那是
+        # 仓位这一层唯一能被 `review` 验证的方式。
+        "suggested_factor": getattr(sizing, "suggested_factor", None),
+        "capped_suggested_factor": getattr(sizing, "capped_suggested_factor", None),
+        "manual_factor": getattr(sizing, "manual_factor", None),
         # 情绪周期位置的三个读数。炸板率说今天封板质量，连板高度说有没有资金
         # 愿意接力，跌停家数说恐慌程度。
         "blowup_rate": getattr(limit_pool, "blowup_rate", None) if ok else None,
@@ -1742,6 +1884,10 @@ def _market_state(
         # 全场成交额的相对变化。存量腾挪与增量入场下的同一个「高低切换」，对仓位
         # 的含义相反——这是把两者分开的那个字段。
         "turnover_total_change": getattr(turnover, "total_change", None) if turnover_ok else None,
+        # 近端窗口**内部**的量能走向。必须和上面那个一起存：块均值对比在 V 形拐点
+        # 上会指反（2026-08-07 实测 -1.8% 对 +33.4%），只存前者的话，事后分组会把
+        # 「量能刚触底回升」的那几天归进「存量博弈」，而那正是两者含义相反的日子。
+        "turnover_total_trend": getattr(turnover, "total_trend", None) if turnover_ok else None,
         # 市值加权口径。`breadth` 是等权的，两者背离时方向读数会系统性偏乐观，
         # 而只有同时存下来，事后才能把「等权强、加权弱」的日子单独拎出来看。
         "index_median_ret": getattr(broad_index, "median_ret", None) if index_ok else None,
@@ -2056,6 +2202,7 @@ def _facts(
         "sectors": [
             {
                 "name": item.name,
+                "level": item.level,
                 "score": item.score,
                 "direction": item.direction,
                 "ret_1d": item.metrics.ret_1d,

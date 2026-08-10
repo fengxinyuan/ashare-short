@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -47,6 +46,7 @@ from ashare_decision_support.ask.question import (
 from ashare_decision_support.ask.report import render_report
 from ashare_decision_support.ask.verdict import from_context, rank
 from ashare_decision_support.chat.session import SYSTEM_PROMPT
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.schedule.timezone import beijing_now
 from ashare_decision_support.writer.llm import unverified_numbers
 
@@ -256,17 +256,18 @@ def _execute(
         note = "未配置 LLM key，本次没有论证段；结论与价位由规则算出，不受影响"
         return {step.key: {"text": "", "note": note} for step in steps}
 
-    def execute(step: Step) -> tuple[str, dict[str, Any]]:
-        return step.key, _run_step(step, llm, phase)
-
-    workers = min(max(1, max_workers), len(steps))
-    if workers == 1:
-        return dict(execute(step) for step in steps)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return dict(pool.map(execute, steps))
+    done, errors = gather(
+        steps, lambda step: _run_step(step, llm, phase), max_workers=max_workers
+    )
+    findings = {step.key: finding for step, finding in done}
+    # 一步调用失败只损失这一步的论证段：它照样在字典里，只是带着说明没有正文。
+    for step, exc in errors:
+        findings[step.key] = {"text": "", "note": f"调用失败（{type(exc).__name__}）"}
+    return findings
 
 
 def _run_step(step: Step, llm: Any, phase: str) -> dict[str, Any]:
+    """跑一步。**调用失败直接抛**，由 `_execute` 那层把它落成这一步的说明。"""
     facts_text = json.dumps(step.facts, ensure_ascii=False, indent=2, default=str)
     hint = PHASE_HINTS.get(phase, "")
     messages = [
@@ -276,10 +277,7 @@ def _run_step(step: Step, llm: Any, phase: str) -> dict[str, Any]:
             "content": f"【事实】\n```json\n{facts_text}\n```\n\n【子问题】{step.question}",
         },
     ]
-    try:
-        reply = (llm.chat(messages) or "").strip()
-    except Exception as exc:
-        return {"text": "", "note": f"调用失败（{type(exc).__name__}）"}
+    reply = (llm.chat(messages) or "").strip()
     if not reply:
         return {"text": "", "note": "模型返回空内容"}
 

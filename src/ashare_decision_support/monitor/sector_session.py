@@ -30,6 +30,7 @@ from ashare_decision_support.monitor.sector_triggers import (
 )
 from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import render_sector_alerts, sector_alert_title
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.sectors import intraday
 from ashare_decision_support.sectors.intraday import SectorSnapshot
 
@@ -102,7 +103,7 @@ class SectorSession:
         板块是旁证不是主线：它挂了不该让个股监控那一轮跟着停。同
         `notify/base.py:publish` 的处置。
         """
-        moment = now or datetime.now()
+        moment = now or beijing_naive_now()
         try:
             snapshot = intraday.take_snapshot(
                 self.taxonomies,

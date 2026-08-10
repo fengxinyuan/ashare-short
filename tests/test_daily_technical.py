@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from ashare_decision_support.models.enums import TrendState
+from ashare_decision_support.schedule.timezone import BEIJING_TZ
 from ashare_decision_support.signals.daily_technical import (
     DailyKChartRenderer,
     DailyTechnicalAnalyzer,
@@ -85,8 +86,12 @@ def test_bar_datetime_reads_every_shape_the_feeds_hand_back() -> None:
 
     # datetime 原样返回；秒与毫秒时间戳都认。
     assert bar_datetime(stamped) is stamped
-    assert bar_datetime(stamped.timestamp()) == stamped
-    assert bar_datetime(stamped.timestamp() * 1000.0) == stamped
+    # epoch 要按**北京**折算，不能按宿主机时区：裸 `stamped.timestamp()` 在 UTC
+    # 容器里会让这条断言凭空要求偏 8 小时的结果，而那正是 `beijing_from_epoch`
+    # 存在的理由。
+    epoch = stamped.replace(tzinfo=BEIJING_TZ).timestamp()
+    assert bar_datetime(epoch) == stamped
+    assert bar_datetime(epoch * 1000.0) == stamped
 
 
 def test_bar_datetime_refuses_rather_than_inventing_a_date() -> None:

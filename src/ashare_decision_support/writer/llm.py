@@ -14,11 +14,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from ashare_decision_support.factcheck import (
+    NUMBER_PATTERN,
+    ORDINAL_CEILING,
+    UNIT_SCALES,
+    fact_numbers,
+)
 from ashare_decision_support.writer.base import BriefWriter, WriteRequest, WriteResult
 
 
@@ -72,17 +77,6 @@ SYSTEM_PROMPT = """你是一名 A 股短线分析助手的文字改写器。
 6. 输出要像分析，不像报表：先给判断，再讲证据，再讲风险/分歧点/下一步观察条件。
 
 输出格式：Markdown，不要代码块包裹，不要堆装饰。"""
-
-# Numbers this small are list ordinals and section numbering, which the model
-# legitimately produces even though they are absent from the facts.
-ORDINAL_CEILING = 20
-
-NUMBER_PATTERN = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
-
-# Chinese financial prose rescales figures inline. A suffix here lets the number
-# in front of it be compared against the facts at that scale, so "0.12亿" is
-# checked against 12198154.38 rather than being called an invention.
-UNIT_SCALES: dict[str, float] = {"万": 1e4, "亿": 1e8, "%": 0.01, "％": 0.01}
 
 
 class LlmClient:
@@ -267,14 +261,7 @@ def unverified_numbers(generated: str, facts_text: str) -> list[str]:
     tokenising "12,198,154.38" as 12 / 198 / 154.38 made every grouped figure
     look fabricated.
     """
-    fact_tokens = {token.replace(",", "") for token in NUMBER_PATTERN.findall(facts_text)}
-    fact_values: set[float] = set()
-    for token in fact_tokens:
-        try:
-            fact_values.add(float(token))
-        except ValueError:
-            continue
-
+    fact_tokens, fact_values = fact_numbers(facts_text)
     offenders: list[str] = []
     for match in NUMBER_PATTERN.finditer(generated):
         raw_token = match.group()

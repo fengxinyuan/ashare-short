@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Any
 
+from ashare_decision_support.numeric import positive
+
 SINA_URL = "https://hq.sinajs.cn/list="
 SINA_REFERER = "https://finance.sina.com.cn"
 USER_AGENT = "Mozilla/5.0"
@@ -146,10 +148,6 @@ class BroadIndexRead:
         scored = [quote for quote in self.quotes if quote.ret is not None]
         return min(scored, key=lambda quote: quote.ret or 0.0) if scored else None
 
-    def best(self) -> IndexQuote | None:
-        scored = [quote for quote in self.quotes if quote.ret is not None]
-        return max(scored, key=lambda quote: quote.ret or 0.0) if scored else None
-
     def summary(self) -> str:
         """一行摘要，按涨跌幅排序。"""
         ordered = sorted(
@@ -243,7 +241,7 @@ def _parse(body: str, names: dict[str, str]) -> list[IndexQuote]:
         fields = line.split('"', 2)[1].split(",")
         if len(fields) < 32:
             continue
-        close = _positive(fields[3])
+        close = positive(fields[3])
         if close is None:
             # 停牌或未开盘的指数返回 0。把 0.00 当点位发出去比报缺失更糟。
             continue
@@ -252,20 +250,12 @@ def _parse(body: str, names: dict[str, str]) -> list[IndexQuote]:
                 code=code,
                 name=names.get(code) or fields[0] or code,
                 close=close,
-                prev_close=_positive(fields[2]),
-                amount=_positive(fields[9]),
+                prev_close=positive(fields[2]),
+                amount=positive(fields[9]),
                 trade_date=fields[30].strip() or None,
             )
         )
     return quotes
-
-
-def _positive(value: str) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 else None
 
 
 def divergence_verdict(

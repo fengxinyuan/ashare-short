@@ -12,44 +12,6 @@ from ashare_decision_support.models.enums import (
 )
 
 
-class AuctionFeatures(BaseModel):
-    """集合竞价读数。**这是适配器协议的一部分，不是策略层的输入。**
-
-    `adapters/base.py` 的 `get_auction_features` 与五个适配器实现都按它出参。策略
-    层目前不消费它——QMT 补不上撮合量与未匹配量（见 `docs/DECISIONS.md`），所以
-    竞价那条线还没建起来。留着是因为归一层（`adapters/mapping.py`）已经在用它当
-    券商字段的落点。
-    """
-
-    symbol: str
-    matched_qty: int = Field(ge=0)
-    # None when the feed cannot observe auction microstructure at all. Engines
-    # must treat None as "unknown", never as zero.
-    matched_amount: float | None = Field(default=None, ge=0)
-    unmatched_qty: int = Field(ge=0)
-    unmatched_side: Literal["B", "S", "N"] = "N"
-    indicative_match_price: float = Field(gt=0)
-    open_gap_pct: float
-    cancel_pre920_ratio: float | None = Field(default=None, ge=0, le=1)
-    seal_ratio: float | None = Field(default=None, ge=0)
-    tail_flow_distortion: bool = False
-    data_stale: bool = False
-    source_ts: datetime
-
-
-class OpenFeatures(BaseModel):
-    """开盘后前若干分钟的读数。与 `AuctionFeatures` 同属适配器协议。"""
-
-    symbol: str
-    minutes_since_open: int = Field(ge=0)
-    price_vs_open_pct: float
-    price_vs_vwap_pct: float
-    volume_ratio: float = Field(ge=0)
-    open_gap_pct: float
-    data_stale: bool = False
-    source_ts: datetime
-
-
 class WyckoffSignal(BaseModel):
     model_config = ConfigDict(use_enum_values=False)
 

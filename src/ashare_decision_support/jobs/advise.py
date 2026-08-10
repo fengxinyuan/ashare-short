@@ -28,13 +28,17 @@ from ashare_decision_support.agents import (
     SymbolIntradayAgent,
     SymbolNewsAgent,
     run_agents,
+    timing_note,
 )
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.jobs.progress import progress_reporter
+from ashare_decision_support.journal import Journal
+from ashare_decision_support.journal.records import Recommendation
 from ashare_decision_support.news import AkshareNewsSource
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import advice_mandatory_block, render_advice_brief
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
 from ashare_decision_support.screens import EarningsScreen
 from ashare_decision_support.signals.dipbuy import measure_dip
@@ -52,6 +56,12 @@ from ashare_decision_support.writer.base import BriefWriter
 
 ADVICE_LATEST_NAME = "advice_latest.json"
 DAILY_LOOKBACK_DAYS = 240
+
+# 台账里这条链路的来源标签。**必须与 `morning` 的 `"morning"` 区分开**：
+# `journal/stats.py` 的 `_selection_edge` / `_veto_cost` 比的是「同日、同筛选
+# 流程、只差最后一刀排序」的两组，而 `advise` 的标的是人手点名的、根本没走过
+# 那道筛选。混进入选组会把那个差值稀释成一个谁都不像的数。
+ADVISE_SOURCE = "advise"
 
 
 def run_advise(
@@ -73,9 +83,10 @@ def run_advise(
     earnings_adapter: Any | None = None,
     security_master_adapter: Any | None = None,
     use_earnings: bool = True,
+    journal: Journal | None = None,
     progress: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
-    today = trade_date or date.today()
+    today = trade_date or beijing_today()
     notes: list[str] = []
     provider = score_provider or RuleBasedScoreProvider()
 
@@ -118,6 +129,9 @@ def run_advise(
     findings = run_agents(collectors, ctx, max_workers=len(collectors))
     for finding in findings.values():
         notes.extend(finding.notes)
+    _timing = timing_note(findings)
+    if _timing:
+        notes.append(_timing)
 
     daily = findings["symbol_daily"]
     if not daily.ok:
@@ -234,6 +248,7 @@ def run_advise(
         advices.append(advice)
 
     facts = _facts(today, advices, notes, period, sentiment, master)
+    recorded = _record_journal(journal, advices, today, facts) if journal is not None else 0
     _progress("② 结构、买卖点和情景已算完，正在整理简报与辩论")
 
     # ---- 多空辩论（可关）--------------------------------------------------
@@ -289,9 +304,53 @@ def run_advise(
         "delivered": delivered,
         "data_notes": notes,
         "facts": facts,
+        "journal_records": recorded,
         "brief_path": brief_path,
         "content": markdown,
     }
+
+
+def _record_journal(
+    journal: Journal,
+    advices: list[StockAdvice],
+    today: date,
+    facts: dict[str, Any],
+) -> int:
+    """把这一轮的买卖点落台账，供 `review` 事后核对。
+
+    **接这条线是为了让 `adjudication` 字段真的有值。** 三层裁决的记录格式
+    （`journal/records.py:_adjudication_record`）和读它的统计
+    （`journal/stats.py:_adjudication_edge`）早就写好了，唯独没有生产写入方：
+    `morning` 跑在盘前，那时没有分时，压根不经过裁决层。于是「模型裁决比规则默认
+    准不准」——**加这一层时唯一没法在设计阶段回答的问题**——在台账里永远是
+    `available: False`。裁决器开不开都要记：不开时 `rule_default` 写下的是规则
+    自己的选择（`used_fallback=True`），那正是对照组。
+
+    **只记进过裁决层的那些**（`adjudication is not None`，即候选集算得出来）。
+    算不出价位的标的记进来会全部落进 `_adjudication_edge` 的「规则默认」组——
+    那个函数的 docstring 说得很清楚，掺进没做过决定的样本，差值就被稀释向零。
+    弃权的记录**要留**：它没有买入价，但 `abstained_samples` 单独统计它。
+
+    **同一只票同一天只记第一条。** `advise` 是随时可以再跑的命令，而
+    `record_many` 是无脑追加，不挡一道，一天跑五次就是五条同源记录，`stats` 会
+    当成五个独立样本。留第一条而不是最后一条，是因为核对流程看的是「记下之后
+    价格有没有进入买入区间」（`journal/verify.py`）——14:50 记的那条只剩十分钟
+    可走，它的「没进区间」说明不了买卖点的好坏。
+    """
+    already = {
+        row.get("symbol")
+        for row in journal.recommendations(since=today, until=today)
+        if row.get("source") == ADVISE_SOURCE
+    }
+    records: list[Recommendation] = []
+    for advice in advices:
+        if advice.symbol in already or advice.adjudication is None:
+            continue
+        # 参考价缺失时 `from_advice` 返回 None——没有参考价就算不出相对值。
+        record = Recommendation.from_advice(advice, today, source=ADVISE_SOURCE, facts=facts)
+        if record is not None:
+            records.append(record)
+    return journal.record_many(list(records))
 
 
 def _default_intraday(data_adapter: Any = None) -> Any | None:

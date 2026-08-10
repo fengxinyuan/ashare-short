@@ -50,7 +50,14 @@ from typing import Any
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.tabular import records
 
-LHB_SOURCE = "akshare.stock_lhb_stock_detail_em"
+# akshare 里这一层唯一的入口函数。写成常量是因为它出现两次——`getattr` 的键和
+# 取不到时的说明文案，两处写死必然漂（改了键忘了文案，读的人就会去查一个根本不
+# 存在的函数名）。
+#
+# 原先这里还有一个 `LHB_SOURCE = "akshare.stock_lhb_stock_detail_em"` 的来源标签，
+# 已删：`SeatRead` 没有任何 provenance 字段，那个标签**无处可去**，从定义那天起
+# 就没有调用方。取数来源已经由下面的说明文案带出来了。
+LHB_FUNCTION = "stock_lhb_stock_detail_em"
 
 # 席位类别。前三类由名称精确判定，是交易所的固定称谓，不是猜的。
 SEAT_INSTITUTION = "机构专用"
@@ -181,9 +188,9 @@ class LhbSeatAdapter:
         code = "".join(ch for ch in str(symbol) if ch.isdigit())[:6]
         read = SeatRead(symbol=symbol, trade_date=day_key)
 
-        fn = getattr(self.ak, "stock_lhb_stock_detail_em", None) if self.ak else None
+        fn = getattr(self.ak, LHB_FUNCTION, None) if self.ak else None
         if fn is None:
-            read.reason = "AkShare 未提供 stock_lhb_stock_detail_em"
+            read.reason = f"AkShare 未提供 {LHB_FUNCTION}"
             return read
 
         merged = self._merge_rows(fn, code, day_key, read)

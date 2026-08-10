@@ -401,6 +401,11 @@ def _readings(payload: dict, intraday: dict, book: dict) -> list[str]:
     gap = finite(intraday.get("price_vs_open_pct"))
     open_price = finite(intraday.get("open"))
     open_gap = finite(intraday.get("open_gap_pct"))
+    day_change = finite(intraday.get("day_change_pct"))
+    if day_change is not None:
+        # 先报「今天涨了多少」。下面两行拆的是这个数的构成（跳空多少 + 开盘后走了
+        # 多少），但读的人最先要的是合计那一个——它是行情软件上的那个涨幅。
+        readings.append(f"今日涨幅 {day_change:+.2%}")
     if open_price is not None:
         # 跳空和开盘后的走势是两件事，分开报。「低开 3% 然后一路涨回来」和
         # 「平开一路阴跌 3%」在只报一个数时长得一样。

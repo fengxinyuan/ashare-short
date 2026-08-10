@@ -39,10 +39,8 @@ from ashare_decision_support.advice.candidates import (
     CandidateSet,
     PriceCandidate,
 )
-from ashare_decision_support.writer.llm import DEFAULT_PROVIDER, NUMBER_PATTERN, LlmClient
-
-# 说明文字里允许出现、且不必追溯到读数的小整数：条目序号、档位数。
-ORDINAL_CEILING = 20
+from ashare_decision_support.factcheck import NUMBER_PATTERN, ORDINAL_CEILING, fact_numbers
+from ashare_decision_support.writer.llm import DEFAULT_PROVIDER, LlmClient
 
 SYSTEM_PROMPT = """你是一名 A 股超短线交易员的价位裁决助手。
 
@@ -259,14 +257,7 @@ def offending_numbers(text: str, candidates: CandidateSet, facts_text: str) -> l
     小整数（≤20 且无小数点）放行：它们是「第 3 档」「5 档买盘」这类序数。
     """
     allowed = candidates.prices()
-    fact_tokens = {token.replace(",", "") for token in NUMBER_PATTERN.findall(facts_text)}
-    fact_values: set[float] = set()
-    for token in fact_tokens:
-        try:
-            fact_values.add(float(token))
-        except ValueError:
-            continue
-
+    fact_tokens, fact_values = fact_numbers(facts_text)
     offenders: list[str] = []
     for match in NUMBER_PATTERN.finditer(text):
         raw = match.group()

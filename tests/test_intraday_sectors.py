@@ -36,7 +36,7 @@ from ashare_decision_support.notify.base import NotifierCapabilities
 from ashare_decision_support.sectors import intraday
 from ashare_decision_support.sectors.base import SectorDefinition
 from ashare_decision_support.sectors.intraday import SectorRead, SectorSnapshot
-from ashare_decision_support.sectors.ths_taxonomy import ThsConceptTaxonomy
+from ashare_decision_support.sectors.ths_taxonomy import ThsConceptTaxonomy, ThsIndustryTaxonomy
 
 
 class RecordingNotifier:
@@ -203,6 +203,33 @@ def test_cache_from_yesterday_is_refetched(tmp_path) -> None:
     again = ThsTaxonomySource(opener=opener_for(files), cache_dir=tmp_path).load()
     assert again.from_cache is False
     assert again.profiles["600000.SH"].name == "今天的名字"
+
+
+def test_shared_source_loads_one_snapshot_for_industry_and_concepts(tmp_path) -> None:
+    """同一轮的行业/概念不能各下载一遍，也不能读到两个不同版本的分类。"""
+    files = {
+        "industries.json": [
+            {"symbol": "600000", "name": "测试银行", "industries": ["银行"]}
+        ],
+        "concepts.json": [
+            {"symbol": "600000", "name": "测试银行", "concepts": ["金融科技"]}
+        ],
+    }
+    calls: list[str] = []
+    base_opener = opener_for(files)
+
+    def recording_opener(request, timeout):
+        calls.append(request.full_url)
+        return base_opener(request, timeout)
+
+    source = ThsTaxonomySource(opener=recording_opener, cache_dir=tmp_path)
+    industry = ThsIndustryTaxonomy(source, min_constituents=1)
+    concept = ThsConceptTaxonomy(source, min_size=1)
+
+    assert industry.list_sectors()[0].name == "银行"
+    assert concept.list_sectors()[0].name == "金融科技"
+    assert industry.snapshot is concept.snapshot
+    assert len(calls) == 2  # industries.json + concepts.json，各一次
 
 
 # ---- 概念闸门 --------------------------------------------------------------

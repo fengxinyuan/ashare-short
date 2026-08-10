@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from statistics import fmean
 from typing import Any
 
 from ashare_decision_support.numeric import finite, first_finite
+from ashare_decision_support.schedule.timezone import beijing_from_epoch, beijing_naive_now
 
 # `strptime` 认得而 `fromisoformat` 认不得的那几种写法：斜杠分隔，以及月/日不补零
 # 的 `2025-8-1`。**顺序不重要**——真正常见的两种（`2025-08-01` 与带时分秒的形式）
@@ -43,12 +45,12 @@ def bar_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value
     if value is None or value == "":
-        return datetime.now()
+        return beijing_naive_now()
     if isinstance(value, (int, float)):
         ts = float(value)
         if ts > 1e12:
             ts /= 1000.0
-        return datetime.fromtimestamp(ts)
+        return beijing_from_epoch(ts)
 
     text = str(value)
     try:
@@ -93,6 +95,33 @@ def mean(values: list[float]) -> float | None:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def volume_ratio(volumes: list[float], window: int, *, digits: int | None = None) -> float | None:
+    """最新一根的量 ÷ 前 `window` 根的均量。样本不够或基线取不出来时返回 None。
+
+    **这是「量比」在本系统里的默认口径**，`daily_technical`（出
+    `volume_ratio_20d`）、`volume_price`（没有快照时自己补算同一个数）与
+    `sectors/momentum`（板块量比）三处共用。三处原来各写了一份，逐字相同——
+    而它们必须相同：`volume_price._volume_ratio` 的第一句就是「快照里有就直接用
+    快照的」，也就是说它那半份实现的全部职责，是在没有快照时**算出和
+    `daily_technical` 一模一样的数**。两份各自演化的话，同一只票的量比会随着
+    「这次有没有日线快照」在两个值之间跳，而两个值都不会报错。
+
+    基线只取正数：停牌日的 0 进了分母会把量比放大成一个吓人的数，而它量的是
+    停牌，不是放量。**最新那根不做这个过滤**——今天量确实是 0（全天停牌）时，
+    量比就该是 0，那是事实不是缺失。
+
+    `signals/wyckoff.py` 有意不用这一份，见它自己的 docstring：那一层要的是
+    中位数基线、不足 20 根也照算、取不出来退 1.0，三条都和这里相反。
+    """
+    if len(volumes) < window + 1:
+        return None
+    baseline = [value for value in volumes[-(window + 1) : -1] if value > 0]
+    if not baseline:
+        return None
+    ratio = volumes[-1] / fmean(baseline)
+    return round(ratio, digits) if digits is not None else ratio
 
 
 # 时间戳字段的候选名，按优先级。落空的（None / "" / 0）跳过继续往后试——

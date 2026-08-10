@@ -501,8 +501,15 @@ def _turnover_section(turnover: dict | None) -> list[str]:
     lines = ["## 成交额挪到哪了（成交额口径）"]
     total_change = turnover.get("total_change")
     if isinstance(total_change, (int, float)):
+        # 标题行是这一节唯一会被扫一眼就走的行，所以块均值与窗口内走向反号时，
+        # 两个数都要出现在这里。只印块均值的话，量能刚触底回升的那一周，最显眼
+        # 的一行印的是「-1.8%」——而当天实际发生的是放量 33%。
+        headline = f"**全场日均成交额 {total_change:+.1%}"
+        total_trend = turnover.get("total_trend")
+        if isinstance(total_trend, (int, float)) and total_trend * total_change < 0:
+            headline += f"，但近端窗口内 {total_trend:+.1%}"
         lines.append(
-            f"**全场日均成交额 {total_change:+.1%}**"
+            headline + "**"
             f"（{turnover.get('sectors') or 0} 个板块指数，"
             f"截至 {turnover.get('trade_date') or '—'}）"
         )
