@@ -83,9 +83,9 @@ def test_the_2026_08_03_reading_is_an_ebb_not_a_normal_day() -> None:
     assert verdict.position_cap == 0.30
     assert verdict.leader_only is True
     # 退潮期允许低吸和超跌反转，但不允许追突破。
-    assert verdict.permits(Playbook.PULLBACK)
-    assert verdict.permits(Playbook.REVERSAL)
-    assert not verdict.permits(Playbook.BREAKOUT)
+    assert Playbook.PULLBACK in verdict.allowed
+    assert Playbook.REVERSAL in verdict.allowed
+    assert Playbook.BREAKOUT not in verdict.allowed
 
 
 def test_a_panic_tape_halts_selection_entirely() -> None:

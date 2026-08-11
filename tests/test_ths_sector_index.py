@@ -19,6 +19,11 @@ from ashare_decision_support.adapters.ths_sector_index import (
 # ---- http double ---------------------------------------------------------
 
 
+def _by_name(snap) -> dict:
+    """按板块名索引读数。断言要点名某个板块，`readings` 是个列表。"""
+    return {r.name: r for r in snap.readings}
+
+
 def _bars(rows: list[tuple[str, float, float, float, float, float]]) -> str:
     """(date, open, high, low, close, amount) -> 同花顺的分号分隔串。"""
     return ";".join(
@@ -106,7 +111,7 @@ def test_close_position_separates_faded_from_supported() -> None:
     http = StubHttp({"881101": ("半导体", FADE_ROWS), "881102": ("白酒", STRONG_ROWS)})
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
 
-    by_name = snap.by_name()
+    by_name = _by_name(snap)
     assert by_name["半导体"].ret_1d > 0
     assert by_name["白酒"].ret_1d > 0
     assert by_name["半导体"].close_position == 0.0     # 收在当日最低
@@ -117,7 +122,7 @@ def test_shape_names_the_pattern_the_return_alone_hides() -> None:
     http = StubHttp({"881101": ("半导体", FADE_ROWS), "881102": ("白酒", STRONG_ROWS)})
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
 
-    by_name = snap.by_name()
+    by_name = _by_name(snap)
     assert "冲高回落" in by_name["半导体"].shape
     assert "有承接" in by_name["白酒"].shape
 
@@ -269,7 +274,7 @@ def test_describe_splits_risers_by_volume_position() -> None:
     http = StubHttp({"881101": ("小金属", STRONG_ROWS), "881102": ("半导体", DRY_ROWS)})
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
 
-    by_name = snap.by_name()
+    by_name = _by_name(snap)
     # 两者涨幅与收位都相同，只有量能位置不同。
     assert by_name["小金属"].ret_1d == pytest.approx(by_name["半导体"].ret_1d)
     assert by_name["小金属"].close_position == by_name["半导体"].close_position
@@ -311,4 +316,4 @@ def test_volume_position_carries_the_scale_not_just_the_ratio() -> None:
     assert "日均" in expanding
     assert "日均" in shrinking
     # 缩量的那个基数更大——这正是只看比值会漏掉的事实。
-    assert snap.by_name()["半导体"].amount_5d > snap.by_name()["小金属"].amount_5d
+    assert _by_name(snap)["半导体"].amount_5d > _by_name(snap)["小金属"].amount_5d

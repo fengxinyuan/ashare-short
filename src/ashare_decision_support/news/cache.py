@@ -15,6 +15,7 @@ reproducible: two runs at 07:40 and 08:20 read the same documents.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -102,3 +103,30 @@ def _doc(row: dict[str, Any]) -> NewsDoc:
     # `symbols` 存进 JSON 变成 list，取回来必须还原成 tuple——`NewsDoc` 是 frozen
     # 且要可哈希的，list 会让下游按文档去重的地方在缓存命中时才炸。
     return NewsDoc(**{**row, "symbols": tuple(row.get("symbols") or ())})
+
+
+def cached_docs(
+    cache: NewsCache | None,
+    trade_date: date,
+    key: str,
+    fetch: Callable[[], list[NewsDoc]],
+) -> list[NewsDoc]:
+    """取缓存，没有才打网络，取回来再写一份。`cache` 为 None 就是直接打网络。
+
+    **按栏目/feed 一个键，不按整源一个键。** 分路取数的源里每一路分属不同机构、
+    各自会挂；整源一个键的话，一路超时就会让另外两路已经取回的内容一起失效，
+    下次重跑再全打一遍。
+
+    收口的理由不是这八行，是**「miss 才写」这个顺序**：`official_source` 与
+    `rss_source` 此前各写一遍，两边一旦有一边把 `write_docs` 写进了 miss 分支
+    外面，症状是那一路每次都重写缓存文件——不报错，也不改变返回值，只有翻缓存
+    目录的 mtime 才看得出来。
+    """
+    if cache is not None:
+        hit = cache.read_docs(trade_date, key)
+        if hit is not None:
+            return hit
+    docs = fetch()
+    if cache is not None:
+        cache.write_docs(trade_date, key, docs)
+    return docs

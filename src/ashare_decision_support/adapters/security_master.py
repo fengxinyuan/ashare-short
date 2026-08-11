@@ -36,8 +36,8 @@ concepts.json     5546 只   {"symbol","name","concepts":[...]}
 指向它。
 
 所以 `themes()` 按成分占比设了一道上限（`MAX_THEME_SHARE`）。**这不是把它们删掉**
-——`concepts_of()` 仍然原样返回全部标签，因为「这只票能不能融资」是个真实且有用的
-事实。只是在「哪个题材在动」这个问题上，它们不参与。
+——`get(symbol).concepts` 仍然原样返回全部标签，因为「这只票能不能融资」是个真实
+且有用的事实。只是在「哪个题材在动」这个问题上，它们不参与。
 
 ## 缓存
 
@@ -140,41 +140,14 @@ class SecurityMaster:
     def get(self, symbol: str) -> SecurityInfo | None:
         return self.entries.get(normalize_symbol(symbol))
 
-    def name_of(self, symbol: str) -> str | None:
-        info = self.get(symbol)
-        return info.name if info else None
-
-    def by_concept(self, concept: str) -> list[str]:
-        """挂了这个概念的全部标的。**精确匹配**，不做模糊——「半导体」和
-        「半导体设备」是两个概念，模糊匹配会把它们混成一个。"""
-        target = str(concept or "").strip()
-        if not target:
-            return []
-        return sorted(
-            symbol for symbol, info in self.entries.items() if target in info.concepts
-        )
-
-    def by_industry(self, industry: str) -> list[str]:
-        """任意一级行业命中即算。三级分类里上级是下级的前缀，按任意级查都该能查到。"""
-        target = str(industry or "").strip()
-        if not target:
-            return []
-        return sorted(
-            symbol for symbol, info in self.entries.items() if target in info.industries
-        )
-
-    def concepts_of(self, symbol: str) -> tuple[str, ...]:
-        info = self.get(symbol)
-        return info.concepts if info else ()
-
     def themes(self, max_share: float = MAX_THEME_SHARE) -> dict[str, int]:
         """概念 → 成分数，**剔除覆盖过广的可交易属性**。
 
         `融资融券` 覆盖 69% 的市场，它是「能不能融资」不是「在炒什么」。把它留在
         题材榜里，「今天哪个题材在动」的答案会永远是它。
 
-        剔除只发生在这里；`concepts_of()` 仍然原样返回全部标签——「这只票能不能
-        融资」是个真实的事实，只是回答不了题材问题。
+        剔除只发生在这里；`get(symbol).concepts` 仍然原样返回全部标签——「这只票
+        能不能融资」是个真实的事实，只是回答不了题材问题。
         """
         if not self.entries:
             return {}

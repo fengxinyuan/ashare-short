@@ -91,9 +91,6 @@ class RegimeVerdict:
         """今天一条打法都不允许——不出手。"""
         return not self.allowed
 
-    def permits(self, playbook: Playbook) -> bool:
-        return playbook in self.allowed
-
     def to_dict(self) -> dict:
         return {
             "cycle": self.cycle.value,

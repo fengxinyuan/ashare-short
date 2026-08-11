@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any
 
+from ashare_decision_support.fanout import gather
 from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.dedup import parse_published
 
@@ -17,6 +19,54 @@ def source_counts(docs: list[NewsDoc]) -> dict[str, int]:
         source = doc.source.strip() or "unknown"
         counts[source] = counts.get(source, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def collect_by_feed(
+    feeds: Sequence[Any],
+    fetch_one: Callable[[Any], list[NewsDoc]],
+    *,
+    limit: int,
+    unreachable_note: str,
+    empty_note: str,
+) -> tuple[list[NewsDoc], list[str], dict[str, Any]]:
+    """并发跑完每一路，按路记账，再交给 `retain_market_docs` 截断。
+
+    返回 `(retained, notes, stats)`。`feeds` 里的每一项只要求有 `.name`（写进
+    不可用 note）与 `.source`（记账用的键）。`unreachable_note` 用 `{names}` 占位。
+
+    **一条都没采到时 `stats` 是空 dict，调用方要照着 `if stats:` 赋值。** 这不是
+    风格问题：`last_market_stats` 是「上一次成功采集的构成」，全挂的那一轮把它
+    覆盖成空，`agents/collectors.py` 那条覆盖率 note 就从「这一路挂了」变成
+    「这一路不存在」——而前者才是真的，后者会让人以为源被摘掉了。
+
+    **收口的理由和 `retain_market_docs` 是同一条，只是更靠前一步。** 那个函数收的
+    是「留下多少」的字段名，这个收的是**「采到多少」那一行**——
+    `raw_by_source[feed.source] = len(rows)`。`official_source` 与 `rss_source`
+    此前各写一遍：谁漏了这一行，`agents/collectors.py` 拼出来的「市场舆情来源
+    覆盖」里那一路就**静默消失**，而不是报错。一路取回 0 条和一路根本没跑，在
+    文档里长得一模一样，只有取数方分得清——所以这一行必须在取数方，也就必须
+    只有一份。
+
+    串行取数等于把每一路的超时相加，而这几路都在盘前链路上，所以走 `gather`。
+    """
+    docs: list[NewsDoc] = []
+    notes: list[str] = []
+    raw_by_source: dict[str, int] = {}
+
+    fetched, unreachable = gather(feeds, fetch_one)
+    for feed, rows in fetched:
+        raw_by_source[feed.source] = len(rows)
+        docs.extend(rows)
+
+    if unreachable:
+        names = "、".join(f"{item.name}（{type(exc).__name__}）" for item, exc in unreachable)
+        notes.append(unreachable_note.format(names=names))
+    if not docs:
+        notes.append(empty_note)
+        return [], notes, {}
+
+    retained, stats = retain_market_docs(docs, limit, raw_by_source)
+    return retained, notes, stats
 
 
 def retain_market_docs(

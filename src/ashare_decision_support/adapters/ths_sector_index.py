@@ -134,9 +134,6 @@ class SectorIndexSnapshot:
         scored = [r for r in self.readings if getattr(r, key) is not None]
         return sorted(scored, key=lambda r: getattr(r, key), reverse=reverse)[:n]
 
-    def by_name(self) -> dict[str, SectorIndexReading]:
-        return {r.name: r for r in self.readings}
-
     def describe(self, n: int = 5) -> list[str]:
         """给简报用的几行摘要。"""
         if not self.readings:

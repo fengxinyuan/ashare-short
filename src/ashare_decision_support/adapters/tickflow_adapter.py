@@ -22,22 +22,7 @@ class TickFlowAdapterError(RuntimeError):
     """Raised when the TickFlow adapter cannot complete a requested action."""
 
 
-# (low, high, multiplier) bands used to infer the volume unit from
-# amount / (volume * price). Anything outside these bands is treated as
-# "unknown unit" instead of being silently passed through.
-VOLUME_UNIT_BANDS: tuple[tuple[float, float, float], ...] = (
-    (0.8, 1.2, 1.0),  # already in shares
-    (8.0, 12.0, 10.0),  # lots of 10
-    (80.0, 120.0, 100.0),  # A-share lots of 100
-)
-
 VOLUME_UNIT_MULTIPLIERS: dict[str, float] = {"share": 1.0, "lot": 100.0, "lot10": 10.0}
-
-# Calendar-day lookback used by the degraded daily proxy. It must comfortably
-# cover the 21-bar baseline needed by the volume-ratio helpers, including
-# around long holidays.
-DAILY_PROXY_LOOKBACK_DAYS = 150
-DAILY_PROXY_MAX_ROWS = 60
 
 # Symbols per batch kline request. The SDK parallelises inside a batch, so the
 # ceiling here is request size rather than throughput.

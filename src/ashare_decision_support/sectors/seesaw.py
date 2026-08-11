@@ -64,11 +64,6 @@ NEGATIVE_THRESHOLD = -0.35
 # 两百个假阳性。
 FAMILY_ERROR_RATE = 0.05
 
-# 同向那一侧的门槛，只用于 `explain_divergence` 判断「今天两个板块同涨同跌
-# 是不是常态」。**不单独出榜**：正相关对在 A 股上多到没有信息量（同一个大盘
-# beta 会让绝大多数板块两两正相关），列出来只是把 beta 重报一遍。
-POSITIVE_THRESHOLD = 0.35
-
 # 半窗最少要有多少个收益点才算得出一个系数。半窗是 30 天，低于 20 说明这个板块
 # 在这半段里停更过，那一半的系数不可比。
 MIN_HALF_POINTS = 20
@@ -82,7 +77,6 @@ TOP_PAIRS = 12
 MIN_SECTORS = 20
 
 LABEL_CONSISTENT = "与历史关系一致"
-LABEL_AGAINST = "与历史关系相反"
 LABEL_UNKNOWN = "两者历史上没有稳定关系"
 
 
@@ -195,7 +189,8 @@ def critical_correlation(pairs_tested: int, points: int) -> float:
     """
     if pairs_tested <= 0 or points <= 3:
         return NEGATIVE_THRESHOLD
-    # 双尾里只用负的那一侧：这一层从不报正相关（见 `POSITIVE_THRESHOLD` 上方）。
+    # 双尾里只用负的那一侧：这一层只报反向对。正相关对在 A 股上多到没有信息量
+    # ——同一个大盘 beta 会让绝大多数板块两两正相关，出榜只是把 beta 重报一遍。
     alpha = FAMILY_ERROR_RATE / (2.0 * pairs_tested)
     z = NormalDist().inv_cdf(max(alpha, 1e-12))
     return min(NEGATIVE_THRESHOLD, math.tanh(z / math.sqrt(points - 3)))
@@ -333,6 +328,11 @@ def explain_divergence(
     一致」的价值在于告诉你今天的分歧是结构性的还是偶然的，仅此而已。
 
     两个都涨或都跌时返回 None：没有分歧要解释。收益缺失同理。
+
+    **只分得开两种情况**，因为 `read` 里只有通过闸门的反向对：这一对历史上反着走
+    （一致），或者没有稳定的反向关系（未知）。「今天背着走、历史上却是同向」那一类
+    落在后者里——要把它单独认出来，得让 `read_seesaw` 同时保留正相关对，那是另一个
+    读数，不是这个函数少写了一个分支。
     """
     if left_return is None or right_return is None:
         return None

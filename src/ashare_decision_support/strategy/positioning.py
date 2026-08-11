@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 class PositionSizingPlan:
     effective_factor: float
     capped_suggested_factor: float
-    cycle_cap: float
     suggested_factor: float | None = None
     manual_factor: float | None = None
     notes: tuple[str, ...] = field(default_factory=tuple)
@@ -57,7 +56,6 @@ def resolve_position_sizing(
     return PositionSizingPlan(
         effective_factor=effective,
         capped_suggested_factor=capped,
-        cycle_cap=cycle_cap,
         suggested_factor=suggested_factor,
         manual_factor=manual_factor,
         notes=tuple(notes),

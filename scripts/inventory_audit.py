@@ -1,7 +1,7 @@
 """Recompute `docs/INVENTORY.md`'s wiring checks instead of trusting them.
 
 That document's whole value is that its answer is a **checkable fact**, not an
-impression. 五条口径，粒度从粗到细——后四条都是在上一条的盲区里发现死码之后补的：
+impression. 六条口径，粒度从粗到细——后五条都是在上一条的盲区里发现死码之后补的：
 
 - **可达性** — 从所有项目入口（CLI 与 MCP）出发，import 图能不能走到这个模块
 - **符号引用** — 模块里的公开符号有没有人真的用；只被 `__init__.py` 转出口、
@@ -11,14 +11,17 @@ impression. 五条口径，粒度从粗到细——后四条都是在上一条�
   `F401` 那样的告警，也不落在前三条的口径里**
 - **私有符号** — 模块级 `_func` 与类上 `_method` 有没有引用点。前四条查的全是
   公开面，而私有面**一条自动告警都没有**
+- **模块级常量** — 顶层 `UPPER_SNAKE` 有没有引用点。前五条一条都看不见它：
+  符号那条只收 `def` 与 `class`，赋值语句不进表
 
 补跑的战果：第二条命中 3 个死符号（INVENTORY §0），第三条命中 7 个「算了没人读」
 的字段（INVENTORY §4.1），第四条命中 13 处方法（DECISIONS §十二、§十三，其中
 `dump_snapshot` × 3 就是 150 行），第五条命中 3 处私有辅助——全是前一条删完之后
-**新掉下来的连锁**，所以它迭代到不动点，一次报完整条链。写成脚本是为了让它们下次
+**新掉下来的连锁**，所以它迭代到不动点，一次报完整条链。第六条命中 5 个常量，
+全是被删掉的实现留下的锚（见 `check_constants`）。写成脚本是为了让它们下次
 还能跑：一条写在文档里、没人执行的口径，和没有这条口径是一回事。
 
-    python3 scripts/inventory_audit.py            # 五条都跑
+    python3 scripts/inventory_audit.py            # 六条都跑
     python3 scripts/inventory_audit.py --symbols  # 只跑其中一条
 
 退出码 1 表示有未接线的模块、符号或方法——可以直接挂进 CI。字段那条、以及方法与
@@ -459,6 +462,72 @@ def check_private() -> tuple[list[str], list[str]]:
     return dead, test_only
 
 
+# --- 第六条：模块级常量有没有被真正引用 -------------------------------------
+
+
+def check_constants() -> list[str]:
+    """第六条口径：**模块顶层的公开常量**（`UPPER_SNAKE`）没有任何引用点。
+
+    前五条一条都看不见它。`check_symbols` 只收模块顶层的 `def` 与 `class`——
+    赋值语句根本不进它的表；字段那条查的是 dataclass 内部；方法与私有那两条按
+    定义也不覆盖。于是一个模块级常量是全仓**唯一一类既没有 ruff 告警、也不落在
+    任何一条审计口径里**的公开面。
+
+    2026-08-11 首次跑，643 个常量里命中 5 个，全是**被删掉的实现留下的锚**：
+    `tickflow_adapter.VOLUME_UNIT_BANDS`（量纲推断搬到 `validate.infer_volume_unit`
+    之后没跟着删）、同文件的 `DAILY_PROXY_LOOKBACK_DAYS` / `DAILY_PROXY_MAX_ROWS`
+    （降级日线代理整段没了，两个参数还在），以及 `seesaw` 的 `POSITIVE_THRESHOLD`
+    / `LABEL_AGAINST`——那两个对应的是 `explain_divergence` 里**从未实现**的第三
+    个分支。常量比函数更容易攒成这样：删实现的时候它不报错，而它头上那段注释
+    还在替它说明「我是干什么的」，读起来像是活的。
+
+    **引用只认 AST，不数 token。** 这是这条与 `check_symbols` 唯一的口径分歧，
+    而且是被 `POSITIVE_THRESHOLD` 逼出来的：它在正上方的注释里被提到过一次
+    （「见 `POSITIVE_THRESHOLD` 上方」），按全文 token 计数就算「有人引用」，
+    于是这条口径会当场瞎掉。**一个只在散文里被提到的常量仍然是死的**——注释
+    解释不了任何运行时行为。所以只认三种：裸名读取、属性读取（`mod.CONST`），
+    以及**完全相等**的字符串字面量（`getattr(mod, "CONST")` 与分发表；docstring
+    里顺带提一句不会命中，因为那是一整条更长的字符串）。
+
+    口径同前几条——宁可漏报不可误报：跨模块重名会让一个死常量蹭到别处的同名
+    引用从而被判活，这是有意接受的。
+    """
+    defs: dict[str, tuple[pathlib.Path, int]] = {}
+    used: set[str] = set()
+    for path in _py_files(*SCAN_ROOTS):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        used |= set(_names_used_in(tree))
+        if not path.is_relative_to(SRC):
+            continue
+        for node in tree.body:  # 只看模块顶层：函数里的局部量不是公开面
+            for name in _assigned_names(node):
+                if name.isupper() and not name.startswith("_"):
+                    defs.setdefault(name, (path, node.lineno))
+
+    dead: list[str] = []
+    for name, (path, lineno) in sorted(defs.items(), key=lambda kv: str(kv[1][0])):
+        if name in used:
+            continue
+        dead.append(name)
+        print(f"  零引用      {name}  ({path.relative_to(ROOT)}:{lineno})")
+
+    print(f"[常量] {len(defs)} 个模块级公开常量，{len(dead)} 个零引用")
+    return dead
+
+
+def _assigned_names(node: ast.stmt):
+    """一条顶层赋值语句绑定的名字。`A = B = ...` 与 `A: int = ...` 都算。"""
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                yield target.id
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        yield node.target.id
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--modules", action="store_true", help="只跑可达性")
@@ -466,6 +535,7 @@ def main() -> int:
     parser.add_argument("--fields", action="store_true", help="只跑 dataclass 字段读取")
     parser.add_argument("--methods", action="store_true", help="只跑公开方法调用点")
     parser.add_argument("--private", action="store_true", help="只跑私有函数/方法引用点")
+    parser.add_argument("--constants", action="store_true", help="只跑模块级常量引用点")
     parser.add_argument(
         "--strict-fields",
         action="store_true",
@@ -473,7 +543,12 @@ def main() -> int:
     )
     args = parser.parse_args()
     run_all = not (
-        args.modules or args.symbols or args.fields or args.methods or args.private
+        args.modules
+        or args.symbols
+        or args.fields
+        or args.methods
+        or args.private
+        or args.constants
     )
 
     failures = 0
@@ -524,6 +599,10 @@ def main() -> int:
                 f"  ↑ {len(tested_only)} 个私有符号只有测试在调："
                 "多半是某次删除留下的连锁，测试和它一起删"
             )
+
+    if run_all or args.constants:
+        # 零引用的常量是二值事实，同模块/符号/方法那三条，计入退出码。
+        failures += len(check_constants())
 
     print("干净" if not failures else f"共 {failures} 处未接线——更新 docs/INVENTORY.md 或删掉它们")
     return 1 if failures else 0

@@ -195,11 +195,10 @@ class RateLimitedClient(_Proxy):
     包在 client 而不是适配器方法上，是因为 `sectors/taxonomy.py` 拿的是
     `adapter.client` 直接调 `universes.*`，绕过了适配器的全部方法。包 client
     是唯一能同时覆盖两条路径的位置。
-    """
 
-    @property
-    def unwrapped(self) -> Any:
-        return object.__getattribute__(self, "_target")
+    转发逻辑全在 `_Proxy` 里；这个子类只为**类型可辨**而存在——`wrap_client`
+    的返回值要能一眼看出「限速了没有」。
+    """
 
 
 def wrap_client(client: Any, api_key: str | None = None, limit: int | None = -1) -> Any:

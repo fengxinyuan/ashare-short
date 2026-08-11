@@ -31,6 +31,7 @@ from __future__ import annotations
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -194,30 +195,35 @@ class SnapshotAdapter:
     # ---- fetchers --------------------------------------------------------
 
     def _fetch_sina(self, codes: list[str]) -> tuple[dict[str, Snapshot], list[str]]:
+        return self._fetch(codes, SINA_URL, SINA_REFERER, "新浪", _parse_sina)
+
+    def _fetch_tencent(self, codes: list[str]) -> tuple[dict[str, Snapshot], list[str]]:
+        return self._fetch(codes, TENCENT_URL, TENCENT_REFERER, "腾讯", _parse_tencent)
+
+    def _fetch(
+        self,
+        codes: list[str],
+        url: str,
+        referer: str,
+        label: str,
+        parse: Callable[[str, str], Snapshot | None],
+    ) -> tuple[dict[str, Snapshot], list[str]]:
+        """一路快照的取数与解析。两路只差 URL / Referer / 标签 / 解析器。
+
+        两个入口保留成独立方法是因为 `get_snapshots` 把它们当**可互换的策略**选
+        （`fetch = self._fetch_sina if ... else self._fetch_tencent`），`health_check`
+        也直接点名新浪那一路。差异收在参数里，取数与「截断即缺失」那段循环只有一份。
+        """
         query = ",".join(_sina_code(code) for code in codes)
         try:
-            body = self._get(f"{SINA_URL}{query}", SINA_REFERER, encoding="gbk")
+            body = self._get(f"{url}{query}", referer, encoding="gbk")
         except Exception as exc:
-            return {}, [f"新浪快照请求失败（{type(exc).__name__}），本轮缺 {len(codes)} 只"]
+            return {}, [f"{label}快照请求失败（{type(exc).__name__}），本轮缺 {len(codes)} 只"]
 
         parsed: dict[str, Snapshot] = {}
         # 服务端可能少回几行；截断即缺失，缺哪几只由 `get_snapshots` 统一报。
         for line, code in zip(body.splitlines(), codes, strict=False):
-            snapshot = _parse_sina(line, code)
-            if snapshot is not None:
-                parsed[code] = snapshot
-        return parsed, []
-
-    def _fetch_tencent(self, codes: list[str]) -> tuple[dict[str, Snapshot], list[str]]:
-        query = ",".join(_sina_code(code) for code in codes)
-        try:
-            body = self._get(f"{TENCENT_URL}{query}", TENCENT_REFERER, encoding="gbk")
-        except Exception as exc:
-            return {}, [f"腾讯快照请求失败（{type(exc).__name__}），本轮缺 {len(codes)} 只"]
-
-        parsed: dict[str, Snapshot] = {}
-        for line, code in zip(body.splitlines(), codes, strict=False):
-            snapshot = _parse_tencent(line, code)
+            snapshot = parse(line, code)
             if snapshot is not None:
                 parsed[code] = snapshot
         return parsed, []

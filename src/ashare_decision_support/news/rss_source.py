@@ -10,10 +10,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from ashare_decision_support.fanout import gather
-from ashare_decision_support.news.balance import retain_market_docs
+from ashare_decision_support.news.balance import collect_by_feed
 from ashare_decision_support.news.base import NewsDoc, NewsSource
-from ashare_decision_support.news.cache import NewsCache
+from ashare_decision_support.news.cache import NewsCache, cached_docs
 from ashare_decision_support.news.health import probe_feeds
 from ashare_decision_support.schedule.timezone import to_beijing_naive
 
@@ -72,24 +71,16 @@ class RssNewsSource(NewsSource):
         self.last_market_stats: dict[str, object] = {}
 
     def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
-        docs: list[NewsDoc] = []
-        notes: list[str] = []
-        raw_by_source: dict[str, int] = {}
         # 每个 feed 一个独立往返，且都在盘前链路上——并发跑，慢的那个决定这一段。
-        fetched, unreachable = gather(self.feeds, lambda feed: self._feed_docs(trade_date, feed))
-        for feed, rows in fetched:
-            raw_by_source[feed.source] = len(rows)
-            docs.extend(rows)
-
-        if unreachable:
-            notes.append(
-                f"海外官方信息源 {'、'.join(f'{item.name}（{type(exc).__name__}）' for item, exc in unreachable)}"
-                " 不可用，本次跳过"
-            )
-        if not docs:
-            notes.append("海外官方宏观信息源未返回可用条目")
-            return [], notes
-        retained, self.last_market_stats = retain_market_docs(docs, limit, raw_by_source)
+        retained, notes, stats = collect_by_feed(
+            self.feeds,
+            lambda feed: self._feed_docs(trade_date, feed),
+            limit=limit,
+            unreachable_note="海外官方信息源 {names} 不可用，本次跳过",
+            empty_note="海外官方宏观信息源未返回可用条目",
+        )
+        if stats:
+            self.last_market_stats = stats
         return retained, notes
 
     def fetch_for_symbols(
@@ -101,16 +92,9 @@ class RssNewsSource(NewsSource):
         return probe_feeds("official_global", self.feeds, lambda f: f.name, self._fetch_feed)
 
     def _feed_docs(self, trade_date: date, feed: RssFeed) -> list[NewsDoc]:
-        """一个 feed 一个缓存键，理由同 `official_source.py:_listing_docs`。"""
-        key = f"rss_{feed.source}"
-        if self.cache is not None:
-            cached = self.cache.read_docs(trade_date, key)
-            if cached is not None:
-                return cached
-        docs = self._fetch_feed(feed)
-        if self.cache is not None:
-            self.cache.write_docs(trade_date, key, docs)
-        return docs
+        return cached_docs(
+            self.cache, trade_date, f"rss_{feed.source}", lambda: self._fetch_feed(feed)
+        )
 
     def _fetch_feed(self, feed: RssFeed) -> list[NewsDoc]:
         request = urllib.request.Request(feed.url, headers={"User-Agent": USER_AGENT})

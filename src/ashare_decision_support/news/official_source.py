@@ -18,10 +18,9 @@ from datetime import date
 from typing import Any
 from urllib.parse import urljoin
 
-from ashare_decision_support.fanout import gather
-from ashare_decision_support.news.balance import retain_market_docs
+from ashare_decision_support.news.balance import collect_by_feed
 from ashare_decision_support.news.base import NewsDoc, NewsSource
-from ashare_decision_support.news.cache import NewsCache
+from ashare_decision_support.news.cache import NewsCache, cached_docs
 from ashare_decision_support.news.health import probe_feeds
 
 USER_AGENT = "Mozilla/5.0"
@@ -105,28 +104,16 @@ class OfficialNewsSource(NewsSource):
         self.last_market_stats: dict[str, object] = {}
 
     def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
-        docs: list[NewsDoc] = []
-        notes: list[str] = []
-        raw_by_source: dict[str, int] = {}
-
         # 三个栏目是三个独立的网络往返，串行等于把三次超时相加。
-        fetched, unreachable = gather(
-            self.listings, lambda listing: self._listing_docs(trade_date, listing)
+        retained, notes, stats = collect_by_feed(
+            self.listings,
+            lambda listing: self._listing_docs(trade_date, listing),
+            limit=limit,
+            unreachable_note="官方信息源 {names} 不可用，本次跳过",
+            empty_note="官方政策与监管信息源未返回可用条目",
         )
-        for listing, rows in fetched:
-            raw_by_source[listing.source] = len(rows)
-            docs.extend(rows)
-
-        if unreachable:
-            notes.append(
-                f"官方信息源 {'、'.join(f'{item.name}（{type(exc).__name__}）' for item, exc in unreachable)}"
-                " 不可用，本次跳过"
-            )
-        if not docs:
-            notes.append("官方政策与监管信息源未返回可用条目")
-            return [], notes
-
-        retained, self.last_market_stats = retain_market_docs(docs, limit, raw_by_source)
+        if stats:
+            self.last_market_stats = stats
         return retained, notes
 
     def fetch_for_symbols(
@@ -140,20 +127,12 @@ class OfficialNewsSource(NewsSource):
         )
 
     def _listing_docs(self, trade_date: date, listing: OfficialListing) -> list[NewsDoc]:
-        """一个栏目一个缓存键，取不到才打网络。
-
-        按栏目而不是按整源缓存：三个栏目分属三个机构、各自会挂。整源一个键的话，
-        一路超时就会让另外两路已经取回的内容也一起失效，下次重跑再全打一遍。
-        """
-        key = f"official_{listing.source}"
-        if self.cache is not None:
-            cached = self.cache.read_docs(trade_date, key)
-            if cached is not None:
-                return cached
-        docs = self._fetch_listing(listing)
-        if self.cache is not None:
-            self.cache.write_docs(trade_date, key, docs)
-        return docs
+        return cached_docs(
+            self.cache,
+            trade_date,
+            f"official_{listing.source}",
+            lambda: self._fetch_listing(listing),
+        )
 
     def _fetch_listing(self, listing: OfficialListing) -> list[NewsDoc]:
         request = urllib.request.Request(listing.url, headers={"User-Agent": USER_AGENT})

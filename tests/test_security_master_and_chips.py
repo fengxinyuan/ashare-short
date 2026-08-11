@@ -73,32 +73,8 @@ def test_english_name_is_none_because_the_source_has_none(tmp_path) -> None:
 
 def test_symbols_are_normalised_so_lookups_match(tmp_path) -> None:
     master = adapter_for(tmp_path).load()
-    assert master.name_of("600519") == "贵州茅台"
-    assert master.name_of("sh600519") == "贵州茅台"
-
-
-def test_reverse_lookup_by_concept_and_industry(tmp_path) -> None:
-    master = adapter_for(tmp_path).load()
-
-    assert master.by_concept("白酒") == ["600519.SH"]
-    # 任意一级行业都能查到——三级分类里上级是下级的前缀。
-    assert master.by_industry("计算机") == ["920130.BJ"]
-    assert master.by_industry("IT服务Ⅲ") == ["920130.BJ"]
-    # 精确匹配：「银行」不该命中「深股通」那只的行业（它根本没有行业）。
-    assert master.by_concept("银行") == ["000001.SZ"]
-
-
-def test_concept_lookup_is_exact_not_fuzzy(tmp_path) -> None:
-    """「半导体」和「半导体设备」是两个概念，模糊匹配会把它们混成一个。"""
-    payloads = {
-        "industries.json": [],
-        "concepts.json": [
-            {"symbol": "600519.SH", "name": "A", "concepts": ["半导体设备"]},
-        ],
-    }
-    master = adapter_for(tmp_path, payloads).load()
-    assert master.by_concept("半导体") == []
-    assert master.by_concept("半导体设备") == ["600519.SH"]
+    assert master.get("600519").name == "贵州茅台"
+    assert master.get("sh600519").name == "贵州茅台"
 
 
 def test_cache_is_reused_without_refetching(tmp_path) -> None:
@@ -172,7 +148,7 @@ def test_broad_attributes_are_excluded_from_themes(tmp_path) -> None:
     assert "融资融券" not in themes, "覆盖 100% 的标签不是题材"
     assert themes["第三代半导体"] == 2
     # 但它仍然是一个真实的事实，逐票查询照常返回。
-    assert "融资融券" in master.concepts_of("600000.SH")
+    assert "融资融券" in master.get("600000.SH").concepts
 
 
 def test_a_non_list_payload_is_refused_not_guessed(tmp_path) -> None:

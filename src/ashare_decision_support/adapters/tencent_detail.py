@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ashare_decision_support.fanout import gather
-from ashare_decision_support.numeric import as_int, finite, positive
+from ashare_decision_support.numeric import as_int, positive
 from ashare_decision_support.symbols import normalize_symbol
 
 DETAIL_URL = "https://stock.gtimg.cn/data/index.php?appn=detail&action=data&c={code}&p={page}"
@@ -43,8 +43,6 @@ class TradePrint:
     sequence: int
     time_text: str
     price: float
-    change: float | None
-    volume_lot: int
     amount: float
     side: str
 
@@ -296,8 +294,6 @@ def _parse_page(body: str, symbol: str) -> list[TradePrint]:
                 sequence=as_int(fields[0]),
                 time_text=str(fields[1]).strip(),
                 price=price,
-                change=finite(fields[3]),
-                volume_lot=as_int(fields[4]),
                 amount=amount,
                 side=side,
             )

@@ -238,7 +238,6 @@ def test_wrap_client_installs_the_gate_for_the_free_tier(monkeypatch) -> None:
     sdk = FakeSdkClient()
     wrapped = wrap_client(sdk, api_key=None)
     assert isinstance(wrapped, RateLimitedClient)
-    assert wrapped.unwrapped is sdk
 
 
 # ---- taxonomy integrity --------------------------------------------------
