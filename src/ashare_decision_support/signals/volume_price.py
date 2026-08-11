@@ -212,7 +212,7 @@ def measure_volume_price(
         climax=_climax(ratio, position),
         climax_stall=_climax_stall(bars, ratio, position),
         dry_up=_dry_up(volumes),
-        breakdown_on_volume=_breakdown(bars, closes, ret_1d, ratio, snapshot),
+        breakdown_on_volume=_breakdown(closes, ret_1d, ratio, snapshot),
         notes=notes,
     )
     return features
@@ -385,7 +385,6 @@ def _dry_up(volumes: list[float]) -> bool | None:
 
 
 def _breakdown(
-    bars: list[dict],
     closes: list[float],
     ret_1d: float | None,
     ratio: float | None,

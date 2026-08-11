@@ -129,7 +129,7 @@ def measure_dip(bars: list[dict], snapshot: Any = None) -> DipFeatures:
     dist_to_ma20 = None if not ma20 else round(last / ma20 - 1.0, 6)
     above_ma20 = None if dist_to_ma20 is None else dist_to_ma20 >= 0
 
-    pullback, down_days = _pullback(highs[-MEDIUM_WINDOW:], closes[-MEDIUM_WINDOW:], last)
+    pullback, down_days = _pullback(highs[-MEDIUM_WINDOW:], last)
     contraction = _contraction(volumes)
     atr_pct = _atr_pct(bars[-MEDIUM_WINDOW - 1:])
     normalised = _normalise(pullback, atr_pct)
@@ -211,7 +211,7 @@ def _band(normalised: float | None) -> str | None:
     return "deep"
 
 
-def _pullback(highs: list[float], closes: list[float], last: float) -> tuple[float | None, int | None]:
+def _pullback(highs: list[float], last: float) -> tuple[float | None, int | None]:
     """回撤幅度与「从高点以来跌了几天」。
 
     down_days 数的是**高点之后的自然日数**，不是连续阴线数——低吸关心的是回调

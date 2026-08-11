@@ -376,8 +376,8 @@ class SectorPredictor:
                 warnings=warnings,
             )
 
-        breadth = _weighted(trusted, "breadth", covered)
-        above_ma20 = _weighted(trusted, "above_ma20", covered)
+        breadth = _weighted(trusted, "breadth")
+        above_ma20 = _weighted(trusted, "above_ma20")
         ret_1d = _median_of(trusted, "ret_1d")
         ret_5d = _median_of(trusted, "ret_5d")
 
@@ -678,7 +678,7 @@ def _bare(symbol: str) -> str:
     return symbol.split(".", maxsplit=1)[0].strip()
 
 
-def _weighted(metrics: list[SectorMetrics], attribute: str, covered_total: int) -> float | None:
+def _weighted(metrics: list[SectorMetrics], attribute: str) -> float | None:
     """Coverage-weighted mean. A sector with 2 measured names must not carry
     the same weight as one with 300."""
     rows = [
