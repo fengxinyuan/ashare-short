@@ -63,7 +63,6 @@ class DailyTechnicalSnapshot(BaseModel):
     resistances: list[PriceLevel] = Field(default_factory=list)
     stop_reference: float | None = None
     target_reference: float | None = None
-    chart_bars: list[dict] = Field(default_factory=list)
     setups: list[dict] = Field(default_factory=list)
     explanation: str
     source_ts: datetime

@@ -1,4 +1,4 @@
-"""盘前主链路：舆情 → 大盘趋势 → 板块排序 → 板块内选股 → 候选池 → 台账.
+"""盘前主链路：舆情 → 大盘趋势 → 板块排序 → 板块内选股 → 候选 → 台账.
 
 自上而下，和 `post_close.py` 相反：那个给你已经选好的票打分，这个从全市场出发，
 先判断该不该做、该做哪个方向的板块，再决定看哪些票。
@@ -7,8 +7,9 @@
 再只对通过筛选的几十只拉长历史。舆情采集与成分股日线在 agent 层并行，两条最慢的
 链路完全重叠。
 
-产出会写进候选池（`state/watchlist.py:CandidatePool`）供盘中监控使用，并落一份
-台账（`journal/`）供事后核对——这两件事让盘前结论不再是一次性的。
+产出落一份台账（`journal/`）供事后核对，这让盘前结论不再是一次性的。候选**只是
+这份晨报的结论**：它进 facts、进简报、进台账，但不再写成一份名单让后面的命令
+默认去读（候选池已删，见 `state/positions.py`）。
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ from ashare_decision_support.journal.records import (
 from ashare_decision_support.news import (
     DailyNewsReader,
     DailyRead,
+    DocAttribution,
     LexiconSentiment,
     MacroDigest,
     NewsCache,
@@ -82,6 +84,7 @@ from ashare_decision_support.news import (
     scan_themes,
     sector_coverage_snapshot,
 )
+from ashare_decision_support.news.dedup import dedup_key
 from ashare_decision_support.news.llm_classifier import (
     ClassifyResult,
     LabelBackedSentiment,
@@ -89,7 +92,7 @@ from ashare_decision_support.news.llm_classifier import (
     build_client,
 )
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
-from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.notify.base import Notifier, publish, written_path
 from ashare_decision_support.notify.render import (
     render_sector_brief,
     render_theme_radar,
@@ -108,6 +111,7 @@ from ashare_decision_support.screens import (
 )
 from ashare_decision_support.sectors import (
     CONCEPT_LEVEL,
+    DEFAULT_LEVEL,
     SectorPredictor,
     SectorRotationStore,
     TickFlowSwTaxonomy,
@@ -117,7 +121,6 @@ from ashare_decision_support.sectors import (
     read_turnover,
     reverse_index,
 )
-from ashare_decision_support.state import SOURCE_SCAN, CandidatePool, WatchEntry
 from ashare_decision_support.strategy.positioning import resolve_position_sizing
 from ashare_decision_support.strategy.regime import RegimeVerdict, regime_from_limit_pool
 from ashare_decision_support.strategy.select import analyze_universe, select_from
@@ -133,9 +136,9 @@ NEWS_SHORTLIST_MULTIPLIER = 3
 
 NEWS_MAX_SYMBOLS = 40
 
-# 自选股每只带几条自己的消息进通读。比候选池那批（`SYMBOL_NEWS_LIMIT` 10 条）少，
+# 持仓每只带几条自己的消息进通读。比板块归因那批（`SYMBOL_NEWS_LIMIT` 10 条）少，
 # 是因为通读要的是「有没有属于它自己的事」，不是情绪聚合——条数少而精更好读。
-MAX_WATCHLIST_HEADLINES = 5
+MAX_HOLDING_HEADLINES = 5
 ROTATION_LOOKBACK_DAYS = 5
 
 # 每路舆情源取多少条。源的默认值是 200，对**板块归因**够用，对**通读**不够：
@@ -166,7 +169,7 @@ class MorningConfig:
     # 机会也多），而行业回答的「这是什么生意」并不因此变得不重要。
     top_concepts: int = 3
     candidates_per_sector: int = 3
-    sector_level: str = "SW1"
+    sector_level: str = DEFAULT_LEVEL
     position_factor: float | None = None
     max_constituents: int | None = None
 
@@ -207,7 +210,6 @@ class Sources:
     notifiers: list[Notifier] | None = None
     debate: DebatePanel | None = None
     journal: Journal | None = None
-    candidate_pool: CandidatePool | None = None
     limit_pool_adapter: Any | None = None
     sector_index_adapter: Any | None = None
     market_scan_adapter: Any | None = None
@@ -246,6 +248,9 @@ class _Collected:
     coverage: dict
     coverage_diagnostics: dict
     raw_doc_count: int
+    # 语料库本体。带到融合那一段，是因为板块选完之后才知道该问它哪几个板块的
+    # 跨日热度——而语料库是在采集这一段建的。
+    corpus: Any
 
 
 @dataclass(slots=True)
@@ -276,6 +281,7 @@ class _Fusion:
     rotation: Any
     theme_radar: list[Any]
     theme_validation: dict[str, Any]
+    sector_news_memory: list[dict[str, Any]]
 
 
 @dataclass(slots=True)
@@ -291,7 +297,7 @@ class _Selection:
 
 @dataclass(slots=True)
 class _Ledger:
-    """⑤ 候选池与台账。"""
+    """⑤ 台账。"""
 
     facts: dict
     state: Any
@@ -519,6 +525,7 @@ def _stage_collect(
         news_targets=news_targets,
         coverage=coverage,
         coverage_diagnostics=coverage_diagnostics,
+        corpus=corpus,
         raw_doc_count=news_finding.get("raw_doc_count", 0)
         + int(supplemented.get("raw_doc_count", 0) or 0),
     )
@@ -600,7 +607,7 @@ def _stage_fuse(
     # 所以「过去一周到一个月轮动到哪了」当天就能回答。
     rotation_price, turnover_migration, seesaw = _rotation_from_series(today, notes)
 
-    # 全市场扫描：给候选池提供可交易性门槛（流通市值/成交额），顺带一个比申万
+    # 全市场扫描：给候选提供可交易性门槛（流通市值/成交额），顺带一个比申万
     # 成分股样本更硬的宽度读数。
     market_scan = fetch_market_scan(
         sources.market_scan_adapter, cfg.use_market_scan, notes, sources.adapter
@@ -618,6 +625,7 @@ def _stage_fuse(
         attribution=labels.attribution(),
         fallback_empty_labels=True,
     )
+    _persist_news_labels(collected.corpus, predictor, definitions, market_docs, labels, notes)
     # 概念彼此重叠，一只股票可能同时属于十几个概念。拿概念指标计算全市场宽度会
     # 重复计权，并让 300 多个概念淹没 31 个行业；大盘口径因此只使用行业指标。
     industry_metrics = {
@@ -702,7 +710,146 @@ def _stage_fuse(
         rotation=rotation,
         theme_radar=theme_radar,
         theme_validation=theme_validation,
+        sector_news_memory=_sector_news_memory(collected.corpus, selected, notes=notes),
     )
+
+
+# 选中板块各取几条跨日舆情记忆。上限压得低是刻意的：这一段是**记忆**不是清单，
+# 一个板块超过三条就没人会读第三条以后的，而 facts 每多一条都要进写稿层 prompt。
+SECTOR_MEMORY_HOURS = 48.0
+SECTOR_MEMORY_HEADLINES = 3
+
+
+def _persist_news_labels(
+    corpus: Any,
+    predictor: SectorPredictor,
+    definitions: list,
+    docs: list,
+    labels: ClassifyResult,
+    notes: list[str],
+) -> None:
+    """把「这条消息算在哪个板块头上」写进语料库。
+
+    **不写的话，跨日热度永远查不到。** `doc_sectors` 此前在生产里是空表：入库
+    （`ingest`）一直在跑，归因（`label`）一个生产调用方都没有，于是
+    `sector_heat(sector=...)` / `recent(sector=...)` 按板块查出来的永远是空——
+    一个建好、有测试、每天都在写入一半数据的表，另一半从来没写过。
+
+    写的是**这一轮真正用于打分的那份归因**（`predictor.attribute_docs`），不是
+    重新按词表匹配一遍：同一条规则有两份实现，它们会各自演化，而事后没人能分清
+    「这条消息当时算在哪个板块」用的是哪一份。
+    """
+    if corpus is None or not getattr(corpus, "ok", False) or not docs:
+        return
+    docs_by_sector = predictor.attribute_docs(
+        definitions, docs, labels.attribution(), fallback_empty_labels=True
+    )
+    model_labels = labels.labels if labels.ok else {}
+
+    attribution: dict[str, DocAttribution] = {}
+    for sector, matched in docs_by_sector.items():
+        for doc in matched:
+            key = dedup_key(doc)
+            if not key:
+                continue
+            current = attribution.get(key)
+            sectors = (*current.sectors, sector) if current else (sector,)
+            model = model_labels.get(key)
+            attribution[key] = DocAttribution(
+                sectors=sectors,
+                # 方向与事件类型只有模型给得出，词表那条路留空——留空是「没这个
+                # 读数」，写一个猜的值是另一回事。
+                direction=getattr(model, "direction", None),
+                event_type=getattr(model, "event", None),
+                mechanism=getattr(model, "why", None),
+            )
+    if not attribution:
+        return
+    written = corpus.label_many(attribution)
+    notes.append(
+        f"{written} 条舆情已按板块归因入库（{'大模型' if labels.ok else '关键词词典'}），"
+        "跨日热度与「还在发酵的那条」按这份归因回查"
+    )
+
+
+def _sector_news_memory(
+    corpus: Any,
+    selected: list,
+    now: Any = None,
+    notes: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """选中板块的**跨日**舆情记忆：新故事流入速度 + 仍在发酵的标题。
+
+    当天那一批读数（`news_doc_count` / `headlines`）回答的是「今天有多少条」；
+    语料库跨日累积的那一维此前没有任何读取点——于是「这个板块的消息是今天突然
+    冒出来的，还是已经发酵两天」在事实包里没有答案，而这两种情况对第二天的含义
+    完全不同。
+
+    两个读数各答一件事，都只描述已经发生的事：
+
+    - `fresh_curve` 数**第一次出现**的文档（`sector_heat`）。一条消息被四个源
+      转发不代表热度翻四倍，那只是同一个故事。
+    - `still_developing` 按 `last_seen` 取（`recent(by="last_seen")`）。一个两天
+      前爆出、至今仍在被提的故事，正是现在推动板块的那个——按 `first_seen` 过滤
+      会把它整个滤掉。
+
+    语料库不可用（`--no-news`、库文件坏了）时返回空列表：这一层是旁证，不该让
+    盘前主链路少一节结论。`now` 只有测试会传——窗口按**真实当下**切，盘前跑批
+    在早上八点看的就该是最近 48 小时。
+    """
+    if corpus is None or not getattr(corpus, "ok", False):
+        return []
+    memory: list[dict[str, Any]] = []
+    for outlook in selected:
+        name = getattr(outlook, "name", "")
+        if not name:
+            continue
+        curve = corpus.sector_heat(name, within_hours=SECTOR_MEMORY_HOURS, now=now)
+        developing = corpus.recent(
+            within_hours=SECTOR_MEMORY_HOURS,
+            sector=name,
+            limit=SECTOR_MEMORY_HEADLINES,
+            by="last_seen",
+            now=now,
+        )
+        if not curve and not developing:
+            continue
+        memory.append(
+            {
+                "sector": name,
+                "level": getattr(outlook, "level", None),
+                "window_hours": SECTOR_MEMORY_HOURS,
+                # 时间桶 → 这一桶里第一次出现的文档数 / 覆盖到的源数。
+                "fresh_curve": [
+                    {
+                        "bucket_start": point.bucket_start.isoformat(timespec="minutes"),
+                        "fresh_docs": point.fresh_docs,
+                        "sources": point.sources,
+                    }
+                    for point in curve
+                ],
+                "fresh_docs_total": sum(point.fresh_docs for point in curve),
+                # 带 first_seen / last_seen 而不是算一个「多久之前」：后者要一个
+                # 当下时钟，而这份 facts 会被落盘、被隔天读到——那时算出来的
+                # 「3 小时前」就成了假的。两个时间戳原样给出，读的人自己减。
+                "still_developing": [
+                    {
+                        "title": doc.title,
+                        "source": doc.source,
+                        "first_seen": doc.first_seen_at.isoformat(timespec="minutes"),
+                        "last_seen": doc.last_seen_at.isoformat(timespec="minutes"),
+                        "source_count": doc.source_count,
+                    }
+                    for doc in developing
+                ],
+            }
+        )
+    # 语料库读失败时返回的是空列表——那和「这几个板块最近确实没有新故事」长得
+    # 一模一样，而后者会被当成一条读数用进判断。所以读不到必须说出口。
+    read_error = getattr(corpus, "read_error", None)
+    if read_error and notes is not None:
+        notes.append(f"板块舆情记忆读取失败（{read_error}），本次事实包不含跨日热度")
+    return memory
 
 
 def _stage_select(
@@ -809,30 +956,15 @@ def _stage_record(
     notes: list[str],
     report: Callable[[str], Any],
 ) -> _Ledger:
-    """⑤ 落候选池与台账。"""
+    """⑤ 落台账。
+
+    这里从前还要把候选写进 `candidates.json`，供 `advise` / `monitor` / `ask`
+    第二天当默认名单读。候选池 2026-08-11 删掉了（见 `state/positions.py`）：
+    候选是**这份晨报的结论**，它该被你读到，而不是变成一份没人维护、却在后面
+    每条命令里默默扩大取数范围的名单。候选仍然进 facts、进简报、进台账——
+    少的只是那次落盘。
+    """
     candidates = selection.candidates
-    pool = (
-        sources.candidate_pool if sources.candidate_pool is not None else CandidatePool(today=today)
-    )
-    pool.replace(
-        [
-            WatchEntry(
-                symbol=item["symbol"],
-                name=item.get("name"),
-                sector=item.get("sector"),
-                industries=list(item.get("industries") or []),
-                industry=item.get("industry"),
-                industry_leaf=item.get("industry_leaf"),
-                industry_path=item.get("industry_path"),
-                concepts=list(item.get("concepts") or []),
-                source=SOURCE_SCAN,
-                score=item.get("score"),
-                added_on=str(today),
-            )
-            for item in candidates
-        ],
-        today,
-    )
 
     facts = build_facts(
         today,
@@ -857,6 +989,7 @@ def _stage_record(
         news_diagnostics=collected.coverage_diagnostics,
         theme_radar=fusion.theme_radar,
         theme_validation=fusion.theme_validation,
+        sector_news_memory=fusion.sector_news_memory,
     )
     state = market_state(
         fusion.market,
@@ -879,7 +1012,7 @@ def _stage_record(
         state,
         macro_context=macro_context,
     )
-    # 对照组和入选组走同一套记录与兑现流程，只是 kind 不同、不推送、不进候选池。
+    # 对照组和入选组走同一套记录与兑现流程，只是 kind 不同、不推送、不进候选。
     recorded_control = _record_journal(
         journal,
         selection.control,
@@ -917,7 +1050,7 @@ def _stage_record(
                 else ""
             )
         )
-    report(f"④ 候选池共 {len(candidates)} 只，正在整理晨报与多空辩论")
+    report(f"④ 当日候选共 {len(candidates)} 只，正在整理晨报与多空辩论")
     return _Ledger(facts=facts, state=state, recorded=recorded)
 
 
@@ -999,13 +1132,7 @@ def _stage_publish(
     )
     delivered = publish(channels, title, markdown)
     file_notifier.write_payload(facts, MORNING_LATEST_NAME)
-    # The caller may have supplied its own FileNotifier, in which case the one
-    # built here never sent and its `last_path` is None. Report the path that
-    # was actually written rather than a null beside a "file" delivery.
-    brief_path = next(
-        (str(c.last_path) for c in channels if getattr(c, "last_path", None)),
-        str(file_notifier.last_path) if file_notifier.last_path else None,
-    )
+    brief_path = written_path(channels, file_notifier)
     report("⑤ 盘前简报已完成")
 
     earnings_verdicts = selection.earnings_verdicts
@@ -1124,9 +1251,9 @@ def _read_news(
 ) -> DailyRead:
     """舆情通读。任何一步失败都返回空读数，简报照出。
 
-    自选股与持仓股的消息单独取一次并带进去，让通读能点名回答「我这几只有没有
-    自己的事」。这批标的通常只有几只，比候选池那 40 只便宜得多，而它们恰恰是
-    最需要逐只交代的——候选池是系统选的，自选股是人自己盯的。
+    持仓的消息单独取一次并带进去，让通读能点名回答「我这几只有没有自己的事」。
+    这批标的通常只有几只，而它们恰恰是最需要逐只交代的——盘前候选是系统当天挑
+    出来的，持仓是你已经承担了风险的。
     """
     if not enabled or not docs:
         return DailyRead()
@@ -1141,15 +1268,17 @@ def _read_news(
         # 未配 key 的提示由 `_classify_news` 出过一次了，这里不重复刷。
         return DailyRead()
 
+    # 单独给持仓补一轮个股舆情：通读要回答的是「今天整体什么行情」，而你手上
+    # 那几只的公告与新闻属于**必须被看到**的一类，不能只靠全市场快讯撞上。
     symbol_docs: dict[str, list] = {}
     names: dict[str, str | None] = {}
     try:
-        from ashare_decision_support.state import Watchlist
+        from ashare_decision_support.state import Positions
 
-        book = Watchlist()
-        watched = book.symbols()
-        if watched and source is not None and hasattr(source, "fetch_for_symbols"):
-            symbol_docs, _ = source.fetch_for_symbols(watched, limit=MAX_WATCHLIST_HEADLINES)
+        book = Positions()
+        held = book.symbols()
+        if held and source is not None and hasattr(source, "fetch_for_symbols"):
+            symbol_docs, _ = source.fetch_for_symbols(held, limit=MAX_HOLDING_HEADLINES)
             names = {entry.symbol: entry.name for entry in book.entries}
     except Exception:
         symbol_docs, names = {}, {}
@@ -1303,7 +1432,7 @@ def _apply_screens(
 ) -> tuple[list[str], dict[str, Any], list[str]]:
     notes: list[str] = []
 
-    # ST/退市状态不再是候选池的过滤条件。可交易性仍然是独立门槛：它处理的是
+    # ST/退市状态不再是候选的过滤条件。可交易性仍然是独立门槛：它处理的是
     # 成交额和流通市值不足导致的执行问题，不以证券名称或代码段替代真实流动性。
     kept, illiquid, stats = LiquidityScreen(scan).filter(symbols)
     liquidity_note = stats.note()

@@ -158,6 +158,7 @@ def build_facts(
     news_diagnostics: dict[str, Any] | None = None,
     theme_radar: list[Any] | None = None,
     theme_validation: dict[str, Any] | None = None,
+    sector_news_memory: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "trade_date": str(today),
@@ -216,6 +217,10 @@ def build_facts(
             if daily_read is not None and getattr(daily_read, "ok", False)
             else None
         ),
+        # 选中板块的**跨日**舆情记忆。与上面 `news_coverage` 的分工：那个数
+        # 今天有多少条，这个答「这些消息是今天冒出来的还是已经发酵两天」——
+        # 同样一条利好，第一天和第三天对第二天的含义完全不同。
+        "sector_news_memory": sector_news_memory or [],
         "theme_radar": [item.to_dict() for item in (theme_radar or [])],
         "theme_validation": theme_validation or {},
         "macro_links": (

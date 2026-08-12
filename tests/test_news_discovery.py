@@ -18,7 +18,7 @@ def test_paper_supply_chain_terms_reach_light_manufacturing() -> None:
     definition = SectorDefinition("轻工制造", "SW1", ("600001.SH",))
     doc = NewsDoc(title="针叶浆价格回落，纸企成本改善")
 
-    by_sector = SectorPredictor(LexiconSentiment())._attribute_docs([definition], [doc])
+    by_sector = SectorPredictor(LexiconSentiment()).attribute_docs([definition], [doc])
 
     assert by_sector["轻工制造"] == [doc]
 

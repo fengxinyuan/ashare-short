@@ -320,3 +320,20 @@ def test_a_notifier_that_raises_does_not_lose_a_finished_brief(tmp_path) -> None
     assert recording.messages                         # 后面的渠道照常收到
     assert "exploding" not in summary["delivered"]    # 抛了的那个不算投递成功
     assert "recording" in summary["delivered"]
+
+
+def test_brief_path_reports_the_file_that_was_actually_written(tmp_path) -> None:
+    """`delivered` 写着 `["file"]`、`brief_path` 却是 null——文件明明写出来了，
+    回执说没有。四条链路此前有两种答法，`postclose` / `preopen` 是错的那种：
+    调用方自带 notifier 时（daemon 就是这么调的），它们只看自己构造的那个。
+    """
+    from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
+    from ashare_decision_support.notify.base import written_path
+
+    caller_owned = FileNotifier(tmp_path, slug="caller")
+    caller_owned.send("标题", "正文")
+    unused = FileNotifier(tmp_path / "never", slug="inner")
+
+    assert written_path([ConsoleNotifier(), caller_owned], unused) == str(caller_owned.last_path)
+    # 谁都没写文件时才是 None。
+    assert written_path([ConsoleNotifier()], unused) is None

@@ -25,8 +25,13 @@ def get_facts(
     output_dir: str = "briefs",
     symbols: list[str] | None = None,
     phase: str | None = None,
+    sections: list[str] | None = None,
 ) -> dict[str, Any]:
-    bundle = build_facts_bundle(output_dir=output_dir, symbols=symbols, phase=phase)
+    """当前时段的事实包。`sections` 只取其中几块，口径与 `ashare-ds facts --sections`
+    完全一致——过滤逻辑在 `build_facts_bundle` 里，这一层只是转发。"""
+    bundle = build_facts_bundle(
+        output_dir=output_dir, symbols=symbols, phase=phase, sections=sections
+    )
     return bundle.to_dict()
 
 
@@ -56,20 +61,3 @@ def refresh_sector_leaders_tool(
         top_per_sector=top_per_sector,
         lookback_days=lookback_days,
     )
-
-
-def get_tool_catalog() -> dict[str, Any]:
-    return {
-        "schema": "ashare-tool-catalog-v1",
-        "role": "deterministic evidence provider for external AI research",
-        "tools": [
-            "get_facts",
-            "monthly_outlook_context",
-            "refresh_sector_leaders",
-        ],
-        "constraints": [
-            "read-only tools do not write orders or account state",
-            "refresh_sector_leaders performs network reads and writes one JSON facts file",
-            "the client owns open-ended web research and final interpretation",
-        ],
-    }

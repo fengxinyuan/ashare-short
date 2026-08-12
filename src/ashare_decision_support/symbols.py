@@ -3,7 +3,7 @@
 Codes arrive in three shapes depending on the source — `600519.SH` from
 TickFlow, `600519` from a dragon-tiger row, `sh600519` from Sina — and any
 layer that persists or compares them has to agree on one. Two lists that
-disagree about whether a watchlist entry is `600519` or `600519.SH` will
+disagree about whether a position entry is `600519` or `600519.SH` will
 silently fail to match, and the failure looks like "the alert never fired".
 """
 

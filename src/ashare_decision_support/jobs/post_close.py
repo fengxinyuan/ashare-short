@@ -1,4 +1,4 @@
-"""盘后：给自选股与持仓打分，产出次日执行卡。
+"""盘后：给传入的标的（省略即持仓）打分，产出次日执行卡。
 
 和 `morning.py` 相反：那个从全市场出发自上而下选票，这个给**你已经在盯的那批**
 打分。两者共用同一段选股逻辑（`strategy/select.py`），所以两张表的分数可比。
@@ -8,7 +8,7 @@
 `EmotionCycle` 七档互不映射——于是盘后给出的次日候选，用的正是盘前明确否定过的
 逻辑，而两边没有任何地方对账。矩阵管线已随本次改造删除。
 
-**自选股不做隐式过滤。** 打法门槛在这里只做**标注**不做剔除（`require_playbook=
+**传进来的票不做隐式过滤。** 打法门槛在这里只做**标注**不做剔除（`require_playbook=
 False`）：这批票是你自己放进来的，「今天没有可用打法」是一个要说出口的结论，不是
 让它从表里消失的理由。同一条口径见 `jobs/advise.py` 对 ST 标的的处理。
 """
@@ -28,7 +28,7 @@ from ashare_decision_support.adapters.base import (
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.jobs.sources import fetch_lhb_seats, fetch_limit_pool, fetch_trade_flow
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_post_close_brief
-from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.notify.base import Notifier, publish, written_path
 from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.scoring import (
     RuleBasedScoreProvider,
@@ -110,7 +110,7 @@ def run_post_close(
         names=names,
         contexts=factor_contexts,
         provider=provider,
-        # 见模块 docstring：自选股只标注不剔除。
+        # 见模块 docstring：传进来的票只标注不剔除。
         require_playbook=False,
     )
     data_notes.extend(result.notes)
@@ -186,7 +186,7 @@ def run_post_close(
         "delivered": delivered,
         "data_notes": data_notes,
         "payload_path": str(Path(output_dir) / POST_CLOSE_LATEST_NAME),
-        "brief_path": str(file_notifier.last_path) if file_notifier.last_path else None,
+        "brief_path": written_path(channels, file_notifier),
         "content": content,
     }
 

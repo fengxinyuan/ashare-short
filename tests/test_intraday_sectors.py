@@ -364,7 +364,7 @@ def test_watched_symbols_are_recorded_on_the_sector() -> None:
         {"SW1": taxonomy},
         adapter=FakeScan(rows),
         now=datetime(2026, 8, 9, 10),
-        watchlist={"600003"},
+        watched_symbols={"600003"},
     ).reads[0]
 
     assert read.watch_hits == (("600003", "票3"),)
@@ -701,7 +701,7 @@ def test_the_budget_counts_pushes_not_folded_triggers(tmp_path) -> None:
     assert _PushLedger(state).spent_today() == 2
 
 
-def test_alerts_touching_the_watchlist_are_ranked_first(tmp_path) -> None:
+def test_alerts_touching_watched_symbols_are_ranked_first(tmp_path) -> None:
     """同一条「转强」，发生在你有仓位的方向上和发生在一个没碰过的方向上，
     紧急程度差一个量级。"""
     engine, state = engine_state(tmp_path)
@@ -727,8 +727,8 @@ def test_alerts_touching_the_watchlist_are_ranked_first(tmp_path) -> None:
     alerts, _ = engine.evaluate(later, first, state, datetime(2026, 8, 9, 10, 20))
 
     assert [item.trigger for item in alerts] == ["tone_strong", "tone_strong"]
-    assert alerts[0].sector == "我的板块"        # 超额更低，但命中自选
-    assert alerts[0].touches_watchlist is True
+    assert alerts[0].sector == "我的板块"        # 超额更低，但命中持仓
+    assert alerts[0].touches_watched is True
 
 
 def test_a_strong_sector_outside_the_attention_band_stays_quiet(tmp_path) -> None:
@@ -876,7 +876,7 @@ class CountingSectorSession:
 class QuietSession:
     """个股那一侧什么都不做，好让断言只落在板块节奏上。"""
 
-    def poll(self, watch, candidates, now, in_session=True):
+    def poll(self, watch, now, in_session=True):
         from ashare_decision_support.monitor.feed import assess_feed
         from ashare_decision_support.monitor.session import PassResult
 
@@ -890,7 +890,6 @@ def test_the_sector_pass_runs_on_its_own_cadence() -> None:
     run_monitor_loop(
         session=QuietSession(),
         watch_symbols=list,
-        candidate_symbols=list,
         notifiers=[],
         now_fn=lambda: datetime(2026, 8, 10, 10, 0),
         sleep=lambda seconds: None,
@@ -908,7 +907,6 @@ def test_the_sector_pass_is_skipped_outside_the_session() -> None:
     run_monitor_loop(
         session=QuietSession(),
         watch_symbols=list,
-        candidate_symbols=list,
         notifiers=[],
         now_fn=lambda: datetime(2026, 8, 10, 12, 0),   # 午休
         sleep=lambda seconds: None,
@@ -926,7 +924,6 @@ def test_a_failing_sector_pass_does_not_kill_the_stock_loop() -> None:
     stats = run_monitor_loop(
         session=QuietSession(),
         watch_symbols=list,
-        candidate_symbols=list,
         notifiers=[],
         now_fn=lambda: datetime(2026, 8, 10, 10, 0),
         sleep=lambda seconds: None,
@@ -946,7 +943,6 @@ def test_sector_alerts_are_published_with_their_own_title() -> None:
     stats = run_monitor_loop(
         session=QuietSession(),
         watch_symbols=list,
-        candidate_symbols=list,
         notifiers=[notifier],
         now_fn=lambda: datetime(2026, 8, 10, 10, 0),
         sleep=lambda seconds: None,
@@ -964,7 +960,7 @@ def test_sector_alerts_are_published_with_their_own_title() -> None:
 # ---- 空名单 ----------------------------------------------------------------
 
 
-def test_an_empty_watchlist_still_runs_the_sector_monitor(monkeypatch) -> None:
+def test_an_empty_position_list_still_runs_the_sector_monitor(monkeypatch) -> None:
     """空仓的日子恰恰是最需要「现在该看哪个方向」的那一天。此前名单为空时
     整个 `run_monitor` 直接 return，板块那一半跟着一起没了。"""
     sector = CountingSectorSession(alerts_on_pass=1)
@@ -987,7 +983,7 @@ def test_an_empty_watchlist_still_runs_the_sector_monitor(monkeypatch) -> None:
     assert notifier.messages
 
 
-def test_disabling_sectors_on_an_empty_watchlist_says_so(monkeypatch) -> None:
+def test_disabling_sectors_on_an_empty_position_list_says_so(monkeypatch) -> None:
     summary = run_monitor(
         adapter=None,
         once=True,

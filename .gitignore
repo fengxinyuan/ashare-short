@@ -27,3 +27,7 @@ tickflow_smoke.json
 # 运行状态：自选股、持仓、台账、告警、舆情语料库。这是**你的数据**，
 # 不是代码——进版本库既泄露持仓又会在每次跑批后制造 diff。
 .runtime_state/
+
+# 参考资料原件。知识已经转写进 docs/KNOWLEDGE_VOLUME_PRICE.md，二进制原件留在
+# 本地即可——它 diff 不了、review 不了，进版本库只是每次 clone 多背 1MB。
+*.pptx

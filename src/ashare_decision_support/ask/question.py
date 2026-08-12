@@ -1,13 +1,13 @@
 """把一句话拆成「问的是哪几只、问的是哪件事」。确定性，无模型。
 
 `ask` 原来对问题文本**一个字都不看**——装配只按时刻决定。于是问「丸美生物低开
-了怎么办」和问「今天该看什么」拿到的是同一份上下文：整个自选池、整个候选池、
+了怎么办」和问「今天该看什么」拿到的是同一份上下文：全部持仓、
 整份台账统计一起倒出来，模型得自己在里面找那一只票。答案跟着散，是结构决定的，
 不是措辞不好。
 
 这一层只回答两个问题，答完交给 `plan.py`：
 
-- **哪几只。** 代码直接认；名字只认系统已经知道的那些（自选、候选、最近一次算过
+- **哪几只。** 代码直接认；名字只认系统已经知道的那些（持仓、最近一次算过
   的结果）。认不出来的名字**列进 `unresolved` 明说**，不猜——猜错一个字，后面
   整条链路会拿另一只票的数据来回答你的问题，而且看不出错在哪。
 - **哪件事。** 买点、卖点、低开、风险、大盘、复盘、选股。一句话可以同时命中几个：
@@ -144,7 +144,7 @@ def parse_question(
     known_names: dict[str, str] | None = None,
     fallback_intents: list[str] | None = None,
 ) -> QuestionSpec:
-    """解析一句话。`known_names` 是 简称 → 代码 的映射，通常来自自选与候选池。
+    """解析一句话。`known_names` 是 简称 → 代码 的映射，通常来自持仓表。
 
     没提问、或者问题里什么都没认出来时，`fallback_intents` 顶上——那是调用方
     按时刻给的默认（盘前问「今天怎么样」问的是大盘与选股，盘中问的是买卖点）。
@@ -175,13 +175,13 @@ def parse_question(
     spec.unresolved = _unresolved_names(spec.raw, known_names or {})
     if spec.unresolved:
         spec.notes.append(
-            "问题里这些词看着像证券简称，但自选股与候选池里都没有，因此**没有**为它们取数："
+            "问题里这些词看着像证券简称，但持仓表里没有，因此**没有**为它们取数："
             + "、".join(spec.unresolved)
-            + "。要问它们，先 `ashare-ds watchlist add <代码>`"
+            + "。要问它们，先 `ashare-ds position open <代码> --cost <成本价>`"
         )
     if not spec.symbols and spec.symbol_specific:
         spec.notes.append(
-            "问题指向具体标的，但没解析出任何代码；下面按自选股与候选池的全部标的回答"
+            "问题指向具体标的，但没解析出任何代码；下面按持仓表里的标的回答"
         )
     return spec
 

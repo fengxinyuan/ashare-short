@@ -20,7 +20,7 @@ from ashare_decision_support.monitor.holdings import (
 from ashare_decision_support.monitor.session import _breakeven_lines
 from ashare_decision_support.monitor.triggers import TriggerEngine
 from ashare_decision_support.state.alerts import AlertState
-from ashare_decision_support.state.watchlist import Watchlist
+from ashare_decision_support.state.positions import Positions
 
 NOW = datetime(2026, 8, 3, 10, 30)
 
@@ -70,7 +70,7 @@ class Intraday:
 def fire(engine, state, advice, intraday, holding=None, support=None):
     return engine.evaluate(
         advice=advice, intraday=intraday, state=state, now=NOW,
-        watchlist=True, holding=holding, daily_support=support,
+        holding=holding, daily_support=support,
     )
 
 
@@ -190,31 +190,26 @@ def test_a_holding_alert_carries_cost_and_open_pnl() -> None:
     assert "亏损" in body
 
 
-def test_holdings_are_never_filtered_down_to_action_only() -> None:
-    """候选池只推 ACTION 是因为那是机器的选股。持仓不适用同一条——
-    漏报一条持仓告警的代价是真金白银，不是错过机会。"""
+def test_a_warn_level_holding_alert_is_not_filtered_out() -> None:
+    """持仓告警不分级别一律要报——漏一条的代价是真金白银，不是错过机会。"""
     engine, state = TriggerEngine(), AlertState(date(2026, 8, 3), Path('/dev/null'))
     holding = held(held_days=TIME_STOP_DAYS + 1)
 
-    # watchlist=False 模拟「不在自选列表里但确实持有」。
     alerts = engine.evaluate(
-        advice=Advice(), intraday=Intraday(10.70), state=state, now=NOW,
-        watchlist=False, holding=holding,
+        advice=Advice(), intraday=Intraday(10.70), state=state, now=NOW, holding=holding,
     )
-    # time_stop 是 WARN 级，若按候选池规则会被滤掉。
+    # time_stop 是 WARN 级，不是 ACTION。
     assert [a.trigger for a in alerts] == ["time_stop"]
 
 
 # ---- 会话装载 ---------------------------------------------------------------
 
 
-def test_the_session_separates_held_names_from_the_rest(tmp_path) -> None:
+def test_the_session_loads_the_position_table(tmp_path) -> None:
     from ashare_decision_support.monitor.session import MonitorSession
 
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    book.add("601939.SH")
-    book.add("600900.SH")
-    book.set_position("601939.SH", cost_price=10.64, today=date(2026, 8, 1))
+    book = Positions(path=tmp_path / "positions.json")
+    book.open("601939.SH", cost_price=10.64, today=date(2026, 8, 1))
 
     session = MonitorSession(
         adapter=None, intraday_adapter=None, session_date=date(2026, 8, 3),
@@ -227,7 +222,7 @@ def test_the_session_separates_held_names_from_the_rest(tmp_path) -> None:
     assert any("持仓 1 只" in note for note in notes)
 
 
-def test_no_watchlist_means_everything_is_treated_as_unheld(tmp_path) -> None:
+def test_no_position_table_means_everything_is_treated_as_unheld(tmp_path) -> None:
     """传 None 不该退化成「你什么都没持有」的静默假设——它是显式的无上下文。"""
     from ashare_decision_support.monitor.session import MonitorSession
 
@@ -240,10 +235,9 @@ def test_no_watchlist_means_everything_is_treated_as_unheld(tmp_path) -> None:
 
 
 def test_a_position_without_a_cost_price_is_called_out(tmp_path) -> None:
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    entry, _ = book.add("601939.SH")
-    entry.holding = True
-    book.save()
+    path = tmp_path / "positions.json"
+    path.write_text('[{"symbol": "601939.SH"}]', encoding="utf-8")
+    book = Positions(path=path)
 
     from ashare_decision_support.monitor.session import MonitorSession
 
@@ -255,23 +249,22 @@ def test_a_position_without_a_cost_price_is_called_out(tmp_path) -> None:
     assert any("没有成本价" in note for note in notes)
 
 
-def test_holding_alerts_sort_ahead_of_candidate_alerts() -> None:
-    """同一批推送里，「你手上那只跌破止损」不该排在「候选池某只进买区」后面。"""
+def test_holding_alerts_sort_ahead_of_the_rest() -> None:
+    """同一批推送里，「你手上那只跌破止损」不该排在「另一只进买区」后面。"""
     from ashare_decision_support.notify.render import render_alerts
 
     class A:
-        def __init__(self, headline, holding, watchlist=True):
+        def __init__(self, headline, holding):
             self.level = "ACTION"
             self.headline = headline
             self.detail = []
             self.as_of = NOW
             self.holding = holding
-            self.watchlist = watchlist
 
     text = render_alerts(
-        [A("候选票进入买入区间", False, watchlist=False), A("建设银行跌破止损", True)], None
+        [A("丸美生物进入买入区间", False), A("建设银行跌破止损", True)], None
     )
-    assert text.index("建设银行") < text.index("候选票")
+    assert text.index("建设银行") < text.index("丸美生物")
     assert "【持仓】" in text
     assert text.startswith("## 先处理")
     assert "## 触发依据" in text
@@ -286,7 +279,6 @@ def test_alert_render_starts_with_action_summary() -> None:
         detail = ["现价 28.28"]
         as_of = NOW
         holding = False
-        watchlist = True
         trigger = "entry_confirmed"
         symbol = "603983.SH"
 
@@ -561,7 +553,6 @@ def test_low_rrr_names_do_not_get_entry_action_alerts() -> None:
     fire(engine, state, advice, Intraday(10.90, vwap=10.9))
     alerts = engine.evaluate(
         advice=advice, intraday=Intraday(10.30, vwap=10.4), state=state, now=NOW,
-        watchlist=True,
         stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
     )
 
@@ -582,7 +573,7 @@ def test_low_rrr_names_are_blocked_on_the_first_pass_too() -> None:
     advice.rrr = 1.09
 
     alerts = engine.evaluate(
-        advice=advice, intraday=Intraday(10.35), state=state, now=NOW, watchlist=True,
+        advice=advice, intraday=Intraday(10.35), state=state, now=NOW,
         stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
     )
 
@@ -603,7 +594,7 @@ def test_earnings_veto_also_blocks_the_entry_action() -> None:
     advice.warnings = ["⚠️ 业绩否决：预告首亏 -158.9%，2026-07-11 披露（盘前链路不会选它）"]
 
     alerts = engine.evaluate(
-        advice=advice, intraday=Intraday(10.35), state=state, now=NOW, watchlist=True,
+        advice=advice, intraday=Intraday(10.35), state=state, now=NOW,
         stabilisation=Stabilisation(confirmed=True, pattern="放量反包", reason="量能 3.2 倍"),
     )
 

@@ -18,7 +18,7 @@ from ashare_decision_support.journal.stats import rolling_validation, summarize
 from ashare_decision_support.journal.store import Journal
 from ashare_decision_support.journal.verify import verify_pending
 from ashare_decision_support.signals.dipbuy import measure_dip
-from ashare_decision_support.state.watchlist import Watchlist
+from ashare_decision_support.state.positions import Positions
 
 
 def bars(
@@ -296,53 +296,54 @@ def test_next_session_readings_are_recorded_separately_from_the_five_day_window(
     assert outcome["mfe_pct"] >= outcome["next_high_pct"]
 
 
-# ---- 持仓状态 -------------------------------------------------------------
+# ---- 持仓表 ---------------------------------------------------------------
 
 
-def test_holding_state_drives_which_question_gets_asked(tmp_path) -> None:
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    book.add("600519")
-    book.add("000001.SZ")
+def test_opening_a_position_makes_it_the_thing_being_watched(tmp_path) -> None:
+    book = Positions(path=tmp_path / "positions.json")
+    assert len(book) == 0
 
-    assert len(book.holdings()) == 0
-    book.set_position("600519", cost_price=1300.0, shares=100, today=date(2026, 8, 3))
+    book.open("600519", cost_price=1300.0, shares=100, today=date(2026, 8, 3))
 
-    assert [entry.symbol for entry in book.holdings()] == ["600519.SH"]
-    assert [entry.symbol for entry in book.unheld()] == ["000001.SZ"]
-
+    assert book.symbols() == ["600519.SH"]
     entry = book.get("600519")
+    assert entry.opened_on == "2026-08-03"
     assert abs(entry.unrealised_pct(1352.0) - (1352.0 / 1300.0 - 1.0)) < 1e-6
 
 
-def test_buying_a_stock_not_yet_watched_adds_it(tmp_path) -> None:
-    """你买了它，它当然该被盯着——不该因为忘了先 add 就漏掉。"""
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    book.set_position("600519", cost_price=1300.0)
-    assert book.get("600519").holding is True
+def test_reopening_the_same_symbol_updates_in_place(tmp_path) -> None:
+    """改仓不该变成第二条记录——两条同代码的持仓会让卖点判断按哪一条都不对。"""
+    book = Positions(path=tmp_path / "positions.json")
+    book.open("600519", cost_price=1300.0, plan_stop=1280.0)
+    book.open("600519", cost_price=1310.0)
 
-
-def test_closing_a_position_keeps_the_stock_on_the_watchlist(tmp_path) -> None:
-    """卖掉不等于不再关注。"""
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    book.set_position("600519", cost_price=1300.0)
-    assert book.close_position("600519") is True
-
+    assert len(book) == 1
     entry = book.get("600519")
-    assert entry is not None
-    assert entry.holding is False
+    assert entry.cost_price == 1310.0
+    # 不带 --stop 的那次改仓不该抹掉上次填的止损。
+    assert entry.plan_stop == 1280.0
+
+
+def test_closing_a_position_removes_it(tmp_path) -> None:
+    """平仓即删除：卖点对一只已经卖掉的票没有意义，历史留在台账里。"""
+    path = tmp_path / "positions.json"
+    book = Positions(path=path)
+    book.open("600519", cost_price=1300.0)
+
+    assert book.close("600519") is True
+    assert book.close("600519") is False
+    assert Positions(path=path).symbols() == []
+
+
+def test_a_hand_edited_file_without_cost_still_loads(tmp_path) -> None:
+    """少一个数应该降级成「只报价位」，而不是让盘中监控起不来。"""
+    path = tmp_path / "positions.json"
+    path.write_text('[{"symbol": "600519.SH", "note": "手工加的"}]', encoding="utf-8")
+
+    entry = Positions(path=path).get("600519")
     assert entry.cost_price is None
     assert entry.unrealised_pct(1400.0) is None
-
-
-def test_old_watchlist_files_load_as_unheld(tmp_path) -> None:
-    """老 watchlist.json 没有持仓字段，读它不该炸也不该猜。"""
-    path = tmp_path / "watchlist.json"
-    path.write_text('[{"symbol": "600519.SH", "note": "旧格式"}]', encoding="utf-8")
-
-    entry = Watchlist(path=path).get("600519")
-    assert entry.holding is False
-    assert entry.cost_price is None
-    assert entry.note == "旧格式"
+    assert entry.note == "手工加的"
 
 
 # ---- 统计分层 -------------------------------------------------------------

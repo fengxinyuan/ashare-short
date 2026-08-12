@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "a-share-ultra-short-ai-system"
-version = "0.2.0"
+# 版本只写一处。`mcp_server` 的 `serverInfo.version` 直接读 `__version__`，两边
+# 各写一个字面量的话，客户端 `initialize` 报的版本和 `pip show` 报的会各说各话。
+dynamic = ["version"]
 description = "A-share ultra-short AI analysis and decision support system"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +42,9 @@ ashare-ds-mcp = "ashare_decision_support.mcp_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "ashare_decision_support.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -165,12 +170,20 @@ max-returns = 10
 # 和上面四条不同，这几个不是「以后要拆」，是**已经看过并决定不拆**：
 #   loop.py        一个轮询循环，5 份状态（档位、连败、连胜、挂起、统计）在
 #                  分支间共享。抽出「跑一轮」就得造一个状态包再传回来。
-#   advise.py      主链路编排，语句多是因为步骤多，分支只有 12。
-#   daily_technical 画 SVG：71 条语句全是坐标计算与标签摆放，没有判断。
+#   advise.py      主链路编排，语句多是因为步骤多（93 条），分支 16 条也全是
+#                  「这一段取不到就跳过」的可选层开关，不是判定分叉。
 #   qmt/tickflow   适配器的字段兜底，分支数等于上游可能给出的字段组合数。
+#
+# **这张表要能被证伪。** 2026-08-11 把每一条摘掉重跑了一遍 ruff，掉下来两条——
+# 它们的豁免理由已经随代码一起没了：
+#   - `daily_technical.py` 的 PLR0915 挂的是那个画 SVG 的渲染器（71 条语句全是
+#     坐标计算），`DailyKChartRenderer` 本轮已删（INVENTORY §3），函数没了豁免
+#     自然也没了；
+#   - `tickflow_adapter.py` 的 PLR0912 挂的是降级日线代理那段字段兜底，那段同样
+#     已经不在了。
+# 留着不报错，但它们会让这张表读起来像「这些文件天生就该超标」——而真实情况是
+# 它们现在**自己过闸**。摘不掉的才留下。
 "src/ashare_decision_support/monitor/loop.py" = ["PLR0912", "PLR0915"]
 "src/ashare_decision_support/jobs/advise.py" = ["PLR0912", "PLR0915"]
-"src/ashare_decision_support/signals/daily_technical.py" = ["PLR0915"]
 "src/ashare_decision_support/adapters/qmt_xtdata.py" = ["PLR0912"]
-"src/ashare_decision_support/adapters/tickflow_adapter.py" = ["PLR0912"]
 "src/ashare_decision_support/adapters/tickflow_intraday.py" = ["PLR0912"]

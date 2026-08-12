@@ -38,6 +38,7 @@ PHASE_LABELS = {
     PHASE_POST_CLOSE: "盘后",
     PHASE_OFF_HOURS: "非交易时段",
 }
+PHASES = tuple(PHASE_LABELS)
 
 # 时段边界。09:15 起算盘前是因为集合竞价从那一刻开始报价；15:00 收盘之后到
 # 次日 05:00 都算盘后，因为那段时间你问的仍然是「今天发生了什么」。
@@ -128,16 +129,16 @@ def resolve_phase(moment: datetime, is_trading_day: bool | None = None) -> str:
 
 
 def load_known_names() -> dict[str, str]:
-    """简称 → 代码。只认自选股与候选池里的名字。
+    """简称 → 代码。只认持仓表里的名字。
 
     **不去全市场查名字**：那要么是一次网络往返，要么是一份会过期的本地表，
     而这一层的作用只是让「丸美生物低开了怎么办」里的名字能对上一个代码。对不上
     的名字由 `question.py` 明确报出来，比猜一个更有用。
     """
     try:
-        from ashare_decision_support.state import CandidatePool, Watchlist
+        from ashare_decision_support.state import Positions
 
-        entries = list(Watchlist().entries) + list(CandidatePool().entries)
+        entries = list(Positions().entries)
     except Exception:
         return {}
     return {
@@ -163,24 +164,44 @@ def assemble(
     `notes`，不会假装是实时的。
 
     `focus` 非空时，实时计算**只覆盖这几只**。问三只票就取三只票的分钟线，而不是
-    把整个自选池加候选池全算一遍——那是几十次 HTTP，而其中绝大多数不会出现在
-    答案里。装配好的上下文仍然包含全部标的列表，只是没有它们的实时价位。
+    把持仓也一起算一遍——那是几十次 HTTP，而其中绝大多数不会出现在答案里。
+    装配好的上下文仍然包含全部标的列表，只是没有它们的实时价位。
+
+    显式传 `phase` 时**必须是四个时段之一**。认不出来的值以前会一路带下去：
+    `phase_label` 原样回显，装配走进「非盘中」那条分支，产出一份自称
+    `phase: banana` 的事实包——对着它问「现在该不该买」，答的是一个不存在的
+    时段。调用方是模型时这一点尤其重要：拼错的枚举值要当场退回，不能变成一份
+    看起来正常的结果。判据同 `research/leaders.py` 对 `levels` 的处置。
     """
+    if phase is not None and phase not in PHASE_LABELS:
+        raise ValueError(f"unsupported phase: {phase!r}; expected one of {list(PHASES)}")
     resolved = phase or resolve_phase(moment, is_trading_day)
 
     ctx = AskContext(phase=resolved, as_of=moment.isoformat(timespec="seconds"))
-    watch, candidates = _load_watchlist(ctx, moment.date())
-    ctx.symbols = list(dict.fromkeys((symbols or []) + watch + candidates))
+    held = _load_positions(ctx)
+    ctx.symbols = list(dict.fromkeys((symbols or []) + held))
     ctx.focus = [symbol for symbol in (focus or []) if symbol]
 
     # 盘前 / 非交易时段：读最近一次主链路的产出。
     if resolved in (PHASE_PRE_OPEN, PHASE_OFF_HOURS, PHASE_POST_CLOSE):
         _load_payload(ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路")
-        _load_payload(ctx, output_dir, STRATEGY_SCREEN_LATEST_NAME, "参数化策略扫描")
+        _load_payload(
+            ctx,
+            output_dir,
+            STRATEGY_SCREEN_LATEST_NAME,
+            "参数化策略扫描",
+            trim=_trim_strategy_screen,
+        )
 
     if resolved == PHASE_INTRADAY:
         _load_payload(ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路")
-        _load_payload(ctx, output_dir, STRATEGY_SCREEN_LATEST_NAME, "参数化策略扫描")
+        _load_payload(
+            ctx,
+            output_dir,
+            STRATEGY_SCREEN_LATEST_NAME,
+            "参数化策略扫描",
+            trim=_trim_strategy_screen,
+        )
         _load_alerts(ctx, moment.date())
         _load_live_levels(ctx, compute_symbols)
     elif resolved == PHASE_POST_CLOSE:
@@ -199,32 +220,83 @@ def assemble(
     return ctx
 
 
+# 全市场筛选进上下文时保留几条。**这是唯一一处按体积截断的地方**，理由是它的
+# 体积和它的信息量不成比例：实测一份三策略的扫描结果 110KB，其中 109KB 是 120 行
+# 结构完全相同的候选，而这一层要回答的是「最近一次筛选挑出了什么样的票」。
+# 完整结果一直在 `briefs/strategy_screen_latest.json` 里，截断多少条写进 notes——
+# **静默截断读起来和「全都在这里」一模一样**，那正是这套系统各处都在防的事。
+SCREEN_KEEP_PER_PROFILE = 5
+SCREEN_KEEP_SHORTLIST = 10
+
+
+def _trim_strategy_screen(payload: Any) -> tuple[Any, list[str]]:
+    """把筛选结果收成「每个策略的漏斗 + 前几名」。
+
+    留下的三样是读的人真正会用的：`config`（这次按什么条件筛的）、`summary`
+    （漏斗，回答「为什么只剩这么几只」）、以及每个策略的头几名。剩下的行不是
+    没有价值，而是**它们的价值在文件里，不在上下文里**——把 120 行塞进模型的
+    输入，换来的是它读不完、也答不准。
+    """
+    if not isinstance(payload, dict):
+        return payload, []
+
+    dropped = 0
+    trimmed = dict(payload)
+    profiles = payload.get("profiles")
+    if isinstance(profiles, dict):
+        kept_profiles = {}
+        for name, item in profiles.items():
+            if not isinstance(item, dict):
+                kept_profiles[name] = item
+                continue
+            candidates = item.get("candidates")
+            if isinstance(candidates, list) and len(candidates) > SCREEN_KEEP_PER_PROFILE:
+                dropped += len(candidates) - SCREEN_KEEP_PER_PROFILE
+                item = {**item, "candidates": candidates[:SCREEN_KEEP_PER_PROFILE]}
+            kept_profiles[name] = item
+        trimmed["profiles"] = kept_profiles
+
+    shortlist = payload.get("diversified_shortlist")
+    if isinstance(shortlist, list) and len(shortlist) > SCREEN_KEEP_SHORTLIST:
+        dropped += len(shortlist) - SCREEN_KEEP_SHORTLIST
+        trimmed["diversified_shortlist"] = shortlist[:SCREEN_KEEP_SHORTLIST]
+
+    if not dropped:
+        return payload, []
+    note = (
+        f"参数化策略扫描已按体积截断：每个策略保留前 {SCREEN_KEEP_PER_PROFILE} 只、"
+        f"多样化短名单保留前 {SCREEN_KEEP_SHORTLIST} 只，共省略 {dropped} 行；"
+        f"完整结果见 {STRATEGY_SCREEN_LATEST_NAME}"
+    )
+    trimmed["截断说明"] = note
+    return trimmed, [note]
+
+
 # ---- blocks --------------------------------------------------------------
 
 
-def _load_watchlist(ctx: AskContext, today: date) -> tuple[list[str], list[str]]:
+def _load_positions(ctx: AskContext) -> list[str]:
+    """持仓进上下文。**它是唯一还会自动进来的名单。**
+
+    自选股与候选池删掉之后，其余标的一律由提问时显式给出——问哪只装哪只。
+    持仓是例外，因为「我该不该卖」这个问题不该要求你先把代码再敲一遍，而回答
+    它必须有成本价、计划止损和持有天数。
+    """
     try:
-        from ashare_decision_support.state import CandidatePool, Watchlist
+        from ashare_decision_support.state import Positions
 
-        book, pool = Watchlist(), CandidatePool(today=today)
+        book = Positions()
     except Exception as exc:
-        ctx.notes.append(f"自选股/候选池读取失败（{type(exc).__name__}），本次不含这一块")
-        return [], []
+        ctx.notes.append(f"持仓读取失败（{type(exc).__name__}），本次不含这一块")
+        return []
 
-    # 用 `Watchlist.holdings()` 而不是自己按属性过滤：字段叫 `holding`，
-    # `getattr(entry, "is_holding", False)` 这类猜名字的写法会**静默**恒为
-    # False——持仓数永远是 0，而盘中问「我该卖吗」时模型正是照着这个数答的。
-    holdings = book.holdings()
-    ctx.blocks["自选与候选"] = {
-        "自选": [entry.to_dict() for entry in book.entries],
-        "候选池": [entry.to_dict() for entry in pool.entries],
-        "候选池生成日": pool.trade_date,
-        "持仓数": len(holdings),
-        # 持仓单独摊平成几个短字段，不复用上面那份 `to_dict()`。原因在渲染那一侧：
-        # `_short` 会把超过 160 字的条目截断，而 `asdict` 的字段顺序把成本价、
-        # 计划止损、计划目标排在最后——正好是被截掉的那几个。没配 key 时
-        # `render()` 就是全部输出，于是「我该不该卖」最需要的三个数恰恰看不见。
-        "持仓": [
+    # 摊平成几个短字段而不是直接 `to_dict()`。原因在渲染那一侧：`_short` 会把
+    # 超过 160 字的条目截断，而 `asdict` 的字段顺序把成本价、计划止损、计划目标
+    # 排在最后——正好是被截掉的那几个。没配 key 时 `render()` 就是全部输出，
+    # 于是「我该不该卖」最需要的三个数恰恰看不见。
+    ctx.blocks["持仓"] = {
+        "持仓数": len(book),
+        "明细": [
             {
                 "symbol": entry.symbol,
                 "成本价": entry.cost_price,
@@ -234,12 +306,15 @@ def _load_watchlist(ctx: AskContext, today: date) -> tuple[list[str], list[str]]
                 "计划止损": entry.plan_stop,
                 "计划目标": entry.plan_target,
             }
-            for entry in holdings
+            for entry in book.entries
         ],
     }
-    if not book.entries and not pool.entries:
-        ctx.notes.append("自选股与候选池都是空的，用 `ashare-ds watchlist add <代码>` 加入标的")
-    return book.symbols(), pool.symbols()
+    if not book.entries:
+        ctx.notes.append(
+            "持仓表是空的；要问某只票直接把代码写进问题里，"
+            "登记持仓用 `ashare-ds position open <代码> --cost <成本价>`"
+        )
+    return book.symbols()
 
 
 def _load_alerts(ctx: AskContext, today: date) -> None:
@@ -306,7 +381,11 @@ def _load_live_levels(
 
 
 def _load_payload(
-    ctx: AskContext, output_dir: str | Path | None, name: str, label: str
+    ctx: AskContext,
+    output_dir: str | Path | None,
+    name: str,
+    label: str,
+    trim: Callable[[Any], tuple[Any, list[str]]] | None = None,
 ) -> None:
     if output_dir is None:
         return
@@ -319,6 +398,9 @@ def _load_payload(
     except Exception as exc:
         ctx.notes.append(f"{label}读取失败（{type(exc).__name__}）")
         return
+    if trim is not None:
+        payload, trim_notes = trim(payload)
+        ctx.notes.extend(trim_notes)
     ctx.blocks[label] = payload
     stamp = payload.get("trade_date") if isinstance(payload, dict) else None
     if stamp:

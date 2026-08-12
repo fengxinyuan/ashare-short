@@ -43,7 +43,12 @@ from ashare_decision_support.news.relevance import (
 from ashare_decision_support.news.rss_source import RssNewsSource
 from ashare_decision_support.news.sentiment import LexiconSentiment
 from ashare_decision_support.news.social_source import SocialSnapshotSource
-from ashare_decision_support.news.store import IngestResult, NewsStore, StoredDoc
+from ashare_decision_support.news.store import (
+    DocAttribution,
+    IngestResult,
+    NewsStore,
+    StoredDoc,
+)
 from ashare_decision_support.news.theme_history import ThemeOutcomeStore
 from ashare_decision_support.news.theme_radar import ThemeSignal, load_themes, scan_themes
 from ashare_decision_support.news.wallstreet_source import WallstreetNewsSource
@@ -56,6 +61,7 @@ __all__ = [
     "CompositeNewsSource",
     "DailyNewsReader",
     "DailyRead",
+    "DocAttribution",
     "EventEvidence",
     "IngestResult",
     "LexiconSentiment",

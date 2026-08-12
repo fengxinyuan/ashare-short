@@ -96,7 +96,7 @@ class SectorRead:
     limit_up: int = 0
     # (名称, 涨跌幅)，按涨跌幅降序。
     leaders: tuple[tuple[str, float], ...] = ()
-    # 这个板块里你自己盯着的票（自选 + 持仓 + 当日候选池），(代码, 名称)。
+    # 这个板块里你自己盯着的票（持仓，或本轮显式传进来的那几只），(代码, 名称)。
     #
     # **在归并时算，不在告警时算。** 告警层拿到的是 `SectorRead`，里面没有成分股
     # 名单；要在那里做交集就得把 1215 只的成分表一路带过去，落盘也会跟着涨一个
@@ -252,17 +252,18 @@ def measure(
     market_median: float,
     total_amount_yi: float,
     min_covered: int = MIN_COVERED,
-    watchlist: set[str] | None = None,
+    watched_symbols: set[str] | None = None,
 ) -> tuple[list[SectorRead], int]:
     """行情行 × 板块定义 → 截面读数。纯计算，不碰网络。
 
     `rows` 是 `MarketScan.rows`，键是**裸 6 位代码**；板块定义里是 `NNNNNN.XX`。
     在这里对齐一次，而不是在归并循环里每次 split ——那是 5 万次字符串切分。
 
-    `watchlist` 是裸代码集合（自选 + 持仓 + 候选池），命中的记进 `watch_hits`。
+    `watched_symbols` 是裸代码集合（持仓，或本轮显式传进来的那几只），命中的记进
+    `watch_hits`。
     """
     reads: list[SectorRead] = []
-    watched = watchlist or set()
+    watched = watched_symbols or set()
     thin = 0
 
     for definition in definitions:
@@ -353,7 +354,7 @@ def take_snapshot(
     now: datetime | None = None,
     min_covered: int = MIN_COVERED,
     min_total_amount_yi: float = MIN_TOTAL_AMOUNT_YI,
-    watchlist: set[str] | None = None,
+    watched_symbols: set[str] | None = None,
 ) -> SectorSnapshot:
     """扫一次全市场，按每个分类各归并一遍。
 
@@ -404,7 +405,7 @@ def take_snapshot(
             market_median,
             total_amount,
             min_covered=min_covered,
-            watchlist=watchlist,
+            watched_symbols=watched_symbols,
         )
         reads.extend(level_reads)
         if thin:

@@ -30,13 +30,7 @@ from ashare_decision_support.monitor.loop import INTERVAL_LADDER, run_monitor_lo
 from ashare_decision_support.monitor.triggers import LEVEL_ACTION, LEVEL_INFO, LEVEL_WARN
 from ashare_decision_support.notify.feishu import MESSAGE_URL, TOKEN_URL, FeishuNotifier, _sign
 from ashare_decision_support.schedule import TradingCalendar, build_timetable, run_daemon
-from ashare_decision_support.state import (
-    AlertState,
-    CandidatePool,
-    DaemonState,
-    WatchEntry,
-    Watchlist,
-)
+from ashare_decision_support.state import AlertState, DaemonState, Positions
 from ashare_decision_support.symbols import bare_code, normalize_symbol
 
 SESSION = date(2026, 8, 3)
@@ -111,7 +105,7 @@ def run_session(paths, levels=(LEVEL_ACTION, LEVEL_WARN)):
     out = []
     for index in range(len(paths)):
         now = script[index][-1]["timestamp"] + timedelta(minutes=1)
-        out.append(session.poll(["600519.SH"], [], now))
+        out.append(session.poll(["600519.SH"], now))
     return session, out
 
 
@@ -141,65 +135,29 @@ def test_unrecognisable_symbol_is_not_guessed_an_exchange() -> None:
     assert normalize_symbol("NOTACODE") == "NOTACODE"
 
 
-# ---- watchlist and candidate pool ----------------------------------------
+# ---- positions -----------------------------------------------------------
 
 
-def test_watchlist_persists_and_deduplicates_across_symbol_forms() -> None:
-    book = Watchlist()
-    book.add("600519", name="贵州茅台", note="核心仓")
-    _, created = book.add("sh600519")
+def test_positions_persist_and_deduplicate_across_symbol_forms() -> None:
+    book = Positions()
+    book.open("600519", cost_price=1300.0, name="贵州茅台", note="核心仓")
+    book.open("sh600519", cost_price=1310.0)
 
-    assert created is False
-    assert Watchlist().symbols() == ["600519.SH"]
-    # A later add without a note must not erase the note typed earlier.
-    assert Watchlist().get("600519.SH").note == "核心仓"
+    assert Positions().symbols() == ["600519.SH"]
+    # 一次不带备注的改仓不该抹掉先前填的那句。
+    assert Positions().get("600519.SH").note == "核心仓"
+    assert Positions().get("600519.SH").cost_price == 1310.0
 
 
-def test_watchlist_remove_and_clear() -> None:
-    book = Watchlist()
-    book.add("600519")
-    book.add("000001")
+def test_positions_close_and_clear() -> None:
+    book = Positions()
+    book.open("600519", cost_price=1300.0)
+    book.open("000001", cost_price=12.0)
 
-    assert book.remove("600519.SH") is True
-    assert book.remove("600519.SH") is False
+    assert book.close("600519.SH") is True
+    assert book.close("600519.SH") is False
     assert book.clear() == 1
-    assert Watchlist().symbols() == []
-
-
-def test_candidate_pool_expires_when_the_trade_date_rolls_over() -> None:
-    CandidatePool(today=SESSION).replace(
-        [WatchEntry(symbol="300750.SZ", source="sector-scan", score=78.0)], SESSION
-    )
-
-    assert CandidatePool(today=SESSION).symbols() == ["300750.SZ"]
-    stale = CandidatePool(today=SESSION + timedelta(days=1))
-    assert stale.symbols() == []
-    assert stale.stale is True
-
-
-def test_candidate_pool_preserves_symbol_metadata() -> None:
-    CandidatePool(today=SESSION).replace(
-        [
-            WatchEntry(
-                symbol="300750.SZ",
-                name="宁德时代",
-                sector="电力设备",
-                industries=["电力设备", "电池", "锂电池"],
-                industry="电力设备",
-                industry_leaf="锂电池",
-                industry_path="电力设备·电池·锂电池",
-                concepts=["固态电池", "储能"],
-                source="sector-scan",
-                score=78.0,
-            )
-        ],
-        SESSION,
-    )
-
-    entry = CandidatePool(today=SESSION).get("300750.SZ")
-    assert entry is not None
-    assert entry.industry_path == "电力设备·电池·锂电池"
-    assert entry.concepts == ["固态电池", "储能"]
+    assert Positions().symbols() == []
 
 
 def test_alert_state_survives_a_reload() -> None:
@@ -218,11 +176,11 @@ def test_alert_state_survives_a_reload() -> None:
 
 
 def test_corrupt_state_file_degrades_instead_of_crashing(tmp_path) -> None:
-    path = tmp_path / "watchlist.json"
+    path = tmp_path / "positions.json"
     path.write_text("{not json", encoding="utf-8")
     # Re-firing every alert of the day is the cost of a parse error taking down
     # the load, so a corrupt file has to read as empty.
-    assert Watchlist(path=path).symbols() == []
+    assert Positions(path=path).symbols() == []
 
 
 # ---- freshness gate ------------------------------------------------------
@@ -290,7 +248,7 @@ def test_a_stale_feed_produces_no_alerts_at_all() -> None:
         StubDaily(), ScriptedIntraday(script), SESSION, alert_state=AlertState.load(SESSION)
     )
     session.prime(["600519.SH"])
-    result = session.poll(["600519.SH"], [], datetime(2026, 8, 3, 10, 0))
+    result = session.poll(["600519.SH"], datetime(2026, 8, 3, 10, 0))
 
     assert result.health.usable is False
     assert result.alerts == []
@@ -361,23 +319,6 @@ def test_info_triggers_appear_when_the_level_is_enabled() -> None:
     assert "vwap_regain" in triggers
 
 
-def test_candidate_pool_names_only_interrupt_at_action_level() -> None:
-    engine = TriggerEngine()
-    state = AlertState.load(SESSION)
-    advice = StockAdvice(symbol="600519.SH", last_price=100.6, entry_low=99.0, entry_high=101.0, stop=95.0)
-
-    from ashare_decision_support.signals.intraday import IntradayAnalyzer
-
-    first = IntradayAnalyzer(today=SESSION).analyze("600519.SH", minute_bars(RISE))
-    engine.evaluate(advice, first, state, datetime(2026, 8, 3, 10, 10), watchlist=False)
-
-    second = IntradayAnalyzer(today=SESSION).analyze("600519.SH", minute_bars([*RISE, 100.6]))
-    advice.last_price = second.last_price
-    alerts = engine.evaluate(advice, second, state, datetime(2026, 8, 3, 10, 30), watchlist=False)
-
-    assert all(alert.level == LEVEL_ACTION for alert in alerts)
-
-
 # ---- loop ----------------------------------------------------------------
 
 
@@ -417,7 +358,6 @@ def test_loop_steps_the_interval_down_when_the_feed_keeps_failing() -> None:
     stats = run_monitor_loop(
         session=session,
         watch_symbols=lambda: ["600519.SH"],
-        candidate_symbols=list,
         notifiers=[],
         now_fn=lambda: datetime(2026, 8, 3, 10, 0),
         sleep=lambda seconds: None,
@@ -438,7 +378,6 @@ def test_feed_suspension_is_announced_once_not_every_pass() -> None:
     run_monitor_loop(
         session=session,
         watch_symbols=lambda: ["600519.SH"],
-        candidate_symbols=list,
         notifiers=[notifier],
         now_fn=lambda: datetime(2026, 8, 3, 10, 0),
         sleep=lambda seconds: None,
@@ -460,7 +399,6 @@ def test_a_pass_that_raises_does_not_kill_the_loop() -> None:
     stats = run_monitor_loop(
         session=session,
         watch_symbols=lambda: ["600519.SH"],
-        candidate_symbols=list,
         notifiers=[],
         now_fn=lambda: datetime(2026, 8, 3, 10, 0),
         sleep=lambda seconds: None,
@@ -1467,7 +1405,6 @@ def test_monitor_loop_refreshes_announcements_on_a_slow_cycle() -> None:
     stats = run_monitor_loop(
         session=session,
         watch_symbols=lambda: ["600519.SH"],
-        candidate_symbols=list,
         notifiers=[],
         now_fn=lambda: datetime(2026, 8, 3, 10, 0),
         sleep=lambda seconds: None,
@@ -1490,7 +1427,6 @@ def test_a_failing_announcement_refresh_does_not_stop_monitoring() -> None:
     stats = run_monitor_loop(
         session=session,
         watch_symbols=lambda: ["600519.SH"],
-        candidate_symbols=list,
         notifiers=[],
         now_fn=lambda: datetime(2026, 8, 3, 10, 0),
         sleep=lambda seconds: None,
@@ -1692,11 +1628,7 @@ def test_advise_appends_the_debate_without_letting_it_touch_the_numbers() -> Non
 
 def test_monitor_loads_announcements_so_the_risk_trigger_has_input() -> None:
     from ashare_decision_support.jobs import run_monitor
-    from ashare_decision_support.state import Watchlist
-
-    book = Watchlist()
-    book.add("600519.SH")
-    book.save()
+    Positions().open("600519.SH", cost_price=1300.0)
 
     class Intraday:
         def get_minute_bars(self, symbols, period="1", **kwargs):
@@ -1718,11 +1650,7 @@ def test_monitor_loads_announcements_so_the_risk_trigger_has_input() -> None:
 
 def test_monitor_says_so_when_the_announcement_source_is_missing() -> None:
     from ashare_decision_support.jobs import run_monitor
-    from ashare_decision_support.state import Watchlist
-
-    book = Watchlist()
-    book.add("600519.SH")
-    book.save()
+    Positions().open("600519.SH", cost_price=1300.0)
 
     class Intraday:
         def get_minute_bars(self, symbols, period="1", **kwargs):
@@ -2064,11 +1992,11 @@ def test_the_model_saying_no_sector_is_a_verdict_not_a_gap() -> None:
     predictor = SectorPredictor(LexiconSentiment())
 
     # 没有归因 -> 关键词把"光伏"挂到电力设备
-    by_keyword = predictor._attribute_docs([definition], [doc], None)
+    by_keyword = predictor.attribute_docs([definition], [doc], None)
     assert by_keyword["电力设备"] == [doc]
 
     # 模型明确判定无归属 -> 就是无归属，不再回退关键词
-    by_model = predictor._attribute_docs([definition], [doc], {dedup_key(doc): ()})
+    by_model = predictor.attribute_docs([definition], [doc], {dedup_key(doc): ()})
     assert by_model["电力设备"] == []
 
 
@@ -2149,3 +2077,74 @@ def test_a_listed_event_type_survives() -> None:
     ]
 
     assert label.event == "订单"
+
+
+def test_a_position_opened_mid_session_is_watched_on_the_next_pass(monkeypatch) -> None:
+    """盘中 `position open` 登记的新仓位要立刻被盯上，不用重启监控。
+
+    这条一直只是 `run_monitor` 里的一句注释：名单是每轮重读的 lambda，而没有任何
+    用例证明它真的每轮重读。写成一次调用两轮、中间加仓，第二轮必须看见它。
+    """
+    from ashare_decision_support.jobs import run_monitor
+
+    polled: list[list[str]] = []
+
+    class Intraday:
+        def get_minute_bars(self, symbols, period="1", **kwargs):
+            polled.append(list(symbols))
+            if len(polled) == 1:
+                # 第一轮跑完再加仓：模拟盘中手工登记。
+                Positions().open("000001.SZ", cost_price=12.0)
+            return {symbol: minute_bars(RISE) for symbol in symbols}, []
+
+    # 轮询之间的降频等待在这里没有意义，跑两轮不该真的睡两分钟。`sleep` 是
+    # `run_monitor_loop` 的**默认参数**（定义时就绑好了 `time.sleep`），补 time
+    # 那一侧补不到，所以从 job 这一侧把循环包一层。
+    import ashare_decision_support.jobs.monitor as monitor_job
+
+    real_loop = monitor_job.run_monitor_loop
+    monkeypatch.setattr(
+        monitor_job,
+        "run_monitor_loop",
+        lambda **kwargs: real_loop(sleep=lambda _seconds: None, **kwargs),
+    )
+
+    Positions().open("600519.SH", cost_price=1300.0)
+    run_monitor(
+        adapter=StubDaily(),
+        intraday_adapter=Intraday(),
+        max_passes=2,
+        notifiers=[],
+        news_source=None,
+        trade_date=SESSION,
+        now=datetime(2026, 8, 3, 10, 0),
+    )
+
+    assert polled[0] == ["600519.SH"]
+    assert "000001.SZ" in polled[1]
+
+
+def test_explicit_symbols_are_not_overridden_by_the_position_table() -> None:
+    """显式传了代码就只盯它——持仓表里的票不该悄悄挤进来。"""
+    from ashare_decision_support.jobs import run_monitor
+
+    polled: list[list[str]] = []
+
+    class Intraday:
+        def get_minute_bars(self, symbols, period="1", **kwargs):
+            polled.append(list(symbols))
+            return {symbol: minute_bars(RISE) for symbol in symbols}, []
+
+    Positions().open("000001.SZ", cost_price=12.0)
+    run_monitor(
+        adapter=StubDaily(),
+        symbols=["600519.SH"],
+        intraday_adapter=Intraday(),
+        once=True,
+        notifiers=[],
+        news_source=None,
+        trade_date=SESSION,
+        now=datetime(2026, 8, 3, 10, 0),
+    )
+
+    assert polled == [["600519.SH"]]

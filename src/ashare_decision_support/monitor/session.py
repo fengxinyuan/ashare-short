@@ -47,7 +47,6 @@ class PassResult:
     health: FeedHealth
     alerts: list[Alert] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    polled: int = 0
     verdict_changed: bool = False
 
 
@@ -93,24 +92,22 @@ class MonitorSession:
 
     # ---- once per session -------------------------------------------------
 
-    def load_positions(self, watchlist: Any) -> list[str]:
-        """读入持仓状态。**已持仓的票要盯的是卖点，不是买点。**
+    def load_positions(self, positions: Any) -> list[str]:
+        """读入持仓。**已持仓的票要盯的是卖点，不是买点。**
 
-        持仓由人手工维护（`watchlist hold`）——系统不下单、不接管账户，不可能
-        自己知道你买了什么。传 None 表示这一轮不带持仓上下文，所有标的都按
+        持仓由人手工维护（`ashare-ds position open`）——系统不下单、不接管账户，
+        不可能自己知道你买了什么。传 None 表示这一轮不带持仓上下文，所有标的都按
         「未持仓、盯买点」处理。
         """
         self.holdings = {}
-        if watchlist is None:
+        if positions is None:
             return []
         notes: list[str] = []
-        for entry in getattr(watchlist, "entries", []) or []:
-            view = HoldingView.from_entry(entry, today=self.session_date)
-            if view is None:
-                continue
+        for entry in getattr(positions, "entries", []) or []:
+            view = HoldingView.from_position(entry, today=self.session_date)
             self.holdings[view.symbol] = view
             if not view.cost_price:
-                notes.append(f"{view.symbol} 标为持仓但没有成本价，只能报绝对价位，给不出浮盈判断")
+                notes.append(f"{view.symbol} 在持仓表里但没有成本价，只能报绝对价位，给不出浮盈判断")
             self._seed_peak(view)
         if self.holdings:
             notes.append(
@@ -192,17 +189,14 @@ class MonitorSession:
     def poll(
         self,
         watch_symbols: list[str],
-        candidate_symbols: list[str],
         now: datetime,
         in_session: bool = True,
     ) -> PassResult:
-        watch = [normalize_symbol(symbol) for symbol in watch_symbols if normalize_symbol(symbol)]
-        candidates = [
-            normalize_symbol(symbol)
-            for symbol in candidate_symbols
-            if normalize_symbol(symbol) and normalize_symbol(symbol) not in set(watch)
-        ]
-        symbols = watch + candidates
+        symbols = list(
+            dict.fromkeys(
+                normalize_symbol(symbol) for symbol in watch_symbols if normalize_symbol(symbol)
+            )
+        )
         if not symbols:
             health = assess_feed({}, 0, now, self._previous_latest, in_session)
             return PassResult(health=health, notes=["监控列表为空"])
@@ -220,13 +214,10 @@ class MonitorSession:
             # publishing signals off data this old is the failure mode the
             # whole gate exists to prevent.
             self.state.save()
-            return PassResult(
-                health=health, notes=fetch_notes, polled=len(symbols), verdict_changed=changed
-            )
+            return PassResult(health=health, notes=fetch_notes, verdict_changed=changed)
 
         intraday = IntradayAnalyzer(today=now.date()).analyze_many(bars, self.prev_closes)
         books = self._fetch_books(symbols, fetch_notes)
-        watch_set = set(watch)
         alerts: list[Alert] = []
         for symbol in symbols:
             snapshot = intraday.get(symbol)
@@ -267,7 +258,6 @@ class MonitorSession:
                     intraday=snapshot,
                     state=self.state,
                     now=now,
-                    watchlist=symbol in watch_set,
                     risk_note=self.risk_notes.get(bare_code(symbol)),
                     armed=armed,
                     holding=holding,
@@ -298,7 +288,6 @@ class MonitorSession:
             health=health,
             alerts=alerts,
             notes=fetch_notes,
-            polled=len(symbols),
             verdict_changed=changed,
         )
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 from dataclasses import dataclass
 from datetime import datetime
 from statistics import fmean
@@ -73,7 +72,7 @@ class DailyTechnicalAnalyzer:
         stop_reference = self._stop_reference(last["close"], supports, ma10 or ma20, atr14)
         target_reference = resistances[0].price if resistances else None
         explanation = self._explanation(trend_state, supports, resistances, ma20, ma60, atr14)
-        setups = self._setups(last["close"], trend_state, supports, resistances, ma20, ma60, volume_ratio_20d)
+        setups = self._setups(last["close"], trend_state, supports, resistances, ma20, volume_ratio_20d)
 
         return DailyTechnicalSnapshot(
             symbol=symbol,
@@ -94,7 +93,6 @@ class DailyTechnicalAnalyzer:
             resistances=resistances,
             stop_reference=stop_reference,
             target_reference=target_reference,
-            chart_bars=[self._chart_bar(row) for row in rows[-80:]],
             setups=setups,
             explanation=explanation,
             source_ts=last["timestamp"],
@@ -277,7 +275,6 @@ class DailyTechnicalAnalyzer:
         supports: list[PriceLevel],
         resistances: list[PriceLevel],
         ma20: float | None,
-        ma60: float | None,
         volume_ratio_20d: float | None,
     ) -> list[dict]:
         setups: list[dict] = []
@@ -337,135 +334,3 @@ class DailyTechnicalAnalyzer:
             )
 
         return setups[:3]
-
-    def _chart_bar(self, row: dict) -> dict:
-        return {
-            "ts": row["timestamp"].isoformat(),
-            "open": row["open"],
-            "high": row["high"],
-            "low": row["low"],
-            "close": row["close"],
-            "volume": row["volume"],
-        }
-
-
-class DailyKChartRenderer:
-    def __init__(self, width: int = 1200, height: int = 760) -> None:
-        self.width = width
-        self.height = height
-
-    def render_svg(self, snapshot: DailyTechnicalSnapshot) -> str:
-        bars = snapshot.chart_bars[-80:]
-        if not bars:
-            return self._empty_svg(snapshot.symbol)
-
-        pad_left = 70
-        pad_right = 180
-        pad_top = 50
-        price_height = 450
-        volume_height = 120
-        gap = 30
-        chart_width = self.width - pad_left - pad_right
-        price_bottom = pad_top + price_height
-        volume_top = price_bottom + gap
-        volume_bottom = volume_top + volume_height
-
-        lows = [bar["low"] for bar in bars]
-        highs = [bar["high"] for bar in bars]
-        price_min = min(lows) * 0.985
-        price_max = max(highs) * 1.015
-        price_span = max(price_max - price_min, 0.01)
-        max_volume = max(bar["volume"] for bar in bars) or 1.0
-        candle_width = max(chart_width / max(len(bars), 1) * 0.55, 3.0)
-
-        def px(index: int) -> float:
-            return pad_left + chart_width * (index + 0.5) / max(len(bars), 1)
-
-        def py(price: float) -> float:
-            return pad_top + (price_max - price) / price_span * price_height
-
-        def vy(volume: float) -> float:
-            return volume_bottom - volume / max_volume * volume_height
-
-        parts: list[str] = [
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.width}" height="{self.height}" viewBox="0 0 {self.width} {self.height}">',
-            '<rect width="100%" height="100%" fill="#f7f3ea"/>',
-            f'<text x="{pad_left}" y="28" font-size="22" font-family="monospace" fill="#1d2a39">{html.escape(snapshot.symbol)} 日K技术图</text>',
-            f'<text x="{pad_left}" y="{self.height - 18}" font-size="12" font-family="monospace" fill="#5f6b7a">{html.escape(snapshot.explanation)}</text>',
-        ]
-
-        for step in range(6):
-            y = pad_top + price_height * step / 5
-            price = price_max - price_span * step / 5
-            parts.append(f'<line x1="{pad_left}" y1="{y:.2f}" x2="{pad_left + chart_width}" y2="{y:.2f}" stroke="#d7d2c8" stroke-width="1"/>')
-            parts.append(f'<text x="10" y="{y + 4:.2f}" font-size="12" font-family="monospace" fill="#6d7a88">{price:.2f}</text>')
-
-        for index, bar in enumerate(bars):
-            x = px(index)
-            color = "#d1495b" if bar["close"] >= bar["open"] else "#2b7a78"
-            parts.append(f'<line x1="{x:.2f}" y1="{py(bar["high"]):.2f}" x2="{x:.2f}" y2="{py(bar["low"]):.2f}" stroke="{color}" stroke-width="1.2"/>')
-            top = py(max(bar["open"], bar["close"]))
-            bottom = py(min(bar["open"], bar["close"]))
-            height = max(bottom - top, 1.2)
-            parts.append(f'<rect x="{x - candle_width / 2:.2f}" y="{top:.2f}" width="{candle_width:.2f}" height="{height:.2f}" fill="{color}" opacity="0.85"/>')
-            v_top = vy(bar["volume"])
-            parts.append(f'<rect x="{x - candle_width / 2:.2f}" y="{v_top:.2f}" width="{candle_width:.2f}" height="{volume_bottom - v_top:.2f}" fill="{color}" opacity="0.40"/>')
-
-        self._add_ma(parts, bars, 5, "#f08c00", px, py)
-        self._add_ma(parts, bars, 20, "#355070", px, py)
-        self._add_ma(parts, bars, 60, "#6d597a", px, py)
-
-        for level in snapshot.supports:
-            y = py(level.price)
-            parts.append(f'<line x1="{pad_left}" y1="{y:.2f}" x2="{pad_left + chart_width}" y2="{y:.2f}" stroke="#2a9d8f" stroke-width="1.4" stroke-dasharray="7 5"/>')
-            parts.append(f'<text x="{pad_left + chart_width + 12}" y="{y + 4:.2f}" font-size="12" font-family="monospace" fill="#2a9d8f">{html.escape(level.label)} {level.price:.2f}</text>')
-
-        for level in snapshot.resistances:
-            y = py(level.price)
-            parts.append(f'<line x1="{pad_left}" y1="{y:.2f}" x2="{pad_left + chart_width}" y2="{y:.2f}" stroke="#d1495b" stroke-width="1.4" stroke-dasharray="7 5"/>')
-            parts.append(f'<text x="{pad_left + chart_width + 12}" y="{y + 4:.2f}" font-size="12" font-family="monospace" fill="#d1495b">{html.escape(level.label)} {level.price:.2f}</text>')
-
-        info_x = pad_left + chart_width + 10
-        info_y = volume_top
-        lines = [
-            f"Trend: {snapshot.trend_state.value}",
-            f"Close: {snapshot.last_close:.2f}",
-            f"MA5: {snapshot.ma5:.2f}" if snapshot.ma5 is not None else "MA5: -",
-            f"MA20: {snapshot.ma20:.2f}" if snapshot.ma20 is not None else "MA20: -",
-            f"MA60: {snapshot.ma60:.2f}" if snapshot.ma60 is not None else "MA60: -",
-            f"ATR14: {snapshot.atr14:.2f}" if snapshot.atr14 is not None else "ATR14: -",
-            f"VolRatio20: {snapshot.volume_ratio_20d:.2f}" if snapshot.volume_ratio_20d is not None else "VolRatio20: -",
-        ]
-        if snapshot.stop_reference is not None:
-            lines.append(f"StopRef: {snapshot.stop_reference:.2f}")
-        if snapshot.target_reference is not None:
-            lines.append(f"TargetRef: {snapshot.target_reference:.2f}")
-        if snapshot.setups:
-            top_setup = snapshot.setups[0]
-            lines.append(f"Setup: {top_setup['setup']}")
-            lines.append(f"Trigger: {top_setup['trigger_price']:.2f}")
-            lines.append(f"Stop: {top_setup['stop_price']:.2f}")
-            lines.append(f"Target: {top_setup['target_price']:.2f}")
-        for idx, line in enumerate(lines):
-            parts.append(f'<text x="{info_x}" y="{info_y + idx * 18:.2f}" font-size="12" font-family="monospace" fill="#1d2a39">{html.escape(line)}</text>')
-
-        parts.append("</svg>")
-        return "".join(parts)
-
-    def _add_ma(self, parts: list[str], bars: list[dict], window: int, color: str, px, py) -> None:
-        if len(bars) < window:
-            return
-        points: list[str] = []
-        for idx in range(window - 1, len(bars)):
-            ma = fmean([bar["close"] for bar in bars[idx - window + 1 : idx + 1]])
-            points.append(f"{px(idx):.2f},{py(ma):.2f}")
-        if points:
-            parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="1.8" points="{" ".join(points)}"/>')
-
-    def _empty_svg(self, symbol: str) -> str:
-        return (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.width}" height="{self.height}">'
-            '<rect width="100%" height="100%" fill="#f7f3ea"/>'
-            f'<text x="40" y="80" font-size="24" font-family="monospace" fill="#1d2a39">{html.escape(symbol)} 无日K数据</text>'
-            '</svg>'
-        )

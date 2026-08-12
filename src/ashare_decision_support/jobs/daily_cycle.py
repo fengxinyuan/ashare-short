@@ -34,7 +34,7 @@ from ashare_decision_support.schedule import (
 )
 from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.sectors import static_taxonomies
-from ashare_decision_support.state import CandidatePool, Watchlist
+from ashare_decision_support.state import Positions
 
 
 def run_daily_cycle(
@@ -102,9 +102,9 @@ def run_daily_cycle(
         )
 
     def preopen_task() -> dict:
-        symbols = list(dict.fromkeys(Watchlist().symbols() + CandidatePool(today=today).symbols()))
+        symbols = Positions().symbols()
         if not symbols:
-            return {"skipped": "自选股与候选池均为空"}
+            return {"skipped": "持仓表为空，09:15 这一轮没有要算价位的票"}
         return run_advise(
             adapter=adapter_factory(),
             symbols=symbols,
@@ -131,9 +131,9 @@ def run_daily_cycle(
         )
 
     def postclose_task() -> dict:
-        symbols = Watchlist().symbols()
+        symbols = Positions().symbols()
         if not symbols:
-            return {"skipped": "自选股为空"}
+            return {"skipped": "持仓表为空，盘后没有要打分的票"}
         return run_post_close(
             adapter=adapter_factory(),
             symbols=symbols,

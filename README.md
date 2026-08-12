@@ -9,16 +9,20 @@ A 股超短线事实采集与分析辅助系统。只做采集、整理、提醒
 
 系统默认**不自动调用模型**。模型相关能力都改成显式开关。
 
+**标的由你给出。** 自选股和候选池已经删掉：`advise` / `ask` / `chat` 只看你在
+命令里写出来的代码，省略时才回落到持仓表。系统替你记着的名单只剩持仓一份——
+它要回答的是「该不该卖」，那个问题不该要求你每次重新敲一遍代码。
+
 从这里开始：[`docs/USAGE.md`](docs/USAGE.md)
 
 ## 能做什么
 
 | 场景 | 命令 | 结果 |
 |---|---|---|
-| 趋势分析 | `ashare-ds morning` / `ashare-ds ask "今天板块趋势怎么样"` | 盘前大盘、板块排序、候选池 |
+| 趋势分析 | `ashare-ds morning` / `ashare-ds ask "今天板块趋势怎么样"` | 盘前大盘、板块排序、当日候选 |
 | 参数化选股 | `ashare-ds strategy-screen --profile all` | TickFlow 全市场日线筛选，多策略结果供 AI 比较 |
 | 股价分析 | `ashare-ds advise 600519.SH` / `ashare-ds ask "600519 现在怎么看"` | 单票结构、分时、成交量、盘口、买卖点 |
-| 自选股监控 | `ashare-ds monitor --once` | 盘中轮询、跃迁告警、持仓卖点 |
+| 盘中监控 | `ashare-ds monitor --once` | 板块状态 + 持仓卖点；不传代码就只盯持仓 |
 | facts 导出 | `ashare-ds facts` | 导出当前事实、宏观联动和近期验证窗口，供 Codex / Claude 使用 |
 | 外部 AI 工具 | `ashare-ds-mcp` | 通过 MCP 向 Codex / Claude Code 提供只读事实与研究资料包 |
 | 全板块龙头 | `ashare-ds sector-leaders --refresh` | 每个行业/概念的量价龙头候选，不等同产业龙头或上涨预测 |
@@ -30,7 +34,7 @@ A 股超短线事实采集与分析辅助系统。只做采集、整理、提醒
 ## 快速开始
 
 ```bash
-cd /root/a-share-ultra-short-ai-system
+cd a-share-ultra-short-ai-system
 python3 -m pip install -e ".[tickflow,akshare]"
 
 cp .env.tickflow.example .env.tickflow
@@ -40,8 +44,8 @@ cp .env.feishu.example .env.feishu   # 可选，填 webhook 后 `--feishu` 自�
 常用命令：
 
 ```bash
-ashare-ds watchlist add 600519.SH 000001.SZ --note "核心仓"
-ashare-ds watchlist hold 600519.SH --cost 1350.6 --stop 1330 --target 1430
+ashare-ds position open 600519.SH --cost 1350.6 --stop 1330 --target 1430
+ashare-ds position list
 
 ashare-ds morning
 ashare-ds monitor --once
@@ -78,12 +82,14 @@ ashare-ds strategy-screen --profile all --all-a --price-max 40
 | [`docs/USAGE.md`](docs/USAGE.md) | 场景到命令的对应表，优先看这个 |
 | [`docs/CODEX_WORKFLOW.md`](docs/CODEX_WORKFLOW.md) | Codex 做链路、板块与个股分析的事实包工作流与边界 |
 | [`docs/EXTERNAL_AI_TOOLS.md`](docs/EXTERNAL_AI_TOOLS.md) | Codex / Claude Code 的 MCP 接入、月度展望与全板块龙头工具 |
-| [`docs/DAILY_PREOPEN_PROMPT.md`](docs/DAILY_PREOPEN_PROMPT.md) | 每日盘前研报提示词：外盘、政策、舆情、题材与先手条件 |
 | [`docs/SOLUTION.md`](docs/SOLUTION.md) | 总览 · 需求拆解 · 运行链路 · 设计约束 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图 · 调度 · 状态 · 失败模式 |
 | [`docs/INVENTORY.md`](docs/INVENTORY.md) | **功能接线清单**：哪个模块今天真的跑、哪些建成但未接线 |
 | [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md) | 数据源实测矩阵与安装说明 |
 | [`docs/PIPELINE.md`](docs/PIPELINE.md) | 舆情 → 板块 → 选股 → 买卖点的计算细节 |
+| [`docs/KNOWLEDGE_VOLUME_PRICE.md`](docs/KNOWLEDGE_VOLUME_PRICE.md) | 量价与形态知识库：白皮书提炼、尾盘打法、K 线词汇与各自的落点 |
+| [`docs/PROMPT_TEMPLATES.md`](docs/PROMPT_TEMPLATES.md) | **交给外部模型的提示词都在这里**：每日盘前固定版、研究版、多 Agent 编排与数字闸门口径 |
+| [`docs/PEER_TRADINGAGENTS.md`](docs/PEER_TRADINGAGENTS.md) | 同类开源项目对照：哪些做法值得抄、哪些不适用 |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | 设计取舍、被否决方案、已删除内容 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | **下一轮**：体检结论、七个真缺口、量价形态/轮动/记忆层设计与实施顺序 |
 | [`docs/REWORK.md`](docs/REWORK.md) | **本轮改造方案**：主链路清理 · 量价策略 · 筹码与元数据 · 行情记忆 |
@@ -108,9 +114,15 @@ tests/     单元测试
 ```bash
 python3 -m pip install -e ".[dev]"
 
-python -m pytest -q          # 单元测试，不打外网
+python3 scripts/check.py     # ruff + 接线审计 + 文档审计 + pytest
+python3 scripts/check.py --fast  # 跳过 pytest，只跑三道静态闸门
+
+python3 -m pytest -q         # 单元测试，不打外网
 ruff check .                 # 静态检查
 ruff check . --fix           # 只应用安全修复
+
+python3 scripts/inventory_audit.py   # 六条接线口径，见 docs/INVENTORY.md
+python3 scripts/docs_audit.py        # 文档里的每条 `ashare-ds` 命令都还跑得通
 ```
 
 `ruff` 的规则族与每一条忽略的理由写在 `pyproject.toml` 的 `[tool.ruff.lint]`

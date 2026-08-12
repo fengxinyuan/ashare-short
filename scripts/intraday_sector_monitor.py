@@ -10,10 +10,10 @@ sector_taxonomy_sw1.json`——也就是说它跑起来就是 FileNotFoundError�
 走 `adapters/ths_taxonomy.py`（行业 + 概念两套，5550 只全覆盖含北交所）。
 
 ```bash
-python scripts/intraday_sector_monitor.py                  # 跑一轮，打印
-python scripts/intraday_sector_monitor.py --loop           # 盘中持续跑
-python scripts/intraday_sector_monitor.py --alerts         # 同时打印跃迁告警
-python scripts/intraday_sector_monitor.py --level SW1      # 只看行业
+python3 scripts/intraday_sector_monitor.py                  # 跑一轮，打印
+python3 scripts/intraday_sector_monitor.py --loop           # 盘中持续跑
+python3 scripts/intraday_sector_monitor.py --alerts         # 同时打印跃迁告警
+python3 scripts/intraday_sector_monitor.py --level SW1      # 只看行业
 ```
 """
 

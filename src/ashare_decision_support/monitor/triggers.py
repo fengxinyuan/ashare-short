@@ -166,7 +166,6 @@ class Alert:
     headline: str
     detail: list[str] = field(default_factory=list)
     name: str | None = None
-    watchlist: bool = True
     # 持仓告警优先级最高：漏报的代价是真金白银，不是错过机会。
     holding: bool = False
     unrealised_pct: float | None = None
@@ -231,7 +230,6 @@ class TriggerEngine:
         intraday: IntradaySnapshot,
         state: AlertState,
         now: datetime,
-        watchlist: bool = True,
         risk_note: str | None = None,
         armed: bool = True,
         holding: HoldingView | None = None,
@@ -275,7 +273,7 @@ class TriggerEngine:
         def emit(trigger: str, headline: str, detail: list[str]) -> None:
             alerts.extend(
                 self._emit(
-                    state, now, symbol, advice, intraday, watchlist, trigger, headline,
+                    state, now, symbol, advice, intraday, trigger, headline,
                     detail, holding=holding, book=book,
                 )
             )
@@ -591,7 +589,6 @@ class TriggerEngine:
         symbol: str,
         advice: StockAdvice,
         intraday: IntradaySnapshot,
-        watchlist: bool,
         trigger: str,
         headline: str,
         detail: list[str],
@@ -601,12 +598,9 @@ class TriggerEngine:
         policy = POLICIES.get(trigger.split(":", 1)[0])
         if policy is None or policy.level not in self.levels:
             return []
-        # Candidates are the machine's picks, not yours. Only the levels that
-        # demand a decision are worth interrupting for.
-        #
-        # 持仓不受这条约束：漏报一条持仓告警的代价是真金白银，不是错过机会。
-        if not watchlist and holding is None and policy.level != LEVEL_ACTION:
-            return []
+        # 这里曾经还有一道「候选池只推 ACTION」的降级：候选是机器挑的，不值得
+        # 为一条 INFO 打断你。候选池删掉之后这道闸门没有输入了——现在被盯的每
+        # 一只要么是你当场输入的，要么在持仓表里，两者都不该被降级。
 
         if policy.once_per_session and state.fire_count(symbol, trigger) > 0:
             return []
@@ -640,7 +634,6 @@ class TriggerEngine:
                 headline=headline,
                 detail=detail,
                 name=advice.name,
-                watchlist=watchlist,
                 holding=holding is not None,
                 unrealised_pct=None if holding is None else holding.unrealised_pct(intraday.last_price),
                 as_of=intraday.last_timestamp,

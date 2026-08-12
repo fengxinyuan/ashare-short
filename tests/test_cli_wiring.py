@@ -38,8 +38,10 @@ class _Bundle:
     rendered = "（事实包正文）"
     notes: list[str] = []
 
-    def to_dict(self) -> dict:
-        return {"schema": "ashare-facts-v1"}
+    def to_dict(self, sections: list[str] | None = None) -> dict:
+        # 签名跟着真实的 `FactsBundle` 走：`facts --sections` 是从这里传下去的，
+        # 替身少一个参数时这条用例正是唯一会红的地方。
+        return {"schema": "ashare-facts-v1", "sections": sections}
 
 
 # 命令 → (argv, 应该被调起的符号, 替身的返回值)
@@ -66,7 +68,7 @@ CASES: dict[str, tuple[list[str], str, Any]] = {
 }
 
 # 不调主链路的命令：只读状态目录或只做诊断。它们在下面另有用例，或者需要外网。
-STATE_ONLY = {"watchlist", "journal", "state", "qmt-health"}
+STATE_ONLY = {"position", "journal", "state", "qmt-health"}
 NEEDS_NETWORK = {"tick-health", "intraday-check", "wyckoff-scan"}
 # 单独写了用例（要打桩适配器，塞不进上面那张表驱动的形状）
 OWN_CASES = {"calendar-refresh"}
@@ -152,7 +154,7 @@ def test_state_only_commands_run_against_the_isolated_state_home(capsys) -> None
     空自选股、空台账是**第一次使用**时的正常状态，不是异常。这几条命令在那种
     状态下崩掉的话，新用户遇到的第一个反馈就是一段栈。
     """
-    for argv in (["watchlist", "list"], ["journal"], ["state"], ["qmt-health"]):
+    for argv in (["position", "list"], ["journal"], ["state"], ["qmt-health"]):
         args = cli.build_parser().parse_args(argv)
         cli.COMMANDS[args.command](args)
         printed = capsys.readouterr().out

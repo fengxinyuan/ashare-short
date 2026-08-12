@@ -16,7 +16,7 @@ from typing import Any
 from ashare_decision_support.jobs.post_close import POST_CLOSE_LATEST_NAME, SNAPSHOT_LATEST_NAME
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_pre_open_brief
-from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.notify.base import Notifier, publish, written_path
 from ashare_decision_support.schedule.timezone import beijing_today
 
 
@@ -51,7 +51,7 @@ def run_pre_open(
         "watch_only": len(payload.get("watch_only") or []),
         "delivered": delivered,
         "data_notes": data_notes,
-        "brief_path": str(file_notifier.last_path) if file_notifier.last_path else None,
+        "brief_path": written_path(channels, file_notifier),
         "content": content,
     }
 

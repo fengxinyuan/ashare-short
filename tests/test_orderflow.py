@@ -336,7 +336,7 @@ class Intraday:
 def fire(engine, state, advice, intraday, book=None, holding=None):
     return engine.evaluate(
         advice=advice, intraday=intraday, state=state, now=ALERT_NOW,
-        watchlist=True, holding=holding, book=book,
+        holding=holding, book=book,
     )
 
 

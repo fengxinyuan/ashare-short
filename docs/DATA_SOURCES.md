@@ -435,7 +435,7 @@ backward_additive`。**若改成 `backward`（后复权），历史保持原始�
 ## 七、安装与检查
 
 ```bash
-cd /root/a-share-ultra-short-ai-system
+cd a-share-ultra-short-ai-system
 python3 -m pip install -e ".[tickflow,akshare]"
 
 cp .env.tickflow.example .env.tickflow   # 填 key；`cli.main()` 启动时自动读进 os.environ
@@ -464,9 +464,9 @@ export TICKFLOW_RATE_LIMIT=55    # 可选，客户端限流阈值（次/60秒）
 可选装，不影响现有功能：
 
 ```bash
-pip install easyquotation      # 新浪/腾讯五档 + 全市场快照（本仓自己解析，非必需）
-pip install baostock           # 历史分钟线回测底座（付费档后已非必需）
-pip install adata              # 五档备份源
+python3 -m pip install easyquotation      # 新浪/腾讯五档 + 全市场快照（本仓自己解析，非必需）
+python3 -m pip install baostock           # 历史分钟线回测底座（付费档后已非必需）
+python3 -m pip install adata              # 五档备份源
 ```
 
 诊断：
@@ -476,7 +476,7 @@ ashare-ds tick-health                              # TickFlow 连通性与能力
 ashare-ds intraday-check --symbols 600519.SH       # 分钟线盘中时效（须在交易时段跑）
 ashare-ds intraday-check --source sina             # 强制免费路，用于两路对比
 ashare-ds qmt-health                               # 本地 QMT 是否就绪
-ashare-ds state                                    # 自选股/候选池/告警/任务/台账
+ashare-ds state                                    # 持仓/告警/任务/台账
 ```
 
 AkShare 接口在版本间会变；测试基线是 `akshare 1.18.81`，某个源开始返回不同列时先看版本。

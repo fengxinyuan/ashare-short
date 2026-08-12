@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from ashare_decision_support.news.base import NewsDoc
-from ashare_decision_support.news.store import NewsStore
+from ashare_decision_support.news.store import DocAttribution, NewsStore
 
 TODAY = date(2026, 8, 3)
 MORNING = datetime(2026, 8, 3, 8, 0, 0)
@@ -132,6 +132,29 @@ def test_labels_are_written_after_ingest_not_during(tmp_path) -> None:
     labelled = corpus.recent(now=MORNING)[0]
     assert labelled.sectors == ("电力设备",)
     assert labelled.direction == "bullish"
+
+
+def test_label_many_writes_attribution_in_one_batch(tmp_path) -> None:
+    corpus = store(tmp_path)
+    pv, chip = doc("光伏组件涨价"), doc("存储芯片扩产")
+    corpus.ingest([pv, chip], TODAY, now=MORNING)
+
+    written = corpus.label_many(
+        {
+            "光伏组件涨价": DocAttribution(
+                sectors=("电力设备",), direction="bullish", event_type="涨价"
+            ),
+            "存储芯片扩产": DocAttribution(
+                sectors=("电子",), direction="bullish", event_type="扩产"
+            ),
+        }
+    )
+
+    assert written == 2
+    labelled = corpus.recent(sector="电力设备", now=MORNING)
+    assert [item.title for item in labelled] == ["光伏组件涨价"]
+    assert labelled[0].direction == "bullish"
+    assert labelled[0].event_type == "涨价"
 
 
 def test_recent_filters_by_sector(tmp_path) -> None:
@@ -288,3 +311,82 @@ def test_the_news_agent_runs_unchanged_without_a_store() -> None:
 
     assert len(data["docs"]) == 1
     assert not any("入库" in note for note in notes)
+
+
+# ---- 接进盘前 facts ---------------------------------------------------------
+
+
+def test_the_sector_memory_carries_the_cross_day_dimension_into_facts(tmp_path) -> None:
+    """当天那批读数答「今天有多少条」，这一层答「已经发酵几天了」。
+
+    两者对第二天的含义不同：一条今天才冒出来的利好和一条已经被说了两天、
+    今天仍在被转的利好，量价上该期待的东西完全不一样。语料库跨日累积的那一维
+    在此之前没有任何生产读取点——写了两个月，谁也读不到。
+    """
+    from ashare_decision_support.jobs.morning import _sector_news_memory
+
+    corpus = store(tmp_path)
+    old_story = doc("电网投资加码，特高压招标落地")
+    corpus.ingest([old_story], TODAY - timedelta(days=2), now=MORNING - timedelta(hours=40))
+    corpus.label(old_story, sectors=["电力设备"])
+    # 两天后仍在被转：last_seen 前移，first_seen 不动。
+    corpus.ingest([old_story], TODAY, now=MORNING)
+
+    fresh = doc("某公司中标储能项目")
+    corpus.ingest([fresh], TODAY, now=MORNING)
+    corpus.label(fresh, sectors=["电力设备"])
+
+    class Outlook:
+        name = "电力设备"
+        level = "SW1"
+
+    memory = _sector_news_memory(corpus, [Outlook()], now=MORNING + timedelta(hours=1))
+
+    assert [item["sector"] for item in memory] == ["电力设备"]
+    block = memory[0]
+    # 三次入库、两个故事：转发不加分，曲线只数第一次出现的那一条。
+    assert block["fresh_docs_total"] == 2
+    # 两条落在不同的时间桶里——「一次涌进来」和「两天里陆续来」不是一回事。
+    assert len(block["fresh_curve"]) == 2
+    titles = [item["title"] for item in block["still_developing"]]
+    # 两天前爆出、今天仍在被提的那条必须在——按 first_seen 过滤会把它整个滤掉，
+    # 而它正是现在推动这个板块的那个故事。
+    assert "电网投资加码，特高压招标落地" in titles
+    # 而且它带着自己的两个时间戳：两天前第一次见到，今天仍在被转。
+    row = next(item for item in block["still_developing"] if item["title"] == titles[-1])
+    assert row["first_seen"] < row["last_seen"]
+
+
+def test_the_sector_memory_is_optional_evidence_not_a_hard_dependency(tmp_path) -> None:
+    """`--no-news` 或语料库坏了，盘前主链路不该因此少一节结论。"""
+    from ashare_decision_support.jobs.morning import _sector_news_memory
+
+    class Outlook:
+        name = "电力设备"
+        level = "SW1"
+
+    assert _sector_news_memory(None, [Outlook()]) == []
+
+
+def test_a_broken_corpus_says_so_instead_of_looking_like_a_quiet_day(tmp_path) -> None:
+    """读失败返回空列表——那和「这个板块最近确实没有新故事」长得一模一样，
+    而后者会被当成一条读数用进判断。所以读不到必须说出口。"""
+    from ashare_decision_support.jobs.morning import _sector_news_memory
+
+    corpus = store(tmp_path)
+    hot = doc("电网投资加码")
+    corpus.ingest([hot], TODAY, now=MORNING)
+    corpus.label(hot, sectors=["电力设备"])
+    # 库文件被改坏（实测过的形状：磁盘写坏、权限变化、并发写入截断）。
+    (tmp_path / "corpus.sqlite3").write_text("not a database", encoding="utf-8")
+
+    class Outlook:
+        name = "电力设备"
+        level = "SW1"
+
+    notes: list[str] = []
+    memory = _sector_news_memory(corpus, [Outlook()], now=MORNING, notes=notes)
+
+    assert memory == []
+    assert corpus.read_error is not None
+    assert any("板块舆情记忆读取失败" in note for note in notes)

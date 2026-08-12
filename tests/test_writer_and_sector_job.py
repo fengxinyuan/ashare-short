@@ -1539,3 +1539,38 @@ def test_the_daemon_ranks_concepts_too(tmp_path) -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "static_taxonomies" in called
+
+
+def test_the_sector_news_memory_reaches_the_facts_of_a_real_morning_run(tmp_path) -> None:
+    """跨日那一维要真的出现在盘前 facts 里。
+
+    单测已经钉住 `_sector_news_memory` 自己的口径，但它接没接上是另一回事——
+    `NewsStore.sector_heat` / `recent` 在此之前写了两个月、有测试、零生产调用方，
+    正是「有测试不等于系统在用」的样子。这条从 `run_morning` 出发。
+    """
+    from ashare_decision_support.news.store import NewsStore
+
+    corpus = NewsStore(tmp_path / "corpus.sqlite3")
+    _run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=FakeNewsSource(),
+        top_sectors=1,
+        candidates_per_sector=1,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+        news_store=corpus,
+    )
+
+    # 断言落盘的那一份：`ask` / `facts` / MCP 读到的正是它。
+    payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
+    memory = payload["sector_news_memory"]
+    assert [item["sector"] for item in memory] == ["电子"]
+    block = memory[0]
+    assert block["fresh_docs_total"] == 1
+    assert block["still_developing"][0]["title"] == "半导体行业订单超预期，芯片涨价"
+    # 两个时间戳原样给出，读的人自己减——落盘之后隔天再读，「3 小时前」就是假的。
+    assert block["still_developing"][0]["first_seen"] <= block["still_developing"][0]["last_seen"]

@@ -40,7 +40,7 @@ SYSTEM_PROMPT = """你是一名 A 股短线分析助手，服务于一位自己�
 5. 不要直接说「建议买入/卖出」。可以陈述系统算出的价位、情景、风险与失效条件，由用户自己决定。
 6. 多个标的时先比优先级，不要按字段顺序逐条复述；能合并的信息就合并成自然语言。
 
-你可以回答趋势分析、股价分析、自选股监控结果和买卖点相关问题。
+你可以回答趋势分析、股价分析、持仓监控结果和买卖点相关问题。
 
 如果用户问的标的不在事实里，提示他用 `/add <代码>` 加入后再问。"""
 
@@ -172,8 +172,8 @@ def render_facts_summary(session: ChatSession) -> str:
         if key == "advice":
             lines.extend(_render_advice_summary(bundle))
             continue
-        if key == "watchlist":
-            lines.extend(_render_watchlist_summary(bundle))
+        if key == "positions":
+            lines.extend(_render_positions_summary(bundle))
             continue
         if key == "alerts":
             lines.extend(_render_alert_summary(bundle))
@@ -202,7 +202,7 @@ def _render_sector_summary(bundle: dict[str, Any]) -> list[str]:
         lines.append(f"- 先看板块：{'、'.join(sectors[:5])}")
     candidates = bundle.get("candidate_symbols") or []
     if candidates:
-        lines.append(f"- 候选池 {len(candidates)} 只：{'、'.join(candidates[:6])}")
+        lines.append(f"- 盘前候选 {len(candidates)} 只：{'、'.join(candidates[:6])}")
     if bundle.get("limit_up") is not None or bundle.get("blowups") is not None:
         pieces = []
         if bundle.get("limit_up") is not None:
@@ -252,30 +252,25 @@ def _render_advice_summary(bundle: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _render_watchlist_summary(bundle: dict[str, Any]) -> list[str]:
-    lines = ["", "## 自选与持仓"]
-    watchlist = bundle.get("watchlist") or []
-    candidates = bundle.get("candidates") or []
-    holdings = [item for item in watchlist if item.get("holding")]
-    watch_items = [item for item in watchlist if not item.get("holding")]
-    lines.append(
-        f"- 自选 {len(watchlist)} 只，持仓 {len(holdings)} 只，候选池 {len(candidates)} 只"
-    )
-    trade_date = bundle.get("candidates_trade_date")
-    if trade_date:
-        lines.append(f"- 候选池日期 {trade_date}")
-    if holdings:
-        lines.append(
-            "- 持仓：" + "、".join((item.get("symbol") or "") for item in holdings[:8])
+def _render_positions_summary(bundle: dict[str, Any]) -> list[str]:
+    lines = ["", "## 持仓"]
+    positions = bundle.get("positions") or []
+    lines.append(f"- 持仓 {len(positions)} 只")
+    for item in positions[:8]:
+        symbol = item.get("symbol") or ""
+        cost = item.get("cost_price")
+        stop = item.get("plan_stop")
+        target = item.get("plan_target")
+        detail = "，".join(
+            part
+            for part in (
+                f"成本 {cost}" if cost else "",
+                f"计划止损 {stop}" if stop else "",
+                f"计划目标 {target}" if target else "",
+            )
+            if part
         )
-    if watch_items:
-        lines.append(
-            "- 自选：" + "、".join((item.get("symbol") or "") for item in watch_items[:8])
-        )
-    if candidates:
-        lines.append(
-            "- 候选：" + "、".join((item.get("symbol") or "") for item in candidates[:8])
-        )
+        lines.append(f"- {symbol}" + (f"：{detail}" if detail else ""))
     return lines
 
 
@@ -354,7 +349,7 @@ HELP_TEXT = """可用命令：
   /drop <代码>            从上下文移除
   /refresh                重新计算当前所有标的
   /sectors                拉取盘前趋势分析：大盘方向与板块排序
-  /watch                  载入自选股、候选池和对应买卖点
+  /positions              载入持仓和对应买卖点
   /alerts                 今天已触发的盘中告警
   /journal [代码]         台账：历史建议与兑现情况
   /debate                 显式做一次多空辩论（需要模型）
@@ -363,7 +358,7 @@ HELP_TEXT = """可用命令：
   /help                   显示本帮助
   /quit                   退出
 
-直接输入问题即可对话，例如「今天板块趋势怎么样」「600519 现在的买卖点是什么」「自选股里谁先触发告警」。"""
+直接输入问题即可对话，例如「今天板块趋势怎么样」「600519 现在的买卖点是什么」「持仓里谁先触发告警」。"""
 
 
 def handle_command(  # noqa: PLR0911, PLR0912 - 见下
@@ -417,8 +412,8 @@ def handle_command(  # noqa: PLR0911, PLR0912 - 见下
 
     # 下面三条读的是自动化链路正在维护的那份状态——对话问的和守护进程看到的
     # 是同一批数据，而不是各算各的。
-    if command == "/watch":
-        return _load_watchlist(session, compute_symbols)
+    if command == "/positions":
+        return _load_positions(session, compute_symbols)
     if command == "/alerts":
         return _load_alerts(session)
     if command == "/journal":
@@ -436,7 +431,7 @@ def _run_debate(session: ChatSession) -> str:
     同一套角色与同一道数字闸门。
     """
     if not session.has_facts:
-        return "上下文为空，先用 /add 或 /watch 加入标的。"
+        return "上下文为空，先用 /add 或 /positions 加入标的。"
 
     from ashare_decision_support.agents.debate import DebatePanel
 
@@ -452,28 +447,20 @@ def _run_debate(session: ChatSession) -> str:
     return f"{body}\n\n{notes}".strip()
 
 
-def _load_watchlist(session: ChatSession, compute_symbols: Callable[[list[str]], dict]) -> str:
-    from ashare_decision_support.state import CandidatePool, Watchlist
+def _load_positions(session: ChatSession, compute_symbols: Callable[[list[str]], dict]) -> str:
+    from ashare_decision_support.state import Positions
 
-    book, pool = Watchlist(), CandidatePool()
-    symbols = list(dict.fromkeys(book.symbols() + pool.symbols()))
-    if not symbols:
-        return "自选股与候选池都为空。用 `ashare-ds watchlist add <代码>` 加入标的。"
+    book = Positions()
+    if not book.entries:
+        return (
+            "持仓表为空。要看某只票直接 `/add <代码>`；"
+            "登记持仓用 `ashare-ds position open <代码> --cost <成本价>`。"
+        )
 
-    session.add_symbols(symbols)
+    session.add_symbols(book.symbols())
     session.set_facts("advice", compute_symbols(session.symbols))
-    session.set_facts(
-        "watchlist",
-        {
-            "watchlist": [entry.to_dict() for entry in book.entries],
-            "candidates": [entry.to_dict() for entry in pool.entries],
-            "candidates_trade_date": pool.trade_date,
-        },
-    )
-    return (
-        f"已载入自选股 {len(book)} 只、持仓 {len(book.holdings())} 只、候选池 {len(pool)} 只。"
-        "先看持仓，再看自选，最后看候选。"
-    )
+    session.set_facts("positions", {"positions": [entry.to_dict() for entry in book.entries]})
+    return f"已载入持仓 {len(book)} 只，并完成计算。用 /show 查看。"
 
 
 def _load_alerts(session: ChatSession) -> str:

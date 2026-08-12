@@ -11,6 +11,7 @@ warning rather than silently removing the name from the answer.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ from ashare_decision_support.journal import Journal
 from ashare_decision_support.journal.records import Recommendation
 from ashare_decision_support.news import AkshareNewsSource
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
-from ashare_decision_support.notify.base import Notifier, publish
+from ashare_decision_support.notify.base import Notifier, publish, written_path
 from ashare_decision_support.notify.render import advice_mandatory_block, render_advice_brief
 from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
@@ -64,34 +65,48 @@ DAILY_LOOKBACK_DAYS = 240
 ADVISE_SOURCE = "advise"
 
 
-def run_advise(
+@dataclass(slots=True)
+class _Reads:
+    """一轮 `advise` 的全部读数。
+
+    从 `run_advise` 里搬出来的，判据和 `jobs/morning_facts.py` 那次搬家一样：
+    **这一段不做任何判断**。四路并行取数加五组纯计算（低吸画像、量价、相对强度、
+    打法判据、打分），每一样都是「算出来放着」，没有一处分支会改变结论。
+
+    搬出来之后 `run_advise` 的主线只剩三步：取读数 → 逐只出建议 → 发布。
+    """
+
+    snapshots: dict[str, Any]
+    wyckoff: dict[str, Any]
+    intraday: dict[str, Any]
+    books: dict[str, Any]
+    names: dict[str, str | None]
+    master: dict[str, Any]
+    sentiment: dict[str, Any]
+    news_events: dict[str, Any]
+    volume_price: dict[str, Any]
+    relative_strength: dict[str, Any]
+    matches: dict[str, Any]
+    scores: dict[str, Any]
+
+
+def _collect(
+    *,
     adapter: Any,
     symbols: list[str],
-    output_dir: str | Path | None = None,
-    period: str = "5",
-    intraday_adapter: Any | None = None,
-    score_provider: ScoreProvider | None = None,
-    writer: BriefWriter | None = None,
-    notifiers: list[Notifier] | None = None,
-    trade_date: date | None = None,
-    news_source: Any | None = None,
-    use_news: bool = True,
-    debate: DebatePanel | None = None,
-    adjudicator: LevelAdjudicator | None = None,
-    use_order_book: bool = True,
-    snapshot_adapter: Any | None = None,
-    earnings_adapter: Any | None = None,
-    security_master_adapter: Any | None = None,
-    use_earnings: bool = True,
-    journal: Journal | None = None,
-    progress: Callable[[str], Any] | None = None,
-) -> dict[str, Any]:
-    today = trade_date or beijing_today()
-    notes: list[str] = []
-    provider = score_provider or RuleBasedScoreProvider()
-
-    _progress = progress_reporter(progress)
-
+    today: date,
+    period: str,
+    intraday_adapter: Any | None,
+    news_source: Any | None,
+    use_news: bool,
+    use_order_book: bool,
+    snapshot_adapter: Any | None,
+    security_master_adapter: Any | None,
+    provider: ScoreProvider,
+    notes: list[str],
+    progress: Callable[[str], Any],
+) -> _Reads:
+    """① 并行取数 + 纯计算。取不到的那一路写进 notes，不抛。"""
     # ---- 并行采集：日线 || 分时 || 个股舆情 --------------------------------
     source = intraday_adapter or _default_intraday(adapter)
     if source is None:
@@ -109,7 +124,7 @@ def run_advise(
         symbols=list(symbols),
         period=period,
     )
-    _progress(f"① 正在计算 {len(symbols)} 只标的的日线、分时、盘口和舆情")
+    progress(f"① 正在计算 {len(symbols)} 只标的的日线、分时、盘口和舆情")
     # 证券简称在建 collector 之前先取：`SymbolNewsAgent` 要用它把「只在正文提到
     # 这只票」的行业综述挡在个股舆情之外（见 `news/relevance.py`）。取不到就传空，
     # 那一层自动放行，行为与从前一致。
@@ -201,36 +216,53 @@ def run_advise(
         )
     }
 
-    # ---- assemble ---------------------------------------------------------
-    # 业绩层在这条链路上**只提示、不移除**。`morning` 是系统主动选票，所以否决；
-    # `advise` 是你点名问一只票，答案必须是「它怎么样」而不是把它藏起来——「这只
-    # 票我不给你看」正是最没用的回答。和上面 ST 的处理完全同一条理由，见下方
-    # `Asked about explicitly, so it is answered — loudly.`
-    earnings_screen = EarningsScreen(_advise_earnings(earnings_adapter, today, use_earnings, notes))
-    earnings_verdicts = earnings_screen.evaluate(symbols)
+    return _Reads(
+        snapshots=snapshots,
+        wyckoff=wyckoff,
+        intraday=intraday,
+        books=books,
+        names=names,
+        master=master,
+        sentiment=sentiment,
+        news_events=news_events,
+        volume_price=volume_price,
+        relative_strength=relative_strength,
+        matches=matches,
+        scores=scores,
+    )
+
+
+def _build_advices(
+    *,
+    symbols: list[str],
+    reads: _Reads,
+    earnings_verdicts: dict[str, Any],
+    adjudicator: LevelAdjudicator | None,
+) -> list[StockAdvice]:
+    """② 逐只出建议。**这一段做判断**，所以它单独成型、单独可读。"""
     engine = AdviceEngine(adjudicator=adjudicator)
     advices: list[StockAdvice] = []
     for symbol in symbols:
-        result = scores.get(symbol)
+        result = reads.scores.get(symbol)
         advice = engine.build(
             symbol=symbol,
-            daily=snapshots.get(symbol),
-            intraday=intraday.get(symbol),
-            wyckoff=wyckoff.get(symbol),
-            name=names.get(symbol),
+            daily=reads.snapshots.get(symbol),
+            intraday=reads.intraday.get(symbol),
+            wyckoff=reads.wyckoff.get(symbol),
+            name=reads.names.get(symbol),
             score=result.score if result else None,
             score_components=result.components if result else None,
-            book=books.get(symbol),
-            instrument=master.get(symbol),
-            match=matches.get(symbol),
+            book=reads.books.get(symbol),
+            instrument=reads.master.get(symbol),
+            match=reads.matches.get(symbol),
         )
         if result:
             advice.warnings.extend(result.warnings)
         _apply_earnings(advice, earnings_verdicts.get(normalize_symbol(symbol)))
-        vp = volume_price.get(symbol)
-        intraday_read = intraday.get(symbol)
-        snapshot = snapshots.get(symbol)
-        wyckoff_read = wyckoff.get(symbol)
+        vp = reads.volume_price.get(symbol)
+        intraday_read = reads.intraday.get(symbol)
+        snapshot = reads.snapshots.get(symbol)
+        wyckoff_read = reads.wyckoff.get(symbol)
         if vp is not None:
             advice.volume_price = vp.to_dict()
             advice.distribution = judge_distribution(
@@ -239,19 +271,39 @@ def run_advise(
                 price_vs_vwap_pct=(intraday_read.price_vs_vwap_pct if intraday_read else None),
                 wyckoff_phase=(wyckoff_read.bias.value if wyckoff_read else None),
             ).to_dict()
-        relative = relative_strength.get(symbol)
+        relative = reads.relative_strength.get(symbol)
         if relative is not None:
             advice.relative_strength = relative.to_dict()
-        event = news_events.get(symbol)
+        event = reads.news_events.get(symbol)
         if event is not None:
             advice.event_evidence = event.to_dict()
         advices.append(advice)
+    return advices
 
-    facts = _facts(today, advices, notes, period, sentiment, master)
-    recorded = _record_journal(journal, advices, today, facts) if journal is not None else 0
-    _progress("② 结构、买卖点和情景已算完，正在整理简报与辩论")
 
-    # ---- 多空辩论（可关）--------------------------------------------------
+@dataclass(slots=True)
+class _Published:
+    """③ 发布的产物：正文、投递到了哪几条通道、简报写在哪。"""
+
+    markdown: str
+    delivered: list[str]
+    brief_path: str | None
+    writer: str
+    used_fallback: bool
+
+
+def _publish(
+    *,
+    today: date,
+    advices: list[StockAdvice],
+    facts: dict[str, Any],
+    notes: list[str],
+    debate: DebatePanel | None,
+    writer: BriefWriter | None,
+    notifiers: list[Notifier] | None,
+    output_dir: str | Path | None,
+) -> _Published:
+    """③ 多空辩论（可关）→ 写稿 → 投递。**这一段也不做判断**，只组织与发送。"""
     debate_block = ""
     if debate is not None:
         result = debate.run(facts)
@@ -271,42 +323,117 @@ def run_advise(
     )
     notes.extend(written.notes)
     markdown = written.markdown
+    # 写稿层可能把辩论整段吞掉或改写。辩论带的是**两方各自的举证**，被改写就
+    # 失去了可核对性，所以按原样补回去——同 `morning` 对通读那一节的处置。
     if debate_block and debate_block not in markdown:
         markdown = f"{markdown}\n\n## 多空视角\n\n{debate_block}"
 
-    delivered: list[str] = []
-    brief_path = None
     title = f"个股买卖点 {today}"
+    brief_path = None
     if output_dir is not None:
         file_notifier = FileNotifier(output_dir, slug="advice")
         channels = notifiers if notifiers is not None else [ConsoleNotifier(), file_notifier]
         delivered = publish(channels, title, markdown)
         file_notifier.write_payload(facts, ADVICE_LATEST_NAME)
-        # 调用方可能自带 FileNotifier，这时内部这个从未发送、last_path 为 None。
-        # 报实际写出的那条路径，而不是在 "file" 已投递旁边放一个 null。
-        brief_path = next(
-            (str(c.last_path) for c in channels if getattr(c, "last_path", None)),
-            str(file_notifier.last_path) if file_notifier.last_path else None,
-        )
+        brief_path = written_path(channels, file_notifier)
     else:
-        # No output directory still means "show me" — only an explicit empty
-        # notifier list (the chat path) suppresses output.
+        # 没给输出目录仍然是「给我看看」——只有显式传空 notifier 列表（对话那条路）
+        # 才是真的不要输出。
         channels = notifiers if notifiers is not None else [ConsoleNotifier()]
         delivered = publish(channels, title, markdown)
+    return _Published(
+        markdown=markdown,
+        delivered=delivered,
+        brief_path=brief_path,
+        writer=written.writer,
+        used_fallback=written.used_fallback,
+    )
+
+
+def run_advise(
+    adapter: Any,
+    symbols: list[str],
+    output_dir: str | Path | None = None,
+    period: str = "5",
+    intraday_adapter: Any | None = None,
+    score_provider: ScoreProvider | None = None,
+    writer: BriefWriter | None = None,
+    notifiers: list[Notifier] | None = None,
+    trade_date: date | None = None,
+    news_source: Any | None = None,
+    use_news: bool = True,
+    debate: DebatePanel | None = None,
+    adjudicator: LevelAdjudicator | None = None,
+    use_order_book: bool = True,
+    snapshot_adapter: Any | None = None,
+    earnings_adapter: Any | None = None,
+    security_master_adapter: Any | None = None,
+    use_earnings: bool = True,
+    journal: Journal | None = None,
+    progress: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    today = trade_date or beijing_today()
+    notes: list[str] = []
+    provider = score_provider or RuleBasedScoreProvider()
+
+    _progress = progress_reporter(progress)
+
+    reads = _collect(
+        adapter=adapter,
+        symbols=symbols,
+        today=today,
+        period=period,
+        intraday_adapter=intraday_adapter,
+        news_source=news_source,
+        use_news=use_news,
+        use_order_book=use_order_book,
+        snapshot_adapter=snapshot_adapter,
+        security_master_adapter=security_master_adapter,
+        provider=provider,
+        notes=notes,
+        progress=_progress,
+    )
+
+    # 业绩层在这条链路上**只提示、不移除**。`morning` 是系统主动选票，所以否决；
+    # `advise` 是你点名问一只票，答案必须是「它怎么样」而不是把它藏起来——「这只
+    # 票我不给你看」正是最没用的回答。和 ST 的处理完全同一条理由，见
+    # `Asked about explicitly, so it is answered — loudly.`
+    earnings_screen = EarningsScreen(_advise_earnings(earnings_adapter, today, use_earnings, notes))
+    advices = _build_advices(
+        symbols=symbols,
+        reads=reads,
+        earnings_verdicts=earnings_screen.evaluate(symbols),
+        adjudicator=adjudicator,
+    )
+
+    facts = _facts(today, advices, notes, period, reads.sentiment, reads.master)
+    recorded = _record_journal(journal, advices, today, facts) if journal is not None else 0
+    _progress("② 结构、买卖点和情景已算完，正在整理简报与辩论")
+
+    published = _publish(
+        today=today,
+        advices=advices,
+        facts=facts,
+        notes=notes,
+        debate=debate,
+        writer=writer,
+        notifiers=notifiers,
+        output_dir=output_dir,
+    )
     _progress("③ 个股分析已完成")
 
     return {
         "trade_date": str(today),
         "requested": len(symbols),
         "advised": sum(1 for item in advices if item.has_actionable_levels),
-        "writer": written.writer,
-        "used_fallback": written.used_fallback,
-        "delivered": delivered,
+        "writer": published.writer,
+        "used_fallback": published.used_fallback,
+        "delivered": published.delivered,
         "data_notes": notes,
         "facts": facts,
         "journal_records": recorded,
-        "brief_path": brief_path,
-        "content": markdown,
+        "brief_path": published.brief_path,
+        "content": published.markdown,
     }
 
 

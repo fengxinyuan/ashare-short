@@ -25,6 +25,10 @@ from ashare_decision_support.state.paths import state_path
 from ashare_decision_support.state.store import read_json, write_json
 
 HISTORY_SCHEMA = "sector-rotation-v1"
+# 记忆按 level 分桶存。写入方是 `jobs/morning.py`（`MorningConfig.sector_level`），
+# 读取方是 `research/monthly.py`——两边各写一个字面量的话，`morning --level SW2`
+# 跑一天之后月度包会静默读到一个空桶，而空桶的表现和「今天没有轮动」一模一样。
+DEFAULT_LEVEL = "SW1"
 DEFAULT_LEADER_COUNT = 5
 DEFAULT_LOOKBACK_DAYS = 5
 DEFAULT_HISTORY_DEPTH = 20

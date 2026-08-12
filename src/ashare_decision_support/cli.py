@@ -8,7 +8,8 @@
 **手工插问**——`morning` / `advise` / `monitor` / `chat` / `review` 单独跑同一批任务，
 用于调试、补跑，或者你想立刻看一眼。
 
-自选股（`watchlist`）是两者共享的输入：所有接受 `--symbols` 的命令省略它时都读自选股。
+**标的由你给出。** 接受 `--symbols` 的命令省略它时只回落到持仓表（`position`），
+不存在第二份「系统替你维护的名单」——自选股与候选池已删，见 `state/positions.py`。
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ from ashare_decision_support.schedule import TradingCalendar
 from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_now, beijing_today
 from ashare_decision_support.sectors import ThsIndustryTaxonomy, static_taxonomies
 from ashare_decision_support.signals import WyckoffAnalyzer
-from ashare_decision_support.state import CandidatePool, Watchlist, state_home
+from ashare_decision_support.state import Positions, state_home
 from ashare_decision_support.strategy.overnight import (
     PROFILES,
     StrategyScreenConfig,
@@ -161,7 +162,7 @@ def _parser_daemon(subparsers) -> None:
 
 def _parser_morning(subparsers) -> None:
     morning = subparsers.add_parser(
-        "morning", help="[需求1] 盘前趋势分析：舆情 → 大盘趋势 → 板块排序 → 板块内选股 → 候选池"
+        "morning", help="[需求1] 盘前趋势分析：舆情 → 大盘趋势 → 板块排序 → 板块内选股 → 当日候选"
     )
     morning.add_argument("--output-dir", default="briefs")
     morning.add_argument("--level", default="SW1", choices=["SW1", "SW2", "SW3"])
@@ -191,7 +192,7 @@ def _parser_morning(subparsers) -> None:
     morning.add_argument(
         "--no-trade-flow",
         action="store_true",
-        help="跳过候选池的逐笔资金旁证（大单净额、尾盘净额），可省约 2 分钟",
+        help="跳过候选的逐笔资金旁证（大单净额、尾盘净额），可省约 2 分钟",
     )
     morning.add_argument(
         "--no-earnings",
@@ -212,9 +213,9 @@ def _parser_morning(subparsers) -> None:
 
 def _parser_monitor(subparsers) -> None:
     monitor = subparsers.add_parser(
-        "monitor", help="[需求3] 自选股价格监控：自选股 + 候选池，按跃迁告警"
+        "monitor", help="[需求3] 盘中监控：持仓卖点 + 板块状态，按跃迁告警"
     )
-    monitor.add_argument("--symbols", nargs="*", help="省略则读自选股 + 候选池")
+    monitor.add_argument("--symbols", nargs="*", help="省略则盯持仓；板块监控与名单无关")
     monitor.add_argument("--once", action="store_true", help="只跑一轮，不循环")
     monitor.add_argument("--max-passes", type=int, help="最多跑几轮（调试用）")
     monitor.add_argument("--period", default="1", choices=list(SUPPORTED_PERIODS))
@@ -245,7 +246,17 @@ def _parser_monitor(subparsers) -> None:
 
 def _parser_advise(subparsers) -> None:
     advise = subparsers.add_parser("advise", help="[需求2/3] 个股股价分析与买卖点推荐")
-    advise.add_argument("--symbols", nargs="*", help="省略则读自选股")
+    # 位置参数与 `--symbols` 等价。README / USAGE 从第一版起写的就是
+    # `ashare-ds advise 600519.SH`，而解析器此前只认 `--symbols`——照文档敲的
+    # 那条命令直接以 `unrecognized arguments` 退出。文档是这条命令的对外契约，
+    # 所以补的是解析器，不是文档。
+    advise.add_argument(
+        "symbols_positional",
+        nargs="*",
+        metavar="SYMBOL",
+        help="要分析的标的；与 --symbols 等价，两者都省略则读持仓",
+    )
+    advise.add_argument("--symbols", nargs="*", help="省略则读持仓")
     advise.add_argument("--output-dir", help="省略则只打印，不落盘")
     advise.add_argument("--period", default="5", choices=list(SUPPORTED_PERIODS))
     advise.add_argument("--no-news", action="store_true", help="跳过个股舆情采集")
@@ -268,7 +279,7 @@ def _parser_ask(subparsers) -> None:
         help="[需求4] 单入口问答：趋势、股价、监控结果都能问",
     )
     ask.add_argument("question", nargs="*", help="省略则只打印装配好的上下文，不调模型")
-    ask.add_argument("--symbols", nargs="*", help="额外加入的标的；自选与候选池自动带上")
+    ask.add_argument("--symbols", nargs="*", help="要看的标的；省略则只带持仓与已落盘结果")
     ask.add_argument("--output-dir", default="briefs", help="读盘前/盘后落盘结果的目录")
     ask.add_argument("--period", default="5", choices=list(SUPPORTED_PERIODS))
     ask.add_argument("--no-live", action="store_true", help="盘中也不重算价位，只读已落盘的")
@@ -287,7 +298,7 @@ def _parser_facts(subparsers) -> None:
         "facts",
         help="[Codex/Claude] 导出统一事实包：默认 JSON，不调模型",
     )
-    facts.add_argument("--symbols", nargs="*", help="额外加入的标的；自选与候选池自动带上")
+    facts.add_argument("--symbols", nargs="*", help="要看的标的；省略则只带持仓与已落盘结果")
     facts.add_argument("--output-dir", default="briefs", help="读盘前/盘后落盘结果的目录")
     facts.add_argument("--period", default="5", choices=list(SUPPORTED_PERIODS))
     facts.add_argument("--no-live", action="store_true", help="盘中也不现算价位，只读已落盘的")
@@ -297,6 +308,11 @@ def _parser_facts(subparsers) -> None:
         choices=["json", "text"],
         help="json=结构化事实包；text=直接输出人类可读摘要",
     )
+    facts.add_argument(
+        "--sections",
+        nargs="+",
+        help="只导出这几块事实（如 盘前主链路 持仓）；省略即全量，省掉的块会写进 notes",
+    )
     facts.add_argument("--output", help="把 JSON bundle 写到文件；text 模式忽略")
     _add_tickflow_args(facts)
 
@@ -305,7 +321,7 @@ def _parser_chat(subparsers) -> None:
     chat = subparsers.add_parser(
         "chat", help="[需求4] 持续对话：对趋势、股价、监控与买卖点多轮追问"
     )
-    chat.add_argument("--symbols", nargs="*", help="省略则读自选股")
+    chat.add_argument("--symbols", nargs="*", help="省略则读持仓；对话里用 /add 随时加")
     chat.add_argument("--period", default="5", choices=list(SUPPORTED_PERIODS))
     chat.add_argument("--llm", action="store_true", help="显式开启模型对话；默认只输出事实包")
     _add_llm_args(chat)
@@ -325,28 +341,25 @@ def _parser_preopen_research(subparsers) -> None:
     )
 
 
-def _parser_watchlist(subparsers) -> None:
-    watch = subparsers.add_parser("watchlist", help="自选股：所有命令的默认标的来源")
-    watch_sub = watch.add_subparsers(dest="action", required=True)
-    watch_add = watch_sub.add_parser("add", help="加入自选")
-    watch_add.add_argument("symbols", nargs="+")
-    watch_add.add_argument("--note", help="备注")
-    watch_rm = watch_sub.add_parser("remove", help="移出自选")
-    watch_rm.add_argument("symbols", nargs="+")
-    watch_sub.add_parser("list", help="列出自选与今日候选池")
-    watch_sub.add_parser("clear", help="清空自选")
+def _parser_position(subparsers) -> None:
+    # 持仓是系统唯一还替你记着的名单。系统不下单、不接管账户，所以成本价、股数、
+    # 计划止损与目标全部手工维护。
+    position = subparsers.add_parser("position", help="持仓：盘中卖点监控的唯一名单")
+    position_sub = position.add_subparsers(dest="action", required=True)
+    position_sub.add_parser("list", help="列出当前持仓")
 
-    # 持仓状态：决定这只票该被盯买点还是盯卖点。系统只出建议，不下单——
-    # 这些字段全部手工维护。
-    watch_hold = watch_sub.add_parser("hold", help="标记为已持仓（盯卖点）")
-    watch_hold.add_argument("symbol")
-    watch_hold.add_argument("--cost", type=float, required=True, help="成本价")
-    watch_hold.add_argument("--shares", type=int, help="股数")
-    watch_hold.add_argument("--opened-on", help="建仓日 YYYY-MM-DD，默认今天")
-    watch_hold.add_argument("--stop", type=float, help="你自己定的止损，优先于系统值")
-    watch_hold.add_argument("--target", type=float, help="你自己定的目标")
-    watch_close = watch_sub.add_parser("close", help="清掉持仓状态，仍留在自选")
-    watch_close.add_argument("symbols", nargs="+")
+    opened = position_sub.add_parser("open", help="登记或修改一笔持仓")
+    opened.add_argument("symbol")
+    opened.add_argument("--cost", type=float, required=True, help="成本价")
+    opened.add_argument("--shares", type=int, help="股数")
+    opened.add_argument("--opened-on", help="建仓日 YYYY-MM-DD，默认今天")
+    opened.add_argument("--stop", type=float, help="你自己定的止损，优先于系统值")
+    opened.add_argument("--target", type=float, help="你自己定的目标")
+    opened.add_argument("--note", help="备注")
+
+    closed = position_sub.add_parser("close", help="平仓：从持仓表里删掉")
+    closed.add_argument("symbols", nargs="+")
+    position_sub.add_parser("clear", help="清空持仓表")
 
 
 def _parser_review(subparsers) -> None:
@@ -382,8 +395,8 @@ def _parser_codex_adjudication(subparsers) -> None:
 
 
 def _parser_post_close(subparsers) -> None:
-    post_close = subparsers.add_parser("post-close-brief", help="盘后：自选股打分与次日执行卡")
-    post_close.add_argument("--symbols", nargs="*", help="省略则读自选股")
+    post_close = subparsers.add_parser("post-close-brief", help="盘后：给定标的打分与次日执行卡")
+    post_close.add_argument("--symbols", nargs="*", help="省略则读持仓")
     post_close.add_argument("--output-dir", default="briefs")
     post_close.add_argument("--days", type=int, default=180)
     post_close.add_argument("--top", type=int)
@@ -502,7 +515,7 @@ def _parser_diagnostics(subparsers) -> None:
     )
 
     subparsers.add_parser("qmt-health", help="诊断：本地 QMT / xtdata 是否就绪")
-    subparsers.add_parser("state", help="诊断：状态目录、自选股、候选池、任务完成情况")
+    subparsers.add_parser("state", help="诊断：状态目录、持仓、任务完成情况")
 
     calendar_refresh = subparsers.add_parser(
         "calendar-refresh", help="从行情源刷新本地节假日表（holidays.json）"
@@ -530,8 +543,8 @@ def build_parser() -> argparse.ArgumentParser:
     _parser_facts(subparsers)
     _parser_preopen_research(subparsers)
     _parser_chat(subparsers)
-    # 自选股
-    _parser_watchlist(subparsers)
+    # 持仓
+    _parser_position(subparsers)
     # 台账与复盘
     _parser_review(subparsers)
     _parser_journal(subparsers)
@@ -633,16 +646,28 @@ def _notifiers(args, output_dir: str | Path | None, slug: str) -> list:
     return channels
 
 
-def _resolve_symbols(args, include_candidates: bool = False) -> list[str]:
-    """`--symbols` 缺省即读自选股，这样自动与手工两种用法看到的是同一批标的。"""
-    explicit = getattr(args, "symbols", None)
-    if explicit:
-        return [normalize_symbol(item) for item in explicit]
+def _explicit_symbols(args) -> list[str]:
+    """命令行上真正写出来的标的。位置参数与 `--symbols` 等价。
 
-    symbols = Watchlist().symbols()
-    if include_candidates:
-        symbols = list(dict.fromkeys(symbols + CandidatePool().symbols()))
-    return symbols
+    两者合并在这里而不是各命令自己拼：README 与 USAGE 一直写的是
+    `ashare-ds advise 600519.SH`，而解析器此前只认 `--symbols`——照文档敲的那条
+    命令直接以 `unrecognized arguments` 退出。
+    """
+    raw = [
+        *(getattr(args, "symbols_positional", None) or []),
+        *(getattr(args, "symbols", None) or []),
+    ]
+    return list(dict.fromkeys(normalize_symbol(item) for item in raw if normalize_symbol(item)))
+
+
+def _resolve_symbols(args) -> list[str]:
+    """要算哪几只：命令行给的，否则持仓。
+
+    **没有第三种来源。** 自选股与候选池删掉之前，省略 `--symbols` 会静默地把
+    十几只你今天根本没在看的票拉进来算一遍——结论看起来一样正常，代价是几十次
+    取数和一份不知道自己在回答谁的输出。
+    """
+    return _explicit_symbols(args) or Positions().symbols()
 
 
 def _source_adapter(args):
@@ -770,7 +795,7 @@ def _cmd_morning(args) -> None:
 def _cmd_monitor(args) -> None:
     summary = run_monitor(
         adapter=_tickflow(args),
-        symbols=_resolve_symbols(args, include_candidates=True) if args.symbols else None,
+        symbols=_explicit_symbols(args) or None,
         period=args.period,
         once=args.once,
         max_passes=args.max_passes,
@@ -785,9 +810,15 @@ def _cmd_monitor(args) -> None:
 
 
 def _cmd_advise(args) -> None:
+    symbols = _resolve_symbols(args)
+    if not symbols:
+        raise SystemExit(
+            "advise 需要标的：`ashare-ds advise 600519.SH`，"
+            "或先用 `ashare-ds position open <代码> --cost <成本价>` 登记持仓"
+        )
     summary = run_advise(
         adapter=_tickflow(args),
-        symbols=_resolve_symbols(args),
+        symbols=symbols,
         output_dir=args.output_dir,
         period=args.period,
         use_news=not args.no_news,
@@ -824,7 +855,7 @@ def _cmd_ask(args) -> None:
 
     summary = run_ask(
         question=" ".join(args.question).strip() or None,
-        symbols=_resolve_symbols(args) if args.symbols else None,
+        symbols=_explicit_symbols(args) or None,
         output_dir=args.output_dir,
         compute_symbols=compute,
         client=LlmClient(provider=args.llm_provider, model=args.llm_model) if args.llm else None,
@@ -851,11 +882,12 @@ def _cmd_facts(args) -> None:
 
     bundle = build_facts_bundle(
         moment=beijing_now(),
-        symbols=_resolve_symbols(args) if args.symbols else None,
+        symbols=_explicit_symbols(args) or None,
         output_dir=args.output_dir,
         compute_symbols=compute,
         is_trading_day=TradingCalendar().is_trading_day(beijing_today()),
-        focus=_resolve_symbols(args) if args.symbols else None,
+        focus=_explicit_symbols(args) or None,
+        sections=args.sections,
     )
     if args.format == "text":
         print(bundle.rendered)
@@ -964,8 +996,8 @@ def _cmd_chat(args) -> None:
     )
 
 
-def _cmd_watchlist(args) -> None:
-    _dump_json(_watchlist_command(args))
+def _cmd_position(args) -> None:
+    _dump_json(_position_command(args))
 
 
 def _cmd_review(args) -> None:
@@ -1184,7 +1216,7 @@ COMMANDS = {
     "facts": _cmd_facts,
     "preopen-research": _cmd_preopen_research,
     "chat": _cmd_chat,
-    "watchlist": _cmd_watchlist,
+    "position": _cmd_position,
     "review": _cmd_review,
     "journal": _cmd_journal,
     "codex-adjudication-packet": _cmd_codex_adjudication_packet,
@@ -1213,45 +1245,31 @@ def main() -> None:
     COMMANDS[args.command](args)
 
 
-def _watchlist_command(args) -> dict:
-    book = Watchlist()
-    if args.action == "add":
-        added, updated = [], []
-        for symbol in args.symbols:
-            entry, created = book.add(symbol, note=args.note)
-            (added if created else updated).append(entry.symbol)
-        return {"added": added, "updated": updated, "total": len(book), "path": str(book.path)}
-
-    if args.action == "remove":
-        removed = [symbol for symbol in args.symbols if book.remove(symbol)]
-        missing = [normalize_symbol(s) for s in args.symbols if normalize_symbol(s) not in removed]
-        return {"removed": removed, "not_found": missing, "total": len(book)}
-
-    if args.action == "clear":
-        return {"cleared": book.clear(), "total": 0}
-
-    if args.action == "hold":
-        entry = book.set_position(
+def _position_command(args) -> dict:
+    book = Positions()
+    if args.action == "open":
+        entry = book.open(
             args.symbol,
             cost_price=args.cost,
             shares=args.shares,
             opened_on=date.fromisoformat(args.opened_on) if args.opened_on else None,
             plan_stop=args.stop,
             plan_target=args.target,
+            note=args.note,
         )
-        return {"holding": entry.to_dict(), "total_holdings": len(book.holdings())}
+        return {"position": entry.to_dict(), "total": len(book)}
 
     if args.action == "close":
-        closed = [symbol for symbol in args.symbols if book.close_position(symbol)]
-        return {"closed": closed, "total_holdings": len(book.holdings())}
+        closed = [symbol for symbol in args.symbols if book.close(symbol)]
+        missing = [normalize_symbol(s) for s in args.symbols if normalize_symbol(s) not in closed]
+        return {"closed": closed, "not_found": missing, "total": len(book)}
 
-    pool = CandidatePool()
+    if args.action == "clear":
+        return {"cleared": book.clear(), "total": 0}
+
     return {
-        "watchlist": [entry.to_dict() for entry in book.entries],
-        "holdings": [entry.symbol for entry in book.holdings()],
-        "candidates": [entry.to_dict() for entry in pool.entries],
-        "candidates_trade_date": pool.trade_date,
-        "candidates_stale": pool.stale,
+        "positions": [entry.to_dict() for entry in book.entries],
+        "total": len(book),
         "path": str(book.path),
     }
 
@@ -1260,7 +1278,7 @@ def _state_report() -> dict:
     from ashare_decision_support.state import AlertState, DaemonState
 
     today = beijing_today()
-    book, pool = Watchlist(), CandidatePool(today=today)
+    book = Positions()
     alerts = AlertState.load(today)
     daemon = DaemonState.load(today)
     calendar = TradingCalendar()
@@ -1272,9 +1290,7 @@ def _state_report() -> dict:
         "tickflow_mode": "full" if os.environ.get("TICKFLOW_API_KEY") else "free",
         "today": str(today),
         "trading_day": calendar.explain(today),
-        "watchlist": book.symbols(),
-        "candidates": pool.symbols(),
-        "candidates_stale": pool.stale,
+        "positions": book.symbols(),
         "alerts_today": alerts.fired_summary()[:20],
         # 板块告警是另一个状态文件，不单独读的话 `state` 会漏报整条链路。
         "sector_alerts_today": fired_sectors_today(today)[:20],

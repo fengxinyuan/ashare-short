@@ -1,21 +1,25 @@
 # 使用指南
 
 这份项目的核心不是“会不会算”，而是“你能不能用命令直接拿到你要的分析”。
-下面按场景整理，优先回答六件事：趋势分析、股价分析、自选股监控、facts 导出、
+下面按场景整理，优先回答五件事：趋势分析、股价分析、盘中监控、facts 导出、
 外部 AI 分析。
 
 默认情况下，`morning` / `advise` 用 `template` 输出，`ask` / `chat` 只导出 facts
 或 facts 上下文，不会自动调模型。只有显式加 `--writer llm` 或 `--llm` 才会走模型。
 
+**要看哪几只由你说了算。** 自选股与候选池已经删掉，`advise` / `ask` / `chat`
+只算你写在命令里的代码；省略时才回落到持仓表。持仓是系统唯一还替你记着的名单，
+因为「该不该卖」这个问题必须有成本价、计划止损和持有天数才答得了。
+
 ## 场景到命令
 
 | 你想做的事 | 推荐命令 | 说明 |
 |---|---|---|
-| 看大盘和板块趋势 | `ashare-ds morning` | 盘前主链路：舆情 → 大盘趋势 → 板块排序 → 候选池 |
+| 看大盘和板块趋势 | `ashare-ds morning` | 盘前主链路：舆情 → 大盘趋势 → 板块排序 → 当日候选 |
 | 问单只股票怎么走 | `ashare-ds ask "600519 现在趋势和买点怎么样"` | 单入口问答，按时段自动装上下文 |
 | 看单只股票的结构、量能和买卖点 | `ashare-ds advise 600519.SH` | 结合日线、分时、成交量、盘口生成买卖点 |
 | 做全市场参数化选股 | `ashare-ds strategy-screen --profile all` | 比较多种形态，输出确定性候选事实 |
-| 监控自选股是否触发告警 | `ashare-ds monitor --feishu` | 持续轮询；首轮会补报已成立的买卖点，后续按跃迁提醒；**同时监控板块异动** |
+| 盯持仓与板块异动 | `ashare-ds monitor --feishu` | 不传代码就盯持仓；首轮补报已成立的买卖点，后续按跃迁提醒；**板块监控与名单无关，空仓也有话说** |
 | 导出统一事实包 | `ashare-ds facts --output facts.json` | 给 Codex / Claude 的结构化输入，不调模型 |
 | 让模型多轮追问同一份事实 | `ashare-ds chat` | 适合连续问“为什么”“如果跌破怎么办”；回答会先给判断，再给证据 |
 | 让模型在候选价里做取舍 | `ashare-ds advise --adjudicate 600519.SH` | 用 LLM 做买卖点裁决，可弃权 |
@@ -25,13 +29,12 @@
 ### 1. 盘前先看趋势
 
 ```bash
-ashare-ds watchlist add 600519.SH 000001.SZ --note "核心仓"
 ashare-ds morning
 ashare-ds morning --explain   # 同时打印筛选漏斗
 ashare-ds morning --top-sectors 5 --top-concepts 3  # 行业、概念分开取名额
 ```
 
-这一步关注的是大盘、板块和候选池，不是逐票追问。
+这一步关注的是大盘、板块和当日候选，不是逐票追问。
 运行时会先打印几行阶段进度，再输出完整晨报。
 行业和概念默认并排计算、各自排名；概念不会参与全市场宽度，避免一只股票因多个
 题材标签被重复计权。只想看行业时使用 `--no-concepts`。
@@ -77,15 +80,22 @@ ashare-ds morning --top-sectors 5 --top-concepts 3  # 行业、概念分开取�
 广度共同确认。新题材可通过 `ASHARE_DS_THEME_CATALOG_PATH=/data/themes.json` 增加：每项包含
 `name`、`terms`、`sectors`、`transmission`、`invalidation`，格式为 JSON 数组或带 `themes` 数组的对象。
 
-### 2. 盘中盯自选股
+### 2. 盘中盯持仓
 
 ```bash
-ashare-ds watchlist hold 600519.SH --cost 1350.6 --stop 1330 --target 1430
+ashare-ds position open 600519.SH --cost 1350.6 --stop 1330 --target 1430
+ashare-ds position list
 ashare-ds monitor --once
 ashare-ds monitor --feishu
+
+ashare-ds monitor --symbols 600519.SH 000001.SZ   # 只盯这两只，不读持仓
+ashare-ds position close 600519.SH                # 卖了就删掉，历史留在台账里
 ```
 
-有成本价时，系统会同时盯卖点；没有成本价时，只盯买点。启动时已经成立的可执行买卖点会补报一次，普通均价震荡不补报，避免刷屏。
+不传 `--symbols` 就盯持仓表里的票，每轮重读——盘中 `position open` 登记的新仓位
+立刻被盯上，不用重启监控。有成本价时盯的是卖点（止损/目标/结构破坏/时间止损/
+浮盈回吐），显式传进来的票没有成本价，盯的是买点。启动时已经成立的可执行买卖点
+会补报一次，普通均价震荡不补报，避免刷屏。
 
 ### 2b. 盘中盯板块趋势
 
@@ -97,7 +107,7 @@ ashare-ds monitor --feishu
 ashare-ds monitor --feishu                  # 个股 + 板块，两条链路
 ashare-ds monitor --no-sectors              # 只要个股告警
 ashare-ds monitor --sector-every 10         # 板块看得稀一点（约 20 分钟一次）
-python scripts/intraday_sector_monitor.py   # 只看板块，不跑个股监控
+python3 scripts/intraday_sector_monitor.py  # 只看板块，不跑个股监控
 ```
 
 推送的七种板块变化：
@@ -120,7 +130,8 @@ python scripts/intraday_sector_monitor.py   # 只看板块，不跑个股监控
   推送正是通道被静音的原因。额度**按小时分配**（每小时 4 条、全天 20 条），所以早盘的
   噪声吃不掉下午的份；超了写进 notes 而不是静默丢掉。
 
-自选股/持仓/候选池里的票落在哪个板块里会直接标在告警上（`⚑ 你盯着的票在这个板块里`），
+你盯着的票（持仓，或本轮 `--symbols` 传进来的）落在哪个板块里会直接标在告警上
+（`⚑ 你盯着的票在这个板块里`），
 并且这类告警排在最前——同一条「退潮」，发生在你有仓位的方向上紧急程度高一个量级。
 
 ### 3. 单票做股价分析
@@ -144,7 +155,7 @@ ashare-ds chat
 
 - `600519 现在趋势怎么样`
 - `今天量能放大但没突破，该怎么理解`
-- `自选股里谁先触发止损`
+- `持仓里谁先触发止损`
 - `如果明天低开，哪个价位先看`
 
 `chat` 适合连续追问同一份事实；`ask` 适合一次性问清楚。
@@ -176,6 +187,15 @@ ashare-ds ask --deep "这几只低开了，结合成交量怎么处理"
 ashare-ds facts --output facts.json
 ```
 
+一份完整事实包是 130KB 量级，只要其中几块时：
+
+```bash
+ashare-ds facts --sections 盘前主链路 持仓
+```
+
+省掉的块名会写进 `notes`——**少给数据可以，让你以为「就这些」不行**。
+MCP 那一侧的 `get_facts` 有同名参数，两条路是同一份实现。
+
 推荐顺序是：
 
 - 先用 `facts` 导出统一 bundle，把舆情、价位、宏观联动、近期验证窗口一次性给外部 AI。
@@ -186,7 +206,7 @@ ashare-ds facts --output facts.json
 
 - 想看“今天市场怎么了”，用 `morning`。
 - 想看“这只票怎么走”，用 `advise` 或 `ask`。
-- 想看“自选股有没有触发动作”，用 `monitor`。
+- 想看“持仓有没有触发动作”，用 `monitor`。
 - 想把事实交给 Codex / Claude 再继续分析，用 `facts`。
 - 想连续追问同一批事实，用 `chat`。
 - 想让模型参与取舍但不参与算价，用 `advise --adjudicate`。

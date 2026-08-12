@@ -4,10 +4,7 @@ from datetime import datetime, timedelta
 
 from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.schedule.timezone import BEIJING_TZ
-from ashare_decision_support.signals.daily_technical import (
-    DailyKChartRenderer,
-    DailyTechnicalAnalyzer,
-)
+from ashare_decision_support.signals.daily_technical import DailyTechnicalAnalyzer
 
 
 def build_bars() -> list[dict]:
@@ -47,17 +44,6 @@ def test_daily_technical_snapshot_has_levels() -> None:
     assert snapshot.resistances
     assert snapshot.supports[0].price < snapshot.last_close
     assert snapshot.resistances[0].price > snapshot.last_close
-    assert snapshot.chart_bars
-
-
-def test_daily_chart_renderer_outputs_svg() -> None:
-    analyzer = DailyTechnicalAnalyzer()
-    snapshot = analyzer.analyze("603983.SH", build_bars())
-    svg = DailyKChartRenderer().render_svg(snapshot)
-
-    assert "<svg" in svg
-    assert "603983.SH" in svg
-    assert "支撑" in svg or "压力" in svg
 
 
 # ---- 时间戳解析 -------------------------------------------------------------

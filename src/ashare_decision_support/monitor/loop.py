@@ -75,7 +75,6 @@ class LoopStats:
 def run_monitor_loop(
     session: MonitorSession,
     watch_symbols: Callable[[], list[str]],
-    candidate_symbols: Callable[[], list[str]],
     notifiers: list[Notifier],
     now_fn: Callable[[], datetime] = datetime.now,
     sleep: Callable[[float], None] = time.sleep,
@@ -107,7 +106,7 @@ def run_monitor_loop(
 
         active = in_session(moment)
         try:
-            result = session.poll(watch_symbols(), candidate_symbols(), moment, in_session=active)
+            result = session.poll(watch_symbols(), moment, in_session=active)
         except Exception as exc:
             # A pass that raises is a bad pass, not a dead loop. The most
             # likely cause is the network, and the next pass may well succeed.

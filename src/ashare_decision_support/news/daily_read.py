@@ -25,7 +25,7 @@
 
 ## 这一层能做什么、不能做什么
 
-**能**：说出传导链（事件 → 机制 → 受影响品种 → 方向），点出主线与风险，给自选股
+**能**：说出传导链（事件 → 机制 → 受影响品种 → 方向），点出主线与风险，给持仓
 与持仓股单独标注属于它们自己的消息。
 
 **不能**：产生任何新数字。约束方式和 `writer/llm.py` 完全一样——复用它的
@@ -64,7 +64,7 @@ from ashare_decision_support.writer.llm import unverified_numbers
 # 长尾（同一条消息的第 4 个转发版本），对判断没有增量。
 MAX_MARKET_HEADLINES = 240
 
-# 每只自选/持仓股最多带几条自己的消息。个股这段是要模型点名回答的，条数少而精
+# 每只持仓股最多带几条自己的消息。个股这段是要模型点名回答的，条数少而精
 # 比堆满更有用。
 MAX_SYMBOL_HEADLINES = 4
 
@@ -165,7 +165,7 @@ SYSTEM_PROMPT = """你是一名 A 股超短线交易员的盘前研究助理。�
    targets（受影响的 A 股板块或品种，最多 3 个）、direction（bullish/bearish/mixed）。
 2. mainlines：今天最可能被资金追的主线，最多 4 条。
 3. risks：今天最需要提防的风险，最多 3 条。
-4. watchlist：针对【自选股与持仓股】清单里的标的，说有没有属于它自己的消息。
+4. holdings：针对【持仓】清单里的标的，说有没有属于它自己的消息。
    没有消息的票不要提，不要为了凑数硬编。
 5. summary：不超过 80 字的一句话判断，像盘前研究结论，不要像清单复述。
 
@@ -181,7 +181,7 @@ SYSTEM_PROMPT = """你是一名 A 股超短线交易员的盘前研究助理。�
             "direction":"bullish","evidence":["标题前十二字"]}],
  "mainlines":[{"text":"...","evidence":["..."],"sectors":["..."]}],
  "risks":[{"text":"...","evidence":["..."]}],
- "watchlist":[{"symbol":"600519.SH","text":"...","evidence":["..."]}],
+ "holdings":[{"symbol":"600519.SH","text":"...","evidence":["..."]}],
  "summary":"..."}
 没有内容的分节给空数组。"""
 
@@ -195,7 +195,7 @@ DIRECTIONS = ("bullish", "bearish", "mixed")
 _NORM_PATTERN = re.compile(r"[\s　【】\[\]（）()《》「」“”\"':：,，.。!！?？、|]+")
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
-# 纯文本型分节（chains 与 watchlist 结构不同，单独处理）。
+# 纯文本型分节（chains 与 holdings 结构不同，单独处理）。
 TEXT_SECTIONS = ("mainlines", "risks")
 
 
@@ -257,7 +257,7 @@ class DailyRead:
     chains: list[Chain] = field(default_factory=list)
     mainlines: list[ReadItem] = field(default_factory=list)
     risks: list[ReadItem] = field(default_factory=list)
-    watchlist: list[ReadItem] = field(default_factory=list)
+    holdings: list[ReadItem] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     headline_count: int = 0
     section_counts: dict[str, int] = field(default_factory=dict)
@@ -267,7 +267,7 @@ class DailyRead:
         return (
             len(self.chains)
             + sum(len(getattr(self, name)) for name in TEXT_SECTIONS)
-            + len(self.watchlist)
+            + len(self.holdings)
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -278,7 +278,7 @@ class DailyRead:
             "section_counts": dict(self.section_counts),
             "chains": [item.to_dict() for item in self.chains],
             **{name: [i.to_dict() for i in getattr(self, name)] for name in TEXT_SECTIONS},
-            "watchlist": [item.to_dict() for item in self.watchlist],
+            "holdings": [item.to_dict() for item in self.holdings],
             "notes": list(self.notes),
         }
 
@@ -307,9 +307,9 @@ class DailyRead:
                 if item.evidence:
                     lines.append(f"  - 依据：{' / '.join(item.evidence)}")
             blocks.append("\n".join(lines))
-        if self.watchlist:
-            lines = ["## 自选股与持仓股"]
-            for item in self.watchlist:
+        if self.holdings:
+            lines = ["## 持仓"]
+            for item in self.holdings:
                 lines.append(f"- **{item.symbol or ''}** {item.text}")
                 if item.evidence:
                     lines.append(f"  - 依据：{' / '.join(item.evidence)}")
@@ -448,7 +448,7 @@ class DailyNewsReader:
                     for row in (payload.get(name) or [])
                     if isinstance(row, dict) and row.get("text")
                 ]
-                for name in (*TEXT_SECTIONS, "watchlist")
+                for name in (*TEXT_SECTIONS, "holdings")
             },
         )
 
@@ -540,7 +540,7 @@ def _build_prompt(
             heads = "；".join(doc.title[:TITLE_LIMIT] for doc in items[:MAX_SYMBOL_HEADLINES])
             lines.append(f"- {symbol} {label}：{heads}")
         if lines:
-            parts.append("【自选股与持仓股】\n" + "\n".join(lines))
+            parts.append("【持仓】\n" + "\n".join(lines))
 
     body = "\n\n".join(parts)
     return (
@@ -627,9 +627,9 @@ def _harvest(
     for name in TEXT_SECTIONS:
         items = [build(row) for row in _as_list(payload.get(name))]
         setattr(result, name, [item for item in items if item is not None])
-    result.watchlist = [
+    result.holdings = [
         item
-        for item in (build(row, allow_symbol=True) for row in _as_list(payload.get("watchlist")))
+        for item in (build(row, allow_symbol=True) for row in _as_list(payload.get("holdings")))
         if item is not None
     ]
 
@@ -651,7 +651,7 @@ def _cites(anchor: str, corpus: list[str]) -> bool:
 def _all_text(result: DailyRead) -> str:
     parts = [result.summary]
     parts.extend(f"{c.trigger} {c.mechanism} {' '.join(c.targets)}" for c in result.chains)
-    for name in (*TEXT_SECTIONS, "watchlist"):
+    for name in (*TEXT_SECTIONS, "holdings"):
         parts.extend(item.text for item in getattr(result, name))
     return " ".join(part for part in parts if part)
 

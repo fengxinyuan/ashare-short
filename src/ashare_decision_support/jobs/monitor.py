@@ -1,12 +1,15 @@
-"""盘中监控任务：把 `monitor/` 那套接到自选股、候选池与推送通道上。
+"""盘中监控任务：把 `monitor/` 那套接到持仓、板块与推送通道上。
 
 `monitor/` 负责判断（时效闸门、跃迁触发、降频），这里负责取名单、建会话、决定
 跑一轮还是跑一天，以及**把当日公告喂进去**——`risk_notice` 那条 WARN 触发器在
 代码里一直存在，但在此之前没有任何调用点给它数据，等于结构上永不触发。
 
-**板块监控不依赖名单。** 个股那条链路要自选股或候选池才有东西可盯；板块截面读的
-是全市场，空仓的日子照样有话说——而空仓的日子恰恰是最需要「现在该看哪个方向」的
-那一天。所以名单为空时不再整体 return，只跳过个股那一半。
+**个股那一半只盯两种票**：命令行显式给的，和持仓表里的。自选股与候选池已经删掉
+（见 `state/positions.py`）——一份没人维护却仍被当默认输入的清单，会让每一轮监控
+都在几十只你今天根本没看的票上发告警。
+
+**板块监控不依赖名单。** 空仓的日子照样有话说，而那恰恰是最需要「现在该看哪个
+方向」的一天。所以名单为空时不再整体 return，只跳过个股那一半。
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ from ashare_decision_support.notify.render import (
     render_feed_suspension,
 )
 from ashare_decision_support.schedule.timezone import beijing_now, beijing_today
-from ashare_decision_support.state import CandidatePool, Watchlist
+from ashare_decision_support.state import Positions
 
 
 def run_monitor(
@@ -59,27 +62,24 @@ def run_monitor(
     moment = now or beijing_now()
     channels = notifiers if notifiers is not None else [ConsoleNotifier()]
 
-    # 显式给了标的就只盯它；否则自选股 + 当日候选池。
-    book = Watchlist()
-    if symbols:
-        watch, candidates = list(symbols), []
-    else:
-        watch = book.symbols()
-        pool = CandidatePool(today=today)
-        candidates = [item for item in pool.symbols() if item not in set(watch)]
+    # 显式给了标的就只盯它；否则盯持仓。没有第三种来源了。
+    positions = Positions()
+    watch = list(symbols) if symbols else positions.symbols()
 
     notes: list[str] = []
     sector = _build_sector_session(
         enabled=sectors, provided=sector_session, today=today, symbols=symbols, notes=notes
     )
 
-    if not watch and not candidates:
-        notes.append("自选股与候选池都为空，本次只跑板块监控；加标的用 `ashare-ds watchlist add <代码>`")
+    if not watch:
+        notes.append(
+            "没有可盯的个股（未传代码、持仓表为空），本次只跑板块监控；"
+            "登记持仓用 `ashare-ds position open <代码> --cost <成本价>`"
+        )
         if sector is None:
             return {
                 "trade_date": str(today),
                 "watch": 0,
-                "candidates": 0,
                 "passes": 0,
                 "alerts": 0,
                 "notes": [*notes, "板块监控也未启用，本次没有任何可做的事"],
@@ -99,17 +99,17 @@ def run_monitor(
             else (default_snapshot_adapter() if use_order_book else None)
         ),
     )
-    notes.extend(session.prime(watch + candidates))
+    notes.extend(session.prime(watch))
     # 持仓在 prime 之后加载：已持仓的票要盯的是卖点（止损/目标/结构破坏/时间止损），
     # 未持仓的盯买点。两套判断的紧急程度不同，没有这一步 monitor 分不清。
-    notes.extend(session.load_positions(book))
+    notes.extend(session.load_positions(positions))
 
     news = news_source if news_source is not None else _default_news_source(news_cache_dir)
     blocked, risk_notes = _refresh_risk(session, news, today)
     notes.extend(risk_notes)
 
     if once or max_passes == 1:
-        result = session.poll(watch, candidates, moment, in_session=in_session(moment))
+        result = session.poll(watch, moment, in_session=in_session(moment))
         notes.extend(result.notes)
         # 走 `publish` 而不是逐个 `channel.send`：投递是副作用，一个渠道的契约
         # 违约（webhook 404、磁盘满）不该让这一轮监控整个抛出去。循环那一侧
@@ -122,7 +122,6 @@ def run_monitor(
         return {
             "trade_date": str(today),
             "watch": len(watch),
-            "candidates": len(candidates),
             "passes": 1,
             "alerts": len(result.alerts),
             "risk_blocked": blocked,
@@ -138,9 +137,8 @@ def run_monitor(
 
     stats = run_monitor_loop(
         session=session,
-        # 每轮重读，这样盘中 `watchlist add` 立刻生效，不用重启监控。
-        watch_symbols=lambda: list(symbols) if symbols else Watchlist().symbols(),
-        candidate_symbols=lambda: [] if symbols else CandidatePool(today=today).symbols(),
+        # 每轮重读，这样盘中 `position open` 登记的新仓位立刻被盯上，不用重启监控。
+        watch_symbols=lambda: list(symbols) if symbols else Positions().symbols(),
         notifiers=channels,
         max_passes=max_passes,
         # 盘中会新挂临时公告，所以不能只在开盘时读一次；但公告源是整日全量拉取，
@@ -152,7 +150,6 @@ def run_monitor(
     return {
         "trade_date": str(today),
         "watch": len(watch),
-        "candidates": len(candidates),
         "passes": stats.passes,
         "alerts": stats.alerts,
         "risk_blocked": blocked,
@@ -181,11 +178,7 @@ def default_sector_session(today: date, symbols: list[str] | None) -> Any:
         session_date=today,
         # 板块告警里「你盯着的票在这个板块里」那一行要每轮重读，理由同
         # `run_monitor_loop` 的 watch_symbols。
-        watch_symbols=lambda: (
-            list(symbols)
-            if symbols
-            else list(Watchlist().symbols()) + list(CandidatePool(today=today).symbols())
-        ),
+        watch_symbols=lambda: list(symbols) if symbols else Positions().symbols(),
     )
 
 
@@ -248,7 +241,6 @@ def _sector_only(
         return {
             "trade_date": str(today),
             "watch": 0,
-            "candidates": 0,
             "passes": 0,
             "alerts": 0,
             **summary,
@@ -258,7 +250,6 @@ def _sector_only(
     stats = run_monitor_loop(
         session=_NullSession(),
         watch_symbols=list,
-        candidate_symbols=list,
         notifiers=channels,
         max_passes=max_passes,
         sector_session=sector,
@@ -267,7 +258,6 @@ def _sector_only(
     return {
         "trade_date": str(today),
         "watch": 0,
-        "candidates": 0,
         "passes": stats.passes,
         "alerts": 0,
         "sector_passes": stats.sector_passes,
@@ -285,13 +275,13 @@ class _NullSession:
     个股。这里返回的健康度是「没有标的可取」，与真实的取数失败可区分。
     """
 
-    def poll(self, watch, candidates, now, in_session=True):
+    def poll(self, watch, now, in_session=True):
         from ashare_decision_support.monitor.feed import assess_feed
         from ashare_decision_support.monitor.session import PassResult
 
         return PassResult(
             health=assess_feed({}, 0, now, None, in_session),
-            notes=["自选股与候选池为空，本轮只跑板块"],
+            notes=["没有可盯的个股，本轮只跑板块"],
         )
 
 
@@ -334,7 +324,7 @@ def _alert_dict(alert) -> dict:
         "detail": alert.detail,
         "as_of": alert.as_of.isoformat(timespec="seconds") if alert.as_of else None,
         "lag_minutes": alert.lag_minutes,
-        "watchlist": alert.watchlist,
+        "holding": alert.holding,
     }
 
 

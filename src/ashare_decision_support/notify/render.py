@@ -330,7 +330,7 @@ def _post_close_conclusion(actionable: list[dict], watch_only: list[dict]) -> st
     if watch_only:
         # 「没有可用打法」和「没有标的」必须长得不一样。
         return (
-            f"自选 {len(watch_only)} 只**没有一只**满足今天允许的入场判据——"
+            f"这 {len(watch_only)} 只**没有一只**满足今天允许的入场判据——"
             "不是它们不够好，是今天没有位置。逐只理由见下。"
         )
     return "没有可用日线，本次无法给出任何判断。"
@@ -410,7 +410,7 @@ def render_post_close_brief(payload: dict) -> str:
 
     lines.append("## 只能看，不能做")
     if not watch_only:
-        lines.append("无——自选股全部有可用打法。")
+        lines.append("无——本次的标的全部有可用打法。")
     else:
         lines.append("这些票今天没有满足判据的打法。**理由本身就是答案**，不是「没选上」。")
         lines.append("")
@@ -874,7 +874,7 @@ def render_advice_brief(trade_date, advices: list, data_notes: list[str] | None 
 
     lines.append("## 先看结论")
     if not advices:
-        lines.append("没有标的需要解释，先补自选股或直接传入代码。")
+        lines.append("没有标的需要解释，直接传入代码即可。")
     else:
         for item in advices[:6]:
             name = f" {item.name}" if item.name else ""
@@ -1051,7 +1051,7 @@ LEVEL_BADGE = {"ACTION": "🔴", "WARN": "🟠", "INFO": "🔵"}
 
 # 触发 → 一句话动作。查表而不是 if 阶梯：这里唯一的逻辑是「持仓表优先于通用表」，
 # 其余全是文案。同一个 trigger 在两张表里含义不同（target_hit 对持仓是兑现，
-# 对候选池是「别把兑现信号当买点」），所以必须是两张表而不是一张带例外。
+# 对未持仓的票是「别把兑现信号当买点」），所以必须是两张表而不是一张带例外。
 _HOLDING_ACTIONS: dict[str, str] = {
     "stop_break": "持仓风控：{headline}，先处理卖出/减仓纪律。",
     "structure_break": "持仓风控：{headline}，先处理卖出/减仓纪律。",
@@ -1141,17 +1141,12 @@ def render_alerts(alerts: list, health) -> str:
         lines.append(f"- {badge} {_alert_action_line(alert)}")
     lines.append("")
     lines.append("## 触发依据")
-    # 持仓排在最前。同一批推送里，「你手上那只跌破止损了」和「候选池某只进买区」
-    # 不该按标的顺序混排——前者的漏读代价是真金白银。
+    # 持仓排在最前。同一批推送里，「你手上那只跌破止损了」和「你临时盯的那只进
+    # 买区」不该按标的顺序混排——前者的漏读代价是真金白银。
     for alert in ordered:
         badge = LEVEL_BADGE.get(alert.level, "•")
         stamp = f"{alert.as_of:%H:%M}" if alert.as_of else "时间未知"
-        if getattr(alert, "holding", False):
-            origin = "【持仓】"
-        elif alert.watchlist:
-            origin = ""
-        else:
-            origin = "（候选池）"
+        origin = "【持仓】" if getattr(alert, "holding", False) else ""
         lines.append(f"{badge} **[{alert.level}] {origin}{alert.headline}**　as-of {stamp}")
         lines.extend(f"　{item}" for item in alert.detail)
         lines.append("")
@@ -1244,9 +1239,9 @@ def render_sector_alerts(alerts: list, snapshot=None) -> str:
     for alert in ordered:
         badge = LEVEL_BADGE.get(getattr(alert, "level", ""), "•")
         stamp = f"{alert.as_of:%H:%M}" if getattr(alert, "as_of", None) else "时间未知"
-        # 命中自选/持仓的板块标出来。同一条「退潮」，发生在你有仓位的方向上
+        # 命中你在盯的票的板块标出来。同一条「退潮」，发生在你有仓位的方向上
         # 和发生在一个你没碰过的方向上，紧急程度差一个量级。
-        flag = "【关联自选】" if getattr(alert, "touches_watchlist", False) else ""
+        flag = "【命中你盯的票】" if getattr(alert, "touches_watched", False) else ""
         lines.append(f"{badge} **[{alert.level}] {flag}{alert.headline}**　as-of {stamp}")
         lines.extend(f"　{item}" for item in getattr(alert, "detail", []) or [])
         lines.append("")

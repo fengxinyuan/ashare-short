@@ -177,22 +177,19 @@ def _volume_price_exits(
     # ---- 顶背离 ----------------------------------------------------------
     # **减仓不清仓**：价还在创新高，只是推动力在衰减。把它当清仓信号会在主升段
     # 中途下车，而那正是这套系统最该避免的一类错。
-    if getattr(vp, "divergence", None) == DIVERGENCE_TOP:
-        if has_gain is False:
-            # 没有浮盈就没有可兑现的东西，这条不适用。
-            pass
-        else:
-            detail = ["价创 20 日新高，但量能低于创前高那一天——推动力在衰减"]
-            if has_gain is None:
-                detail.append("未知是否持仓：若已持有，这是兑现判据而非离场判据")
-            signals.append(
-                ExitSignal(
-                    trigger="top_divergence",
-                    action=EXIT_TRIM,
-                    reason="顶背离：价创新高而量没跟上",
-                    detail=detail,
-                )
+    # 没有浮盈就没有可兑现的东西，这条不适用。
+    if getattr(vp, "divergence", None) == DIVERGENCE_TOP and has_gain is not False:
+        detail = ["价创 20 日新高，但量能低于创前高那一天——推动力在衰减"]
+        if has_gain is None:
+            detail.append("未知是否持仓：若已持有，这是兑现判据而非离场判据")
+        signals.append(
+            ExitSignal(
+                trigger="top_divergence",
+                action=EXIT_TRIM,
+                reason="顶背离：价创新高而量没跟上",
+                detail=detail,
             )
+        )
 
     return signals
 

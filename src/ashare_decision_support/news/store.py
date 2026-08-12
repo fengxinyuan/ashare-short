@@ -57,6 +57,10 @@ DEFAULT_RELATIVE_PATH = ("news", "corpus.sqlite3")
 # 更细会被单条消息的多源转发主导，更粗看不出盘中的起量。
 DEFAULT_BUCKET_HOURS = 1
 
+# 一次 `IN (...)` 里塞多少个 key。SQLite 的变量上限旧版是 999，取 500 留足余量——
+# 这个数只影响分几批，不影响结果。
+_SOURCE_COUNT_CHUNK = 500
+
 
 @dataclass(frozen=True)
 class StoredDoc:
@@ -100,6 +104,20 @@ class StoredDoc:
             "direction": self.direction,
             "event_type": self.event_type,
         }
+
+
+@dataclass(frozen=True)
+class DocAttribution:
+    """一条消息的归因：属于哪几个板块，以及（模型给了的话）方向与事件类型。
+
+    单独一个类型而不是三个并列的字典，是因为这三样**必须一起写**：一条消息的
+    方向脱离它归属的板块就没有意义，而分开传的话调用方少传一个不会有任何症状。
+    """
+
+    sectors: tuple[str, ...] = ()
+    direction: str | None = None
+    event_type: str | None = None
+    mechanism: str | None = None
 
 
 @dataclass
@@ -180,6 +198,11 @@ class NewsStore:
         self.path = Path(path) if path is not None else state_path(*DEFAULT_RELATIVE_PATH)
         self.ok = False
         self.error: str | None = None
+        # 最近一次**读**失败的原因。构造失败记在 `error` 里，而读失败此前谁也不知道：
+        # 每个读方法都是 `except Exception: return []`，于是一个锁住的、损坏的或
+        # 权限不对的库，在调用方看来和「这个板块最近没有新消息」一模一样。
+        # 而「没数据」与「读不到」在这套系统里从来不是同一件事。
+        self.read_error: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as conn:
@@ -271,9 +294,43 @@ class NewsStore:
                             "INSERT OR IGNORE INTO doc_sectors(key, sector) VALUES (?, ?)",
                             (key, sector),
                         )
-        except Exception:
+        except Exception as exc:
+            self._note_read_failure(exc)
             return False
         return True
+
+    def label_many(self, labels: dict[str, DocAttribution]) -> int:
+        """整批写归因，**一次连接**。返回写进去的条数。
+
+        逐条 `label()` 在盘前是 600 次 `sqlite3.connect` + 600 次 WAL pragma——
+        写的东西一模一样，代价全在连接上。归因是每天一次的批量动作，本来就该批量写。
+
+        和 `ingest` 分开的理由写在 `label` 的 docstring 里：入库发生在采集之后、
+        归因之前，归因还可能整批作废退回词典。入库不该等归因。
+        """
+        if not self.ok or not labels:
+            return 0
+        written = 0
+        try:
+            with self._connect() as conn:
+                for key, item in labels.items():
+                    if not key:
+                        continue
+                    conn.execute(
+                        "UPDATE docs SET direction=COALESCE(?,direction), "
+                        "event_type=COALESCE(?,event_type), mechanism=COALESCE(?,mechanism) "
+                        "WHERE key=?",
+                        (item.direction, item.event_type, item.mechanism, key),
+                    )
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO doc_sectors(key, sector) VALUES (?, ?)",
+                        [(key, sector) for sector in item.sectors if sector],
+                    )
+                    written += 1
+        except Exception as exc:
+            self._note_read_failure(exc)
+            return written
+        return written
 
     # ---- 读 --------------------------------------------------------------
 
@@ -320,7 +377,8 @@ class NewsStore:
             with self._connect() as conn:
                 rows = conn.execute(" ".join(sql), params).fetchall()
                 return [self._hydrate(conn, row) for row in rows]
-        except Exception:
+        except Exception as exc:
+            self._note_read_failure(exc)
             return []
 
     def sector_heat(
@@ -353,10 +411,9 @@ class NewsStore:
                 ).fetchall()
                 if not rows:
                     return []
-                sources = dict(conn.execute(
-                        "SELECT key, COUNT(*) FROM doc_sources GROUP BY key"
-                    ).fetchall())
-        except Exception:
+                sources = self._source_counts(conn, [key for _, key in rows])
+        except Exception as exc:
+            self._note_read_failure(exc)
             return []
 
         buckets: dict[datetime, list[str]] = {}
@@ -389,7 +446,8 @@ class NewsStore:
                 row = conn.execute(
                     "SELECT first_seen_at FROM docs WHERE key = ?", (key,)
                 ).fetchone()
-        except Exception:
+        except Exception as exc:
+            self._note_read_failure(exc)
             return None
         return _parse_iso(row[0]) if row else None
 
@@ -527,6 +585,41 @@ class NewsStore:
             "SELECT first_seen_at, seen_count FROM docs WHERE key = ?", (key,)
         ).fetchone()
         return bool(row) and row[0] == iso and row[1] == 1
+
+    def _note_read_failure(self, exc: Exception) -> None:
+        """读失败记在实例上，让调用方能把它写进 notes。
+
+        **仍然不抛。** 语料库是旁证，它读不到不该中断盘前跑批——但「读不到」必须
+        说出口。调用方拿到的空列表，在此之前和「这个板块最近确实没有新故事」长得
+        完全一样，而后者会被当成一条读数用进判断。
+        """
+        self.read_error = f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _source_counts(conn: sqlite3.Connection, keys: list[str]) -> dict[str, int]:
+        """这几条各自被几个源报道过。
+
+        **只数用得上的那几条。** 这里原来是一句无 WHERE 的
+        `SELECT key, COUNT(*) FROM doc_sources GROUP BY key`——语料库按设计是
+        跨日累积的（那是这个模块存在的理由），于是它把整张表聚合一遍，只为取回
+        窗口里那几十个 key；而板块热度现在每个盘前要按选中板块调好几次。
+
+        分批是因为 SQLite 的变量个数有上限，而窗口内的 key 数不由这一层控制。
+        """
+        counts: dict[str, int] = {}
+        unique = list(dict.fromkeys(keys))
+        for start in range(0, len(unique), _SOURCE_COUNT_CHUNK):
+            chunk = unique[start : start + _SOURCE_COUNT_CHUNK]
+            # 拼进 SQL 的只有问号个数，key 本身仍然走参数绑定。
+            placeholders = ",".join("?" * len(chunk))
+            counts.update(
+                conn.execute(
+                    f"SELECT key, COUNT(*) FROM doc_sources WHERE key IN ({placeholders}) "
+                    "GROUP BY key",
+                    chunk,
+                ).fetchall()
+            )
+        return counts
 
     @staticmethod
     def _hydrate(conn: sqlite3.Connection, row: tuple) -> StoredDoc:

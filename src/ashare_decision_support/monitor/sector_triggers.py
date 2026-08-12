@@ -154,7 +154,7 @@ class SectorAlert:
     excess_pct: float | None = None
     rank: int | None = None
     as_of: datetime | None = None
-    # 这个板块里命中的自选/持仓/候选池标的，用于排序时优先。
+    # 这个板块里命中的持仓（或本轮显式盯的）标的，用于排序时优先。
     watch_hits: tuple[tuple[str, str], ...] = ()
 
     @property
@@ -163,7 +163,7 @@ class SectorAlert:
         return policy.label if policy is not None else self.trigger
 
     @property
-    def touches_watchlist(self) -> bool:
+    def touches_watched(self) -> bool:
         return bool(self.watch_hits)
 
 
@@ -650,15 +650,15 @@ def _derive_state(read: SectorRead, rank: int) -> dict:
 
 
 def _priority(alert: SectorAlert) -> tuple:
-    """排序键：级别 → 是否命中自选 → 超额绝对值。
+    """排序键：级别 → 是否命中你盯着的票 → 超额绝对值。
 
-    命中自选排在前面，是因为同样一条「退潮」，发生在你持仓所在的板块上和发生在
+    命中持仓排在前面，是因为同样一条「退潮」，发生在你持仓所在的板块上和发生在
     一个你没碰过的板块上，紧急程度差一个量级。
     """
     level_order = {LEVEL_ACTION: 0, LEVEL_WARN: 1, LEVEL_INFO: 2}
     return (
         level_order.get(alert.level, 3),
-        0 if alert.touches_watchlist else 1,
+        0 if alert.touches_watched else 1,
         -abs(alert.excess_pct or 0.0),
     )
 

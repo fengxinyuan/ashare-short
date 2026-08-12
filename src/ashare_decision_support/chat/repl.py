@@ -47,7 +47,7 @@ def run_chat(
         write("已装配上下文，可以直接问趋势、买卖点、监控结果或如果跌破怎么办。")
         write(render_facts_summary(session))
     else:
-        write("\n上下文为空，先用 /watch 或 /add <代码> 加入标的。")
+        write("\n上下文为空，先用 /add <代码> 加入标的，或 /positions 载入持仓。")
 
     while True:
         try:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,25 @@ def _split_long_piece(text: str, limit: int) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def written_path(channels: list[Notifier], fallback: Any = None) -> str | None:
+    """这一次简报**实际**写在哪个文件里；没写文件就是 None。
+
+    四条链路都要回答这个问题，而它们此前有两种答法。`morning` / `advise` 那两条
+    先扫一遍真正投递过的渠道，取到谁写了盘；`postclose` / `preopen` 只看自己
+    构造的那个 `FileNotifier`——**调用方自带 notifier 时（daemon 就是这么调的），
+    内部那个从未发送，`last_path` 是 None**，于是 summary 里 `delivered` 写着
+    `["file"]`、`brief_path` 却是 null：文件明明写出来了，回执说没有。
+
+    收成一个函数，四条链路从此只有一种答法。
+    """
+    for channel in channels:
+        path = getattr(channel, "last_path", None)
+        if path:
+            return str(path)
+    path = getattr(fallback, "last_path", None)
+    return str(path) if path else None
 
 
 def publish(notifiers: list[Notifier], title: str, content: str) -> list[str]:

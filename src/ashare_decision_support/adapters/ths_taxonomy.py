@@ -35,7 +35,7 @@
 3. 从来没取到过则 `ok=False`，由调用方决定回退还是中止——**不返回空分类**，
    空分类会让下游读成「今天没有板块」。
 
-量纲与命名：`symbol` 一律过 `normalize_symbol`，与台账、自选股同一口径。
+量纲与命名：`symbol` 一律过 `normalize_symbol`，与台账、持仓表同一口径。
 """
 
 from __future__ import annotations

@@ -237,7 +237,7 @@ class SectorPredictor:
         attribution: dict[str, tuple[str, ...]] | None = None,
         fallback_empty_labels: bool = False,
     ) -> list[SectorOutlook]:
-        docs_by_sector = self._attribute_docs(
+        docs_by_sector = self.attribute_docs(
             definitions,
             market_docs or [],
             attribution,
@@ -611,7 +611,7 @@ class SectorPredictor:
         reasons.append(f"板块回撤过深（中位 {depth:.1f} 个日波幅，{points:+.1f}）")
         return points
 
-    def _attribute_docs(
+    def attribute_docs(
         self,
         definitions: list[SectorDefinition],
         docs: list[NewsDoc],
@@ -623,6 +623,10 @@ class SectorPredictor:
         给了 `attribution`（大模型归因）就优先用它，只有模型没给结论的那条才退回
         关键词。两者混用是刻意的：模型漏一条不该让这条消息彻底消失，而模型给了
         结论时不该再让词表去覆盖它。
+
+        **公开的原因**：这份「哪条消息算在哪个板块头上」的映射是板块预测的
+        可测试边界。让调用方自己按 `sector_terms` 再匹配一遍，等于让同一条规则
+        有两份实现，而它们会各自演化。
         """
         from ashare_decision_support.news.dedup import dedup_key
 

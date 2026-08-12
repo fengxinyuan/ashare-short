@@ -2,7 +2,7 @@
 
 ```text
 daily_cycle  全天时间表编排（`daemon` 命令）
-morning      盘前主链路：舆情 → 大盘 → 板块 → 选股 → 候选池 → 台账
+morning      盘前主链路：舆情 → 大盘 → 板块 → 选股 → 当日候选 → 台账
 monitor      盘中循环：时效闸门 → 跃迁触发 → 告警
 advise       个股买卖点与情景推演
 post_close   盘后：自选与持仓打分，产出次日执行卡

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -86,11 +86,9 @@ def test_intraday_computes_live_levels_while_pre_open_does_not() -> None:
         calls.append(list(symbols))
         return {"symbols": [{"symbol": symbols[0], "last_price": 20.0}]}
 
-    from ashare_decision_support.state import Watchlist
+    from ashare_decision_support.state import Positions
 
-    book = Watchlist()
-    book.add("600519.SH")
-    book.save()
+    Positions().open("600519.SH", cost_price=1300.0)
 
     intraday = assemble(datetime(2026, 7, 31, 10, 30), compute_symbols=compute)
     assert calls == [["600519.SH"]]
@@ -109,18 +107,16 @@ def test_live_computation_failure_costs_only_that_block() -> None:
     def boom(symbols: list[str]) -> dict:
         raise RuntimeError("adapter down")
 
-    from ashare_decision_support.state import Watchlist
+    from ashare_decision_support.state import Positions
 
-    book = Watchlist()
-    book.add("600519.SH")
-    book.save()
+    Positions().open("600519.SH", cost_price=1300.0)
 
     ctx = assemble(datetime(2026, 7, 31, 10, 30), compute_symbols=boom)
 
     assert "实时买卖点" not in ctx.blocks
     assert "台账统计" in ctx.blocks
     assert "近期验证" in ctx.blocks
-    assert "自选与候选" in ctx.blocks
+    assert "持仓" in ctx.blocks
     assert any("实时买卖点计算失败" in note for note in ctx.notes)
 
 
@@ -257,11 +253,9 @@ def test_facts_bundle_is_ready_for_external_ai_consumers() -> None:
     def compute(symbols: list[str]) -> dict:
         return {"symbols": [{"symbol": symbols[0], "last_price": 20.0}]}
 
-    from ashare_decision_support.state import Watchlist
+    from ashare_decision_support.state import Positions
 
-    book = Watchlist()
-    book.add("600519.SH")
-    book.save()
+    Positions().open("600519.SH", cost_price=1300.0)
 
     bundle = build_facts_bundle(
         moment=datetime(2026, 7, 31, 10, 30),
@@ -287,11 +281,9 @@ def test_cli_parser_accepts_the_facts_command() -> None:
 
 
 def test_render_prefers_shortline_summary_over_raw_field_listing() -> None:
-    from ashare_decision_support.state import Watchlist
+    from ashare_decision_support.state import Positions
 
-    book = Watchlist()
-    book.add("600519.SH")
-    book.save()
+    Positions().open("600519.SH", cost_price=1300.0)
 
     def compute(symbols: list[str]) -> dict:
         return {
@@ -407,70 +399,112 @@ def test_a_held_position_is_actually_counted() -> None:
     """持仓数是盘中问答里最能改变答案方向的一个数——看到 0，模型就不会往
     「该不该卖」上答。
 
-    字段叫 `holding`。按别的名字 `getattr(entry, ..., False)` 会**静默**恒为
-    False，而静默的 0 和真的空仓在装配好的上下文里长得一模一样：不会报错，
-    不会有 note，只是答案默默偏了。
+    持仓表是**唯一**还会自动进上下文的名单，所以它读空了不会有别的东西顶上：
+    没有 note、不报错，只是答案默默偏向买入侧。
     """
-    from ashare_decision_support.state import Watchlist
+    from ashare_decision_support.state import Positions
 
-    book = Watchlist()
-    book.add("600519.SH")
-    book.add("000001.SZ")
-    book.set_position("600519.SH", cost_price=1350.6)
-    book.save()
+    Positions().open("600519.SH", cost_price=1350.6)
 
-    block = assemble(datetime(2026, 7, 31, 8, 30)).blocks["自选与候选"]
+    block = assemble(datetime(2026, 7, 31, 8, 30)).blocks["持仓"]
 
     assert block["持仓数"] == 1
-    assert [item["symbol"] for item in block["持仓"]] == ["600519.SH"]
+    assert [item["symbol"] for item in block["明细"]] == ["600519.SH"]
+    assert block["明细"][0]["成本价"] == 1350.6
 
 
-def test_candidate_pool_metadata_survives_into_the_assembled_context() -> None:
-    from ashare_decision_support.state import CandidatePool, WatchEntry
+def test_an_empty_position_table_says_how_to_ask_about_a_symbol() -> None:
+    """空持仓不该只是一个 0。它要说清楚「那我怎么问某只票」——这正是删掉
+    自选股之后最容易卡住的一步。"""
+    ctx = assemble(datetime(2026, 7, 31, 8, 30))
 
-    trade_day = date(2026, 8, 7)
-    CandidatePool(today=trade_day).replace(
-        [
-            WatchEntry(
-                symbol="300750.SZ",
-                name="宁德时代",
-                sector="电力设备",
-                industries=["电力设备", "电池", "锂电池"],
-                industry="电力设备",
-                industry_leaf="锂电池",
-                industry_path="电力设备·电池·锂电池",
-                concepts=["固态电池", "储能"],
-                source="sector-scan",
-                score=88.0,
-            )
-        ],
-        trade_day,
-    )
-
-    block = assemble(datetime(2026, 8, 7, 8, 30)).blocks["自选与候选"]
-    row = block["候选池"][0]
-
-    assert row["industry_path"] == "电力设备·电池·锂电池"
-    assert row["concepts"] == ["固态电池", "储能"]
+    assert ctx.blocks["持仓"]["持仓数"] == 0
+    assert any("直接把代码写进问题里" in note for note in ctx.notes)
 
 
 def test_the_cost_basis_survives_being_rendered() -> None:
     """成本价必须**出现在 `render()` 的文本里**，不只是在 blocks 里。
 
     没配 key 时 `render()` 就是全部输出，而它按 160 字截断每一条。持仓那一条
-    原来复用 `WatchEntry.to_dict()`（`asdict` 顺序），成本价、计划止损、计划目标
-    正好排在最后——一只名字和备注稍长的票就会把这三个数截掉。断言渲染后的文本，
-    是因为断言 blocks 通不过这个洞：blocks 里它们一直都在。
+    原来复用 `to_dict()`（`asdict` 顺序），成本价、计划止损、计划目标正好排在
+    最后——一只名字和备注稍长的票就会把这三个数截掉。断言渲染后的文本，是因为
+    断言 blocks 通不过这个洞：blocks 里它们一直都在。
     """
-    from ashare_decision_support.state import Watchlist
+    from ashare_decision_support.state import Positions
 
-    book = Watchlist()
-    book.add("600519.SH", name="贵州茅台", sector="食品饮料", note="低吸 · 回调到年线附近接")
-    book.set_position("600519.SH", cost_price=1350.6, plan_stop=1300.0, plan_target=1420.0)
-    book.save()
+    Positions().open(
+        "600519.SH",
+        cost_price=1350.6,
+        plan_stop=1300.0,
+        plan_target=1420.0,
+        name="贵州茅台",
+        note="低吸 · 回调到年线附近接",
+    )
 
     rendered = assemble(datetime(2026, 7, 31, 8, 30)).render()
 
     assert "1350.6" in rendered
     assert "1300.0" in rendered
     assert "1420.0" in rendered
+
+
+def test_facts_can_be_narrowed_to_a_few_blocks(tmp_path, monkeypatch) -> None:
+    """一次完整事实包是 130KB 量级。问「今天板块怎么排」时，那 7KB 的买卖点是
+    白付的——而调用方常常是模型，白付的部分会一直占着它的上下文。"""
+    monkeypatch.setenv("ASHARE_DS_HOME", str(tmp_path / "state"))
+
+    picked = build_facts_bundle(
+        moment=datetime(2026, 7, 31, 20, 0),
+        output_dir=tmp_path,
+        is_trading_day=False,
+        sections=["持仓"],
+    ).to_dict()
+
+    assert list(picked["facts"]) == ["时段", "时刻", "标的", "持仓", "装配说明"]
+    assert any("省略的块" in note for note in picked["notes"])
+
+
+def test_the_readable_view_describes_the_same_blocks_as_the_data(tmp_path, monkeypatch) -> None:
+    """`rendered` 是 `facts` 的可读版，两者必须说同一批块。
+
+    在 `to_dict` 里过滤就会出现「只要了一块，可读版里却印着全部」——比不过滤更糟，
+    因为它看起来是对的，而多出来的那几块正是调用方以为自己没要的。
+    """
+    monkeypatch.setenv("ASHARE_DS_HOME", str(tmp_path / "state"))
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps({"trade_date": "2026-07-31", "sectors": [{"name": "电力设备"}]}),
+        encoding="utf-8",
+    )
+
+    picked = build_facts_bundle(
+        moment=datetime(2026, 7, 31, 20, 0),
+        output_dir=tmp_path,
+        is_trading_day=False,
+        sections=["持仓"],
+    )
+
+    assert "[持仓]" in picked.rendered
+    assert "[盘前主链路]" not in picked.rendered
+    # 省掉的块只出现在「省略了什么」那句话里，不出现在正文里。
+    notes_text = picked.rendered.rsplit("[持仓]", 1)[-1]
+    assert "省略的块" in notes_text and "盘前主链路" in notes_text
+
+
+def test_an_unknown_section_name_is_refused(tmp_path, monkeypatch) -> None:
+    """认不出来的块名直接报错，不静默返回一个空包。"""
+    import pytest
+
+    monkeypatch.setenv("ASHARE_DS_HOME", str(tmp_path / "state"))
+    with pytest.raises(ValueError, match="unknown sections"):
+        build_facts_bundle(
+            moment=datetime(2026, 7, 31, 20, 0),
+            output_dir=tmp_path,
+            is_trading_day=False,
+            sections=["没有这一块"],
+        )
+
+
+def test_the_cli_exposes_the_same_sections_flag() -> None:
+    """CLI 与 MCP 是同一件事的两条路，口径不能各写一份。"""
+    args = build_parser().parse_args(["facts", "--sections", "持仓", "台账统计"])
+    assert args.sections == ["持仓", "台账统计"]

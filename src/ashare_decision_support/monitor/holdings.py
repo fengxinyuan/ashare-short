@@ -14,7 +14,7 @@
 | **浮盈回吐** | 冲高之后又跌回来 | 上面四条**没有一条会响**：止损远在下方、目标没到、支撑没破、期限没到。而这正是「坐电梯」的全过程 |
 
 系统只出建议，**不下单、不撤单、不接管账户**——持仓成本、股数、计划止损与目标全部由
-你手工维护（`watchlist hold`），这里只读不写。
+你手工维护（`ashare-ds position open`），这里只读不写。
 """
 
 from __future__ import annotations
@@ -69,10 +69,13 @@ class HoldingView:
     held_days: int | None = None
 
     @classmethod
-    def from_entry(cls, entry: Any, today: date | None = None) -> HoldingView | None:
-        """从 `WatchEntry` 构造。没持仓返回 None——调用方据此走买点那条路。"""
-        if entry is None or not getattr(entry, "holding", False):
-            return None
+    def from_position(cls, entry: Any, today: date | None = None) -> HoldingView:
+        """从 `state.Position` 构造。
+
+        以前这里还要判一次「这条记录到底持没持仓」——自选股和持仓混在同一份
+        清单里，靠一个 `holding` 布尔位区分。持仓表拆出来之后那个分支消失了：
+        表里的每一条按定义都是持仓，没有第二种可能。
+        """
         return cls(
             symbol=entry.symbol,
             cost_price=entry.cost_price,
@@ -122,7 +125,7 @@ def effective_targets(holding: HoldingView | None, computed: list[float] | None)
     阶梯留着，等于在你已经做完决定的地方再塞两个提醒。这与 L3 裁决选中一个目标
     就只报那一个是同一条口径（`advice/engine.py:_adjudicate`）。
 
-    这个函数此前不存在，于是 `watchlist hold --target` 填进去的价位在整条监控
+    这个函数此前不存在，于是 `position open --target` 填进去的价位在整条监控
     链路里没有任何读取点——**你设的目标价永远不会触发告警**，而对称位置上的
     `plan_stop` 一直是生效的。
     """

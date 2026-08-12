@@ -145,7 +145,7 @@ def test_a_chain_that_cannot_cite_the_corpus_is_dropped():
     reply = """{"chains":[
       {"trigger":"某个没人报道过的事","mechanism":"凭空推理","targets":["石油石化"],
        "direction":"bullish","evidence":["这句话原文里没有"]}],
-      "mainlines":[],"risks":[],"watchlist":[],"summary":""}"""
+      "mainlines":[],"risks":[],"holdings":[],"summary":""}"""
     result = _reader(reply).read(CORPUS, date(2026, 8, 2))
     assert result.ok is False
     assert not result.chains
@@ -157,7 +157,7 @@ def test_a_chain_that_quotes_the_corpus_survives_with_its_evidence():
       {"trigger":"以色列袭击伊朗核设施","mechanism":"原油供给风险溢价",
        "targets":["石油石化","油运"],"direction":"bullish",
        "evidence":["以色列袭击伊朗核设施"]}],
-      "mainlines":[],"risks":[],"watchlist":[],"summary":"地缘推升油价"}"""
+      "mainlines":[],"risks":[],"holdings":[],"summary":"地缘推升油价"}"""
     result = _reader(reply).read(CORPUS, date(2026, 8, 2))
     assert result.ok is True
     chain = result.chains[0]
@@ -177,7 +177,7 @@ def test_an_invented_number_discards_the_whole_read():
        "targets":["半导体"],"direction":"bullish",
        "evidence":["韩国7月出口同比"]}],
       "mainlines":[],"risks":[],
-      "watchlist":[],"summary":"预计A股半导体今日高开3.7%"}"""
+      "holdings":[],"summary":"预计A股半导体今日高开3.7%"}"""
     result = _reader(reply).read(CORPUS, date(2026, 8, 2))
     assert result.ok is False
     assert any("原文中没有的数字" in note for note in result.notes)
@@ -186,22 +186,22 @@ def test_an_invented_number_discards_the_whole_read():
 def test_a_quoted_number_is_allowed_because_it_is_in_the_corpus():
     reply = """{"chains":[],"mainlines":[
       {"text":"韩国7月出口同比 62.8% 高于预期，存储链景气","evidence":["韩国7月出口同比"]}],
-      "risks":[],"watchlist":[],"summary":""}"""
+      "risks":[],"holdings":[],"summary":""}"""
     result = _reader(reply).read(CORPUS, date(2026, 8, 2))
     assert result.ok is True
     assert result.mainlines[0].text.startswith("韩国7月出口")
 
 
-def test_a_watchlist_item_for_a_symbol_that_was_not_asked_about_is_dropped():
+def test_a_holdings_item_for_a_symbol_that_was_not_asked_about_is_dropped():
     """模型只能对喂进去的标的发言，不能自己添一只。"""
     reply = """{"chains":[],"mainlines":[],"risks":[],
-      "watchlist":[
+      "holdings":[
         {"symbol":"600519.SH","text":"茅台大涨","evidence":["以色列袭击伊朗核设施"]},
         {"symbol":"601939.SH","text":"建行发行二级资本债","evidence":["建设银行完成发行"]}],
       "summary":""}"""
     symbol_docs = {"601939.SH": [doc("建设银行完成发行600亿元二级资本债券")]}
     result = _reader(reply).read(CORPUS, date(2026, 8, 2), symbol_docs=symbol_docs)
-    assert [item.symbol for item in result.watchlist] == ["601939.SH"]
+    assert [item.symbol for item in result.holdings] == ["601939.SH"]
 
 
 def test_a_malformed_reply_degrades_to_an_empty_read():

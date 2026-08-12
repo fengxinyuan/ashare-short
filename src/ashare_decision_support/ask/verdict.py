@@ -120,7 +120,7 @@ class Decision:
 def assess(payload: dict[str, Any], holding: dict[str, Any] | None = None) -> Decision:
     """把 `jobs/advise.py:_facts` 里的一条 symbol 记录压成一张卡。
 
-    `holding` 是自选股里那条持仓记录（有成本价才算）。有它就走卖出侧——同一只票
+    `holding` 是持仓表里那条记录（有成本价才算）。有它就走卖出侧——同一只票
     没持仓时该盯买点、已持仓时该盯卖点，两套判断的输入和紧急程度本来就不同。
     """
     payload = payload or {}
@@ -180,7 +180,7 @@ def from_context(
 ) -> tuple[list[Decision], str | None]:
     """从装配好的 blocks 里生出全部决策卡，附带「数据来自哪一块」。
 
-    `focus` 非空时只留这几只——问三只票就只出三张卡，不把整个自选池铺开。
+    `focus` 非空时只留这几只——问三只票就只出三张卡，不把持仓也一起铺开。
     """
     payload, source = _advice_payload(blocks)
     if payload is None:
@@ -205,17 +205,17 @@ def _advice_payload(blocks: dict[str, Any]) -> tuple[dict | None, str | None]:
 
 
 def _holdings(blocks: dict[str, Any]) -> dict[str, dict]:
-    book = blocks.get("自选与候选")
+    book = blocks.get("持仓")
     if not isinstance(book, dict):
         return {}
     return {
         str(entry.get("symbol") or ""): _normalise_holding(entry)
-        for entry in book.get("持仓") or []
+        for entry in book.get("明细") or []
         if isinstance(entry, dict)
     }
 
 
-# `ask/context.py` 把持仓摊平成中文字段名（那是给人读的渲染需要），`WatchEntry`
+# `ask/context.py` 把持仓摊平成中文字段名（那是给人读的渲染需要），`state.Position`
 # 用的是英文字段名。两种都收，在这里归一——判断逻辑只认一套键，否则「成本价」
 # 取不到时会**静默**走成买入侧，而持仓最需要的恰恰是卖点那一套。
 _HOLDING_ALIASES = {

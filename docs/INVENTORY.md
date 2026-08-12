@@ -7,9 +7,9 @@
 代码，是**下判断的时候把它算进去了**。所以接线状态必须是一个能查的事实，而不是
 读完全仓 import 才能拼出来的印象。
 
-- 生成日期：**2026-08-10**
-- 口径：`src/` 共 **169 个模块**（CLI 与 MCP 两个入口）
-- 判定方法：从 `cli.py` 出发做 import 可达性，加上公开符号、dataclass 字段、
+- 生成日期：**2026-08-11**
+- 口径：`src/` 共 **171 个模块**（CLI 与 MCP 两个入口）
+- 判定方法：从 `cli.py` 与 `mcp_server.py` 出发做 import 可达性，加上公开符号、dataclass 字段、
   类上公开方法、私有函数/方法这四层的实际引用检查。**五条都要过**——只被
   `__init__.py` 转出口而没人用它的符号、算了没人读的字段、没有任何调用点的
   方法与私有辅助，都算未接线。五条全在 `scripts/inventory_audit.py` 里，见 §4。
@@ -20,11 +20,17 @@
 
 | 状态 | 模块数 | 含义 |
 |---|---|---|
-| **活** | 169 | 至少有一条 CLI 或 MCP 入口能走到，且符号被真正调用 |
+| **活** | 171 | 至少有一条 CLI 或 MCP 入口能走到，且符号被真正调用 |
 | **建成·未接线** | **0** | 代码写完了、大多有测试，但没有任何调用方 |
-| **已删** | 2 | 本轮删除，见 §3 |
+| **已删** | 4 | 见 §3 |
 
-当前没有已建未接线模块。新增模块仍需按本文档的可达性口径复核，避免未来重新积累死代码。
+当前没有已建未接线模块，**五条口径全部为 0**。新增模块仍需按本文档的可达性口径
+复核，避免未来重新积累死代码。
+
+**2026-08-11 一次替换 + 一次删除。** `state/watchlist.py`（自选股 + 候选池）换成
+`state/positions.py`（只有持仓），判据是使用方式变了而不是代码写得不好，理由与
+连锁影响见 DECISIONS §十八；`signals/daily_technical.py` 里的 `DailyKChartRenderer`
+删掉，见 §19.3。模块数 171 不变（删一个加一个）。
 
 **2026-08-09 补一轮符号级复核。** 模块级早就是 0，但本文档的口径有**两条**，
 第二条（「只被 `__init__.py` 转出口而没人用它的符号」）此前没有真正跑过。跑完
@@ -59,10 +65,11 @@
 **这一节是本文档的重点。** 下面每个模块都能 import、都能单独调用、大多有测试
 通过，但**没有任何 job / signal / CLI 路径调用它们**。
 
-> **模块级是 0，方法级不是。** 2026-08-10 新增的第四条口径（§4.2）在**已接线的
-> 模块内部**找到 3 处同样形状的东西：`NewsStore.sector_heat` / `recent` 与
-> `DailyKChartRenderer.render_svg`——完整功能、有测试、零生产调用方。整模块死码
-> 早就清干净了，剩下的都藏在活模块里，这一节的口径按定义看不见它们。
+> **模块级早就是 0，方法级是 2026-08-11 才归零的。** 第四条口径（§4.2）在**已接线
+> 的模块内部**找到过 3 处同样形状的东西：`NewsStore.sector_heat` / `recent` 与
+> `DailyKChartRenderer.render_svg`——完整功能、有测试、零生产调用方。前两个已接进
+> 盘前 facts，第三个已删（DECISIONS §19.2、§19.3）。整模块死码清干净之后，剩下的
+> 都藏在活模块里，这一节的口径按定义看不见它们。
 
 | 模块 | 行数 | 测试 | 属于哪件事 | 接上它就能拿到什么 |
 |---|---|---|---|---|
@@ -84,7 +91,7 @@
 （`tests/test_intraday_sectors.py`，35 条）。
 
 剩下的缺口是**盘前**那一侧：`morning` 的板块排序仍然只用行业，不用概念。
-接它要改候选池的产出口径，不是纯增量，所以单列在 ROADMAP 而不是顺手做掉。
+接它要改候选的产出口径，不是纯增量，所以单列在 ROADMAP 而不是顺手做掉。
 
 ### 1.2 已接入：相对宽基强度
 
@@ -139,10 +146,12 @@ ROADMAP 里有明确的去向，`git rm` 之后再捡回来的成本不为零。
 
 ---
 
-## 3. 本轮已删（3 类）
+## 3. 已删（5 类）
 
 | 模块 | 行数 | 删除理由 |
 |---|---|---|
+| `state/watchlist.py`（`Watchlist` / `CandidatePool` / `WatchEntry`） | ~284 | 自选股与候选池：**没人维护却仍是所有命令的默认输入**。换成 `state/positions.py`（只有持仓），见 DECISIONS §十八 |
+| `DailyKChartRenderer` + `DailyTechnicalSnapshot.chart_bars` | ~110 | SVG K 线渲染器，零生产调用方。这套系统的产物是 JSON 与 Markdown，见 DECISIONS §19.3 |
 | `research.py` + `tests/test_research_pipeline.py` | 17 | **文件自己的 docstring 写着「已删除，等待 `git rm`」。** `ResearchPipeline` 那条矩阵管线已被 `strategy/select.py` 取代 |
 | `adapters/chip_distribution.py` + 测试 | ~200 | 被 `signals/chips.py`（换手衰减法估算）取代，且本机东财 CYQ 实测不可达。ROADMAP §7 快赢 #1 点名要删 |
 | `simulation/` + `tests/test_paper_simulation.py` | ~1,400 | 纸上交易与决策卡订单校验不属于分析主链路，已由 facts 导出与人工判断替代 |
@@ -154,21 +163,27 @@ ROADMAP 里有明确的去向，`git rm` 之后再捡回来的成本不为零。
 
 ## 4. 怎么复核这份清单
 
-判定不是手写的，可以重跑——**五条口径都在脚本里**，退出码非 0 就是有未接线的
-模块、符号、方法或私有辅助：
+判定不是手写的，可以重跑——**六条口径都在脚本里**，退出码非 0 就是有未接线的
+模块、符号、方法、私有辅助或常量：
 
 ```bash
-python3 scripts/inventory_audit.py                  # 五条都跑
+python3 scripts/inventory_audit.py                  # 六条都跑
 python3 scripts/inventory_audit.py --symbols        # 只跑「仅转出口」那条
 python3 scripts/inventory_audit.py --fields         # 只跑「算了没人读」那条
 python3 scripts/inventory_audit.py --methods        # 只跑「没有调用点」那条
 python3 scripts/inventory_audit.py --private        # 只跑「私有符号没人引用」那条
+python3 scripts/inventory_audit.py --constants      # 只跑「模块级常量没人引用」那条
 python3 scripts/inventory_audit.py --strict-fields  # 把第三条也计入退出码
 ```
 
-本文档的数字就是这个脚本的输出：`169 个模块 / 169 个可达 / 464 个公开符号 /
-0 个仅转出口 / 987 个 dataclass 公开字段 / 5 个没有读取点 / 461 个公开方法 /
-0 个零引用 / 11 个只有测试在调 / 727 个私有函数与方法 / 0 个零引用`。
+本文档的数字就是这个脚本的输出：`171 个模块 / 171 个可达 / 482 个公开符号 /
+0 个仅转出口 / 1015 个 dataclass 公开字段 / 0 个没有读取点 / 452 个公开方法 /
+0 个零引用 / 0 个只有测试在调 / 742 个私有函数与方法 / 0 个零引用 /
+644 个模块级公开常量 / 0 个零引用`。
+
+**2026-08-11 起六条全部归零**，包括此前只报告不计分的那两档（「算了没人读的
+字段」与「只有测试在调的方法」）。归零本身不是目标——目标是**清单上没有悬而
+未决的条目**：每一条要么接上了，要么删了，要么在本文里写明了为什么留着。
 
 写成脚本而不是留在 git 历史里，是因为第二条口径此前正是这么丢的——文档里写着
 「可以重跑」，脚本却只存在于某次会话，于是那条检查两个月没跑过，攒出 3 个死符号
@@ -211,15 +226,19 @@ docstring 里：前两条的判据是二值的（模块要么有调用方要么�
 | `Finding.elapsed_ms` | **接上**（`agents/base.py:timing_note`，用在 `jobs/morning.py` 与 `jobs/advise.py`）。每个 Finding 都记着自己跑了多久，调用方却只 `extend(finding.notes)`——「盘前哪一段慢」在生产环境里没有答案，只能临时加计时器重跑。并行跑批里最慢那条腿决定整轮墙钟时间，所以按耗时降序原样列出，不设阈值 |
 | `IntradaySnapshot.minutes_since_open` | **接进 `_facts`**。上面几个比率的可信度全取决于它：10:00 的量比 1.8 和 14:50 的量比 1.8 是两回事，只给比率等于把「才走了 30 分钟」藏起来 |
 | `SectorIndexReading.amount_5d` | **接上**（`ths_sector_index.py:describe`）。比值说「比自己以前放量了吗」，绝对额说「这个板块有没有足够容量」 |
-| `TradePrint.change` / `volume_lot` | **留着，理由在此**：`TradePrint` 的职责就是**如实承载腾讯逐笔的那一行**，摘要只需要 `amount` 与 `side` 是消费侧的事。删掉会让解析层变成有损的，下一个消费者得回去重解一遍——而这两个字段本身不构成任何「系统有这项能力」的假象 |
-| `PassResult.polled` | **留着，同上**：`PassResult` 是「一轮轮询产出了什么」的记录，0 条告警扫了 2 只和扫了 20 只是两件事。不往 note 里报是因为盘中每几十秒一轮，那会把告警淹掉 |
+| `TradePrint.change` / `volume_lot` | ~~留着~~ → **2026-08-11 删掉**。「如实承载源数据那一行」这条理由撑不住两个月都没有消费者的事实：真需要时从解析函数改回来是十几行，而挂在清单上的每一行都在稀释这份清单的意义 |
+| `PassResult.polled` | ~~留着~~ → **2026-08-11 删掉**，同上 |
 
-分诊完之后**待分诊**的候选是 0。脚本仍会印出 5 行——上表里判「留着」的那 4 个
-（`TradePrint.change` / `volume_lot`、`PassResult.polled`、`PositionSizingPlan.cycle_cap`）
-每次都会再印一遍，因为这条检查**没有豁免清单**，那是有意的：豁免清单会在三个月内
-长成第二份没人读的文档。第 5 行 `HeatPoint.bucket_start` 是 2026-08-10 新出现的，
-它没人读的原因不在字段本身——它唯一的生产者 `NewsStore.sector_heat` 就在 §4.2
-那张「仅测试在调」的表里，跟着一起等判断。
+**2026-08-11 这条口径归零。** 上表里判「留着」的 4 个（`TradePrint.change` /
+`volume_lot`、`PassResult.polled`、`PositionSizingPlan.cycle_cap`）已经全部删掉。
+`cycle_cap` 那条尤其干净：§4.1 给它写的「留着」理由（与台账里的
+`regime_position_cap` 同源同值，重复存一遍只会在两者漂移时制造一个假的交叉验证）
+本身就是删它的理由——**一个不该被读的字段，和一个没人读的字段，在这条口径下
+是同一件事**。`HeatPoint.bucket_start` 不再是孤儿——它唯一的生产者
+`NewsStore.sector_heat` 已经接进盘前 facts（§4.2）。
+
+这条检查**仍然没有豁免清单**，那是有意的：豁免清单会在三个月内长成第二份没人读的
+文档。归零的正确做法是清单上不留悬案，不是给悬案发免死金牌。
 
 ### 4.2 第四条口径：没有调用点的公开方法（2026-08-10 新增）
 
@@ -239,12 +258,15 @@ ruff 眼里和被调 100 次的方法长得一模一样。2026-08-09 临时扫�
 第二档必须把测试单独摘出来数，不能沿用第二条那句「测试也是调用方」：竞价采集层
 （DECISIONS §十二，950 行）当年正是**有测试、全绿、零生产调用方**。
 
-当前 11 个「仅测试在调」，分三类：
+**2026-08-11：这一档也归零了**，三类各有各的结局——三种结局本身就是这条口径的
+全部用法：
 
 | 方法 | 判定 |
 |---|---|
-| `SecurityMaster.name_of` / `by_concept` / `by_industry` / `concepts_of`、`SectorIndexSnapshot.by_name`、`RegimeVerdict.permits`、`Watchlist.unheld`、`RateLimitedClient.unwrapped` | 数据持有者上的小查询器，各 2–7 行。不构成「系统有这项能力」的假象，留着 |
-| `NewsStore.sector_heat`（53 行）+ `recent`、`DailyKChartRenderer.render_svg`（97 行） | **建成·未接线**，且是完整功能而非脚手架。接不接是产品决定，不是清理——列在这里等一次判断，别默默留着 |
+| ~~`SecurityMaster.name_of` / `by_concept` / `by_industry` / `concepts_of`、`SectorIndexSnapshot.by_name`、`RegimeVerdict.permits`、`RateLimitedClient.unwrapped`~~ | 数据持有者上的小查询器，各 2–7 行。上一版判「留着」，这一版**删掉**：小不是留下的理由，没有调用方才是判据，而「哪天会用上」两个月没有兑现 |
+| ~~`Watchlist.unheld`~~ | 随 `Watchlist` 整个删掉，见 DECISIONS §十八 |
+| ~~`NewsStore.sector_heat`（53 行）+ `recent`~~ | **已接线**：盘前 facts 的 `sector_news_memory`，见 DECISIONS §19.2。语料库跨日累积的那一维此前没有任何生产读取点 |
+| ~~`DailyKChartRenderer.render_svg`（97 行）~~ | **已删**，见 DECISIONS §19.3。这套系统的产物是 JSON 与 Markdown，没有一条链路会消费一张图 |
 | ~~`Recommendation.from_advice`~~ | **2026-08-10 已接线**，见 DECISIONS §14.2。它不是查询器也不是待定功能，是一根**断了的线**：台账字段、压缩函数、读它的统计全都写好了，唯独没有生产写入方 |
 
 `from_advice` 那一条是这条口径到目前为止最贵的一次命中，值得记住它的形状——
@@ -288,3 +310,53 @@ NaN/inf 全挡）。教训留在有调用方的那一份里，不留在没有调
 
 接线之后记得把它从 §1 移到 §2——**这份文档过期就没有价值**，它唯一的用处是
 「查得到、且查到的是真的」。
+
+### 4.4 第六条口径：没人引用的模块级常量（2026-08-11 新增）
+
+前五条一条都看不见它。第二条（公开符号）**只收模块顶层的 `def` 与 `class`**，
+赋值语句根本不进它的表；字段那条查的是 dataclass 内部；方法与私有那两条按定义
+也不覆盖。于是模块顶层的 `UPPER_SNAKE` 是全仓**唯一一类既没有 ruff 告警、也不
+落在任何一条审计口径里**的公开面。
+
+首次跑，643 个常量里命中 5 个，**全是被删掉的实现留下的锚**：
+
+| 常量 | 怎么掉下来的 |
+|---|---|
+| `tickflow_adapter.VOLUME_UNIT_BANDS` | 量纲推断搬去 `validate.infer_volume_unit` 之后没跟着删。那张表连同头上三行注释还在，读起来像是活的 |
+| `tickflow_adapter.DAILY_PROXY_LOOKBACK_DAYS` / `DAILY_PROXY_MAX_ROWS` | 降级日线代理整段没了，两个参数还留着 |
+| `seesaw.POSITIVE_THRESHOLD` / `LABEL_AGAINST` | 对应 `explain_divergence` 里**从未实现**的第三个分支，见下 |
+
+**常量比函数更容易攒成这一形状**：删实现的时候它不报错，而它头上那段注释还在
+替它说明「我是干什么的」。`VOLUME_UNIT_BANDS` 的注释写着「used to infer the
+volume unit」——那件事早就在别的文件里做了。
+
+**引用只认 AST，不数 token。** 这是这条与第二条唯一的口径分歧，而且是被
+`POSITIVE_THRESHOLD` 逼出来的：它在正上方的注释里被提到过一次（「见
+`POSITIVE_THRESHOLD` 上方」），按全文 token 计数就算「有人引用」，这条口径会
+当场瞎掉。**一个只在散文里被提到的常量仍然是死的**——注释解释不了任何运行时
+行为。所以只认裸名读取、属性读取（`mod.CONST`）与**完全相等**的字符串字面量
+（`getattr` 与分发表）。
+
+`seesaw` 那两个不只是死码，它们指出了一处**说了没做**：`POSITIVE_THRESHOLD` 的
+注释声称自己「只用于 `explain_divergence` 判断今天两个板块同涨同跌是不是常态」，
+而那个函数只分得开「与历史关系一致」和「没有稳定关系」两种。今天背着走、历史上
+却是正相关的那一对，会被判成后者。已按「删掉残留」处理：常量删掉，并在
+`explain_divergence` 的 docstring 里写明它只分两种情况、以及要认出第三种得让
+`read_seesaw` 同时保留正相关对——**那是另一个读数，不是这个函数少写了一个分支**。
+
+---
+
+## 5. 第二道闸门：文档里的命令还跑不跑得通
+
+这份文档管的是「代码接没接上」。它有一个对称的盲区：**文档写的用法，代码还认不认**。
+2026-08-11 撞上一次——README 与 `docs/USAGE.md` 从第一版起写的都是
+`ashare-ds advise 600519.SH`，而解析器只认 `--symbols`，照文档敲直接退出。
+文档、代码、测试**三边各自都是绿的**，没有任何一条现有口径会去看两者对不对得上。
+
+```bash
+python3 scripts/docs_audit.py        # 用法文档里的每条 `ashare-ds` 命令都过一遍解析器
+```
+
+只解析不执行，不打网络、不碰状态目录。`ROADMAP.md` / `REWORK.md` 不在范围内：
+它们写的是还没做的设计，里面的命令解析失败是正确结果。范围按文档的**用途**划，
+不按一份「这几行豁免」的清单——理由同 §4.1。

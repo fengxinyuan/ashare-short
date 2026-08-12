@@ -1,7 +1,7 @@
 """卖点监控补的两个洞。
 
-1. **你自己设的目标价从未被任何代码读过。** `watchlist hold --target` 一直能填，
-   `WatchEntry.plan_target` 一直存着，`HoldingView` 一直带着它——而整条监控链路
+1. **你自己设的目标价从未被任何代码读过。** `position open --target` 一直能填，
+   `Position.plan_target` 一直存着，`HoldingView` 一直带着它——而整条监控链路
    没有一个读取点。对称位置上的 `plan_stop` 从一开始就是生效的。
 
 2. **浮盈回吐没有任何触发器。** 冲高又跌回来时，四类卖出触发**一条都不会响**：
@@ -22,7 +22,7 @@ from ashare_decision_support.monitor.holdings import (
 )
 from ashare_decision_support.monitor.triggers import TriggerEngine
 from ashare_decision_support.state.alerts import AlertState
-from ashare_decision_support.state.watchlist import Watchlist
+from ashare_decision_support.state.positions import Positions
 
 NOW = datetime(2026, 8, 3, 10, 30)
 
@@ -67,8 +67,7 @@ def state():
 
 def fire(engine, st, advice, intraday, holding=None, **kw):
     return engine.evaluate(
-        advice=advice, intraday=intraday, state=st, now=NOW,
-        watchlist=True, holding=holding, **kw,
+        advice=advice, intraday=intraday, state=st, now=NOW, holding=holding, **kw,
     )
 
 
@@ -292,8 +291,8 @@ BARS = [
 def test_the_peak_is_seeded_from_the_holding_period_not_from_today(tmp_path) -> None:
     """只用当日峰值会漏掉最常见的坐电梯：昨天冲到 +10%，今天平开一路阴跌。
     今天的峰值约等于开盘价，日内回撤很小，移动止损整天不响。"""
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    book.set_position("601939.SH", cost_price=10.00, opened_on=date(2026, 8, 1))
+    book = Positions(path=tmp_path / "positions.json")
+    book.open("601939.SH", cost_price=10.00, opened_on=date(2026, 8, 1))
 
     session = _session(tmp_path, {"601939.SH": BARS})
     session.load_positions(book)
@@ -305,12 +304,9 @@ def test_the_peak_is_seeded_from_the_holding_period_not_from_today(tmp_path) -> 
 def test_no_open_date_means_no_seed_rather_than_a_year_of_history(tmp_path) -> None:
     """没有建仓日就没有「持仓期」。拿 240 天的历史最高当峰值会算出一个假的
     回撤幅度——少一个种子只是迟一点，播一个错的种子会直接报错误的告警。"""
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    entry, _ = book.add("601939.SH")
-    entry.holding = True
-    entry.cost_price = 10.00
-    entry.opened_on = None
-    book.save()
+    path = tmp_path / "positions.json"
+    path.write_text('[{"symbol": "601939.SH", "cost_price": 10.0}]', encoding="utf-8")
+    book = Positions(path=path)
 
     session = _session(tmp_path, {"601939.SH": BARS})
     session.load_positions(book)
@@ -320,8 +316,8 @@ def test_no_open_date_means_no_seed_rather_than_a_year_of_history(tmp_path) -> N
 
 def test_seeding_survives_missing_daily_bars(tmp_path) -> None:
     """拿不到日线不该让装载持仓这一步炸掉——盘中的实时高点会自己累积。"""
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    book.set_position("601939.SH", cost_price=10.00, opened_on=date(2026, 8, 1))
+    book = Positions(path=tmp_path / "positions.json")
+    book.open("601939.SH", cost_price=10.00, opened_on=date(2026, 8, 1))
 
     session = _session(tmp_path, {})
     notes = session.load_positions(book)
@@ -387,8 +383,8 @@ def test_a_real_poll_delivers_the_peak_and_the_atr_all_the_way_through(tmp_path)
     成本 10.00、持仓期最高 11.00、现价 10.40——回吐六成、约 2 个日波幅。"""
     from ashare_decision_support.monitor.session import MonitorSession
 
-    book = Watchlist(path=tmp_path / "watchlist.json")
-    book.set_position("601939.SH", cost_price=10.00, opened_on=date(2026, 8, 1))
+    book = Positions(path=tmp_path / "positions.json")
+    book.open("601939.SH", cost_price=10.00, opened_on=date(2026, 8, 1))
 
     session = MonitorSession(
         adapter=_StubDaily(),
@@ -403,7 +399,7 @@ def test_a_real_poll_delivers_the_peak_and_the_atr_all_the_way_through(tmp_path)
     # 时效闸门是监控的第一步：now 必须紧跟最后一根分钟线，否则这一轮会被判成
     # 数据停更而整轮不产出信号。
     result = session.poll(
-        ["601939.SH"], [], session.intraday_adapter.bars[-1]["timestamp"] + timedelta(minutes=1)
+        ["601939.SH"], session.intraday_adapter.bars[-1]["timestamp"] + timedelta(minutes=1)
     )
 
     assert [a.trigger for a in result.alerts] == ["giveback"]

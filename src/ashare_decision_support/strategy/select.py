@@ -76,7 +76,7 @@ class SelectedSymbol:
         return primary.value if primary else None
 
     def to_row(self) -> dict[str, Any]:
-        """台账、候选池、渲染三处共用的那一行。
+        """台账、候选、渲染三处共用的那一行。
 
         字段名与改造前 `jobs/morning.py:_rank_candidates` 产出的行**逐字相同**。
         `journal/records.py` 与 `notify/render.py` 都按这些名字读，改名会让台账里

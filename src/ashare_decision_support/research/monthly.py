@@ -10,6 +10,7 @@ from typing import Any
 from ashare_decision_support.facts import build_facts_bundle
 from ashare_decision_support.research.leaders import LEADERS_LATEST_NAME
 from ashare_decision_support.schedule.timezone import beijing_now
+from ashare_decision_support.sectors import DEFAULT_LEVEL, SectorRotationStore
 
 MONTHLY_SCHEMA = "ashare-monthly-research-context-v1"
 
@@ -43,6 +44,7 @@ def build_monthly_context(
             "不得当作未来收益概率。"
         ),
     }
+    sector_rotation_memory, rotation_notes = _load_sector_rotation_memory(now.date())
     leaders, leader_notes = _load_json(Path(output_dir) / LEADERS_LATEST_NAME)
     end = now.date() + timedelta(days=horizon)
     events = _event_window(now.date(), end)
@@ -58,6 +60,7 @@ def build_monthly_context(
         },
         "a_share_facts": facts_payload,
         "historical_validation": historical_validation,
+        "sector_rotation_memory": sector_rotation_memory,
         "sector_leaders": leaders,
         "event_window": events,
         "external_research_tasks": _research_tasks(now.date(), end, events),
@@ -67,7 +70,7 @@ def build_monthly_context(
                 "industry and concept leadership map",
                 "event-to-A-share transmission chains",
                 "three scenarios with confirmation and invalidation conditions",
-                "candidate watchlist grouped by evidence strength",
+                "candidate positions grouped by evidence strength",
             ],
             "rules": [
                 "do not introduce a stock code absent from verified sources without labeling it unverified",
@@ -76,8 +79,29 @@ def build_monthly_context(
                 "state what evidence would falsify each scenario",
             ],
         },
-        "notes": [*bundle.notes, *leader_notes],
+        "notes": [*bundle.notes, *leader_notes, *rotation_notes],
     }
+
+
+def _load_sector_rotation_memory(trade_date: date) -> tuple[dict[str, Any], list[str]]:
+    """读已经落盘的行业轮动记忆。**只读，不算**——写入方是盘前主链路。
+
+    月度包不因为缺少记忆而失败：一份还没跑过 `morning` 的状态目录里，
+    `summarize` 返回的是 regime=「样本不足」的摘要，那本身就是一条如实的读数。
+    这里只兜住状态文件损坏那一类（`read_json` 已经把它降级成空记忆，剩下的是
+    路径本身取不到）。
+    """
+    try:
+        summary = SectorRotationStore().summarize(trade_date, DEFAULT_LEVEL)
+    except (OSError, ValueError) as exc:
+        return {}, [f"板块轮动记忆读取失败（{type(exc).__name__}）"]
+    return (
+        {
+            "industry_level": summary.to_dict(),
+            "interpretation": "只描述已落盘的近期板块排名稳定性，不是未来收益预测。",
+        },
+        [],
+    )
 
 
 def _load_json(path: Path) -> tuple[dict[str, Any] | None, list[str]]:

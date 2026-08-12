@@ -33,7 +33,7 @@ from ashare_decision_support.ask.verdict import (
     rank,
 )
 from ashare_decision_support.ask.visual import price_ladder
-from ashare_decision_support.state import Watchlist
+from ashare_decision_support.state import Positions
 
 
 def payload(
@@ -264,7 +264,6 @@ def test_a_question_the_system_has_no_data_for_becomes_a_declared_gap() -> None:
 
 
 def test_deep_mode_keeps_question_parse_notes_in_the_result() -> None:
-    _watchlist("600519.SH")
     report, result = _deep("华熙生物今天低开了怎么办", _facts(payload(last=23.00)), StubClient())
 
     assert "华熙生物" in report or any("华熙生物" in note for note in result["notes"])
@@ -298,21 +297,16 @@ def test_each_symbol_step_only_carries_its_own_facts() -> None:
 # ---- 分步执行 -------------------------------------------------------------
 
 
-def _watchlist(*symbols: str) -> None:
-    book = Watchlist()
-    for symbol in symbols:
-        book.add(symbol)
-    book.save()
-
-
 def _facts(*items: dict) -> dict:
     return {"trade_date": "2026-08-03", "symbols": list(items)}
 
 
-def _deep(question: str, facts: dict, client, **kwargs) -> tuple[str, dict]:
+def _deep(question: str, facts: dict, client, symbols=("600519.SH",), **kwargs) -> tuple[str, dict]:
+    """标的显式传进来——自选股删掉之后，`ask` 只看问题里点名的和持仓那几只。"""
     printed: list[str] = []
     result = run_ask(
         question=question,
+        symbols=list(symbols),
         now=datetime(2026, 8, 3, 10, 30),
         is_trading_day=True,
         deep=True,
@@ -327,14 +321,15 @@ def _deep(question: str, facts: dict, client, **kwargs) -> tuple[str, dict]:
 def test_one_discarded_step_costs_only_that_step() -> None:
     """原来是一次调用产出整个答案：一个追溯不到的数字下去，整段丢弃。
     现在丢的只是那一步的论证——卡、排序、价位轴全部由规则产生，一个字不少。"""
-    _watchlist("600519.SH", "000001.SZ")
     facts = _facts(
         payload(symbol="600519.SH", name="贵州茅台", last=23.00),
         payload(symbol="000001.SZ", name="平安银行", last=23.00),
     )
     client = StubClient(replies={"600519.SH": "目标看到 999.99 元。"})
 
-    report, result = _deep("这两只怎么样", facts, client)
+    report, result = _deep(
+        "这两只怎么样", facts, client, symbols=("600519.SH", "000001.SZ")
+    )
 
     assert "论证段缺失：含无法追溯的数字" in report
     # 被丢弃的**句子**不能出现；那个数字本身会出现在「丢了什么」的说明里，
@@ -352,7 +347,6 @@ def test_a_dead_provider_still_produces_the_whole_deterministic_report() -> None
         def chat(self, messages):
             raise RuntimeError("provider down")
 
-    _watchlist("600519.SH")
     report, _ = _deep("怎么看", _facts(payload(last=23.00)), Boom())
 
     assert "## 先看结论" in report
@@ -369,7 +363,6 @@ def test_without_a_key_the_cards_and_the_ladder_still_come_out() -> None:
         def chat(self, messages):  # pragma: no cover - 不该被调用
             raise AssertionError("不该调用模型")
 
-    _watchlist("600519.SH")
     report, result = _deep("怎么看", _facts(payload(last=23.00)), NoKey())
 
     assert "结论" in report and "止损" in report
@@ -378,9 +371,10 @@ def test_without_a_key_the_cards_and_the_ladder_still_come_out() -> None:
 
 
 def test_only_the_named_symbols_get_recomputed() -> None:
-    """问三只票不该把整个自选池加候选池全算一遍——那是几十次 HTTP，
+    """问一只票不该把上下文里的其余标的全算一遍——那是几十次 HTTP，
     而其中绝大多数不会出现在答案里。"""
-    _watchlist("600519.SH", "000001.SZ", "300750.SZ")
+    Positions().open("000001.SZ", cost_price=12.0)
+    Positions().open("300750.SZ", cost_price=200.0)
     seen: list[list[str]] = []
 
     def compute(symbols: list[str]) -> dict:
@@ -402,7 +396,6 @@ def test_only_the_named_symbols_get_recomputed() -> None:
 
 def test_the_conclusion_comes_first() -> None:
     """「没重点」的解法不是写得更短，是把结论放在读的人第一眼的位置。"""
-    _watchlist("600519.SH")
     report, _ = _deep("怎么看", _facts(payload(last=23.00)), StubClient())
 
     assert report.index("## 先看结论") < report.index("## 逐只决策卡")
@@ -411,7 +404,6 @@ def test_the_conclusion_comes_first() -> None:
 
 def test_the_report_stays_natural_when_there_are_no_decisions() -> None:
     """没有决策卡时也不该回到编号式目录。"""
-    _watchlist("600519.SH")
     report, _ = _deep("大盘怎么样", _facts(), StubClient())
 
     assert "## 先看结论" in report
@@ -441,12 +433,9 @@ def test_a_symbol_without_levels_says_so_instead_of_drawing_a_flat_line() -> Non
 
 
 def test_holdings_reach_the_sell_side_through_the_assembled_context() -> None:
-    """`context.py` 把持仓摊平成中文字段名，`WatchEntry` 用的是英文名。对不上时
+    """`context.py` 把持仓摊平成中文字段名，`state.Position` 用的是英文名。对不上时
     不会报错，只会**静默**走成买入侧——而持仓最需要的恰恰是卖点那一套。"""
-    book = Watchlist()
-    book.add("600519.SH", name="贵州茅台")
-    book.set_position("600519.SH", cost_price=20.00, plan_stop=22.90)
-    book.save()
+    Positions().open("600519.SH", cost_price=20.00, plan_stop=22.90, name="贵州茅台")
 
     ctx = assemble(
         datetime(2026, 8, 3, 10, 30),

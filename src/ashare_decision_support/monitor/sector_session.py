@@ -93,7 +93,7 @@ class SectorSession:
         # 一天一次的清理，挂在会话构造上而不是每轮 poll 上：这是 IO，而且
         # 板块序列是状态目录里最大的一类文件（一天约 3MB），没人删的话一年 750MB。
         self.pruned = intraday.prune_history(root=store_root)
-        # 每轮重读，这样盘中 `watchlist add` 立刻影响「你盯着的票在这个板块里」
+        # 每轮重读，这样盘中 `position open/close` 立刻影响「你盯着的票在这个板块里」
         # 那一行——与 `jobs/monitor.py` 里 watch_symbols 每轮重读同一个理由。
         self._watch_symbols = watch_symbols
 
@@ -109,7 +109,7 @@ class SectorSession:
                 self.taxonomies,
                 adapter=self.adapter,
                 now=moment,
-                watchlist=self._watchlist(),
+                watched_symbols=self._watched_symbols(),
             )
         except Exception as exc:
             return SectorPassResult(notes=[f"板块截面取数失败（{type(exc).__name__}: {exc}）"])
@@ -130,7 +130,7 @@ class SectorSession:
             notes.append(f"板块告警状态落盘失败（{type(exc).__name__}），可能重复推送")
         return SectorPassResult(snapshot=snapshot, alerts=alerts, notes=list(snapshot.notes) + notes)
 
-    def _watchlist(self) -> set[str]:
+    def _watched_symbols(self) -> set[str]:
         if self._watch_symbols is None:
             return set()
         try:
