@@ -330,7 +330,7 @@ def test_an_answer_with_an_invented_number_is_discarded_and_the_raw_data_shown()
     )
 
     assert result["answer"] is None
-    assert any("无法追溯的数字" in note for note in result["notes"])
+    assert any("数据中不存在的数字" in note for note in result["notes"])
     assert any("原始数据" in line for line in printed)
 
 

@@ -331,7 +331,7 @@ def test_one_discarded_step_costs_only_that_step() -> None:
         "这两只怎么样", facts, client, symbols=("600519.SH", "000001.SZ")
     )
 
-    assert "论证段缺失：含无法追溯的数字" in report
+    assert "论证段缺失：含数据中不存在的数字" in report
     # 被丢弃的**句子**不能出现；那个数字本身会出现在「丢了什么」的说明里，
     # 那是必须留的——不说清丢了什么，缺失就变成了沉默。
     assert "目标看到" not in report

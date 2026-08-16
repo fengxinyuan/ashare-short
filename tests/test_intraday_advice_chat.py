@@ -177,7 +177,7 @@ def test_day_change_is_given_directly_not_left_for_the_reader_to_compose() -> No
     模型要说「今天涨了 3.3%」就得自己乘出来，而乘出来的数不在事实里，
     `unverified_numbers` 会把**整段论证**丢掉。
     """
-    from ashare_decision_support.writer.llm import unverified_numbers
+    from ashare_decision_support.factcheck import unverified_numbers
 
     rows = minute_rows("2026-07-31", 48, start_price=10.0)
     snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze(
@@ -622,7 +622,7 @@ def test_chat_discards_an_answer_that_invents_a_number() -> None:
     answer, notes = ChatResponder(client).answer(session_with_facts(), "能到多少")
 
     assert "已丢弃" in answer
-    assert notes and "数字校验拦截" in notes[0]
+    assert notes and "数据中不存在的数字" in notes[0]
 
 
 def test_chat_records_history_only_for_accepted_answers() -> None:

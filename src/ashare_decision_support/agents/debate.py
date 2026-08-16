@@ -6,7 +6,7 @@
 这种双面读数顶到台面上。
 
 三个角色共享一条硬约束：**不产生任何新数字**。它们看到的只有确定性层算好的
-fact bundle，输出要过 `writer/llm.py:unverified_numbers` 同一套闸门；越界的
+fact bundle，输出要过 `factcheck.py:review_output` 同一套闸门；越界的
 整段丢弃，简报退回模板体。
 
 辩论只在盘前与盘后跑（每天 3 次调用）。盘中告警不走这里——见 docs/ARCHITECTURE.md §五。
@@ -18,11 +18,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from ashare_decision_support.writer.llm import (
-    DEFAULT_PROVIDER,
-    LlmClient,
-    unverified_numbers,
-)
+from ashare_decision_support.factcheck import OutputGuard, review_output
+from ashare_decision_support.writer.llm import DEFAULT_PROVIDER, LlmClient
 
 ROLE_BULL = "bull"
 ROLE_BEAR = "bear"
@@ -111,9 +108,12 @@ class DebatePanel:
 
         facts_text = json.dumps(facts, ensure_ascii=False, indent=2, default=str)
         result = DebateResult()
+        # 尺子从同一份事实里取，四个角色共用一把：多头说「可以重仓」和裁判说
+        # 「可以重仓」，越的是同一条线。
+        guard = OutputGuard.from_facts(facts)
 
-        bull = self._ask(ROLE_BULL, PROMPTS[ROLE_BULL], facts_text, result)
-        bear = self._ask(ROLE_BEAR, PROMPTS[ROLE_BEAR], facts_text, result)
+        bull = self._ask(ROLE_BULL, PROMPTS[ROLE_BULL], facts_text, result, guard=guard)
+        bear = self._ask(ROLE_BEAR, PROMPTS[ROLE_BEAR], facts_text, result, guard=guard)
         result.arguments.extend([bull, bear])
 
         if include_judge and not (bull.used_fallback and bear.used_fallback):
@@ -124,7 +124,14 @@ class DebatePanel:
                 f"【多头意见】\n{bull.markdown}\n\n【空头意见】\n{bear.markdown}"
             )
             result.arguments.append(
-                self._ask(ROLE_JUDGE, PROMPTS[ROLE_JUDGE], combined, result, facts_text=facts_text)
+                self._ask(
+                    ROLE_JUDGE,
+                    PROMPTS[ROLE_JUDGE],
+                    combined,
+                    result,
+                    facts_text=facts_text,
+                    guard=guard,
+                )
             )
         return result
 
@@ -135,6 +142,7 @@ class DebatePanel:
         user_content: str,
         result: DebateResult,
         facts_text: str | None = None,
+        guard: OutputGuard | None = None,
     ) -> Argument:
         try:
             generated = self.client.chat(
@@ -154,11 +162,11 @@ class DebatePanel:
             result.notes.append(note)
             return Argument(role=role, markdown="", used_fallback=True, note=note)
 
-        offenders = unverified_numbers(text, facts_text or user_content)
-        if offenders:
-            # Discarded whole, not patched. A partially-trustworthy argument is
-            # worse than none: the reader cannot tell which half to believe.
-            note = f"{role} 角色输出包含无法追溯的数字 {offenders[:5]}，整段丢弃"
+        # Discarded whole, not patched. A partially-trustworthy argument is
+        # worse than none: the reader cannot tell which half to believe.
+        review = review_output(text, facts_text or user_content, guard)
+        if not review.ok:
+            note = f"{role} 角色{review.reason()}，整段丢弃"
             result.notes.append(note)
             return Argument(role=role, markdown="", used_fallback=True, note=note)
 

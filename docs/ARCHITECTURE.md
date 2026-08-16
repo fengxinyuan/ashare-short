@@ -124,7 +124,7 @@ class PriceCandidate:
 
 ### 数字闸门
 
-全部 L3 输出过 `writer/llm.py:unverified_numbers`。买卖点裁决另有一道更严的：
+全部 L3 输出过 `factcheck.py:review_output`（数字 + 措辞 + 立场三条）。买卖点裁决另有一道更严的：
 
 ```text
 通用闸门（简报、对话）：数字必须能追溯到 facts —— 逐字 / 按精度舍入 / 万亿% 换算　✅ 已建

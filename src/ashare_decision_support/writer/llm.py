@@ -18,12 +18,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-from ashare_decision_support.factcheck import (
-    NUMBER_PATTERN,
-    ORDINAL_CEILING,
-    UNIT_SCALES,
-    fact_numbers,
-)
+from ashare_decision_support.factcheck import OutputGuard, review_output
 from ashare_decision_support.writer.base import BriefWriter, WriteRequest, WriteResult
 
 
@@ -184,11 +179,13 @@ class LlmBriefWriter(BriefWriter):
         if not generated.strip():
             return self._fallback(request, "LLM 返回空内容，改用模板输出")
 
-        unverified = unverified_numbers(generated, facts_text)
-        if unverified:
+        # 三件一起查：数字能不能追溯、有没有预测性措辞、有没有改掉规则层的结论。
+        # 处置只有一种——整段丢弃回落模板，因为一份「结论被悄悄改过」的简报比没有
+        # 简报更危险：它读起来和规则层算出来的那份一模一样。
+        review = review_output(generated, facts_text, OutputGuard.from_facts(request.facts))
+        if not review.ok:
             return self._fallback(
-                request,
-                f"LLM 输出包含原始数据中不存在的数字 {'、'.join(unverified[:5])}，已丢弃并改用模板输出",
+                request, f"LLM 输出{review.reason()}，已丢弃并改用模板输出"
             )
 
         # Compliance text is appended, never generated. The model summarised the
@@ -239,50 +236,3 @@ def _strip_leading_title(markdown: str) -> str:
         return markdown
     _, _, rest = markdown.partition("\n")
     return rest.lstrip("\n")
-
-
-def unverified_numbers(generated: str, facts_text: str) -> list[str]:
-    """Numbers in `generated` that cannot be traced back to `facts_text`.
-
-    Three ways a number is accepted, in increasing order of leniency:
-
-    1. it appears verbatim in the facts;
-    2. some fact value equals it once rounded to the precision the model wrote
-       it at — this is what lets 8.1 be written as "8.10" and
-       12198154.379999977 as "12198154.38";
-    3. the same, after applying the 万 / 亿 / % suffix that follows it.
-
-    Without (2) and (3) the gate fires on every response, because rewriting
-    prose *is* reformatting numbers. What it still cannot accept is a figure
-    with no basis in the input at any scale or precision, which is the failure
-    mode that matters: an invented target price or a made-up count.
-
-    Thousands separators are part of the token, not three separate numbers:
-    tokenising "12,198,154.38" as 12 / 198 / 154.38 made every grouped figure
-    look fabricated.
-    """
-    fact_tokens, fact_values = fact_numbers(facts_text)
-    offenders: list[str] = []
-    for match in NUMBER_PATTERN.finditer(generated):
-        raw_token = match.group()
-        token = raw_token.replace(",", "")
-        if token in fact_tokens or token in facts_text:
-            continue
-        if "." not in token and int(token) <= ORDINAL_CEILING:
-            continue
-
-        value = float(token)
-        decimals = len(token.partition(".")[2])
-        scales = [1.0]
-        suffix = generated[match.end() : match.end() + 1]
-        if suffix in UNIT_SCALES:
-            scales.append(UNIT_SCALES[suffix])
-
-        if any(
-            round(fact / scale, decimals) == value
-            for fact in fact_values
-            for scale in scales
-        ):
-            continue
-        offenders.append(raw_token)
-    return list(dict.fromkeys(offenders))

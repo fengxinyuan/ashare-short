@@ -180,7 +180,7 @@ def test_an_invented_number_discards_the_whole_read():
       "holdings":[],"summary":"预计A股半导体今日高开3.7%"}"""
     result = _reader(reply).read(CORPUS, date(2026, 8, 2))
     assert result.ok is False
-    assert any("原文中没有的数字" in note for note in result.notes)
+    assert any("数据中不存在的数字" in note for note in result.notes)
 
 
 def test_a_quoted_number_is_allowed_because_it_is_in_the_corpus():

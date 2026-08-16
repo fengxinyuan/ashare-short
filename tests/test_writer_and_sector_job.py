@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 from ashare_decision_support.cli import _writer as build_cli_writer
+from ashare_decision_support.factcheck import unverified_numbers
 from ashare_decision_support.jobs.morning import (
     MorningConfig,
     Sources,
@@ -15,12 +16,7 @@ from ashare_decision_support.jobs.morning import (
 from ashare_decision_support.news import NewsDoc
 from ashare_decision_support.sectors import CONCEPT_LEVEL
 from ashare_decision_support.sectors.base import SectorDefinition
-from ashare_decision_support.writer import (
-    LlmBriefWriter,
-    TemplateWriter,
-    WriteRequest,
-    unverified_numbers,
-)
+from ashare_decision_support.writer import LlmBriefWriter, TemplateWriter, WriteRequest
 
 
 def _run_morning(**kwargs):
@@ -128,14 +124,11 @@ def test_the_three_number_gates_share_one_definition_of_a_free_ordinal() -> None
 
     from ashare_decision_support import factcheck
     from ashare_decision_support.advice import adjudicate, external
-    from ashare_decision_support.writer import llm
 
-    assert (
-        llm.ORDINAL_CEILING
-        is adjudicate.ORDINAL_CEILING
-        is external.ORDINAL_CEILING
-        is factcheck.ORDINAL_CEILING
-    )
+    # 散文那道闸门 2026-08-15 从 `writer/llm.py` 搬进 `factcheck.py`（它有五个调用
+    # 方，写简报那一层不该替另外四条链路保管它），所以这里不再有 `llm` 那一项——
+    # 写简报的那一层现在根本不做数字扫描。
+    assert adjudicate.ORDINAL_CEILING is external.ORDINAL_CEILING is factcheck.ORDINAL_CEILING
 
     src = pathlib.Path(factcheck.__file__).parent
     definitions = [

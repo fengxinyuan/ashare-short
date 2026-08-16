@@ -9,7 +9,7 @@
    要么能在候选集里查到，要么查不到；查不到就整条丢弃。它没有「写一个数」的
    通道，只有「指一个已有的数」的通道。
 2. 说明文字里的每一个数字，必须**恰好等于**某个候选价或某条 L1 读数。这道闸门
-   比简报那道（`writer/llm.py:unverified_numbers`）严：那边允许按精度四舍五入，
+   比简报那道（`factcheck.py:unverified_numbers`）严：那边允许按精度四舍五入，
    因为改写散文本来就在重排数字；这边不允许，因为 22.95 和 22.96 在文本比对里
    都能过，而它们是两个不同的挂单价。
 
@@ -39,7 +39,13 @@ from ashare_decision_support.advice.candidates import (
     CandidateSet,
     PriceCandidate,
 )
-from ashare_decision_support.factcheck import NUMBER_PATTERN, ORDINAL_CEILING, fact_numbers
+from ashare_decision_support.factcheck import (
+    NUMBER_PATTERN,
+    ORDINAL_CEILING,
+    OutputGuard,
+    fact_numbers,
+    review_output,
+)
 from ashare_decision_support.writer.llm import DEFAULT_PROVIDER, LlmClient
 
 SYSTEM_PROMPT = """你是一名 A 股超短线交易员的价位裁决助手。
@@ -191,6 +197,14 @@ class LevelAdjudicator:
             )
             return fallback
 
+        # 提示词第 4 条（不得给概率）与「不得改变结论」在这一层同样成立，而它们
+        # 数字闸门看不见——「胜率更高」一个数字都没有。数字那一档不交给共用入口：
+        # 这一层只认数值相等，比散文那边严（见 `factcheck.py` 开头的表）。
+        crossed = review_output(reason, guard=OutputGuard.from_facts(facts))
+        if not crossed.ok:
+            fallback.notes.append(f"裁决理由{crossed.reason()}，整条丢弃，退回规则默认")
+            return fallback
+
         if str(payload.get("action") or "").lower() == "abstain":
             return Adjudication(
                 symbol=candidates.symbol,
@@ -249,7 +263,7 @@ class LevelAdjudicator:
 def offending_numbers(text: str, candidates: CandidateSet, facts_text: str) -> list[str]:
     """裁决文字里**不能恰好对上**任何候选价或事实读数的数字。
 
-    和 `writer/llm.py:unverified_numbers` 的区别只有一条，但很关键：那边接受
+    和 `factcheck.py:unverified_numbers` 的区别只有一条，但很关键：那边接受
     「按你写的精度四舍五入之后相等」，这边只接受**数值相等**。散文改写会重排
     数字，价位不会——把 22.9512 写成 22.95 在简报里是正常的表述，在挂单价上是
     另一个价。

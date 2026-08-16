@@ -456,7 +456,7 @@ memory/daily/2026-08-03.md     叙述层：一段人话，给人读、给 LLM �
 **叙述层的三条硬约束**（复用现有 `news/daily_read.py` 的做法，别另造一套）：
 
 1. 每条结论必须**回抄它依据的标题前 12 字**，核不上就丢
-2. 数字必须能在事实层里找到（复用 `writer/llm.py:unverified_numbers`）
+2. 数字必须能在事实层里找到（复用 `factcheck.py:unverified_numbers`）
 3. **不产出预测。** 「明天可能补涨」不写。日报是记录，不是预言
 
 ### 6.4 周报与月报

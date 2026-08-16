@@ -46,9 +46,9 @@ from ashare_decision_support.ask.question import (
 from ashare_decision_support.ask.report import render_report
 from ashare_decision_support.ask.verdict import from_context, rank
 from ashare_decision_support.chat.session import SYSTEM_PROMPT
+from ashare_decision_support.factcheck import OutputGuard, review_output
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.schedule.timezone import beijing_now
-from ashare_decision_support.writer.llm import unverified_numbers
 
 # 时段说明拼在系统提示后面。同一个问题在盘前和盘中要的是不同的答案——盘前问
 # 「这只怎么样」问的是要不要挂单，盘中问的是现在这个价位该不该动。
@@ -165,10 +165,11 @@ def run_ask(
         emit(f"\n（{note}）")
         return _result(ctx, answer=None, notes=[note])
 
-    facts_text = ctx.facts_text()
-    offenders = unverified_numbers(reply or "", facts_text)
-    if offenders:
-        note = f"回答含无法追溯的数字 {offenders[:5]}，整段丢弃"
+    # 立场那道闸门在这条链路上比在简报里更该有：`ask` 是随时能问的，深夜问出来的
+    # 「立即买入」指向一个已经不存在的时刻，而问的人手边没有那张表可以对照。
+    review = review_output(reply or "", ctx.facts_text(), _guard(ctx))
+    if not review.ok:
+        note = f"回答{review.reason()}，整段丢弃"
         emit(ctx.render())
         emit(f"\n（{note}。上面是未经模型的原始数据。）")
         return _result(ctx, answer=None, notes=[note])
@@ -283,10 +284,20 @@ def _run_step(step: Step, llm: Any, phase: str) -> dict[str, Any]:
 
     # 闸门比对的是**这一步的**事实，不是全量上下文。这比原来更严：一段引用了别的
     # 步骤才有的数字，在这里会被拦下，而在全量比对下它能蒙混过关。
-    offenders = unverified_numbers(reply, facts_text)
-    if offenders:
-        return {"text": "", "note": f"含无法追溯的数字 {offenders[:3]}，整段丢弃"}
+    review = review_output(reply, facts_text, OutputGuard.from_facts(step.facts, phase=phase))
+    if not review.ok:
+        return {"text": "", "note": f"{review.reason(limit=1)}，整段丢弃"}
     return {"text": reply, "note": ""}
+
+
+def _guard(ctx: AskContext) -> OutputGuard:
+    """这次问答的那把尺子：盘前算出来的仓位系数，加上此刻的时段。
+
+    盘前那份 payload 取不到时（当天还没跑过 `morning`），尺子上只剩时段——
+    这正是 `OutputGuard` 允许每个字段单独缺失的原因。
+    """
+    morning = ctx.blocks.get("盘前主链路")
+    return OutputGuard.from_facts(morning, phase=ctx.phase)
 
 
 def _position_factor(blocks: dict[str, Any]) -> float | None:

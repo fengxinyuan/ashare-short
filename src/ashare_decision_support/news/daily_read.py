@@ -29,7 +29,7 @@
 与持仓股单独标注属于它们自己的消息。
 
 **不能**：产生任何新数字。约束方式和 `writer/llm.py` 完全一样——复用它的
-`unverified_numbers` 闸门，输出里每一个数字都必须能在**喂进去的标题原文**里找到。
+`factcheck.py` 那道闸门，输出里每一个数字都必须能在**喂进去的标题原文**里找到。
 模型可以引用「韩国综指涨 17.91%」，因为那句话就在语料里；它编不出「A 股半导体今日
 大概率涨 3%」，因为 3% 无处可查，那一条会被整条丢弃。
 
@@ -56,9 +56,9 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
+from ashare_decision_support.factcheck import review_output
 from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.dedup import parse_published
-from ashare_decision_support.writer.llm import unverified_numbers
 
 # 单次喂给模型的市场快讯上限。240 条标题约 8k token，一次装得下。再多就是当天的
 # 长尾（同一条消息的第 4 个转发版本），对判断没有增量。
@@ -390,14 +390,13 @@ class DailyNewsReader:
             result.notes.append("舆情通读没有一条结论能引用到原文，整份丢弃")
             return result
 
-        # 数字闸门：输出里每个数字都要能在喂进去的标题里找到，口径与 writer 一致。
-        invented = unverified_numbers(_all_text(result), corpus)
-        if invented:
+        # 闸门：数字要能在喂进去的标题里找到，措辞不得越过确定性层。口径与写稿层
+        # 一致（`factcheck.review_output`）。措辞那一条数字闸门看不见——「大概率
+        # 反弹」不带任何数字。这里不判立场：通读读的是标题，手上没有情绪周期那把尺子。
+        review = review_output(_all_text(result), corpus)
+        if not review.ok:
             return DailyRead(
-                notes=[
-                    (f"舆情通读出现原文中没有的数字 {'、'.join(invented[:5])}，整份丢弃"
-                    "（这一层不允许产生新数字）")
-                ]
+                notes=[f"舆情通读{review.reason()}，整份丢弃（这一层不允许产生新数字）"]
             )
 
         result.ok = True

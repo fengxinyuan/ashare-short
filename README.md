@@ -90,6 +90,7 @@ ashare-ds strategy-screen --profile all --all-a --price-max 40
 | [`docs/KNOWLEDGE_VOLUME_PRICE.md`](docs/KNOWLEDGE_VOLUME_PRICE.md) | 量价与形态知识库：白皮书提炼、尾盘打法、K 线词汇与各自的落点 |
 | [`docs/PROMPT_TEMPLATES.md`](docs/PROMPT_TEMPLATES.md) | **交给外部模型的提示词都在这里**：每日盘前固定版、研究版、多 Agent 编排与数字闸门口径 |
 | [`docs/PEER_TRADINGAGENTS.md`](docs/PEER_TRADINGAGENTS.md) | 同类开源项目对照：哪些做法值得抄、哪些不适用 |
+| [`docs/PEER_DAILY_STOCK_ANALYSIS.md`](docs/PEER_DAILY_STOCK_ANALYSIS.md) | 同类开源项目对照（daily_stock_analysis）：护栏 · 降级读数 · 组合层 |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | 设计取舍、被否决方案、已删除内容 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | **下一轮**：体检结论、七个真缺口、量价形态/轮动/记忆层设计与实施顺序 |
 | [`docs/REWORK.md`](docs/REWORK.md) | **本轮改造方案**：主链路清理 · 量价策略 · 筹码与元数据 · 行情记忆 |

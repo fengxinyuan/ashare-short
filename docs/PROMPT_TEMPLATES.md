@@ -442,3 +442,19 @@ ashare-ds preopen-research --output briefs/preopen-research.json
 - 盘前舆情通读：`src/ashare_decision_support/news/daily_read.py`
 - 深挖问答：`src/ashare_decision_support/ask/runner.py`
 - 多空裁判：`src/ashare_decision_support/agents/debate.py`
+
+## 七、这些提示词里，哪几条真的被执行
+
+**提示词是请求，闸门才是约束。** 上面每一份都写着「不许编数字」「不许给概率」
+这类要求，而生产链路里只有过闸的那几条会被真的执行——照抄这些模板去接别的系统时，
+要么把闸门一起接上，要么知道自己没有它。
+
+| 口径 | 实现 | 越界之后 |
+|---|---|---|
+| 文字里的数字必须能在事实里找到 | `factcheck.py:unverified_numbers`（散文，允许按精度四舍五入与 万/亿/% 换算）、`advice/adjudicate.py:offending_numbers`（价位，只认数值相等）、`advice/external.py`（外部裁决包，只认原样出现） | 整段丢弃，回落确定性层 |
+| 不得给概率 / 胜率 / 预期收益率 | `factcheck.py:prose_violations`，六个出文字的地方共用 `review_output` 一个入口 | 同上 |
+| 不得改变已经算好的结论（仓位上限、情绪周期、时段） | `factcheck.py:OutputGuard.stance_conflicts` | 同上 |
+| 裁决只能在候选集里选，不能造价 | `advice/adjudicate.py`（模型输出候选 key，再过一道精确相等） | 该标的弃权 |
+
+后两条 2026-08-15 才接上；在那之前它们只写在提示词里，没有任何执行。判据与边界见
+[`PEER_DAILY_STOCK_ANALYSIS.md`](PEER_DAILY_STOCK_ANALYSIS.md) §2.1。

@@ -25,8 +25,9 @@ from ashare_decision_support.advice.view import (
     sort_advice_items,
     trade_context_parts_from_dict,
 )
+from ashare_decision_support.factcheck import OutputGuard, review_output
 from ashare_decision_support.schedule.timezone import beijing_today
-from ashare_decision_support.writer.llm import LlmClient, unverified_numbers
+from ashare_decision_support.writer.llm import LlmClient
 
 SYSTEM_PROMPT = """你是一名 A 股短线分析助手，服务于一位自己做超短线的交易者。
 
@@ -139,16 +140,23 @@ class ChatResponder:
         except Exception as exc:
             return (f"LLM 调用失败（{type(exc).__name__}），本轮无法回答。", [str(exc)[:120]])
 
-        offenders = unverified_numbers(reply, session.facts_text())
-        if offenders:
-            # Same gate as the brief writer: a number with no basis in the facts
-            # is a fabrication, and in a conversation it is more dangerous than
-            # in a report because it arrives without the surrounding table.
+        # Same gate as the brief writer: a number with no basis in the facts
+        # is a fabrication, and in a conversation it is more dangerous than in a
+        # report because it arrives without the surrounding table.
+        #
+        # 尺子从 `sectors` 那一包里取——`/sectors` 装进来的正是盘前那份读数，里面
+        # 有当天的仓位系数。没装过它时 `from_facts` 拿到 None，此时只查数字与措辞，
+        # 不判立场：判不了的时候不判（同 `factcheck.OutputGuard`）。
+        review = review_output(
+            reply, session.facts_text(), OutputGuard.from_facts(session.facts.get("sectors"))
+        )
+        if not review.ok:
             return (
-                "本轮回答包含数据中不存在的数字（"
-                + "、".join(offenders[:5])
-                + "），已丢弃。请换个问法，或用 `/show` 直接看原始数据。",
-                [f"数字校验拦截：{'、'.join(offenders[:5])}"],
+                (
+                    f"本轮回答{review.reason()}，已丢弃。"
+                    "请换个问法，或用 `/show` 直接看原始数据。"
+                ),
+                [f"口径拦截：{review.reason()}"],
             )
 
         session.record("user", question)
