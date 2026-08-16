@@ -25,7 +25,9 @@ from ashare_decision_support.advice.view import (
     sort_advice_items,
     trade_context_parts_from_dict,
 )
+from ashare_decision_support.runhealth import HealthLedger
 from ashare_decision_support.schedule.clock import AFTERNOON_CLOSE
+from ashare_decision_support.schedule.timezone import beijing_today
 
 PHASE_PRE_OPEN = "pre_open"
 PHASE_INTRADAY = "intraday"
@@ -68,6 +70,8 @@ class AskContext:
     notes: list[str] = field(default_factory=list)
     # 问题点名的那几只。空表示没点名，此时全部标的一视同仁。
     focus: list[str] = field(default_factory=list)
+    # 每一块的时点判定。装配过程中逐块记录，装配结束时自己也变成一个块。
+    health: HealthLedger = field(default_factory=lambda: HealthLedger(today=beijing_today()))
 
     @property
     def phase_label(self) -> str:
@@ -178,6 +182,7 @@ def assemble(
     resolved = phase or resolve_phase(moment, is_trading_day)
 
     ctx = AskContext(phase=resolved, as_of=moment.isoformat(timespec="seconds"))
+    ctx.health = HealthLedger(today=moment.date())
     held = _load_positions(ctx)
     ctx.symbols = list(dict.fromkeys((symbols or []) + held))
     ctx.focus = [symbol for symbol in (focus or []) if symbol]
@@ -212,6 +217,11 @@ def assemble(
         _load_payload(ctx, output_dir, ADVICE_LATEST_NAME, "最近一次买卖点")
 
     _load_journal(ctx)
+
+    # 时点判定放在最后，因为它读的是上面每一步记下来的状态。它是一个**块**而不是
+    # 一条 note：这份包的主要读者是另一个模型，而对它来说「盘前主链路是三个交易日
+    # 之前的」写在散文第七条里，和没写没有区别。
+    ctx.blocks["数据健康"] = ctx.health.to_dict()
 
     if resolved == PHASE_OFF_HOURS:
         ctx.notes.append("非交易时段：以下全部是最近一次跑出来的旧数据，不是实时行情")
@@ -376,8 +386,10 @@ def _load_live_levels(
         )
     try:
         ctx.blocks["实时买卖点"] = compute_symbols(targets)
+        ctx.health.live("实时买卖点")
     except Exception as exc:
         ctx.notes.append(f"实时买卖点计算失败（{type(exc).__name__}: {exc}），本次不含这一块")
+        ctx.health.failed("实时买卖点", type(exc).__name__)
 
 
 def _load_payload(
@@ -392,18 +404,26 @@ def _load_payload(
     path = Path(output_dir) / name
     if not path.exists():
         ctx.notes.append(f"{label}尚无落盘结果（{path}），本次不含这一块")
+        ctx.health.missing(label, "尚无落盘结果")
         return
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         ctx.notes.append(f"{label}读取失败（{type(exc).__name__}）")
+        ctx.health.failed(label, type(exc).__name__)
         return
     if trim is not None:
         payload, trim_notes = trim(payload)
         ctx.notes.extend(trim_notes)
     ctx.blocks[label] = payload
     stamp = payload.get("trade_date") if isinstance(payload, dict) else None
-    if stamp:
+    read = ctx.health.stamped(label, stamp)
+    if read.degraded:
+        # 陈旧要在 notes 里也说一句：`render()`（没配 key 时的全部输出）是顺着读的，
+        # 而这句话的作用是让人在读那份排序**之前**就知道它是哪天的。它已经包含
+        # 数据日期，所以不再另外写一条「数据日期是 X」——两条并排只会互相稀释。
+        ctx.notes.append(read.describe())
+    elif stamp:
         ctx.notes.append(f"{label}的数据日期是 {stamp}")
 
 
