@@ -28,6 +28,7 @@ from ashare_decision_support.advice.view import (
 from ashare_decision_support.runhealth import HealthLedger
 from ashare_decision_support.schedule.clock import AFTERNOON_CLOSE
 from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.strategy.portfolio import MIN_CLUSTER_SYMBOLS, read_portfolio
 
 PHASE_PRE_OPEN = "pre_open"
 PHASE_INTRADAY = "intraday"
@@ -304,8 +305,13 @@ def _load_positions(ctx: AskContext) -> list[str]:
     # 超过 160 字的条目截断，而 `asdict` 的字段顺序把成本价、计划止损、计划目标
     # 排在最后——正好是被截掉的那几个。没配 key 时 `render()` 就是全部输出，
     # 于是「我该不该卖」最需要的三个数恰恰看不见。
+    #
+    # 组合层那几个字段摊在同一层（`**read.to_dict()`）而不是嵌一层「组合」：
+    # 「三只票里两只是同一个题材」和「这三只分别是什么」是同一个问题的两半，
+    # 中间隔一个键名会让读的人（和模型）把它当成另一块可选内容跳过去。
+    read = read_portfolio(book.entries, master=_cached_master(book.entries))
     ctx.blocks["持仓"] = {
-        "持仓数": len(book),
+        **read.to_dict(),
         "明细": [
             {
                 "symbol": entry.symbol,
@@ -319,12 +325,34 @@ def _load_positions(ctx: AskContext) -> list[str]:
             for entry in book.entries
         ],
     }
+    ctx.notes.extend(read.describe())
     if not book.entries:
         ctx.notes.append(
             "持仓表是空的；要问某只票直接把代码写进问题里，"
             "登记持仓用 `ashare-ds position open <代码> --cost <成本价>`"
         )
     return book.symbols()
+
+
+def _cached_master(entries: list[Any]) -> Any:
+    """标的元数据，只读缓存。取不到返回 None，归并那一层照旧能说出「没有分类」。
+
+    在这里读而不是在 `strategy/portfolio.py` 里读：那一层是纯计算，它不该知道
+    元数据是从缓存来的还是调用方传进来的——`jobs/advise.py` 那条链路手里已经有
+    一份 master，将来接上时不该再读一次盘。
+
+    **不到两只就不读。** 那份缓存是 1.9MB / 5550 只，解析一次 58ms，而这个函数在
+    每次问答、每次 `facts`、每次 MCP 调用上都会走到——空仓和单票归并不出任何东西，
+    那 58ms 是纯付出。判据用 `MIN_CLUSTER_SYMBOLS`，和归并那一侧同一个数。
+    """
+    if len(entries) < MIN_CLUSTER_SYMBOLS:
+        return None
+    try:
+        from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
+
+        return SecurityMasterAdapter().cached()
+    except Exception:
+        return None
 
 
 def _load_alerts(ctx: AskContext, today: date) -> None:

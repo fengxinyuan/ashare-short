@@ -76,6 +76,7 @@ from ashare_decision_support.strategy.overnight import (
     screen_notes,
     screen_overnight,
 )
+from ashare_decision_support.strategy.portfolio import MIN_CLUSTER_SYMBOLS, read_portfolio
 from ashare_decision_support.symbols import normalize_symbol
 from ashare_decision_support.writer import (
     DEFAULT_PROVIDER,
@@ -1267,11 +1268,32 @@ def _position_command(args) -> dict:
     if args.action == "clear":
         return {"cleared": book.clear(), "total": 0}
 
+    # `position list` 是唯一一个「一次看到全部持仓」的地方，所以组合层读数挂在
+    # 这里：单笔的止损与目标每一行都有，而「这几笔合起来是不是一笔重仓」在逐行
+    # 输出里永远看不出来。归并用缓存里的元数据，不打网络（见 `cached()`）。
+    read = read_portfolio(book.entries, master=_cached_security_master(book.entries))
     return {
         "positions": [entry.to_dict() for entry in book.entries],
         "total": len(book),
+        "portfolio": read.to_dict(),
+        "portfolio_notes": read.describe(),
         "path": str(book.path),
     }
+
+
+def _cached_security_master(entries: list):
+    """缓存里的标的元数据；读不到就是 None，归并那一层会说明「没有分类」。
+
+    走 `cached()` 而不是 `_security_master_reference()` 那条：`position list`
+    是一条随手敲的查询命令，不该为了给持仓打行业标签去打一次外网。不到两只干脆
+    不读——归并不出东西，而那份缓存解析一次 58ms（判据同 `MIN_CLUSTER_SYMBOLS`）。
+    """
+    if len(entries) < MIN_CLUSTER_SYMBOLS:
+        return None
+    try:
+        return SecurityMasterAdapter().cached()
+    except Exception:
+        return None
 
 
 def _state_report() -> dict:

@@ -224,6 +224,23 @@ class SecurityMasterAdapter:
 
         return SecurityMaster(notes=[*notes, "标的元数据不可用，本次不含行业与概念标签"])
 
+    def cached(self) -> SecurityMaster:
+        """只读缓存，**一次网络都不打**。
+
+        `load()` 的降级顺序（缓存新鲜就用、否则拉、拉不到再退回旧缓存）在跑批链路
+        上是对的：那时慢几秒换一份新分类值得。装配事实包与盘中循环不是那个场景
+        ——`ask` / `facts` / `chat` 随时会被调用，一次同步的外网往返会让「导出当前
+        事实」这个动作变成一件不确定要等多久的事，而这一层要的只是「这几只票分别
+        属于哪个行业和题材」，三天前的分类和今天的没有区别。
+
+        缓存不在就是空表加一条说明，不静默返回一份「没有任何集中度」的读数——
+        `strategy/portfolio.py` 靠 `ok` 分得开「没有分类」和「不集中」。
+        """
+        cached = self._read_cache()
+        if cached is not None:
+            return cached
+        return SecurityMaster(notes=["标的元数据缓存为空，本次不含行业与题材归并"])
+
     def health_check(self) -> dict[str, Any]:
         master = self.load()
         payload = master.stats()

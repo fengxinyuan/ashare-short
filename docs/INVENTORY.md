@@ -27,6 +27,20 @@
 当前没有已建未接线模块，**五条口径全部为 0**。新增模块仍需按本文档的可达性口径
 复核，避免未来重新积累死代码。
 
+**2026-08-15 新增两个模块，都在主链路上。** `runhealth.py`（事实包里每一块的时点
+判定：当日 / 上一交易日 / 陈旧 / 缺失，按**交易日**数不按自然日）与
+`strategy/portfolio.py`（组合层读数：权重、行业与题材归并、计划完整度）。接线点
+分别是 `ask/context.py:assemble`（`数据健康` 块，`facts` / `ask` / `chat` / MCP 四
+条路共用）与 `cli.py:_position_command` + 同一处的持仓块。判据与来源见
+[`PEER_DAILY_STOCK_ANALYSIS.md`](PEER_DAILY_STOCK_ANALYSIS.md) §2.2、§2.3。
+
+同日 `factcheck.py` 从「数字追溯的共用件」扩成整道输出闸门（措辞与立场两条口径），
+接线点是全部四个出散文的地方加舆情通读；`adapters/security_master.py` 多一个
+`cached()`（只读缓存、不打网络），供上面两处装配时取行业与题材。
+
+> **表头那个模块数由脚本算，不由这份文档记。** 每次改动之后跑
+> `python3 scripts/inventory_audit.py`，它打印的第一行就是当时的真值。
+
 **2026-08-11 一次替换 + 一次删除。** `state/watchlist.py`（自选股 + 候选池）换成
 `state/positions.py`（只有持仓），判据是使用方式变了而不是代码写得不好，理由与
 连锁影响见 DECISIONS §十八；`signals/daily_technical.py` 里的 `DailyKChartRenderer`
