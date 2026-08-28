@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from ashare_decision_support.jobs.morning import _attach_theme_context
+from ashare_decision_support.jobs.morning_select import _attach_theme_context
 from ashare_decision_support.news import NewsDoc, SocialSnapshotSource, load_themes, scan_themes
 from ashare_decision_support.notify.render import render_theme_radar
 from ashare_decision_support.sectors.base import SectorMetrics

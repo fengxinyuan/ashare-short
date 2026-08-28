@@ -30,6 +30,17 @@ from dataclasses import dataclass, field
 
 from ashare_decision_support.numeric import positive
 
+# 低于这个板块数就不给结论。横截面统计在小样本上毫无意义——20 个板块算出的秩
+# 相关，随便两个板块换位就能翻号；占比更甚，样本太小时一个板块的异动就能改写
+# 所有其他板块的占比。
+#
+# `rotation` / `turnover` / `seesaw` 三处原来各写了一份 `MIN_SECTORS = 20`，而且
+# 后两份的注释各自写着「同 `rotation.py:MIN_SECTORS` 的理由与取值」——**注释里
+# 互相指认，恰好说明它是一个旋钮而不是三个**。三份并存时，把其中一份调到 30
+# 不会让另外两处报错，只会让那两句「同上」的注释从此是假的。收在这里，和
+# `align()` 同一条理由：共用的是判据。
+MIN_SECTORS = 20
+
 
 def bar_value(bar: dict, key: str) -> float | None:
     """取日线里的一格数，要求**有限且为正**，否则 None。
@@ -133,6 +144,62 @@ def pct(values: list[float], window: int) -> float | None:
     if previous <= 0:
         return None
     return values[-1] / previous - 1.0
+
+
+def pearson(left: list[float], right: list[float]) -> float | None:
+    """两列等长读数的皮尔逊相关。任一侧方差为 0 时返回 None，**不返回 0**。
+
+    方差为 0 的含义是「这一列整段没有变化」，那是数据问题；返回 0 会让它读起来
+    像「实测无关」，而那两件事该导向不同的动作。同 `numeric` 那一层对「拿不到」
+    与「等于零」的区分。
+
+    `rotation.py` 与 `seesaw.py` 原来各写了一份这段协方差——前者叫 `_spearman`
+    （对秩求相关），后者叫 `_pearson`（对涨跌幅求相关）。**两个名字掩盖了它们是
+    同一段算式**：斯皮尔曼的定义就是「先转秩、再求皮尔逊」，所以那两份实现里
+    真正不同的只有「进来的是不是秩」和「样本数下限是几」，都在调用方那一侧。
+
+    两份并存的代价和 `MIN_SECTORS` 一样是静默的：给其中一份补一条判据（比如
+    方差为 0 时记一条 note、或者改成样本方差），另一条链路会在同样的输入上保持
+    沉默，而两条都不报错。
+
+    **只算一次开方（`(var_l * var_r) ** 0.5`）**，取自 `seesaw` 那份：跷跷板要扫
+    C(n,2) 对板块，是两处里唯一的热路径。与 `rotation` 原先的两次开方在最后一位
+    上可能差一个 ULP，而两处的产物都过 `rounded(..., 4)`，落盘的数一个字不变。
+    """
+    size = len(left)
+    if size < 2 or size != len(right):
+        return None
+    mean_left = sum(left) / size
+    mean_right = sum(right) / size
+    cov = sum((a - mean_left) * (b - mean_right) for a, b in zip(left, right, strict=True))
+    var_left = sum((a - mean_left) ** 2 for a in left)
+    var_right = sum((b - mean_right) ** 2 for b in right)
+    if var_left <= 0.0 or var_right <= 0.0:
+        return None
+    return cov / (var_left * var_right) ** 0.5
+
+
+def ranks(values: list[float]) -> list[float]:
+    """平均秩，并列取均值。
+
+    并列不处理的话，一堆同值会按输入顺序拿到不同的秩，让相关系数带上一点与数据
+    无关的信息。
+
+    和 `pearson()` 一起收在这里，是因为「转秩再求相关」是同一件事的两半：秩留在
+    `rotation` 里而相关收到这里，下一个要算秩相关的调用方仍然只能再抄一份秩。
+    """
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    result = [0.0] * len(values)
+    index = 0
+    while index < len(order):
+        end = index
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[index]]:
+            end += 1
+        average = (index + end) / 2.0 + 1.0
+        for position in range(index, end + 1):
+            result[order[position]] = average
+        index = end + 1
+    return result
 
 
 def rounded(value: float | None, digits: int = 6) -> float | None:

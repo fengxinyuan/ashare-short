@@ -41,8 +41,10 @@ from typing import Any
 
 from ashare_decision_support.models.enums import EmotionCycle
 from ashare_decision_support.signals.volume_price import (
+    CLIMAX_STALL_TEXT,
     DIVERGENCE_TOP,
     QUADRANT_DOWN_EXPAND,
+    TOP_DIVERGENCE_TEXT,
 )
 
 # 顶背离只对**已有浮盈**的持仓构成减仓理由。没有浮盈时价格根本没创新高，
@@ -118,7 +120,7 @@ def assess_exits(
     """收盘口径的卖出判据。
 
     每一项缺数据就跳过，不判负——「没测到」不该变成一条卖出理由，那和让数据缺失
-    冒充风险判断是同一个错（同 `jobs/morning.py:_market_scan` 的口径）。
+    冒充风险判断是同一个错（同 `jobs/sources.py:fetch_market_scan` 的口径）。
 
     `has_unrealised_gain` 只影响顶背离那一条：它是**兑现**判据，对还在亏损的仓位
     说「减仓落袋」没有意义。传 None 表示不知道是否持仓，此时按「可能持有」处理并
@@ -153,7 +155,7 @@ def _volume_price_exits(
             ExitSignal(
                 trigger="climax_stall",
                 action=EXIT_TRIM,
-                reason="天量滞涨：放巨量而收在日内下半段",
+                reason=CLIMAX_STALL_TEXT,
                 detail=detail,
             )
         )
@@ -186,7 +188,7 @@ def _volume_price_exits(
             ExitSignal(
                 trigger="top_divergence",
                 action=EXIT_TRIM,
-                reason="顶背离：价创新高而量没跟上",
+                reason=TOP_DIVERGENCE_TEXT,
                 detail=detail,
             )
         )

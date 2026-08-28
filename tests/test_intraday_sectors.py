@@ -521,6 +521,28 @@ def test_a_restarted_session_still_compares_against_the_open(tmp_path) -> None:
     assert baseline.as_of.hour == 9                      # 不是重启时刻
 
 
+@pytest.mark.parametrize("moment", [
+    datetime(2026, 8, 10, 9, 20),
+    datetime(2026, 8, 10, 12, 0),
+    datetime(2026, 8, 10, 15, 10),
+])
+def test_sector_session_skips_scans_outside_continuous_trading(tmp_path, moment) -> None:
+    class MustNotFetch:
+        def fetch(self):
+            raise AssertionError("休市时不应访问全市场行情")
+
+    session = SectorSession(
+        session_date=moment.date(), taxonomies={}, adapter=MustNotFetch(), store_root=tmp_path
+    )
+
+    result = session.poll(moment)
+
+    assert result.snapshot is None
+    assert result.alerts == []
+    assert any("跳过" in note for note in result.notes)
+    assert not session.path.exists()
+
+
 # ---- 跃迁告警 --------------------------------------------------------------
 
 

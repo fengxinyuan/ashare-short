@@ -51,7 +51,15 @@ REGIME_STRESSED = BLOWUP_STRESSED
 # 分档定在统计侧、由这里说了算。存的是原始数不是标签，也正是这个原因。
 TURNOVER_EXPANDING = 0.05
 TURNOVER_SHRINKING = -0.05
-MACRO_UNRECORDED = "未记录"
+
+# 「这一条记录里没有这个读数」的统一桶名。全表十来个分组函数都会往这里丢两类行：
+# 该层上线之前写的老记录，以及关掉那一层（`--no-trade-flow` 之类）跑出来的批次。
+#
+# 收成一个常量是因为其中一处是**比较**而不是返回：`_model_readiness` 要把未记录
+# 的行排除在「见过几种情绪周期」之外，于是同一个字符串在 `_regime_bucket` 里写、
+# 在那句 `!=` 里读。两端各写一份字面量时，改了桶名而漏掉那句比较**不会报错**，
+# 只会让「未记录」当成一种真实周期计数，样本充分性的门槛就此提前变绿。
+UNRECORDED = "未记录"
 MACRO_NONE = "无明确宏观链路"
 MACRO_NO_SIGNAL = "无方向信号"
 MACRO_NO_EXPECTATION = "无预期差"
@@ -72,7 +80,7 @@ def summarize(outcomes: list[dict]) -> dict[str, Any]:
         "by_trend": _group(usable, lambda row: row.get("trend_state") or "未知"),
         # 按打法分组。回踩和突破的止损距离、持有期本来就不同，混在一起算出的
         # 平均兑现率不描述其中任何一类。这一组是「该保留哪几条打法」的答案位置。
-        "by_playbook": _group(usable, lambda row: row.get("playbook") or "未记录"),
+        "by_playbook": _group(usable, lambda row: row.get("playbook") or UNRECORDED),
         # 入选 vs 对照。这一组是全表里唯一能回答「这套筛选本身有没有用」的：
         # 入选组次日涨 1.2% 听起来不错，但若对照组涨 1.4%，规则就是负价值。
         "by_group": _group(usable, lambda row: row.get("rec_kind") or "recommendation"),
@@ -421,7 +429,7 @@ def _model_readiness(rows: list[dict]) -> dict[str, Any]:
     regimes = {
         _regime_bucket(row)
         for row in rows
-        if _regime_bucket(row) != "未记录"
+        if _regime_bucket(row) != UNRECORDED
     }
     checks = {
         "samples": (len(rows), MODEL_READY_SAMPLES),
@@ -452,7 +460,7 @@ def _regime_bucket(row: dict) -> str:
 
     rate = state.get("blowup_rate")
     if not isinstance(rate, (int, float)):
-        return "未记录"
+        return UNRECORDED
     if rate < REGIME_HEALTHY:
         return f"封板结实(<{REGIME_HEALTHY:.0%})"
     if rate < REGIME_STRESSED:
@@ -475,9 +483,9 @@ def _macro_expectation_buckets(row: dict) -> tuple[str, ...]:
 def _macro_buckets(row: dict, field: str, empty_bucket: str) -> tuple[str, ...]:
     context = row.get("macro_context")
     if not isinstance(context, dict) or not context:
-        return (MACRO_UNRECORDED,)
+        return (UNRECORDED,)
     if not context.get("recorded"):
-        return (MACRO_UNRECORDED,)
+        return (UNRECORDED,)
     values = tuple(
         sorted(
             {
@@ -492,17 +500,28 @@ def _macro_buckets(row: dict, field: str, empty_bucket: str) -> tuple[str, ...]:
 
 def _pullback_bucket(row: dict) -> str:
     band = (row.get("dip") or {}).get("pullback_band")
-    return str(band) if band else "未记录"
+    return str(band) if band else UNRECORDED
+
+
+def _state_label_bucket(row: dict, field: str) -> str:
+    """取建议发出**当时**记录下来的 `market_state` 标签，取不到就落进未记录桶。
+
+    轮动方向与指数背离两组分别调它一次。两处共用的不只是这三行，更是同一条
+    纪律：**读记录下来的标签、不拿原始数现算**。现算会让阈值调整追溯改写历史
+    ——调完之后同一条老记录落进另一个桶，而它当天实际报出去的结论并没有变。
+    同一条纪律见 `_regime_bucket`（它多一层：老记录才回退到现算）。
+    """
+    label = (row.get("market_state") or {}).get(field)
+    return str(label) if isinstance(label, str) and label else UNRECORDED
 
 
 def _rotation_bucket(row: dict) -> str:
-    """周度轮动方向。读的是建议发出当时记录下来的标签，不现算。
+    """周度轮动方向。
 
     老记录（这一层上线之前写的）没有这个字段，落进「未记录」——那正是它该去的
     地方：把它们混进任何一个真实档位，都会用一段没测过的历史去支持一个结论。
     """
-    label = (row.get("market_state") or {}).get("rotation_adjacent")
-    return str(label) if isinstance(label, str) and label else "未记录"
+    return _state_label_bucket(row, "rotation_adjacent")
 
 
 def _turnover_bucket(row: dict) -> str:
@@ -513,7 +532,7 @@ def _turnover_bucket(row: dict) -> str:
     """
     change = (row.get("market_state") or {}).get("turnover_total_change")
     if not isinstance(change, (int, float)):
-        return "未记录"
+        return UNRECORDED
     if change >= TURNOVER_EXPANDING:
         return f"放量(≥{TURNOVER_EXPANDING:.0%})"
     if change <= TURNOVER_SHRINKING:
@@ -533,32 +552,29 @@ def _large_net_bucket(row: dict) -> str:
     """
     flow = row.get("trade_flow") or {}
     if not flow.get("ok"):
-        return "未记录"
+        return UNRECORDED
     value = flow.get("large_net_amount")
     if not isinstance(value, (int, float)):
-        return "未记录"
+        return UNRECORDED
     return "大单净流入" if value > 0 else "大单净流出"
 
 
 def _index_bucket(row: dict) -> str:
-    """等权与市值加权是否背离。用记录下来的判定标签，不拿原始数现算。
-
-    现算会让阈值调整**追溯改写历史**：调完之后，同一条老记录会落进另一个桶，
-    而它当天实际报出去的结论并没有变。同一条纪律见 `_regime_bucket`。
+    """等权与市值加权是否背离。用记录下来的判定标签，不拿原始数现算——
+    理由见 `_state_label_bucket`。
     """
-    label = (row.get("market_state") or {}).get("index_divergence")
-    return str(label) if isinstance(label, str) and label else "未记录"
+    return _state_label_bucket(row, "index_divergence")
 
 
 def _entry_basis_bucket(row: dict) -> str:
     entry = (row.get("adjudication") or {}).get("chosen_entry") or {}
-    return str(entry.get("basis") or "未记录")
+    return str(entry.get("basis") or UNRECORDED)
 
 
 def _decider_bucket(row: dict) -> str:
     verdict = row.get("adjudication") or {}
     if not verdict:
-        return "未记录"
+        return UNRECORDED
     if verdict.get("abstained"):
         return "模型弃权"
     if verdict.get("used_fallback"):

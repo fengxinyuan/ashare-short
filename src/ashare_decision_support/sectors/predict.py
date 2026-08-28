@@ -13,14 +13,20 @@ own judgement decide anything further.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from statistics import median
 from typing import Any
 
+from ashare_decision_support.emotion_scale import (
+    BLOWUP_HEALTHY,
+    BLOWUP_STRESSED,
+    STREAK_MOMENTUM,
+    STREAK_WEAK,
+)
 from ashare_decision_support.news.base import NewsDoc, SentimentAnalyzer
 from ashare_decision_support.news.events import detect_events
-from ashare_decision_support.numeric import clamp
+from ashare_decision_support.numeric import clamp, median_of
 from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics, SectorOutlook
 from ashare_decision_support.sectors.keywords import MARKET_LEVEL_KEYWORDS, sector_terms
+from ashare_decision_support.symbols import bare_code
 
 # Component ceilings. The sum of the three caps plus the base has to stay inside
 # [0, 100], and no single reading may carry the score on its own — that is the
@@ -121,14 +127,11 @@ MARKET_SENTIMENT_CAP = 8.0
 # 同级，不和宽度同级。
 MARKET_LIMIT_CAP = 10.0
 
-# 炸板率分界。低于 onset 视作封板结实，高于 full 视作情绪退潮，中间线性过渡。
-# 和过热折减一样用斜坡而不是阈值：50% 与 51% 不该给出差一倍的结论。
-BLOWUP_HEALTHY = 0.25
-BLOWUP_STRESSED = 0.55
-
-# 连板高度分界，用来衡量有没有资金愿意接力。
-STREAK_WEAK = 2
-STREAK_STRONG = 6
+# 炸板率与连板高度的切点走 `emotion_scale.py` 那一份。这一层拿它们当**斜坡的两个
+# 端点**（低于 HEALTHY 视作封板结实，高于 STRESSED 视作情绪退潮，中间线性过渡；
+# 和过热折减一样用斜坡而不是阈值：50% 与 51% 不该给出差一倍的结论），闸门拿它们
+# 当硬切点——**用法不同不构成各定一套的理由**：端点和切点不是同一个数的时候，
+# 「打分说偏空」和「闸门说可以做」会各自成立。
 
 # Score bands for the direction label. Deliberately wide in the middle: an
 # unbacktested composite should say "中性" far more often than it says anything
@@ -202,7 +205,7 @@ def limit_pool_points(
         reasons.append(f"炸板率 {blowup_rate:.0%}，{verdict}（{seal:+.1f}）")
 
     if max_streak is not None and max_streak > 0:
-        if max_streak >= STREAK_STRONG:
+        if max_streak >= STREAK_MOMENTUM:
             streak = MARKET_LIMIT_CAP * 0.4
             verdict = "有资金接力"
         elif max_streak <= STREAK_WEAK:
@@ -378,8 +381,8 @@ class SectorPredictor:
 
         breadth = _weighted(trusted, "breadth")
         above_ma20 = _weighted(trusted, "above_ma20")
-        ret_1d = _median_of(trusted, "ret_1d")
-        ret_5d = _median_of(trusted, "ret_5d")
+        ret_1d = median_of(metric.ret_1d for metric in trusted)
+        ret_5d = median_of(metric.ret_5d for metric in trusted)
 
         score = BASE_SCORE
         if breadth is not None:
@@ -497,8 +500,7 @@ class SectorPredictor:
                 f"基准建议 {factor:.2f}（上限 {MAX_SUGGESTED_FACTOR:.2f}）"
             )
 
-            extended_rets = [metric.ret_5d for metric in trusted if metric.ret_5d is not None]
-            median_5d = median(extended_rets) if extended_rets else None
+            median_5d = median_of(metric.ret_5d for metric in trusted)
             haircut = overheat_factor(breadth, median_5d)
             if haircut < 1.0:
                 factor = clamp(factor * haircut, 0.1, MAX_SUGGESTED_FACTOR)
@@ -669,17 +671,13 @@ class SectorPredictor:
             return {}
         # Dragon-tiger rows carry bare 6-digit codes while the taxonomy carries
         # exchange-suffixed ones, so both sides are reduced to the bare code.
-        by_code = {_bare(symbol): value for symbol, value in net_inflow_by_symbol.items()}
+        by_code = {bare_code(symbol): value for symbol, value in net_inflow_by_symbol.items()}
         totals: dict[str, float] = {}
         for definition in definitions:
-            total = sum(by_code.get(_bare(symbol), 0.0) for symbol in definition.symbols)
+            total = sum(by_code.get(bare_code(symbol), 0.0) for symbol in definition.symbols)
             if total:
                 totals[definition.name] = total
         return totals
-
-
-def _bare(symbol: str) -> str:
-    return symbol.split(".", maxsplit=1)[0].strip()
 
 
 def _weighted(metrics: list[SectorMetrics], attribute: str) -> float | None:
@@ -694,8 +692,3 @@ def _weighted(metrics: list[SectorMetrics], attribute: str) -> float | None:
     if not rows or not total:
         return None
     return sum(value * count for value, count in rows) / total
-
-
-def _median_of(metrics: list[SectorMetrics], attribute: str) -> float | None:
-    values = [getattr(metric, attribute) for metric in metrics if getattr(metric, attribute) is not None]
-    return median(values) if values else None

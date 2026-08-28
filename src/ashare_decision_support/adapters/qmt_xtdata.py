@@ -175,15 +175,7 @@ class QmtXtDataAdapter(MarketDataAdapter):
         if isinstance(value, (list, tuple)):
             return [self._to_plain(item) for item in value]
         if hasattr(value, "dtype") and getattr(value.dtype, "names", None):
-            names = list(value.dtype.names)
-            if hasattr(value, "shape") and getattr(value, "shape", None):
-                try:
-                    row = value[0]
-                except Exception:
-                    row = value
-            else:
-                row = value
-            return {name: self._to_plain(row[name]) for name in names}
+            return self._from_record(value)
         if hasattr(value, "tolist"):
             try:
                 return self._to_plain(value.tolist())
@@ -192,3 +184,22 @@ class QmtXtDataAdapter(MarketDataAdapter):
         if hasattr(value, "__dict__"):
             return {key: self._to_plain(item) for key, item in vars(value).items()}
         return str(value)
+
+    def _from_record(self, value: Any) -> dict[str, Any]:
+        """numpy 结构化数组（带 `dtype.names` 的那种）→ 普通 dict。
+
+        切出来是为了让 `_to_plain` 保持一条**平的类型分发阶梯**：那张阶梯上每一行
+        都是「认出一种形状，交出一个结果」，读的时候可以一行一行扫过去。八种形状
+        里只有这一种在认出之后还要再判一次「拿到的是一整列还是其中一行」——那段
+        判断和形状识别无关，留在阶梯中间会让人在扫到第七行之前先停下来读六行取行
+        逻辑。`pyproject` 里为 `max-returns` 辩护的正是这条阶梯的形状，所以这次
+        **一个 return 都没有从阶梯上拿走**，只把嵌套的那一层挪出去。
+        """
+        names = list(value.dtype.names)
+        row = value
+        if hasattr(value, "shape") and getattr(value, "shape", None):
+            try:
+                row = value[0]
+            except Exception:
+                row = value
+        return {name: self._to_plain(row[name]) for name in names}

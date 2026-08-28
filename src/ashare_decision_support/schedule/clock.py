@@ -41,3 +41,12 @@ def minutes_since_open(moment: datetime) -> int:
     if moment < afternoon_open:
         return MORNING_MINUTES
     return MORNING_MINUTES + int((moment - afternoon_open).total_seconds() // 60)
+
+
+def is_continuous_session(moment: datetime) -> bool:
+    """Whether live A-share quotes should be moving at this moment."""
+    current = moment.time().replace(tzinfo=None)
+    return (
+        MORNING_OPEN <= current <= MORNING_CLOSE
+        or AFTERNOON_OPEN <= current <= AFTERNOON_CLOSE
+    )

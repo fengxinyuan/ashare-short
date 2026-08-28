@@ -21,8 +21,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from ashare_decision_support.numeric import finite
-from ashare_decision_support.signals.series import change, mean, series
+from ashare_decision_support.numeric import finite, mean
+from ashare_decision_support.signals.series import change, series
 
 # 回调深度的档位，单位是**这只票自己的日均真实波幅（ATR%）**，不是绝对百分比。
 #

@@ -21,13 +21,12 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.adapters.http import TENCENT_REFERER, fetch_text
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import as_int, positive
-from ashare_decision_support.symbols import normalize_symbol
+from ashare_decision_support.symbols import normalize_symbol, prefixed_code
 
 DETAIL_URL = "https://stock.gtimg.cn/data/index.php?appn=detail&action=data&c={code}&p={page}"
-REFERER = "https://gu.qq.com"
-USER_AGENT = "Mozilla/5.0"
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MAX_PAGES = 80
 # 逐笔取数的并发度。腾讯这个端点没有公开配额；4 是实测档位（22 只标的 0 失败），
@@ -219,7 +218,7 @@ class TencentDetailAdapter:
         )
 
     def _fetch_prints(self, symbol: str) -> list[TradePrint]:
-        code = _tencent_code(symbol)
+        code = prefixed_code(symbol)
         prints: list[TradePrint] = []
         previous_fingerprint: tuple[tuple[int, str], ...] | None = None
         # 从第 0 页起。第 0 页装的是 09:25 集合竞价那一笔和开盘后约 8 分钟的成交，
@@ -246,17 +245,10 @@ class TencentDetailAdapter:
         return prints
 
     def _get(self, url: str) -> str:
-        request = urllib.request.Request(
-            url,
-            headers={"Referer": REFERER, "User-Agent": USER_AGENT},
+        return fetch_text(
+            self._opener, url, timeout=self.timeout, referer=TENCENT_REFERER,
+            encoding="gbk", errors="replace",
         )
-        with self._opener(request, timeout=self.timeout) as response:
-            return response.read().decode("gbk", errors="replace")
-
-
-def _tencent_code(symbol: str) -> str:
-    code, _, suffix = normalize_symbol(symbol).partition(".")
-    return f"{suffix.lower()}{code}" if suffix else code
 
 
 def _parse_page(body: str, symbol: str) -> list[TradePrint]:

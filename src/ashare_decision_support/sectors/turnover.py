@@ -51,7 +51,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.numeric import mean
 from ashare_decision_support.sectors import panel
+from ashare_decision_support.sectors.panel import MIN_SECTORS
 
 # 近端与前段窗口。5 + 15 = 20 个交易日 ≈ 一个月，与 `rotation.py` 的提法对齐。
 # 两段**不重叠**，理由和 `rotation.py:SectorTrend.ret_prior` 完全一样：前段若
@@ -67,10 +69,6 @@ SHARE_MOVE = 0.05
 # 日间 ±5% 是常态噪声；低于这个幅度时「窗口内在放量」和「窗口内基本没动」
 # 讲的是同一件事，多印一行只会稀释上面那行的信息。见 `TurnoverMigration.total_trend`。
 TREND_MOVE = 0.05
-
-# 低于这个板块数不给结论。占比是横截面量，样本太小时一个板块的异动就能改写
-# 所有其他板块的占比。与 `rotation.py:MIN_SECTORS` 同一条理由、同一个值。
-MIN_SECTORS = 20
 
 # 榜单取前几名。
 TOP_COUNT = 10
@@ -244,14 +242,16 @@ def read_turnover(
         read.notes.append("板块成交额存在非正的日合计，本次不给迁移结论")
         return read
 
+    # 四段窗口都取自 `span`，而 `span` 每条的长度就是 `need = recent + prior`，
+    # 所以这几个切片非空是**由上面的长度闸门保证**的，`mean` 不会在这里交出 None。
     entries: list[SectorTurnover] = []
     for index, (code, name, bars) in enumerate(aligned):
         window = span[index]
         shares = [window[i]["amount"] / totals[i] for i in range(need)]
-        share_recent = _mean(shares[-recent_window:])
-        share_prior = _mean(shares[:prior_window])
-        amount_recent = _mean([row["amount"] for row in window[-recent_window:]])
-        amount_prior = _mean([row["amount"] for row in window[:prior_window]])
+        share_recent = mean(shares[-recent_window:])
+        share_prior = mean(shares[:prior_window])
+        amount_recent = mean(row["amount"] for row in window[-recent_window:])
+        amount_prior = mean(row["amount"] for row in window[:prior_window])
         change = (share_recent / share_prior - 1.0) if share_prior else None
         ret = panel.pct(panel.closes(bars), recent_window)
         entries.append(
@@ -269,8 +269,8 @@ def read_turnover(
         )
 
     read.entries = entries
-    read.total_recent = panel.rounded(_mean(totals[-recent_window:]), 2)
-    read.total_prior = panel.rounded(_mean(totals[:prior_window]), 2)
+    read.total_recent = panel.rounded(mean(totals[-recent_window:]), 2)
+    read.total_prior = panel.rounded(mean(totals[:prior_window]), 2)
     if read.total_prior:
         read.total_change = panel.rounded(read.total_recent / read.total_prior - 1.0)
     # 近端窗口内部的走向。取首末两根而不是拟合斜率：这一层要答的是「这一周结束时
@@ -442,7 +442,3 @@ def _observations(
             + "、".join(item.name for item in neglected[:6])
         )
     return lines
-
-
-def _mean(values: list[float]) -> float:
-    return sum(values) / len(values) if values else 0.0

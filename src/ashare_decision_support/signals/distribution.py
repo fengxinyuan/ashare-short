@@ -69,6 +69,7 @@ from ashare_decision_support.signals.volume_price import (
     QUADRANT_DOWN_FLAT,
     QUADRANT_FLAT,
     QUADRANT_UP_EXPAND,
+    TOP_DIVERGENCE_TEXT,
 )
 
 VERDICT_SHAKEOUT = "洗盘"
@@ -248,7 +249,7 @@ def _judge_structure(features, wyckoff_phase, dist, shake) -> None:
     if getattr(features, "breakdown_on_volume", None):
         dist.append((1.5, "放量跌破 MA20：和缩量回踩正好相反的那一面"))
     if getattr(features, "divergence", None) == DIVERGENCE_TOP:
-        dist.append((1.0, "顶背离：价创新高而量没跟上"))
+        dist.append((1.0, TOP_DIVERGENCE_TEXT))
     if getattr(features, "dry_up", None):
         shake.append((1.5, "地量：连续缩量，卖压已经很薄"))
     if wyckoff_phase:

@@ -41,10 +41,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ashare_decision_support.numeric import finite
+from ashare_decision_support.numeric import finite, mean
 from ashare_decision_support.signals.candles import close_position
 from ashare_decision_support.signals.dipbuy import normalised_volume
-from ashare_decision_support.signals.series import change, mean, series
+from ashare_decision_support.signals.series import change, series
 
 # 放/缩量的切点。1.2 与 0.8 之间是「平量」——留一条中性带，否则量比在 1.0 附近
 # 来回穿越时，四象限标签会每天翻面。
@@ -93,6 +93,16 @@ QUADRANT_FLAT = "横盘"
 
 DIVERGENCE_TOP = "顶背离"
 DIVERGENCE_BOTTOM = "底背离"
+
+# 判据的**名字**收在上面，这两条还各有一句**定义**——同一个信号会由三层各自说出
+# 来：量价读数（本模块 `describe`）、派发判定（`signals/distribution.py`）、卖点
+# 判据（`strategy/exits.py`）。三处此前都 `== DIVERGENCE_TOP` 地共用名字，却把
+# 后半句各写各的。
+#
+# 于是改名字三处一起变，改句子只有一处变——**同一份简报里同一个信号出现两种
+# 说法**，而两种都不报错。名字和它的定义必须在同一处。
+CLIMAX_STALL_TEXT = "天量滞涨：放巨量而收在日内下半段"
+TOP_DIVERGENCE_TEXT = f"{DIVERGENCE_TOP}：价创新高而量没跟上"
 
 
 @dataclass(frozen=True)
@@ -152,7 +162,7 @@ class VolumePriceFeatures:
             label = "三倍量" if self.vol_ratio_1d >= TRIPLE_VOLUME else "倍量"
             lines.append(f"{label}：较前一日放大 {self.vol_ratio_1d:.2f} 倍")
         if self.climax_stall:
-            lines.append("天量滞涨：放巨量而收在日内下半段")
+            lines.append(CLIMAX_STALL_TEXT)
         elif self.climax:
             lines.append("天量：量比已达情绪透支区间")
         if self.dry_up:

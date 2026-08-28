@@ -29,6 +29,12 @@ from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from typing import Any
 
+from ashare_decision_support.schedule.timezone import (
+    beijing_from_epoch,
+    beijing_naive_now,
+    beijing_today,
+)
+
 CALL_TIMEOUT_SECONDS = 45
 
 SESSION_CLOSE = 15 * 60  # minutes from midnight
@@ -95,7 +101,7 @@ def parse_ts(value: Any) -> datetime | None:
             ts /= 1000.0
         if ts < 1e8:
             return None
-        return datetime.fromtimestamp(ts)
+        return beijing_from_epoch(ts)
     text = str(value).strip()
     if not text or text.lower() in {"nan", "nat", "none"}:
         return None
@@ -110,10 +116,10 @@ def parse_ts(value: Any) -> datetime | None:
             continue
         # Bare times/dates carry no year: anchor them to today.
         if parsed.year == 1900:
-            today = date.today()
+            today = beijing_today()
             parsed = parsed.replace(year=today.year, month=parsed.month or today.month, day=parsed.day or today.day)
             if fmt in {"%H:%M:%S", "%H:%M"}:
-                parsed = anchor_bare_time(parsed.time(), datetime.now())
+                parsed = anchor_bare_time(parsed.time(), beijing_naive_now())
         return parsed
     try:
         return datetime.fromisoformat(text)
@@ -206,8 +212,8 @@ def in_session(now: datetime) -> bool:
 def build_probes(ak: Any, tf_client: Any, symbols: list[str]) -> list[Probe]:
     probes: list[Probe] = []
     bare = [s.split(".")[0] for s in symbols]
-    today = date.today()
-    close = last_session_close(datetime.now()).date()
+    today = beijing_today()
+    close = last_session_close(beijing_naive_now()).date()
 
     # ---- TickFlow free tier ------------------------------------------------
     if tf_client is not None:
@@ -259,7 +265,9 @@ def build_probes(ak: Any, tf_client: Any, symbols: list[str]) -> list[Probe]:
 
         def tf_quotes() -> Result:
             """Expected to fail on the free tier — that failure IS the paid-tier case."""
-            payload = tf_client.quotes.get(symbols[0])
+            # TickFlow's public client is keyword-only here. Keep this probe
+            # valid so a service rejection is not confused with our own call bug.
+            payload = tf_client.quotes.get(symbols=symbols[0])
             rows = payload if isinstance(payload, list) else frame_rows(payload) or ([payload] if payload else [])
             return Result(ok=bool(rows), seconds=0.0, rows=len(rows),
                           latest=newest([r for r in rows if isinstance(r, dict)], "timestamp", "time"))
@@ -541,7 +549,7 @@ def build_library_probes(symbols: list[str]) -> list[Probe]:
         bs = None
     if bs is not None:
         def bao_5min() -> Result:
-            end = last_session_close(datetime.now()).date()
+            end = last_session_close(beijing_naive_now()).date()
             rs = bs.query_history_k_data_plus(
                 "sh.600519", "date,time,code,open,high,low,close,volume",
                 start_date=(end - timedelta(days=7)).isoformat(), end_date=end.isoformat(),
@@ -568,7 +576,7 @@ def build_library_probes(symbols: list[str]) -> list[Probe]:
 
 
 def audit(probes: list[Probe], repeats: int) -> dict:
-    now = datetime.now()
+    now = beijing_naive_now()
     close = last_session_close(now)
     session = in_session(now)
     report: dict[str, Any] = {
@@ -697,7 +705,7 @@ def watch(symbols: list[str], seconds: int, interval: float) -> dict:
                 entry["ok"] += 1
                 entry["latencies"].append(time.perf_counter() - start)
                 if stamp is not None:
-                    entry["staleness"].append((datetime.now() - stamp).total_seconds())
+                    entry["staleness"].append((beijing_naive_now() - stamp).total_seconds())
                     if entry["last_stamp"] is not None and stamp > entry["last_stamp"]:
                         entry["advances"] += 1
                     entry["last_stamp"] = stamp
@@ -706,7 +714,7 @@ def watch(symbols: list[str], seconds: int, interval: float) -> dict:
                 entry["errors"].append(f"{type(exc).__name__}: {exc}"[:120])
         time.sleep(interval)
 
-    now = datetime.now()
+    now = beijing_naive_now()
     report = {
         "generated_at": now.isoformat(timespec="seconds"),
         "in_session": in_session(now),
@@ -754,6 +762,13 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=3.0, help="seconds between polls in --watch mode")
     args = parser.parse_args()
 
+    if args.repeats < 1:
+        parser.error("--repeats must be at least 1")
+    if args.watch < 0:
+        parser.error("--watch must be non-negative")
+    if args.interval <= 0:
+        parser.error("--interval must be greater than 0")
+
     if args.watch:
         report = watch(args.symbols, args.watch, args.interval)
         if args.json:
@@ -783,7 +798,7 @@ def main() -> None:
     if args.only:
         probes = [p for p in probes if p.key in set(args.only)]
 
-    now = datetime.now()
+    now = beijing_naive_now()
     print(f"# 数据源实测 {now:%Y-%m-%d %H:%M:%S}  交易时段={in_session(now)}  "
           f"上一收盘={last_session_close(now):%Y-%m-%d %H:%M}  repeats={args.repeats}\n")
 

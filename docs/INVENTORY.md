@@ -7,12 +7,12 @@
 代码，是**下判断的时候把它算进去了**。所以接线状态必须是一个能查的事实，而不是
 读完全仓 import 才能拼出来的印象。
 
-- 生成日期：**2026-08-11**
-- 口径：`src/` 共 **171 个模块**（CLI 与 MCP 两个入口）
+- 生成日期：**2026-08-26**
+- 口径：`src/` 共 **188 个模块**（CLI 与 MCP 两个入口）
 - 判定方法：从 `cli.py` 与 `mcp_server.py` 出发做 import 可达性，加上公开符号、dataclass 字段、
-  类上公开方法、私有函数/方法这四层的实际引用检查。**五条都要过**——只被
+  类上公开方法、私有函数/方法、模块级公开常量这五层的实际引用检查。**六条都要过**——只被
   `__init__.py` 转出口而没人用它的符号、算了没人读的字段、没有任何调用点的
-  方法与私有辅助，都算未接线。五条全在 `scripts/inventory_audit.py` 里，见 §4。
+  方法与私有辅助、没人读的常量，都算未接线。六条全在 `scripts/inventory_audit.py` 里，见 §4。
 
 ---
 
@@ -20,19 +20,26 @@
 
 | 状态 | 模块数 | 含义 |
 |---|---|---|
-| **活** | 171 | 至少有一条 CLI 或 MCP 入口能走到，且符号被真正调用 |
+| **活** | 188 | 至少有一条 CLI 或 MCP 入口能走到，且符号被真正调用 |
 | **建成·未接线** | **0** | 代码写完了、大多有测试，但没有任何调用方 |
-| **已删** | 4 | 见 §3 |
+| **已删** | 5 | 见 §3 |
 
-当前没有已建未接线模块，**五条口径全部为 0**。新增模块仍需按本文档的可达性口径
+当前没有已建未接线模块，**六条口径全部为 0**。新增模块仍需按本文档的可达性口径
 复核，避免未来重新积累死代码。
+
+**2026-08-21 接上线外盘历史基准率。** `adapters/overseas_history.py` 负责刷新海外
+指数日线，`sectors/baserate.py` 负责把「外盘 T 日 → A 股反应日」对齐后查历史
+反应日与 1/3/5 日超额；两者不进评分，只进 `preopen-research` 的
+`sector_base_rates`。维护入口是 `ashare-ds history-refresh`：它同时调用
+`ThsSectorIndexAdapter.backfill()` 与 `OverseasHistoryAdapter.refresh()`，让基准率
+样本有明确填充路径，不再是写好但没人能维护的缓存。
 
 **2026-08-15 新增两个模块，都在主链路上。** `runhealth.py`（事实包里每一块的时点
 判定：当日 / 上一交易日 / 陈旧 / 缺失，按**交易日**数不按自然日）与
 `strategy/portfolio.py`（组合层读数：权重、行业与题材归并、计划完整度）。接线点
 分别是 `ask/context.py:assemble`（`数据健康` 块，`facts` / `ask` / `chat` / MCP 四
 条路共用）与 `cli.py:_position_command` + 同一处的持仓块。判据与来源见
-[`PEER_DAILY_STOCK_ANALYSIS.md`](PEER_DAILY_STOCK_ANALYSIS.md) §2.2、§2.3。
+`docs/DECISIONS.md` 与 `docs/ARCHITECTURE.md` 中记录了相应设计取舍。
 
 同日 `factcheck.py` 从「数字追溯的共用件」扩成整道输出闸门（措辞与立场两条口径），
 接线点是全部四个出散文的地方加舆情通读；`adapters/security_master.py` 多一个
@@ -104,8 +111,8 @@
 是盘中板块监控的两个层级之一。同日补上了 taxonomy 单元测试
 （`tests/test_intraday_sectors.py`，35 条）。
 
-剩下的缺口是**盘前**那一侧：`morning` 的板块排序仍然只用行业，不用概念。
-接它要改候选的产出口径，不是纯增量，所以单列在 ROADMAP 而不是顺手做掉。
+盘前行业与概念排序均已接入：`morning` 默认分别取行业和概念名额，`--no-concepts`
+可关闭概念层；`sector-analysis` 只读复看最近一次落盘结果，不重复取数。
 
 ### 1.2 已接入：相对宽基强度
 
@@ -190,10 +197,10 @@ python3 scripts/inventory_audit.py --constants      # 只跑「模块级常量�
 python3 scripts/inventory_audit.py --strict-fields  # 把第三条也计入退出码
 ```
 
-本文档的数字就是这个脚本的输出：`171 个模块 / 171 个可达 / 482 个公开符号 /
-0 个仅转出口 / 1015 个 dataclass 公开字段 / 0 个没有读取点 / 452 个公开方法 /
-0 个零引用 / 0 个只有测试在调 / 742 个私有函数与方法 / 0 个零引用 /
-644 个模块级公开常量 / 0 个零引用`。
+本文档的数字就是这个脚本的输出：`188 个模块 / 188 个可达 / 532 个公开符号 /
+0 个仅转出口 / 1095 个 dataclass 公开字段 / 0 个没有读取点 / 492 个公开方法 /
+0 个零引用 / 0 个只有测试在调 / 777 个私有函数与方法 / 0 个零引用 /
+696 个模块级公开常量 / 0 个零引用`（2026-08-26 实测）。
 
 **2026-08-11 起六条全部归零**，包括此前只报告不计分的那两档（「算了没人读的
 字段」与「只有测试在调的方法」）。归零本身不是目标——目标是**清单上没有悬而
@@ -250,6 +257,24 @@ docstring 里：前两条的判据是二值的（模块要么有调用方要么�
 本身就是删它的理由——**一个不该被读的字段，和一个没人读的字段，在这条口径下
 是同一件事**。`HeatPoint.bucket_start` 不再是孤儿——它唯一的生产者
 `NewsStore.sector_heat` 已经接进盘前 facts（§4.2）。
+
+**2026-08-15：漏报模式第一次有了实例。** `check_fields` 的 docstring 一直写着
+它可能漏报——「字段名与别处的属性重名时会被当成有人读」——但举的是假想例子。
+这次抓到一个真的：`MorningConfig.explain`。CLI 逐字段构造 `MorningConfig` 时
+把 `explain=args.explain` 传了进去，而 `run_morning` 里**从头到尾没有一处读
+`cfg.explain`**；`--explain` 的全部行为都在 CLI 那一侧（读 `args.explain`，
+打印 `summary["funnel"]`），漏斗计数本来就无条件算、无条件落盘。于是这个开关
+开或关，`run_morning` 的行为一模一样。
+
+审计看不见它，是因为全仓有两处**同名但无关**的属性读取顶住了判据：`args.explain`
+（argparse 的 Namespace）和 `calendar.explain(today)`（交易日历的方法）。这正是
+docstring 里那句「宁可漏报不可误报」的成本——它是真的会漏，所以这条口径归零
+**不等于**这类字段已经绝迹。
+
+配置类的字段比台账字段更值得这样单独看一眼：台账字段随 `asdict()` 进 JSON，
+有产物就有读者；而一个**只用来改行为的开关**没有第二个读者，没人读就等于没接线。
+它比死代码更坏一点——死代码不骗人，而一个不生效的开关会让人以为自己关掉了某段
+逻辑。已删（`jobs/morning.py`、`cli.py`），`--explain` 的行为一行没变。
 
 这条检查**仍然没有豁免清单**，那是有意的：豁免清单会在三个月内长成第二份没人读的
 文档。归零的正确做法是清单上不留悬案，不是给悬案发免死金牌。
@@ -358,6 +383,43 @@ volume unit」——那件事早就在别的文件里做了。
 `explain_divergence` 的 docstring 里写明它只分两种情况、以及要认出第三种得让
 `read_seesaw` 同时保留正相关对——**那是另一个读数，不是这个函数少写了一个分支**。
 
+#### 4.4.1 这条口径漏什么：跨模块重名会互相顶账（2026-08-15 实测）
+
+引用是**按名字在全仓数的**，不按定义它的那个模块数。所以两个模块各定义一个
+`FOO`、只有一个模块读它时，另一个那份也算「有人引用」——这条口径会报干净。
+脚本自己写着这是「宁可漏报」的取舍（见 §4.3 私有那条的对比），但它漏掉的
+到底是什么形状，此前没有实例。2026-08-15 这轮清理撞上两个，都是它报干净的：
+
+| 漏掉的 | 实际情况 |
+|---|---|
+| `jobs/advise.py:DAILY_LOOKBACK_DAYS` | **定义了从没被读过**。同名常量在 `monitor/session.py` 与 `agents/collectors.py` 各有一份且都在用，替它顶了账 |
+| `monitor/loop.py:SECTOR_EVERY`、`sectors/{rotation,turnover,seesaw}.py:MIN_SECTORS` | 都不是死的，但是**同一个旋钮的多份定义**：改一份另几份不动，且不报错 |
+
+两类都已收口（前者删掉，后两者分别收进 `sectors/panel.py` 与
+`adapters/base.py`）。**结论不是这条口径该改成按模块数**——那会把
+`__init__.py` 转出口、`getattr` 分发表这些正当写法全判成死码。结论是
+**重名常量要当成一处来管**：同名同值出现在两个模块，不是巧合，是一个还没收口
+的旋钮。查法是 §4 那个脚本查不到的，得直接比对定义点：
+
+```bash
+python3 - <<'PY'
+import ast, pathlib, collections
+seen = collections.defaultdict(list)
+for p in pathlib.Path('src').rglob('*.py'):
+    for node in ast.parse(p.read_text(encoding='utf-8')).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+           and isinstance(node.targets[0], ast.Name) and node.targets[0].id.isupper():
+            try: seen[(node.targets[0].id, repr(ast.literal_eval(node.value)))].append(f"{p}:{node.lineno}")
+            except Exception: pass
+for (name, value), locs in sorted(seen.items()):
+    if len(locs) > 1:
+        print(name, value, *locs, sep="\n  ")
+PY
+```
+
+同名**同值**才报——同名不同值（各模块各自的 `TIMEOUT_SECONDS`、`MAX_WORKERS`）
+是正当的独立旋钮，不在此列。
+
 ---
 
 ## 5. 第二道闸门：文档里的命令还跑不跑得通
@@ -371,6 +433,6 @@ volume unit」——那件事早就在别的文件里做了。
 python3 scripts/docs_audit.py        # 用法文档里的每条 `ashare-ds` 命令都过一遍解析器
 ```
 
-只解析不执行，不打网络、不碰状态目录。`ROADMAP.md` / `REWORK.md` 不在范围内：
-它们写的是还没做的设计，里面的命令解析失败是正确结果。范围按文档的**用途**划，
+只解析不执行，不打网络、不碰状态目录。`ROADMAP.md` 不在范围内：它写的是还没做的
+设计，里面的命令解析失败是正确结果。范围按文档的**用途**划，
 不按一份「这几行豁免」的清单——理由同 §4.1。

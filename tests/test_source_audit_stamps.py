@@ -68,3 +68,21 @@ def test_a_bare_time_is_never_stamped_in_the_future() -> None:
     for hour in range(24):
         stamped = audit.anchor_bare_time(dtime(hour, 30), now)
         assert stamped <= now, f"{hour}:30 被标到了未来：{stamped}"
+
+
+def test_tickflow_quotes_probe_uses_keyword_only_symbols() -> None:
+    class Quotes:
+        def get(self, *, symbols):
+            assert symbols == "600519.SH"
+            return [{"timestamp": "2026-08-26 15:00:00"}]
+
+    class Client:
+        quotes = Quotes()
+
+    probes = audit.build_probes(None, Client(), ["600519.SH"])
+    probe = next(item for item in probes if item.key == "tf_quotes")
+
+    result = audit.run_once(probe)
+
+    assert result.ok is True
+    assert result.rows == 1

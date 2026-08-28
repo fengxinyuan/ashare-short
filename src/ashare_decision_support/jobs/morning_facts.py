@@ -23,6 +23,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from ashare_decision_support.sectors.clusters import cluster_ranked_sectors
 from ashare_decision_support.strategy.regime import RegimeVerdict
 
 
@@ -158,6 +159,7 @@ def build_facts(
     news_diagnostics: dict[str, Any] | None = None,
     theme_radar: list[Any] | None = None,
     theme_validation: dict[str, Any] | None = None,
+    sector_forecast_validation: dict[str, Any] | None = None,
     sector_news_memory: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -223,6 +225,8 @@ def build_facts(
         "sector_news_memory": sector_news_memory or [],
         "theme_radar": [item.to_dict() for item in (theme_radar or [])],
         "theme_validation": theme_validation or {},
+        "sector_forecast_validation": sector_forecast_validation or {},
+        "sector_clusters": cluster_ranked_sectors(outlooks),
         "macro_links": (
             macro_links.to_dict()
             if macro_links is not None and getattr(macro_links, "ok", False)

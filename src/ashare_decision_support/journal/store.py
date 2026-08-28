@@ -12,6 +12,7 @@ from ashare_decision_support.journal.records import (
     VERIFIABLE_KINDS,
     Outcome,
     Recommendation,
+    record_key,
 )
 from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_path
@@ -71,17 +72,13 @@ class Journal:
         没有对照的兑现数据就算不出「入选 vs 落选」的收益差。
         """
         rows = self.rows(since=today - timedelta(days=lookback_days), until=today)
-        resolved = {
-            f"{row.get('symbol')}|{row.get('trade_date')}|{row.get('source')}"
-            for row in rows
-            if row.get("kind") == KIND_OUTCOME
-        }
+        resolved = {record_key(row) for row in rows if row.get("kind") == KIND_OUTCOME}
         pending: list[dict] = []
         seen: set[str] = set()
         for row in rows:
             if row.get("kind") not in VERIFIABLE_KINDS:
                 continue
-            key = f"{row.get('symbol')}|{row.get('trade_date')}|{row.get('source')}"
+            key = record_key(row)
             day = _parse_date(row.get("trade_date"))
             if key in resolved or key in seen or day is None:
                 continue

@@ -16,6 +16,7 @@ from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.events import detect_events
 from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics
 from ashare_decision_support.sectors.keywords import sector_terms
+from ashare_decision_support.symbols import bare_code
 
 
 @dataclass(frozen=True)
@@ -204,14 +205,10 @@ def _sector_inflows(
 ) -> dict[str, float]:
     if not by_symbol:
         return {}
-    normalized = {_bare(symbol): value for symbol, value in by_symbol.items()}
+    normalized = {bare_code(symbol): value for symbol, value in by_symbol.items()}
     return {
         definition.name: sum(
-            normalized.get(_bare(symbol), 0.0) for symbol in definition.symbols
+            normalized.get(bare_code(symbol), 0.0) for symbol in definition.symbols
         )
         for definition in definitions
     }
-
-
-def _bare(symbol: str) -> str:
-    return symbol.split(".", maxsplit=1)[0].strip()

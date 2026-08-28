@@ -30,6 +30,7 @@ L3  只在候选里挑，不造新数      →  「今天选 22.80，因为买�
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -218,26 +219,7 @@ def _entry_candidates(
         )
 
     if breakout_trigger is not None:
-        distance = (breakout_trigger - last) / last
-        if 0 <= distance <= MAX_BREAKOUT_DISTANCE:
-            # 突破打法的默认值必须是确认价，不是回踩带。它仍是一个受限候选，
-            # L3 可以明确改选更保守的低吸候选，但不能另造追价。
-            add(
-                breakout_trigger,
-                BASIS_BREAKOUT_TRIGGER,
-                {
-                    "trigger": round(breakout_trigger, 3),
-                    "session_high": high,
-                    "distance_pct": round(distance, 4),
-                    "caveat": "仅在放量站上该价后执行；未触发前不追价",
-                },
-                mandatory=True,
-            )
-        else:
-            result.notes.append(
-                f"突破触发价 {round(breakout_trigger, 3)} 距现价 {distance:.1%}，"
-                f"超过 {MAX_BREAKOUT_DISTANCE:.0%} 执行上限，放弃追价"
-            )
+        _breakout_entry(result, add, last, high, breakout_trigger)
 
     # 非突破默认值是分时均价回踩带的下沿。突破触发价已存在时，它降为备选，
     # 保留给 L3 在候选集内选择更保守的执行方案。
@@ -288,6 +270,43 @@ def _entry_candidates(
 
     if not result.entries:
         result.notes.append("现价下方 6% 内没有任何有依据的买入位，属于无参照的追高位置")
+
+
+def _breakout_entry(
+    result: CandidateSet,
+    add: Callable[..., None],
+    last: float,
+    high: float,
+    breakout_trigger: float,
+) -> None:
+    """突破打法的那一个候选：站上触发价才买，太远就不买。
+
+    单独一段，是因为它是买入侧唯一**允许高于现价**的口径——其余候选全部落在
+    现价下方的低吸带里，共用 `add` 里那条「高于现价的买入价不是买入价，是追价」
+    的默认闸门。突破是那条闸门的唯一例外（`mandatory=True` 放行），而例外和它
+    自己的距离上限（`MAX_BREAKOUT_DISTANCE`，比低吸的 6% 严一半）必须挨在一起
+    读——拆开之后，「哪条规则在放行它」在两个地方各写了一半。
+    """
+    distance = (breakout_trigger - last) / last
+    if not (0 <= distance <= MAX_BREAKOUT_DISTANCE):
+        result.notes.append(
+            f"突破触发价 {round(breakout_trigger, 3)} 距现价 {distance:.1%}，"
+            f"超过 {MAX_BREAKOUT_DISTANCE:.0%} 执行上限，放弃追价"
+        )
+        return
+    # 突破打法的默认值必须是确认价，不是回踩带。它仍是一个受限候选，
+    # L3 可以明确改选更保守的低吸候选，但不能另造追价。
+    add(
+        breakout_trigger,
+        BASIS_BREAKOUT_TRIGGER,
+        {
+            "trigger": round(breakout_trigger, 3),
+            "session_high": high,
+            "distance_pct": round(distance, 4),
+            "caveat": "仅在放量站上该价后执行；未触发前不追价",
+        },
+        mandatory=True,
+    )
 
 
 # ---- stop ----------------------------------------------------------------

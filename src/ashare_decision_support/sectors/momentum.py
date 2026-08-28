@@ -12,9 +12,11 @@ level; `strong_count` deliberately uses a return threshold instead.
 
 from __future__ import annotations
 
-from statistics import fmean, median
+from statistics import fmean
 
+from ashare_decision_support.numeric import median_of
 from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics
+from ashare_decision_support.sectors.panel import rounded
 from ashare_decision_support.signals.dipbuy import measure_dip
 
 # A 9.5% daily gain is at the main-board limit. 创业板/科创板 stocks cap at 20%,
@@ -105,14 +107,14 @@ class SectorMomentum:
             name=definition.name,
             constituents=definition.size,
             covered=covered,
-            ret_1d=round(median(rets_1d), 6) if rets_1d else None,
-            ret_5d=round(median(rets_5d), 6) if rets_5d else None,
-            ret_20d=round(median(rets_20d), 6) if rets_20d else None,
-            pullback=round(median(pullbacks), 6) if pullbacks else None,
-            pullback_atr=round(median(pullbacks_atr), 4) if pullbacks_atr else None,
+            ret_1d=rounded(median_of(rets_1d), 6),
+            ret_5d=rounded(median_of(rets_5d), 6),
+            ret_20d=rounded(median_of(rets_20d), 6),
+            pullback=rounded(median_of(pullbacks), 6),
+            pullback_atr=rounded(median_of(pullbacks_atr), 4),
             breadth=round(sum(1 for value in rets_1d if value > 0) / len(rets_1d), 4) if rets_1d else None,
             strong_count=sum(1 for value in rets_1d if value >= self.strong_threshold),
-            volume_ratio=round(median(volume_ratios), 4) if volume_ratios else None,
+            volume_ratio=rounded(median_of(volume_ratios), 4),
             above_ma20=round(above_ma / ma_samples, 4) if ma_samples else None,
         )
 

@@ -25,7 +25,7 @@ from datetime import time as clock_time
 from typing import Any
 
 from ashare_decision_support.adapters.freshness import in_session
-from ashare_decision_support.monitor.sector_session import publish_sector_alerts
+from ashare_decision_support.monitor.sector_session import SECTOR_EVERY, publish_sector_alerts
 from ashare_decision_support.monitor.session import MonitorSession
 from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import (
@@ -54,10 +54,6 @@ MONITOR_END = clock_time(14, 55)
 # reading it once at 09:35 and never again misses exactly the ones that matter.
 # 15 passes at the fastest interval is half an hour.
 RISK_REFRESH_EVERY = 15
-
-# 每多少轮做一次板块截面。板块 pass 是一次全市场扫描（56 页并发），比个股那轮贵，
-# 而且板块排名在两分钟里的移动基本是噪声。默认见 `monitor/sector_session.py`。
-SECTOR_EVERY = 5
 
 
 @dataclass

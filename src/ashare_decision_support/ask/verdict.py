@@ -139,7 +139,7 @@ def assess(payload: dict[str, Any], holding: dict[str, Any] | None = None) -> De
     book = payload.get("order_book") or {}
     adjudication = payload.get("adjudication") or {}
 
-    decision.blockers = _blockers(payload, book, adjudication)
+    decision.blockers = _blockers(payload, adjudication)
     decision.readings = _readings(payload, intraday, book)
     if decision.stop and decision.last_price:
         decision.stop_distance_pct = round(
@@ -370,7 +370,7 @@ def _sell_side(decision: Decision, holding: dict[str, Any], book: dict[str, Any]
 # ---- 读数与阻断 -----------------------------------------------------------
 
 
-def _blockers(payload: dict, book: dict, adjudication: dict) -> list[str]:
+def _blockers(payload: dict, adjudication: dict) -> list[str]:
     blockers: list[str] = []
     for warning in payload.get("warnings") or []:
         text = str(warning)

@@ -17,7 +17,7 @@ concepts.json     5546 只   {"symbol","name","concepts":[...]}
 原始需求里提到「中英文名称」，但两份文件的字段只有 `symbol` / `name` / `industries`
 或 `concepts`——`name` 是中文简称，**没有任何英文字段**。所以 `name_en` 一律为 None，
 不用拼音、不用代码、不去别处凑一个。缺字段就是缺字段，编一个出来会让下游以为它是
-真的（同 `adapters/mapping.py` 的契约：缺必需字段就报错，可选字段默认 None）。
+真的（同 `SecurityInfo` 的契约：缺了就是 None / 空，不猜）。
 
 ## 概念为什么不进打分
 
@@ -58,15 +58,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.adapters.ths_taxonomy import (
+    BASE_URL,
+    CONCEPT_FILE,
+    INDUSTRY_FILE,
+)
 from ashare_decision_support.jsoncache import read_stamped, write_stamped
 from ashare_decision_support.state.paths import state_path
 from ashare_decision_support.symbols import normalize_symbol
 
+# 地址与两个文件名从 `adapters/ths_taxonomy.py` 取，那边是按这个源命名的模块，
+# 理由写在它的常量上方：同一台主机的同两份 JSON 被两个适配器各读一遍。
+#
+# **可被 env 覆盖的只有这一边，这是有意的**：`ENV_URL` 指的是「标的元数据从哪
+# 取」，换镜像时板块分类那边并不跟着换。两边共用的是**默认地址**，不是同一个
+# 开关——共用默认值让「上游换地址」只需改一处，各自的开关仍然各归各。
 ENV_URL = "ASHARE_DS_SECURITY_MASTER_URL"
-DEFAULT_BASE_URL = "https://files.688798.xyz/ths/"
-
-INDUSTRIES_FILE = "industries.json"
-CONCEPTS_FILE = "concepts.json"
 
 # 缓存 schema 版本。结构变了之后老缓存里按旧口径写的行会静默参与新口径的查询，
 # 所以版本不匹配时重建而不是猜——同 `news/store.py:SCHEMA_VERSION`。
@@ -190,7 +197,7 @@ class SecurityMasterAdapter:
         timeout: float = DEFAULT_TIMEOUT,
         opener: Any = None,
     ) -> None:
-        raw = base_url or os.environ.get(ENV_URL) or DEFAULT_BASE_URL
+        raw = base_url or os.environ.get(ENV_URL) or BASE_URL
         self.base_url = raw if raw.endswith("/") else raw + "/"
         self.cache_path = Path(cache_path) if cache_path else state_path(*CACHE_RELATIVE_PATH)
         self.timeout = timeout
@@ -258,10 +265,10 @@ class SecurityMasterAdapter:
 
     def _fetch(self) -> tuple[SecurityMaster | None, list[str]]:
         notes: list[str] = []
-        industries, note = self._fetch_one(INDUSTRIES_FILE)
+        industries, note = self._fetch_one(INDUSTRY_FILE)
         if note:
             notes.append(note)
-        concepts, note = self._fetch_one(CONCEPTS_FILE)
+        concepts, note = self._fetch_one(CONCEPT_FILE)
         if note:
             notes.append(note)
 

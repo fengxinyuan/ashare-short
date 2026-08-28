@@ -84,6 +84,7 @@ def test_monthly_context_delegates_external_event_research(tmp_path, monkeypatch
     assert payload["contract"]["external_ai_role"].startswith("collect current external events")
     assert any(item["name"] == "国庆节" for item in payload["event_window"])
     assert payload["sector_leaders"]["schema"] == "ashare-sector-leaders-v1"
+    assert payload["sector_leaders"]["view"] == "summary"
     assert "recent_validation" in payload["historical_validation"]
     assert "industry_level" in payload["sector_rotation_memory"]
     assert any(task["topic"] == "business leadership verification" for task in payload["external_research_tasks"])
@@ -103,7 +104,39 @@ def test_mcp_lists_read_only_and_refresh_tools() -> None:
     assert initialized["result"]["serverInfo"]["name"] == "ashare-decision-support"
     tools = {item["name"]: item for item in listed["result"]["tools"]}
     assert tools["get_facts"]["annotations"]["readOnlyHint"] is True
+    assert tools["daily_sector_analysis"]["annotations"]["readOnlyHint"] is True
+    assert tools["preopen_research_context"]["annotations"]["readOnlyHint"] is True
     assert tools["refresh_sector_leaders"]["annotations"]["readOnlyHint"] is False
+
+
+def test_daily_sector_tool_reads_the_cached_analysis(tmp_path) -> None:
+    from ashare_decision_support.tool_api import daily_sector_analysis
+
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps({"trade_date": "2026-08-26", "sectors": []}), encoding="utf-8"
+    )
+
+    payload = daily_sector_analysis(output_dir=str(tmp_path))
+
+    assert payload["schema"] == "ashare-sector-analysis-v1"
+    assert payload["trade_date"] == "2026-08-26"
+    assert payload["view"] == "summary"
+
+    full = daily_sector_analysis(output_dir=str(tmp_path), detail="full")
+    assert "view" not in full
+
+
+def test_preopen_tool_can_be_used_without_global_snapshot(tmp_path, monkeypatch) -> None:
+    from ashare_decision_support.tool_api import preopen_research_context
+
+    monkeypatch.setattr(
+        "ashare_decision_support.tool_api.build_preopen_research",
+        lambda **kwargs: {"output_dir": kwargs["output_dir"], "market_adapter": kwargs["market_adapter"]},
+    )
+
+    payload = preopen_research_context(output_dir=str(tmp_path), include_global=False)
+
+    assert payload == {"output_dir": str(tmp_path), "market_adapter": None}
 
 
 def test_mcp_monthly_tool_returns_structured_content(tmp_path, monkeypatch) -> None:
@@ -169,6 +202,24 @@ def test_every_mcp_tool_input_is_self_describing() -> None:
             assert spec.get("description"), f"{tool['name']}.{name} 缺字段说明"
 
 
+def test_get_facts_sections_schema_does_not_advertise_unstable_blocks() -> None:
+    listed = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    tools = {item["name"]: item for item in listed["result"]["tools"]}
+
+    description = tools["get_facts"]["inputSchema"]["properties"]["sections"]["description"]
+
+    assert "最近一次买卖点" not in description
+    assert "实际可用块随 phase" in description
+    assert "unknown sections" in description
+
+
+def test_sector_leaders_cli_accepts_mcp_parameter_aliases() -> None:
+    args = cli.build_parser().parse_args(
+        ["sector-leaders", "--top-per-sector", "4", "--lookback-days", "200"]
+    )
+    assert args.top == 4 and args.days == 200
+
+
 def test_the_server_reports_the_package_version() -> None:
     """两处各写一个字面量的话，`initialize` 报的版本和 `pip show` 的会各说各话。"""
     from ashare_decision_support import __version__
@@ -177,6 +228,44 @@ def test_the_server_reports_the_package_version() -> None:
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
     )
     assert initialized["result"]["serverInfo"]["version"] == __version__
+
+
+def test_sector_tool_text_is_compact_and_not_duplicate_json() -> None:
+    from ashare_decision_support.mcp_server import _text_content
+
+    forecast = {
+        "schema": "ashare-sector-forecast-v1",
+        "target_session": "2026-08-28",
+        "market": {"state": "偏强但快速轮动", "direction": "偏强"},
+        "confidence": {"status": "uncalibrated"},
+        "forecasts": [
+            {"name": "科技成长", "scenario": "延续观察", "score": 80, "members": ["电子"]}
+        ],
+        "execution_protocol": {"confirm_after": "09:35"},
+    }
+    backtest = {
+        "schema": "sector-price-baseline-backtest-v1",
+        "date_range": {"start": "2020-01-01", "end": "2026-08-27"},
+        "sector_count": 90,
+        "methods": [
+            {
+                "method": "momentum_5d",
+                "label": "5日强势延续",
+                "holdout": [
+                    {"horizon": 5, "samples": 100, "win_rate": 0.48, "mean_excess": -0.001}
+                ],
+            }
+        ],
+    }
+
+    forecast_text = _text_content(forecast)
+    backtest_text = _text_content(backtest)
+
+    assert forecast_text.startswith("# 板块情景预测")
+    assert "structuredContent" in forecast_text
+    assert backtest_text.startswith("# 板块价格基线历史验证")
+    assert "48.00%" in backtest_text and "-0.10%" in backtest_text
+    assert not forecast_text.lstrip().startswith("{")
 
 
 def test_an_unknown_argument_comes_back_as_a_tool_error_not_a_dead_server() -> None:
@@ -270,7 +359,7 @@ def test_the_stdio_loop_answers_line_by_line_and_survives_garbage() -> None:
     replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert [item.get("id") for item in replies] == [1, None, 2]
     assert replies[1]["error"]["code"] == -32700
-    assert len(replies[2]["result"]["tools"]) == 3
+    assert len(replies[2]["result"]["tools"]) == len(mcp_server._TOOLS)
 
 
 # ---- 体积：这是给模型调的工具，每一份多余的拷贝都是它的上下文 ----------------
@@ -294,6 +383,30 @@ def test_the_text_content_is_the_readable_view_not_a_second_json_dump(monkeypatc
     assert result["content"][0]["text"] == "【非交易时段】读数摘要"
     # 机器要的那份没少。
     assert result["structuredContent"]["facts"]["盘前主链路"].startswith("x")
+
+
+def test_monthly_mcp_text_is_a_summary_not_a_second_payload(monkeypatch) -> None:
+    from ashare_decision_support.mcp_server import _text_content
+
+    monkeypatch.setattr(
+        "ashare_decision_support.mcp_server.monthly_outlook_context",
+        lambda **kwargs: {},
+    )
+    payload = {
+        "schema": "ashare-monthly-research-context-v1",
+        "as_of": "2026-08-28T08:00:00+08:00",
+        "horizon": {"days": 31, "end_date": "2026-09-28"},
+        "a_share_facts": {"rendered": "事实摘要"},
+        "sector_leaders": None,
+        "notes": ["龙头缓存缺失"],
+        "large_matrix": list(range(1000)),
+    }
+
+    text = _text_content(payload)
+
+    assert "事实摘要" in text
+    assert "龙头缓存缺失" in text
+    assert "large_matrix" not in text
 
 
 def test_a_payload_without_a_readable_view_still_gets_json_content(monkeypatch) -> None:

@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 
 from ashare_decision_support import cli
+from ashare_decision_support.journal import Journal, Recommendation
 
 # argv 里的这个占位符会被换成 tmp_path。默认的 `--output-dir briefs` 是**相对
 # 当前目录**的，跑测试时会在仓库根上长出一个 briefs/。
@@ -52,11 +53,23 @@ class _Bundle:
 CASES: dict[str, tuple[list[str], str, Any]] = {
     "daemon": (["daemon", "--dry-run", "--quiet", "--output-dir", OUT], "run_daily_cycle", {}),
     "morning": (["morning", "--quiet", "--output-dir", OUT], "run_morning", {"funnel": {}}),
+    "sector-analysis": (
+        ["sector-analysis", "--format", "json", "--output-dir", OUT],
+        "load_daily_sector_analysis",
+        {"trade_date": "2026-08-26"},
+    ),
     "monitor": (["monitor", "--once", "--quiet", "--output-dir", OUT], "run_monitor", {}),
     "advise": (["advise", "--quiet", "--symbols", "600519.SH"], "run_advise", {"facts": {}}),
     "ask": (["ask", "--no-live", "今天板块怎么排"], "run_ask", {"notes": [], "mode": "facts"}),
     "facts": (["facts", "--no-live"], "build_facts_bundle", _Bundle()),
-    "preopen-research": (["preopen-research", "--no-global"], "build_facts_bundle", _Bundle()),
+    "preopen-research": (
+        ["preopen-research", "--no-global"],
+        # 盘前研报的组包已经搬进 `research/preopen.py`（DECISIONS §17.2 那条判据），
+        # 所以这里盯的是 `cli` 真正调起的那个入口，而不是它内部再往下调的
+        # `build_facts_bundle`——盯里面那层的话，命令改成调别的组包函数也不会红。
+        "build_preopen_research",
+        {"as_of": "2026-08-15T09:00:00", "facts": {}, "overseas_snapshot": None},
+    ),
     "chat": (["chat"], "run_chat", None),
     "review": (["review", "--quiet", "--output-dir", OUT], "run_review", {}),
     "post-close-brief": (
@@ -71,8 +84,14 @@ CASES: dict[str, tuple[list[str], str, Any]] = {
 STATE_ONLY = {"position", "journal", "state", "qmt-health"}
 NEEDS_NETWORK = {"tick-health", "intraday-check", "wyckoff-scan"}
 # 单独写了用例（要打桩适配器，塞不进上面那张表驱动的形状）
-OWN_CASES = {"calendar-refresh"}
+OWN_CASES = {"calendar-refresh", "history-refresh"}
 COVERED_ELSEWHERE = {
+    # tests/test_sector_backtest.py 覆盖纯计算；此命令只做本地序列读取与 JSON 输出
+    "sector-backtest",
+    # tests/test_sector_forecast.py 覆盖组包；命令只做缓存读取与 JSON 输出
+    "sector-forecast",
+    # tests/test_sector_confirmation.py 覆盖纯计算；命令只读当天盘中序列
+    "sector-confirmation",
     # tests/test_ask.py::_cmd_strategy_screen
     "strategy-screen",
     # tests/test_external_tools.py 覆盖纯计算、MCP 调用与两条命令的解析
@@ -148,6 +167,74 @@ def test_handlers_pass_keywords_that_the_chain_actually_declares(monkeypatch, tm
     assert config.sector_level == "SW1"
 
 
+def test_tickflow_adapter_banner_does_not_pollute_stdout(monkeypatch, capsys) -> None:
+    class NoisyAdapter:
+        def __init__(self, **kwargs):
+            print("third-party banner")
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(cli, "TickFlowAdapter", NoisyAdapter)
+
+    adapter = cli._tickflow(cli.build_parser().parse_args(["state"]))
+
+    assert isinstance(adapter, NoisyAdapter)
+    assert capsys.readouterr().out == ""
+
+
+def test_explain_prints_the_control_sample_its_help_text_promises(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`--explain` 的帮助承诺了「对照样本」，屏幕上就得有。
+
+    `control_sample` 一直被算出来、也一直随事实包落盘，但**从没进过 `--explain`
+    的输出**——四个标签的那张表里没有它。漏掉的偏偏是最不能漏的一档：入选组
+    自己不构成证据，`review` 的 edge 是拿它跟对照组比出来的，对照组塌成 0 的
+    时候整张兑现表都不成立，而那正是该在盘前就看见的一次。
+
+    断言落在**那两行打印**上，不是「数字出现过」——`_dump_json` 会把整份
+    summary 打出来，funnel 的数字在 JSON 里本来就有，按数字断言的话把这两行
+    删掉测试照样绿。
+    """
+    funnel = {
+        "universe": 5550,
+        "selected_sector_constituents": 812,
+        "screened_constituents": 320,
+        "final_candidates": 15,
+        "control_sample": 12,
+    }
+    monkeypatch.setattr(cli, "run_morning", lambda *args, **kwargs: {"funnel": funnel})
+
+    args = cli.build_parser().parse_args(
+        ["morning", "--quiet", "--explain", "--output-dir", str(tmp_path / "briefs")]
+    )
+    cli.COMMANDS["morning"](args)
+
+    lines = capsys.readouterr().out.splitlines()
+    funnel_line = next(line for line in lines if line.startswith("筛选漏斗："))
+    for count in ("5550", "812", "320", "15"):
+        assert count in funnel_line
+
+    control_line = next(
+        (line for line in lines if line.startswith("对照样本：")),
+        None,
+    )
+    assert control_line is not None, "帮助里写了对照样本，`--explain` 却没打印它"
+    assert "12" in control_line
+
+
+def test_text_output_writes_nested_path_without_printing_report(tmp_path, capsys, monkeypatch) -> None:
+    target = tmp_path / "nested" / "sector.md"
+    payload = {"trade_date": "2026-08-26", "market": {}, "sectors": []}
+    monkeypatch.setattr(cli, "load_daily_sector_analysis", lambda output_dir: payload)
+    args = cli.build_parser().parse_args(
+        ["sector-analysis", "--format", "text", "--output", str(target), "--output-dir", str(tmp_path)]
+    )
+    cli.COMMANDS[args.command](args)
+
+    assert target.read_text(encoding="utf-8").startswith("# 每日板块分析 2026-08-26")
+    assert capsys.readouterr().out == ""
+
+
 def test_state_only_commands_run_against_the_isolated_state_home(capsys) -> None:
     """只读状态的命令要能在空状态下跑完并给出合法 JSON。
 
@@ -159,6 +246,46 @@ def test_state_only_commands_run_against_the_isolated_state_home(capsys) -> None
         cli.COMMANDS[args.command](args)
         printed = capsys.readouterr().out
         assert json.loads(printed) is not None, f"{argv} 没有输出合法 JSON"
+
+
+def test_state_journal_counts_explain_control_and_veto_samples() -> None:
+    journal = Journal()
+    for kind, symbol in (
+        ("recommendation", "600000.SH"),
+        ("control", "600001.SH"),
+        ("vetoed", "600002.SH"),
+    ):
+        row = Recommendation(
+            symbol=symbol,
+            trade_date="2026-08-01",
+            source="morning",
+            reference_price=10.0,
+        )
+        row.kind = kind
+        journal.record(row)
+
+    report = cli._state_report()["journal"]
+
+    assert report["recommendations"] == 1
+    assert report["controls"] == 1
+    assert report["vetoed"] == 1
+    assert report["verifiable_total"] == 3
+    assert report["pending_verification"] == 3
+    assert report["pending_by_kind"] == {
+        "recommendation": 1,
+        "control": 1,
+        "vetoed": 1,
+    }
+    assert report["model_samples"] == 0
+
+
+def test_pre_open_missing_payload_has_an_actionable_cli_error(tmp_path) -> None:
+    args = cli.build_parser().parse_args(
+        ["pre-open-brief", "--payload", str(tmp_path / "missing.json")]
+    )
+
+    with pytest.raises(SystemExit, match="先运行 `ashare-ds post-close-brief`"):
+        cli.COMMANDS[args.command](args)
 
 
 def test_codex_adjudication_round_trip_reads_and_writes_files(tmp_path, capsys) -> None:
@@ -237,6 +364,73 @@ def test_calendar_refresh_keeps_the_old_table_when_the_feed_has_none(monkeypatch
     assert payload["trading_days"] == 0
     assert "保持原状" in payload["note"]
     assert cli.TradingCalendar().is_trading_day(date(2026, 10, 1)) is False
+
+
+def test_history_refresh_calls_both_history_adapters(monkeypatch, capsys) -> None:
+    """历史缓存有明确维护入口，基准率层不再只是写好没人能填样本。"""
+    calls: dict[str, Any] = {}
+
+    class _SectorResult:
+        notes = ["板块历史已回填"]
+
+        def to_dict(self):
+            return {"ok": True, "codes": 2, "notes": self.notes}
+
+    class _OverseasResult:
+        notes = ["海外历史已刷新"]
+
+        def to_dict(self):
+            return {"ok": True, "keys": ["sox"], "notes": self.notes}
+
+    class _SectorAdapter:
+        def backfill(self, *, since_year, until_year):
+            calls["sector"] = (since_year, until_year)
+            return _SectorResult()
+
+    class _OverseasAdapter:
+        def refresh(self, keys):
+            calls["overseas"] = tuple(keys)
+            return _OverseasResult()
+
+    monkeypatch.setattr(cli, "ThsSectorIndexAdapter", _SectorAdapter)
+    monkeypatch.setattr(cli, "OverseasHistoryAdapter", _OverseasAdapter)
+
+    args = cli.build_parser().parse_args(
+        ["history-refresh", "--since-year", "2025", "--until-year", "2026", "--keys", "sox"]
+    )
+    cli.COMMANDS[args.command](args)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == {"sector": (2025, 2026), "overseas": ("sox",)}
+    assert payload["tasks"] == ["sector-index", "overseas"]
+    assert payload["sector_index"]["ok"] is True
+    assert payload["overseas"]["keys"] == ["sox"]
+
+
+def test_history_refresh_can_run_only_overseas(monkeypatch, capsys) -> None:
+    class _OverseasResult:
+        notes = []
+
+        def to_dict(self):
+            return {"ok": True}
+
+    class _OverseasAdapter:
+        def refresh(self, keys):
+            return _OverseasResult()
+
+    monkeypatch.setattr(
+        cli,
+        "ThsSectorIndexAdapter",
+        lambda: (_ for _ in ()).throw(AssertionError("sector should not run")),
+    )
+    monkeypatch.setattr(cli, "OverseasHistoryAdapter", _OverseasAdapter)
+
+    args = cli.build_parser().parse_args(["history-refresh", "--only", "overseas"])
+    cli.COMMANDS[args.command](args)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tasks"] == ["overseas"]
+    assert "sector_index" not in payload
 
 
 def test_no_command_is_left_without_an_owner() -> None:

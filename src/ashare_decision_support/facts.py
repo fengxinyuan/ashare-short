@@ -26,9 +26,10 @@ class FactsBundle:
     symbols: list[str] = field(default_factory=list)
     facts: dict[str, Any] = field(default_factory=dict)
     rendered: str = ""
+    compact_rendered: str = ""
     notes: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, compact_rendered: bool = False) -> dict[str, Any]:
         return {
             "schema": FACTS_SCHEMA,
             "contract": {
@@ -40,9 +41,10 @@ class FactsBundle:
             "phase": self.phase,
             "phase_label": self.phase_label,
             "as_of": self.as_of,
+            "data_status": (self.facts.get("数据健康") or {}).get("判定", "未记录"),
             "symbols": list(self.symbols),
             "facts": dict(self.facts),
-            "rendered": self.rendered,
+            "rendered": self.compact_rendered if compact_rendered else self.rendered,
             "notes": list(self.notes),
         }
 
@@ -98,5 +100,6 @@ def build_facts_bundle(
         symbols=list(ctx.symbols),
         facts=ctx.facts(),
         rendered=ctx.render(),
+        compact_rendered=ctx.render_compact(),
         notes=list(ctx.notes),
     )

@@ -22,8 +22,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ashare_decision_support.state.paths import DEFAULT_HOME, ENV_HOME
+
 ENV_FILE = "ASHARE_DS_ENV_FILE"
-ENV_HOME = "ASHARE_DS_HOME"
 
 # 同名变量以先出现的文件为准。专用文件排在 `.env` 前面，避免通用配置意外
 # 抢走某条数据源或推送通道的密钥。
@@ -41,8 +42,10 @@ def _repo_root() -> Path:
 def _state_home() -> Path:
     raw = os.environ.get(ENV_HOME)
     # 不用 state.paths.state_home()：那个会 mkdir，而「找一下有没有密钥文件」
-    # 不该有创建目录的副作用。
-    return Path(raw).expanduser() if raw else Path.home() / ".ashare-ds"
+    # 不该有创建目录的副作用。取的是同一个环境变量名与同一个默认目录——那两个
+    # 值原来在这里各写了一份，改了 `state/paths.py` 的默认目录而没改这里的话，
+    # 密钥会静默地继续在旧目录里找，而「没找到 .env」和「没有 .env」不报错。
+    return Path(raw).expanduser() if raw else DEFAULT_HOME
 
 
 def candidate_files() -> list[Path]:

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from ashare_decision_support.adapters.base import fetch_daily_bars
+from ashare_decision_support.adapters.base import DAILY_LOOKBACK_DAYS, fetch_daily_bars
 from ashare_decision_support.adapters.snapshot import default_snapshot_adapter
 from ashare_decision_support.agents.base import AgentContext
 from ashare_decision_support.news.balance import source_counts
@@ -29,7 +29,6 @@ from ashare_decision_support.signals.relative_strength import benchmark_for
 from ashare_decision_support.symbols import bare_code
 
 METRIC_LOOKBACK_DAYS = 60
-DAILY_LOOKBACK_DAYS = 240
 DRAGON_TIGER_LOOKBACK_DAYS = 5
 
 # Per-stock news documents kept per symbol. Ten headlines is roughly two weeks
@@ -304,12 +303,13 @@ class SectorMetricsAgent:
 
     def run(self, ctx: AgentContext) -> tuple[dict, list[str]]:
         start = ctx.trade_date - timedelta(days=METRIC_LOOKBACK_DAYS)
-        bars = fetch_daily_bars(ctx.adapter, self.symbols, start, ctx.trade_date)
+        notes: list[str] = []
+        bars = fetch_daily_bars(ctx.adapter, self.symbols, start, ctx.trade_date, notes)
         metrics = SectorMomentum().measure(self.definitions, bars)
         covered = sum(1 for rows in bars.values() if rows)
         return (
             {"metrics": metrics, "bars": bars},
-            [f"板块动量样本：{covered}/{len(self.symbols)} 只成分股有可用日线"],
+            [*notes, f"板块动量样本：{covered}/{len(self.symbols)} 只成分股有可用日线"],
         )
 
 
@@ -323,10 +323,12 @@ class SymbolDailyAgent:
             return {"snapshots": {}, "wyckoff": {}, "bars": {}, "prev_closes": {}}, []
 
         start = ctx.trade_date - timedelta(days=DAILY_LOOKBACK_DAYS)
-        bars = fetch_daily_bars(ctx.adapter, ctx.symbols, start, ctx.trade_date)
+        notes: list[str] = []
+        bars = fetch_daily_bars(ctx.adapter, ctx.symbols, start, ctx.trade_date, notes)
         usable = {symbol: rows for symbol, rows in bars.items() if rows}
         missing = [symbol for symbol in ctx.symbols if symbol not in usable]
-        notes = [f"无日线数据的标的：{'、'.join(missing[:8])}"] if missing else []
+        if missing:
+            notes.append(f"无日线数据的标的：{'、'.join(missing[:8])}")
 
         return (
             {
@@ -365,10 +367,12 @@ class BenchmarkDailyAgent:
             return {"bars": {}}, []
 
         start = ctx.trade_date - timedelta(days=DAILY_LOOKBACK_DAYS)
-        bars = fetch_daily_bars(ctx.adapter, self.benchmarks, start, ctx.trade_date)
+        notes: list[str] = []
+        bars = fetch_daily_bars(ctx.adapter, self.benchmarks, start, ctx.trade_date, notes)
         usable = {symbol: rows for symbol, rows in bars.items() if rows}
         missing = [symbol for symbol in self.benchmarks if symbol not in usable]
-        notes = [f"相对强度缺少宽基日线：{'、'.join(missing)}"] if missing else []
+        if missing:
+            notes.append(f"相对强度缺少宽基日线：{'、'.join(missing)}")
         return {"bars": usable}, notes
 
 

@@ -113,10 +113,6 @@ def reachable_from_entrypoints() -> set[str]:
     return seen
 
 
-# 兼容已有的外部脚本调用；新口径包含 MCP 入口。
-reachable_from_cli = reachable_from_entrypoints
-
-
 def check_modules() -> list[str]:
     by_name = {_module_name(p): p for p in _py_files(SRC)}
     reached = reachable_from_entrypoints()

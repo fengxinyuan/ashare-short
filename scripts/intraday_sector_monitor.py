@@ -27,6 +27,7 @@ from datetime import time as clock_time
 from ashare_decision_support.adapters.freshness import in_session
 from ashare_decision_support.monitor.sector_session import SectorSession
 from ashare_decision_support.notify.render import render_sector_alerts, sector_alert_title
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.sectors import intraday
 
 
@@ -68,14 +69,14 @@ def main() -> None:
         taxonomies = {key: value for key, value in taxonomies.items() if key in set(args.level)}
 
     if not args.loop:
-        _one_pass(args, taxonomies, datetime.now(), session_date)
+        _one_pass(args, taxonomies, beijing_naive_now(), session_date)
         return
 
     hour, _, minute = args.until.partition(":")
     until = clock_time(int(hour), int(minute or 0))
 
     while True:
-        now = datetime.now()
+        now = beijing_naive_now()
         if now.time() > until:
             print(f"[{now:%H:%M:%S}] 到达 {args.until}，收工", flush=True)
             break

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from ashare_decision_support.adapters.base import MarketDataAdapter
 from ashare_decision_support.adapters.ratelimit import wrap_client
 from ashare_decision_support.numeric import finite, first_finite
 from ashare_decision_support.schedule.timezone import (
+    BEIJING_TZ,
     beijing_from_epoch,
     beijing_naive_now,
 )
@@ -15,7 +16,13 @@ from ashare_decision_support.schedule.timezone import (
 # Exchange timezone. Epoch-millisecond windows must be anchored to it explicitly,
 # otherwise a host running in UTC shifts the request window by 8 hours and
 # silently drops the first or last trading day of the range.
-CN_TZ = timezone(timedelta(hours=8))
+#
+# This used to be a local `timezone(timedelta(hours=8))`, duplicated verbatim in
+# `news/wallstreet_source.py`. `schedule/timezone.py` says the clock has exactly
+# one source, and two private copies are how that stops being true. Behaviour is
+# unchanged: the fixed +08:00 offset and `Asia/Shanghai` agree on every date from
+# 1992 on — they differ only across the 1986-1991 DST years, which no trading
+# date or news timestamp reaches.
 
 
 class TickFlowAdapterError(RuntimeError):
@@ -138,8 +145,8 @@ class TickFlowAdapter(MarketDataAdapter):
         if not callable(batch_fn):
             return self.get_historical_bars(symbols, start, end)
 
-        start_time = int(datetime.combine(start, time.min, tzinfo=CN_TZ).timestamp() * 1000)
-        end_time = int(datetime.combine(end + timedelta(days=1), time.min, tzinfo=CN_TZ).timestamp() * 1000) - 1
+        start_time = int(datetime.combine(start, time.min, tzinfo=BEIJING_TZ).timestamp() * 1000)
+        end_time = int(datetime.combine(end + timedelta(days=1), time.min, tzinfo=BEIJING_TZ).timestamp() * 1000) - 1
         count = min(max((end - start).days * 2 + 16, 64), 10000)
         step = max(1, min(int(chunk_size), BATCH_MAX_CHUNK))
 
@@ -201,8 +208,8 @@ class TickFlowAdapter(MarketDataAdapter):
         get_fn = getattr(klines, "get", None) or getattr(klines, "batch", None)
         if not callable(get_fn):
             return None
-        start_time = int(datetime.combine(start, time.min, tzinfo=CN_TZ).timestamp() * 1000)
-        end_time = int(datetime.combine(end + timedelta(days=1), time.min, tzinfo=CN_TZ).timestamp() * 1000) - 1
+        start_time = int(datetime.combine(start, time.min, tzinfo=BEIJING_TZ).timestamp() * 1000)
+        end_time = int(datetime.combine(end + timedelta(days=1), time.min, tzinfo=BEIJING_TZ).timestamp() * 1000) - 1
         count = min(max((end - start).days * 2 + 16, 64), 10000)
         # `adjust` is passed explicitly: the SDK default is forward adjustment,
         # which rescales history and makes limit-up/limit-down and tick-size

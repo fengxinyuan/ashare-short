@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from ashare_decision_support.jobs import run_post_close, run_pre_open
 from ashare_decision_support.notify import FileNotifier, split_utf8_text
@@ -136,7 +137,6 @@ def test_post_close_then_pre_open_round_trip(tmp_path) -> None:
         adapter=adapter,
         symbols=["AAA.SH", "BBB.SZ"],
         output_dir=tmp_path,
-        notifiers=[],
         # 涨停池要联网，且这条链路测的是选股段不是情绪判定。关掉后 regime 走
         # UNKNOWN 分支，仓位上限按退潮档——这正是「未知不等于中性」的预期行为。
         use_limit_pool=False,
@@ -146,6 +146,7 @@ def test_post_close_then_pre_open_round_trip(tmp_path) -> None:
     assert summary["scored"] == 2
     assert summary["actionable"] + summary["watch_only"] == 2
     assert summary["regime"] == "未知"
+    assert Path(summary["brief_path"]).name == f"post-close-{summary['trade_date'].replace('-', '')}.md"
 
     payload_path = tmp_path / "post_close_latest.json"
     assert payload_path.exists()

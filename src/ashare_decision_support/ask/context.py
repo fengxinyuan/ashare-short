@@ -25,6 +25,12 @@ from ashare_decision_support.advice.view import (
     sort_advice_items,
     trade_context_parts_from_dict,
 )
+from ashare_decision_support.artifacts import (
+    ADVICE_LATEST_NAME,
+    MORNING_LATEST_NAME,
+    POST_CLOSE_LATEST_NAME,
+    STRATEGY_SCREEN_LATEST_NAME,
+)
 from ashare_decision_support.runhealth import HealthLedger
 from ashare_decision_support.schedule.clock import AFTERNOON_CLOSE
 from ashare_decision_support.schedule.timezone import beijing_today
@@ -53,11 +59,6 @@ SESSION_OPEN = clock_time(9, 15)
 # 它留在本地；收盘时刻则和全仓一致，没有第二种口径。共用的是取值，不是叫法——
 # 本层的时段判断读作 `SESSION_CLOSE` 更顺，别名保留这个词。
 SESSION_CLOSE = AFTERNOON_CLOSE
-
-MORNING_LATEST_NAME = "morning_latest.json"
-ADVICE_LATEST_NAME = "advice_latest.json"
-POST_CLOSE_LATEST_NAME = "post_close_latest.json"
-STRATEGY_SCREEN_LATEST_NAME = "strategy_screen_latest.json"
 
 
 @dataclass
@@ -105,6 +106,21 @@ class AskContext:
         if self.notes:
             lines.append("")
             lines.extend(f"（{note}）" for note in self.notes)
+        return "\n".join(lines)
+
+    def render_compact(self) -> str:
+        """输出适合终端快速阅读的摘要，完整结构仍由 `render()` 保留。"""
+        lines = [f"【{self.phase_label}】{self.as_of}"]
+        if self.symbols:
+            lines.append(f"标的 {len(self.symbols)} 只：{'、'.join(self.symbols[:20])}")
+        for name, block in self.blocks.items():
+            lines.extend(["", f"[{name}]"])
+            lines.extend(_render_compact_block(name, block))
+        if self.notes:
+            lines.extend(["", "[数据提示]"])
+            lines.extend(f"- {note}" for note in self.notes[:12])
+            if len(self.notes) > 12:
+                lines.append(f"- … 另有 {len(self.notes) - 12} 条")
         return "\n".join(lines)
 
 
@@ -190,7 +206,9 @@ def assemble(
 
     # 盘前 / 非交易时段：读最近一次主链路的产出。
     if resolved in (PHASE_PRE_OPEN, PHASE_OFF_HOURS, PHASE_POST_CLOSE):
-        _load_payload(ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路")
+        _load_payload(
+            ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路", trim=_trim_morning
+        )
         _load_payload(
             ctx,
             output_dir,
@@ -200,7 +218,9 @@ def assemble(
         )
 
     if resolved == PHASE_INTRADAY:
-        _load_payload(ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路")
+        _load_payload(
+            ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路", trim=_trim_morning
+        )
         _load_payload(
             ctx,
             output_dir,
@@ -209,9 +229,11 @@ def assemble(
             trim=_trim_strategy_screen,
         )
         _load_alerts(ctx, moment.date())
+        _load_sector_confirmation(ctx, output_dir)
         _load_live_levels(ctx, compute_symbols)
     elif resolved == PHASE_POST_CLOSE:
         _load_alerts(ctx, moment.date())
+        _load_sector_confirmation(ctx, output_dir)
         _load_payload(ctx, output_dir, POST_CLOSE_LATEST_NAME, "次日执行卡")
     else:
         # 盘前与非交易时段没有当日实时价位可谈，用最近一次算过的那份。
@@ -231,6 +253,25 @@ def assemble(
     return ctx
 
 
+def _load_sector_confirmation(ctx: AskContext, output_dir: str | Path | None) -> None:
+    """Join two local artifacts; failure must not hide the rest of the facts bundle."""
+    try:
+        ctx.blocks["板块预测盘中验证"] = _build_sector_confirmation(
+            output_dir or "briefs"
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        ctx.notes.append(f"板块预测盘中验证不可用（{type(exc).__name__}: {exc}）")
+
+
+def _build_sector_confirmation(output_dir: str | Path) -> dict[str, Any]:
+    """Lazy import avoids research.monthly -> facts -> context import cycle."""
+    from ashare_decision_support.research.sector_confirmation import (
+        build_sector_confirmation,
+    )
+
+    return build_sector_confirmation(output_dir)
+
+
 # 全市场筛选进上下文时保留几条。**这是唯一一处按体积截断的地方**，理由是它的
 # 体积和它的信息量不成比例：实测一份三策略的扫描结果 110KB，其中 109KB 是 120 行
 # 结构完全相同的候选，而这一层要回答的是「最近一次筛选挑出了什么样的票」。
@@ -238,6 +279,75 @@ def assemble(
 # **静默截断读起来和「全都在这里」一模一样**，那正是这套系统各处都在防的事。
 SCREEN_KEEP_PER_PROFILE = 5
 SCREEN_KEEP_SHORTLIST = 10
+MORNING_KEEP_CANDIDATES = 12
+
+
+def _trim_morning(payload: Any) -> tuple[Any, list[str]]:
+    """Keep decision facts; leave large audit matrices in morning_latest.json."""
+    if not isinstance(payload, dict):
+        return payload, []
+
+    keep = (
+        "trade_date", "news_as_of", "market", "rotation_price", "turnover_migration",
+        "seesaw", "sector_index", "limit_pool", "rotation", "position_factor",
+        "suggested_position_factor", "position_factor_reasons", "sectors", "candidates",
+        "theme_radar", "macro_links", "sector_forecast_validation", "sector_clusters", "data_notes",
+    )
+    trimmed = {key: payload.get(key) for key in keep if payload.get(key) is not None}
+    sectors = payload.get("sectors") or []
+    trimmed["sectors"] = [_pick_sector(item) for item in sectors[:10]]
+    candidates = payload.get("candidates") or []
+    trimmed["candidates"] = [_pick_candidate(item) for item in candidates[:MORNING_KEEP_CANDIDATES]]
+    trimmed["data_notes"] = (payload.get("data_notes") or [])[:20]
+    for key in ("rotation_price", "turnover_migration", "seesaw", "sector_index"):
+        trimmed[key] = _trim_diagnostic(trimmed.get(key))
+
+    dropped_candidates = max(0, len(candidates) - len(trimmed["candidates"]))
+    dropped_notes = max(0, len(payload.get("data_notes") or []) - len(trimmed["data_notes"]))
+    omitted_sections = [key for key in payload if key not in keep]
+    note = (
+        "盘前主链路已为外部分析压缩："
+        f"候选保留前 {len(trimmed['candidates'])} 只（省略 {dropped_candidates}），"
+        f"数据说明省略 {dropped_notes} 条，审计块省略 {omitted_sections}；"
+        f"完整结果见 {MORNING_LATEST_NAME}"
+    )
+    trimmed["截断说明"] = note
+    return trimmed, [note]
+
+
+def _pick_sector(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    keys = (
+        "name", "level", "score", "direction", "ret_1d", "ret_5d", "breadth",
+        "volume_ratio", "net_inflow", "reasons", "warnings", "headlines",
+    )
+    return {key: item[key] for key in keys if key in item}
+
+
+def _pick_candidate(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    keys = (
+        "symbol", "name", "sector", "score", "last_close", "trend_state",
+        "stop_reference", "target_reference", "wyckoff_bias", "reasons", "warnings",
+        "score_components", "setup", "playbook", "industry_path", "concepts", "trade_flow",
+    )
+    return {key: item[key] for key in keys if key in item}
+
+
+def _trim_diagnostic(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key == "sectors":
+            continue
+        if isinstance(item, list):
+            result[key] = item[:3] if key in {"observations", "notes"} else item[:5]
+        else:
+            result[key] = item
+    return result
 
 
 def _trim_strategy_screen(payload: Any) -> tuple[Any, list[str]]:
@@ -470,6 +580,101 @@ def _render_block(block: Any, indent: str = "  ") -> list[str]:
             [f"{indent}… 另有 {len(block) - 12} 条"] if len(block) > 12 else []
         )
     return [f"{indent}{short(block)}"]
+
+
+def _render_compact_block(name: str, block: Any) -> list[str]:
+    """保留每块的决策字段，避免终端默认输出整份嵌套事实。"""
+    if not isinstance(block, dict):
+        return _render_block(block)[:16]
+    special_renderer = {
+        "数据健康": _render_data_health,
+        "板块预测盘中验证": _render_sector_confirmation,
+    }.get(name)
+    if special_renderer is not None:
+        return special_renderer(block)
+    if name == "盘前主链路":
+        market = block.get("market") or {}
+        lines = [
+            (
+                f"  大盘：{market.get('direction', '—')}；评分 {short(market.get('score'))}；"
+                f"上涨宽度 {short(market.get('breadth'))}；5日中位 {short(market.get('median_ret_5d'))}"
+            )
+        ]
+        sectors = block.get("sectors") or []
+        if sectors:
+            lines.append(
+                "  板块："
+                + "；".join(
+                    f"{item.get('name', '—')} {item.get('direction', '—')} {short(item.get('score'))}"
+                    for item in sectors[:8]
+                    if isinstance(item, dict)
+                )
+            )
+        candidates = block.get("candidates") or []
+        if candidates:
+            lines.append(
+                "  候选："
+                + "；".join(
+                    f"{item.get('symbol', '—')} {item.get('name', '')}".strip()
+                    for item in candidates[:8]
+                    if isinstance(item, dict)
+                )
+            )
+        lines.extend(f"  边界：{note}" for note in (block.get("data_notes") or [])[:4])
+        return lines
+    if name == "参数化策略扫描":
+        lines: list[str] = []
+        for profile, item in (block.get("profiles") or {}).items():
+            if not isinstance(item, dict):
+                continue
+            summary = item.get("summary") or {}
+            candidates = item.get("candidates") or []
+            symbols = "、".join(
+                str(row.get("symbol")) for row in candidates[:4] if isinstance(row, dict)
+            )
+            lines.append(
+                f"  {profile}：候选 {summary.get('candidates', len(candidates))}；"
+                f"前列 {symbols or '—'}"
+            )
+        shortlist = block.get("diversified_shortlist") or []
+        if shortlist:
+            lines.append(
+                "  综合短名单："
+                + "、".join(str(row.get("symbol")) for row in shortlist[:8] if isinstance(row, dict))
+            )
+        return lines or ["  暂无筛选结果。"]
+    if name in {"台账统计", "近期验证"}:
+        keys = ("samples", "sessions", "trusted", "model_ready", "available_sessions")
+        return [f"  {key}: {short(block[key])}" for key in keys if key in block]
+    full = _render_block(block)
+    return full[:24] + (["  … 已压缩，完整字段请使用 JSON"] if len(full) > 24 else [])
+
+
+def _render_sector_confirmation(block: dict[str, Any]) -> list[str]:
+    lines = [f"  截至：{block.get('as_of') or '—'}；{block.get('data_status', '—')}"]
+    lines.extend(
+        f"  - {item.get('name', '—')}：{item.get('status', '—')}；"
+        f"超额 {_reading(item.get('excess_pct'))}；广度 {_reading(item.get('breadth'))}"
+        for item in (block.get("results") or [])[:8]
+        if isinstance(item, dict)
+    )
+    return lines
+
+
+def _reading(value: Any) -> str:
+    return "—" if value is None else short(value)
+
+
+def _render_data_health(block: dict[str, Any]) -> list[str]:
+    status = block.get("status") or block.get("判定") or "—"
+    lines = [f"  总体：{status}"]
+    for item in (block.get("blocks") or block.get("块") or [])[:8]:
+        if isinstance(item, dict):
+            lines.append(
+                f"  - {item.get('name', item.get('名称', '—'))}："
+                f"{item.get('status', item.get('判定', '—'))}"
+            )
+    return lines
 
 
 def _render_advice_like_block(block: dict[str, Any]) -> list[str]:

@@ -369,7 +369,7 @@ HELP_TEXT = """可用命令：
 直接输入问题即可对话，例如「今天板块趋势怎么样」「600519 现在的买卖点是什么」「持仓里谁先触发告警」。"""
 
 
-def handle_command(  # noqa: PLR0911, PLR0912 - 见下
+def handle_command(  # noqa: PLR0911, PLR0912, C901 - 见下
     session: ChatSession,
     line: str,
     compute_symbols: Callable[[list[str]], dict],

@@ -14,7 +14,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from ashare_decision_support.adapters.base import fetch_daily_bars, security_names
+from ashare_decision_support.adapters.base import (
+    DAILY_LOOKBACK_DAYS,
+    fetch_daily_bars,
+    security_names,
+)
 from ashare_decision_support.advice.engine import AdviceEngine, StockAdvice, risk_reward
 from ashare_decision_support.monitor.feed import FeedHealth, assess_feed
 from ashare_decision_support.monitor.holdings import HoldingView
@@ -27,8 +31,6 @@ from ashare_decision_support.signals.orderflow import read_many
 from ashare_decision_support.signals.stabilise import assess_stabilisation
 from ashare_decision_support.state.alerts import AlertState
 from ashare_decision_support.symbols import bare_code, normalize_symbol
-
-DAILY_LOOKBACK_DAYS = 240
 
 # Minute granularity for the monitor. 1-minute bars give ~8 sessions of
 # history, which covers the 5-session volume baseline with room to spare.

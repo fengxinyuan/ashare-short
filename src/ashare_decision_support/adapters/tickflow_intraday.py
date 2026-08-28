@@ -52,12 +52,12 @@ import time
 from datetime import date, datetime
 from typing import Any
 
+from ashare_decision_support.adapters.base import SUPPORTED_PERIODS
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.schedule.timezone import BEIJING_TZ, beijing_from_epoch
 
 # 仓内沿用的周期写法（"1"/"5"/…）到 TickFlow 写法（"1m"/"5m"/…）。
 PERIOD_SUFFIX = "m"
-SUPPORTED_PERIODS: tuple[str, ...] = ("1", "5", "15", "30", "60")
 
 # 服务端单次返回上限，实测钉死在这个数上，调大 `count` 无效。
 MAX_BARS_PER_REQUEST = 5000
@@ -104,6 +104,11 @@ class TickFlowIntradayAdapter:
         symbols: list[str],
         period: str = "5",
         max_bars: int | None = None,
+        # **收下但不用**，而且不是疏漏：这一路是 `klines.batch` 一次要一批，
+        # 并发度由服务端的批量接口决定，没有可调的线程池——新浪那路是逐只
+        # 取数、`gather` 开池，所以那边它是真的生效的。留着是为了让两个适配器
+        # 的签名一致：`build_intraday_adapter` 在运行时才决定给出哪一个，签名
+        # 分叉会把「付费档能传、免费档不能传」变成只在生产才出现的 TypeError。
         max_workers: int | None = None,
     ) -> tuple[dict[str, list[dict]], list[str]]:
         if period not in SUPPORTED_PERIODS:

@@ -323,7 +323,7 @@ def test_the_sector_memory_carries_the_cross_day_dimension_into_facts(tmp_path) 
     今天仍在被转的利好，量价上该期待的东西完全不一样。语料库跨日累积的那一维
     在此之前没有任何生产读取点——写了两个月，谁也读不到。
     """
-    from ashare_decision_support.jobs.morning import _sector_news_memory
+    from ashare_decision_support.jobs.morning_fuse import _sector_news_memory
 
     corpus = store(tmp_path)
     old_story = doc("电网投资加码，特高压招标落地")
@@ -359,7 +359,7 @@ def test_the_sector_memory_carries_the_cross_day_dimension_into_facts(tmp_path) 
 
 def test_the_sector_memory_is_optional_evidence_not_a_hard_dependency(tmp_path) -> None:
     """`--no-news` 或语料库坏了，盘前主链路不该因此少一节结论。"""
-    from ashare_decision_support.jobs.morning import _sector_news_memory
+    from ashare_decision_support.jobs.morning_fuse import _sector_news_memory
 
     class Outlook:
         name = "电力设备"
@@ -371,7 +371,7 @@ def test_the_sector_memory_is_optional_evidence_not_a_hard_dependency(tmp_path) 
 def test_a_broken_corpus_says_so_instead_of_looking_like_a_quiet_day(tmp_path) -> None:
     """读失败返回空列表——那和「这个板块最近确实没有新故事」长得一模一样，
     而后者会被当成一条读数用进判断。所以读不到必须说出口。"""
-    from ashare_decision_support.jobs.morning import _sector_news_memory
+    from ashare_decision_support.jobs.morning_fuse import _sector_news_memory
 
     corpus = store(tmp_path)
     hot = doc("电网投资加码")

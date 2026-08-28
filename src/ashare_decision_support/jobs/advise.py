@@ -32,6 +32,7 @@ from ashare_decision_support.agents import (
     timing_note,
 )
 from ashare_decision_support.agents.debate import DebatePanel
+from ashare_decision_support.artifacts import ADVICE_LATEST_NAME
 from ashare_decision_support.jobs.progress import progress_reporter
 from ashare_decision_support.journal import Journal
 from ashare_decision_support.journal.records import Recommendation
@@ -54,9 +55,6 @@ from ashare_decision_support.strategy.playbook import evaluate_playbooks
 from ashare_decision_support.symbols import normalize_symbol
 from ashare_decision_support.writer import TemplateWriter, WriteRequest
 from ashare_decision_support.writer.base import BriefWriter
-
-ADVICE_LATEST_NAME = "advice_latest.json"
-DAILY_LOOKBACK_DAYS = 240
 
 # 台账里这条链路的来源标签。**必须与 `morning` 的 `"morning"` 区分开**：
 # `journal/stats.py` 的 `_selection_edge` / `_veto_cost` 比的是「同日、同筛选

@@ -139,6 +139,72 @@ def test_dump_json_creates_missing_parent_directory(tmp_path) -> None:
     assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
 
 
+def test_dump_json_does_not_duplicate_file_payload_on_stdout(tmp_path, capsys) -> None:
+    target = tmp_path / "result.json"
+    _dump_json({"large": [1, 2, 3]}, str(target))
+
+    assert target.is_file()
+    assert capsys.readouterr().out == ""
+
+
+def test_morning_cli_receipt_omits_bulky_diagnostics() -> None:
+    from ashare_decision_support.cli import _morning_cli_summary
+
+    summary = {
+        "trade_date": "2026-08-28",
+        "sectors_selected": ["电子"],
+        "payload_path": "briefs/morning_latest.json",
+        "news_sector_diagnostics": {"电子": {"documents": list(range(100))}},
+        "data_notes": [f"note-{index}" for index in range(12)],
+        "content": "very long report",
+    }
+
+    receipt = _morning_cli_summary(summary)
+
+    assert receipt["trade_date"] == "2026-08-28"
+    assert receipt["full_payload"] == "briefs/morning_latest.json"
+    assert "news_sector_diagnostics" not in receipt and "content" not in receipt
+    assert len(receipt["data_notes"]) == 8
+    assert receipt["data_notes_omitted"] == 4
+
+
+def test_intraday_facts_include_cached_sector_confirmation(tmp_path, monkeypatch) -> None:
+    from ashare_decision_support.ask import context
+
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps({"trade_date": "2026-08-28", "market": {}, "sectors": []}),
+        encoding="utf-8",
+    )
+    expected = {"schema": "ashare-sector-confirmation-v2", "results": []}
+    monkeypatch.setattr(context, "_build_sector_confirmation", lambda output_dir: expected)
+
+    ctx = context.assemble(
+        datetime(2026, 8, 28, 10, 0), output_dir=tmp_path, is_trading_day=True
+    )
+
+    assert ctx.blocks["板块预测盘中验证"] == expected
+    assert "[板块预测盘中验证]" in ctx.render_compact()
+    assert "截至：—" in ctx.render_compact()
+
+
+def test_facts_cli_accepts_the_same_phase_contract_as_mcp() -> None:
+    args = build_parser().parse_args(["facts", "--phase", "intraday", "--no-live"])
+    assert args.phase == "intraday"
+
+
+def test_facts_bundle_exposes_compact_text_without_changing_json_shape(tmp_path) -> None:
+    bundle = build_facts_bundle(
+        moment=datetime(2026, 8, 8, 20, 0),
+        output_dir=tmp_path,
+        is_trading_day=False,
+    )
+
+    assert len(bundle.compact_rendered) < len(bundle.rendered)
+    assert "[数据健康]" in bundle.compact_rendered
+    assert bundle.to_dict()["data_status"] in {"正常", "降级", "未记录"}
+    assert "compact_rendered" not in bundle.to_dict()
+
+
 def test_strategy_screen_parser_accepts_all_profiles() -> None:
     args = build_parser().parse_args(["strategy-screen", "--profile", "all", "--all-a", "--allow-st"])
     assert args.profile == "all"
@@ -172,7 +238,11 @@ def test_strategy_screen_cli_writes_batch_payload_with_stubbed_data(tmp_path, mo
 
     monkeypatch.setattr(cli, "ThsIndustryTaxonomy", Taxonomy)
     monkeypatch.setattr(cli, "_tickflow", lambda args: object())
-    monkeypatch.setattr(cli, "fetch_daily_bars", lambda adapter, symbols, start, end: {symbol: [] for symbol in symbols})
+    monkeypatch.setattr(
+        cli,
+        "fetch_daily_bars",
+        lambda adapter, symbols, start, end, **kwargs: {symbol: [] for symbol in symbols},
+    )
     target = tmp_path / "nested" / "screen.json"
     args = build_parser().parse_args(
         ["strategy-screen", "--profile", "all", "--exclude-st", "--output", str(target)]
@@ -182,7 +252,7 @@ def test_strategy_screen_cli_writes_batch_payload_with_stubbed_data(tmp_path, mo
     assert payload["schema"] == "ashare-strategy-screen-batch-v2"
     assert payload["profiles"]["balanced-pullback"]["summary"]["excluded_st"] == 1
     assert "fixture taxonomy" in payload["data_notes"]
-    assert capsys.readouterr().out
+    assert capsys.readouterr().out == ""
 
 
 def test_the_payloads_own_date_is_surfaced_so_stale_data_is_visible(tmp_path) -> None:
@@ -265,6 +335,7 @@ def test_facts_bundle_is_ready_for_external_ai_consumers() -> None:
 
     payload = bundle.to_dict()
     assert payload["schema"] == "ashare-facts-v1"
+    assert payload["data_status"] in {"正常", "降级", "未记录"}
     assert payload["contract"]["as_of_field"] == "as_of"
     assert payload["phase"] == PHASE_INTRADAY
     assert payload["facts"]["时段"] == "盘中"

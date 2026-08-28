@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ashare_decision_support.adapters.http import fetch_text
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import finite
 
@@ -42,7 +43,6 @@ BASE_URL = (
     "?page={page}&num={size}&sort=symbol&asc=1&node={node}&symbol=&_s_r_a=page"
 )
 REFERER = "https://vip.stock.finance.sina.com.cn/"
-USER_AGENT = "Mozilla/5.0"
 
 NODE_ALL_A = "hs_a"
 PAGE_SIZE = 100          # 服务端硬上限，加大无效
@@ -201,11 +201,9 @@ class MarketScanAdapter:
 
     def _page(self, page: int) -> list[dict]:
         url = BASE_URL.format(page=page, size=PAGE_SIZE, node=self.node)
-        request = urllib.request.Request(
-            url, headers={"User-Agent": USER_AGENT, "Referer": REFERER}
+        text = fetch_text(
+            self._opener, url, timeout=self.timeout, referer=REFERER, encoding="gbk"
         )
-        with self._opener(request, timeout=self.timeout) as response:
-            text = response.read().decode("gbk", "ignore")
         text = text.strip()
         if not text or text in ("null", "[]"):
             return []

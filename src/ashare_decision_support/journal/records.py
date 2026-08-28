@@ -165,9 +165,20 @@ class Recommendation:
     def to_dict(self) -> dict:
         return asdict(self)
 
-    @property
-    def key(self) -> str:
-        return f"{self.symbol}|{self.trade_date}|{self.source}"
+
+def record_key(row: Any) -> str:
+    """建议与兑现的关联键：`symbol|trade_date|source`。
+
+    这个键是台账唯一的 join——`Journal.pending()` 拿它判断一条建议有没有被兑现，
+    对不上的那些会被永远当成「还没结算」。所以它必须只有一处定义：此前
+    `Recommendation` 与 `Outcome` 各挂了一个同式的 `key` 属性，而**真正做 join 的
+    是 `store.py` 里的两句裸 f-string**，两个属性一个调用方都没有。三份并存时改
+    任何一份都不报错，只会让兑现悄悄停止匹配。
+
+    入参是**读回来的行**而不是 dataclass：台账是 JSONL，`pending()` 手里只有
+    `dict`。写入端要算这个键的话，`to_dict()` 之后同样能用。
+    """
+    return f"{row.get('symbol')}|{row.get('trade_date')}|{row.get('source')}"
 
 
 def _adjudication_record(advice: Any) -> dict[str, Any]:
@@ -257,10 +268,6 @@ class Outcome:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-    @property
-    def key(self) -> str:
-        return f"{self.symbol}|{self.trade_date}|{self.source}"
 
 
 def facts_hash(facts: Any) -> str:

@@ -26,6 +26,7 @@ from ashare_decision_support.adapters.base import (
     security_metadata,
 )
 from ashare_decision_support.agents.debate import DebatePanel
+from ashare_decision_support.artifacts import POST_CLOSE_LATEST_NAME, SNAPSHOT_LATEST_NAME
 from ashare_decision_support.jobs.sources import fetch_lhb_seats, fetch_limit_pool, fetch_trade_flow
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_post_close_brief
 from ashare_decision_support.notify.base import Notifier, publish, written_path
@@ -38,9 +39,6 @@ from ashare_decision_support.scoring import (
 from ashare_decision_support.strategy.positioning import resolve_position_sizing
 from ashare_decision_support.strategy.regime import regime_from_limit_pool
 from ashare_decision_support.strategy.select import evaluate_universe
-
-POST_CLOSE_LATEST_NAME = "post_close_latest.json"
-SNAPSHOT_LATEST_NAME = "snapshots_latest.json"
 
 
 def run_post_close(
@@ -160,7 +158,13 @@ def run_post_close(
             content = f"{content}\n\n## 多空视角\n\n{block}"
 
     title = f"盘后简报 {trade_date_resolved}"
-    file_notifier = FileNotifier(output_dir, slug="post-close")
+    # 文件名必须跟行情所属交易日走，而不是跟命令执行日走。15:00 前、休市日或
+    # 数据源晚一日时二者会不同；按执行日命名会让次日盘前拿错复盘归属。
+    file_notifier = FileNotifier(
+        output_dir,
+        slug="post-close",
+        stamp=trade_date_resolved.strftime("%Y%m%d"),
+    )
     channels = notifiers if notifiers is not None else [ConsoleNotifier(), file_notifier]
     delivered = publish(channels, title, content)
 

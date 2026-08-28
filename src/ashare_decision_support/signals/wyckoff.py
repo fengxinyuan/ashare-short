@@ -109,14 +109,18 @@ class WyckoffAnalyzer:
         elif effort_result == EffortResult.ABSORPTION:
             score += 8.0 if close_position >= 0.5 else -8.0
         elif effort_result == EffortResult.EXHAUSTION:
-            # 【存疑，本轮清理未改动行为】两个分支都是 8.0，所以 `close_position`
-            # 这个判据是**死的**——不论收在上半区还是下半区，结果都是 -8.0。
-            # 邻近的 ABSORPTION 写的是 `+8.0 if ... else -8.0`，对称地看，这里
-            # 原意大概是 `-8.0 if close_position >= 0.5 else +8.0`（衰竭出现在
-            # 上涨末端偏空，出现在下跌末端偏多）。
-            # 没有一条测试覆盖这个分支，改它会直接改动评分输出，属于口径决策
-            # 而不是清理，所以留给你定。
-            score -= 8.0 if close_position >= 0.5 else 8.0  # noqa: RUF034
+            # 衰竭出现在上涨末端偏空，出现在下跌末端偏多。
+            #
+            # **方向取自涨跌本身，不取自收盘位置。** `_effort_result` 是用
+            # `abs(short_move_pct) >= 1.2` 认出衰竭的——缩量而走出大幅波动，
+            # 涨跌方向在识别那一步就被 `abs()` 丢掉了，所以打分这一步必须自己
+            # 捡回来，否则「缩量急拉」和「缩量急杀」会拿到同一个分。邻近的
+            # COMPRESSION 分支用的是同一个判据（`short_return_pct >= 0`）。
+            #
+            # 2026-08-17 之前这里写的是 `8.0 if close_position >= 0.5 else 8.0`，
+            # 两个分支同值，恒为 -8.0——`close_position` 是个死判据，靠一行
+            # `noqa: RUF034` 压着。
+            score -= 8.0 if short_return_pct >= 0 else -8.0
         elif effort_result == EffortResult.COMPRESSION:
             score += 4.0 if short_return_pct >= 0 else -4.0
         score = round(clamp(score, -100.0, 100.0), 2)

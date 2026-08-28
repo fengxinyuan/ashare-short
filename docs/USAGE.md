@@ -16,11 +16,16 @@
 | 你想做的事 | 推荐命令 | 说明 |
 |---|---|---|
 | 看大盘和板块趋势 | `ashare-ds morning` | 盘前主链路：舆情 → 大盘趋势 → 板块排序 → 当日候选 |
+| 复看最近一次板块分析 | `ashare-ds sector-analysis` | 只读 `morning` 的落盘事实，不重复访问行情源 |
+| 生成板块情景预测 | `ashare-ds sector-forecast` | 主题重叠去重，并列出09:35后的确认/失效条件 |
+| 盘中验证板块预测 | `ashare-ds sector-confirmation` | 读取 `monitor` 已落盘截面，返回已确认/部分确认/已否决 |
+| 检查价格信号是否有效 | `ashare-ds sector-backtest` | 本地历史、固定基线、时间序列后30%留出验证 |
 | 问单只股票怎么走 | `ashare-ds ask "600519 现在趋势和买点怎么样"` | 单入口问答，按时段自动装上下文 |
 | 看单只股票的结构、量能和买卖点 | `ashare-ds advise 600519.SH` | 结合日线、分时、成交量、盘口生成买卖点 |
 | 做全市场参数化选股 | `ashare-ds strategy-screen --profile all` | 比较多种形态，输出确定性候选事实 |
 | 盯持仓与板块异动 | `ashare-ds monitor --feishu` | 不传代码就盯持仓；首轮补报已成立的买卖点，后续按跃迁提醒；**板块监控与名单无关，空仓也有话说** |
 | 导出统一事实包 | `ashare-ds facts --output facts.json` | 给 Codex / Claude 的结构化输入，不调模型 |
+| 维护历史缓存 | `ashare-ds history-refresh` | 回填同花顺板块指数与海外指数日线，供外盘映射历史基准率读取 |
 | 让模型多轮追问同一份事实 | `ashare-ds chat` | 适合连续问“为什么”“如果跌破怎么办”；回答会先给判断，再给证据 |
 | 让模型在候选价里做取舍 | `ashare-ds advise --adjudicate 600519.SH` | 用 LLM 做买卖点裁决，可弃权 |
 
@@ -32,12 +37,36 @@
 ashare-ds morning
 ashare-ds morning --explain   # 同时打印筛选漏斗
 ashare-ds morning --top-sectors 5 --top-concepts 3  # 行业、概念分开取名额
+ashare-ds sector-analysis     # 复看最近一次每日板块分析
+ashare-ds sector-analysis --format text      # markdown/text 等价
+ashare-ds sector-analysis --format json --output sector-analysis.json
+ashare-ds sector-forecast    # 情景排序；评分不是上涨概率
+ashare-ds monitor --once     # 09:35后采集一轮盘中板块截面
+ashare-ds sector-confirmation
+ashare-ds sector-backtest --output briefs/sector_backtest_latest.json
 ```
 
 这一步关注的是大盘、板块和当日候选，不是逐票追问。
 运行时会先打印几行阶段进度，再输出完整晨报。
 行业和概念默认并排计算、各自排名；概念不会参与全市场宽度，避免一只股票因多个
 题材标签被重复计权。只想看行业时使用 `--no-concepts`。
+
+`sector-analysis` 是只读查看入口：它读取 `briefs/morning_latest.json`，汇总主攻板块、
+行业指数位置、价格轮动、成交额迁移和情绪旁证，不会重新跑 `morning`，也不会消耗行情源配额。
+如果文件不存在，先运行一次 `ashare-ds morning`；如果数据日期早于今天，报告顶部会标出滞后天数，
+这时它只能当历史复看，不能当作“现在”的板块判断。
+
+`sector-forecast` 把高度重叠的行业和概念折成主题簇，避免“芯片、电子、存储”被误读成
+三条独立证据。输出明确区分预测目标日与信息截止日，并要求盘中广度、相对收益和成交额
+共同确认。`sector-backtest` 比较5日动量、超跌反转、趋势回调、强弱加速四个不调参基线；
+它的滚动3/5日窗口会重叠，因此只能用于识别明显失效，不能直接解释为独立胜率样本。
+`sector-confirmation` 不重写盘前判断，只附加盘中证据；广度低于45%，或放量但超额转负，
+会明确标记为“已否决”。没有09:35后的有效截面时只返回“等待数据”，不会猜测结果。
+CLI 每次运行会按“交易日 + 主题”去重写入确认台账，并保留状态变化序列；MCP 与
+`get_facts` 仍然完全只读，不会因为模型查看数据而修改台账。
+
+`--max-constituents` 只用于快速诊断链路，会在 summary 和 `morning_latest.json` 中标记
+`diagnostic_mode=true`。诊断模式下的覆盖率、主攻板块和候选都不能视为正式全量结论。
 
 晨报里有四节是**只出读数、不进打分**的（打分权重未经回测，这几层连权重都还没有）：
 
@@ -202,8 +231,29 @@ ashare-ds facts --output facts.json
 ashare-ds facts --sections 盘前主链路 持仓
 ```
 
+需要在终端快速查看时使用文本模式；默认是精简摘要，完整文本加 `--full`。JSON 模式
+仍然保留完整结构，并在顶层提供 `data_status`（`正常` / `降级` / `未记录`）。
+
+```bash
+ashare-ds facts --format text --no-live
+ashare-ds facts --format text --full --no-live
+```
+
 省掉的块名会写进 `notes`——**少给数据可以，让你以为「就这些」不行**。
 MCP 那一侧的 `get_facts` 有同名参数，两条路是同一份实现。
+CLI 也可用 `facts --phase pre_open|intraday|post_close|off_hours` 固定装配时段，适合
+回放和自动化测试；省略时仍按北京时间与交易日历自动判断。
+
+盘前研报包要看外盘映射的历史基准率时，先维护本地历史缓存：
+
+```bash
+ashare-ds history-refresh
+ashare-ds history-refresh --only overseas --keys sox kospi taiex
+```
+
+这条命令只填样本：同花顺板块指数 + 海外指数日线。`preopen-research` 会只读这些
+缓存，把「过去类似外盘条件出现后，相关 A 股板块怎么反应」放进
+`sector_base_rates`，但它不生成预测、不改变板块评分。
 
 包里有一块叫 `数据健康`，回答的是「这份包里每一块是什么时候的」：数据日期、落后了
 几个**交易日**、判定（当日 / 上一交易日 / 陈旧 / 缺失 / 读取失败），以及整份包是

@@ -19,8 +19,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from ashare_decision_support.adapters.base import SUPPORTED_PERIODS
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import finite
+from ashare_decision_support.symbols import prefixed_code
 from ashare_decision_support.tabular import records
 
 # Sina caps the response at this many bars per period, so the window each
@@ -33,8 +35,6 @@ SINA_MAX_BARS = 1970
 # an optimisation. Kept modest because sustained polling against Sina has not
 # been rate-limit tested — see docs/DATA_SOURCES.md §九.
 DEFAULT_WORKERS = 8
-
-SUPPORTED_PERIODS: tuple[str, ...] = ("1", "5", "15", "30", "60")
 
 
 class IntradayDataError(RuntimeError):
@@ -73,7 +73,9 @@ class SinaIntradayAdapter:
         workers = min(max(1, int(max_workers or self.max_workers)), len(symbols))
 
         def fetch(symbol: str) -> list[dict]:
-            table = self.ak.stock_zh_a_minute(symbol=sina_symbol(symbol), period=period, adjust="")
+            table = self.ak.stock_zh_a_minute(
+                symbol=prefixed_code(symbol), period=period, adjust=""
+            )
             bars = _to_bars(table, symbol)
             return bars[-max_bars:] if max_bars is not None else bars
 
@@ -106,21 +108,6 @@ class SinaIntradayAdapter:
             "periods": list(SUPPORTED_PERIODS),
             "max_bars_per_request": SINA_MAX_BARS,
         }
-
-
-def sina_symbol(symbol: str) -> str:
-    """`600519.SH` / `600519` -> `sh600519`."""
-    text = symbol.strip().lower()
-    if text.startswith(("sh", "sz", "bj")):
-        return text
-    code, _, suffix = text.partition(".")
-    if suffix in {"sh", "sz", "bj"}:
-        return f"{suffix}{code}"
-    if code.startswith(("600", "601", "603", "605", "688", "689")):
-        return f"sh{code}"
-    if code.startswith(("000", "001", "002", "003", "300", "301")):
-        return f"sz{code}"
-    return f"bj{code}"
 
 
 def _to_bars(table: Any, symbol: str) -> list[dict]:

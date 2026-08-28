@@ -33,7 +33,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 STATUS_TODAY = "当日"
@@ -195,12 +195,15 @@ def _default_calendar() -> Any:
 
 
 def _as_date(value: Any) -> date | None:
-    """`2026-08-12` / `20260812` / `date` 三种都收，其余返回 None。
+    """`2026-08-12` / `20260812` / `2026/08/12 15:00:00` / `date` 都收，其余返回 None。
 
-    三种是因为落盘的那几份 payload 各写各的：盘前主链路写 ISO 串，板块指数那一路
-    的 `trade_date` 是八位数字。认不出来时**不猜**——猜错一位就是把当日数据判成
-    陈旧，或者反过来。
+    形状这么多是因为落盘的那几份 payload 各写各的：盘前主链路写 ISO 串，板块指数
+    那一路的 `trade_date` 是八位数字，而 `morning` 的板块包里还会出现带斜杠、带
+    收盘时刻的写法（`research/daily_sector.py` 原来为此自己留了一份解析器）。
+    认不出来时**不猜**——猜错一位就是把当日数据判成陈旧，或者反过来。
     """
+    if isinstance(value, datetime):
+        return value.date()
     if isinstance(value, date):
         return value
     text = str(value or "").strip()
@@ -208,6 +211,9 @@ def _as_date(value: Any) -> date | None:
         return None
     if len(text) == 8 and text.isdigit():
         text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    # 日期之后的部分（空格分隔的时刻、或者 `T`）对判定没有影响，切掉再解析；
+    # 斜杠与短横只是同一个日期的两种写法。
+    text = text.replace("/", "-")[:10]
     try:
         return date.fromisoformat(text)
     except ValueError:

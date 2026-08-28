@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ashare_decision_support.numeric import finite, positive
+from ashare_decision_support.numeric import finite, mean, positive
 
 # 近端窗口：用最后这么多根分钟线判断「现在」的状态。
 RECENT_BARS = 10
@@ -144,7 +144,7 @@ def _reversal(rows: list[dict]) -> str | None:
     last = rows[-1]
     prior = rows[-(REVERSAL_LOOKBACK + 1) : -1]
     prior_high = max(row["high"] for row in prior)
-    prior_volume = _mean([row["volume"] for row in prior])
+    prior_volume = _mean_volume(prior)
     if not prior_volume or last["close"] <= prior_high:
         return None
     ratio = last["volume"] / prior_volume
@@ -175,8 +175,8 @@ def _retest(rows: list[dict]) -> str | None:
 
 
 def _contraction(recent: list[dict], baseline: list[dict]) -> float | None:
-    base = _mean([row["volume"] for row in baseline])
-    now = _mean([row["volume"] for row in recent])
+    base = _mean_volume(baseline)
+    now = _mean_volume(recent)
     if not base or now is None:
         return None
     return round(now / base, 4)
@@ -204,8 +204,10 @@ def _clean(bars: list[dict]) -> list[dict]:
     return rows
 
 
-def _mean(values: list[float]) -> float | None:
-    usable = [value for value in values if value > 0]
-    if not usable:
-        return None
-    return sum(usable) / len(usable)
+def _mean_volume(rows: list[dict]) -> float | None:
+    """成交量均值，跳过 0。
+
+    `_clean` 把取不到的成交量填成 0.0，所以这一列里的 0 是「没这一格」而不是
+    「这根没成交」。先过 `positive` 再求平均，`mean` 会把它交回来的 None 跳掉。
+    """
+    return mean(positive(row["volume"]) for row in rows)

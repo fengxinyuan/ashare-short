@@ -28,7 +28,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,6 +45,7 @@ from ashare_decision_support.factcheck import (
     fact_numbers,
     review_output,
 )
+from ashare_decision_support.llmreply import parse_object
 from ashare_decision_support.writer.llm import DEFAULT_PROVIDER, LlmClient
 
 SYSTEM_PROMPT = """你是一名 A 股超短线交易员的价位裁决助手。
@@ -182,7 +182,7 @@ class LevelAdjudicator:
             fallback.notes.append(f"裁决调用失败（{type(exc).__name__}），退回规则默认")
             return fallback
 
-        payload = _parse_json(raw or "")
+        payload = parse_object(raw or "")
         if payload is None:
             fallback.notes.append("裁决输出不是可解析的 JSON，退回规则默认")
             return fallback
@@ -297,21 +297,3 @@ def _resolve(candidates: CandidateSet, key: Any, side: str) -> PriceCandidate | 
     # side 也要对：模型把止损位填进 entry 字段时，价格本身是合法候选，但那组
     # 结论是错的。按 key 查到还不够，还得查到的是这一侧的候选。
     return found if found is not None and found.side == side else None
-
-
-_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _parse_json(raw: str) -> dict | None:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        _, _, text = text.partition("\n")
-    match = _JSON_BLOCK.search(text)
-    if match is None:
-        return None
-    try:
-        payload = json.loads(match.group())
-    except (ValueError, TypeError):
-        return None
-    return payload if isinstance(payload, dict) else None

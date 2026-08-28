@@ -48,19 +48,23 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.adapters.http import BROWSER_USER_AGENT, fetch_text
 from ashare_decision_support.jsoncache import read_stamped, write_stamped
 from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_home
 from ashare_decision_support.symbols import normalize_symbol
 
+# 这份静态分类的地址与两个文件名。**同一台主机上的同两个文件还被
+# `adapters/security_master.py` 读一遍**（它取的是同两份 JSON 里的名称与标签，
+# 做的是标的画像，不是板块分类），所以那边从这里 import，不再写第二份。
+#
+# 这是「改一处而漏了另一处不会报错」的那一类：上游换个文件名或换台机器，只改一边
+# 的话另一边照样能跑——它只会继续对着旧地址取，直到某天两个模块对同一只票的行业
+# 给出不同答案，而中间没有任何一步会失败。
 BASE_URL = "https://files.688798.xyz/ths/"
 INDUSTRY_FILE = "industries.json"
 CONCEPT_FILE = "concepts.json"
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 TIMEOUT_SECONDS = 30
 
 CACHE_DIR_NAME = "taxonomy"
@@ -354,12 +358,11 @@ class ThsTaxonomySource:
         )
 
     def _get_json(self, filename: str, errors: list[str]) -> Any:
-        request = urllib.request.Request(
-            f"{self.base_url}{filename}", headers={"User-Agent": USER_AGENT}
-        )
         try:
-            with self._opener(request, timeout=self.timeout) as response:
-                payload = response.read().decode("utf-8", "ignore")
+            payload = fetch_text(
+                self._opener, f"{self.base_url}{filename}", timeout=self.timeout,
+                user_agent=BROWSER_USER_AGENT,
+            )
             return json.loads(payload)
         except Exception as exc:
             errors.append(f"{filename}: {type(exc).__name__}")

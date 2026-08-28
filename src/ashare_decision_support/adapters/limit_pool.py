@@ -25,8 +25,15 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+from ashare_decision_support.adapters.http import BROWSER_USER_AGENT, fetch_text
+from ashare_decision_support.emotion_scale import (
+    BLOWUP_HEALTHY,
+    BLOWUP_STRESSED,
+    STREAK_MOMENTUM,
+    STREAK_WEAK,
+)
 from ashare_decision_support.fanout import gather
-from ashare_decision_support.numeric import as_int, finite
+from ashare_decision_support.numeric import as_int, finite, median_of
 
 BASE_URL = (
     "https://push2ex.eastmoney.com/getTopic{pool}Pool"
@@ -34,10 +41,6 @@ BASE_URL = (
     "&Pageindex=0&pagesize={size}&sort=fbt%3Aasc&date={date}"
 )
 REFERER = "https://quote.eastmoney.com/"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 
 POOL_LIMIT_UP = "ZT"
 POOL_BLOWUP = "ZB"
@@ -49,19 +52,16 @@ TIMEOUT_SECONDS = 12
 # 盘前回溯上限。跨一个长假也够。
 LOOKBACK_DAYS = 5
 
-# 情绪分档。连板高度是超短线情绪最常用的刻度：能出 5 板说明有资金愿意接力，
-# 全场最高 2 板说明没有。分档只用于措辞，不参与打分。
-STREAK_STRONG = 5
-STREAK_WEAK = 2
-
-# 炸板率分档，同样只用于措辞。
-BLOWUP_HEALTHY = 0.25
-BLOWUP_STRESSED = 0.45
+# 情绪分档只用于措辞，不参与打分——但**切点仍然共用** `emotion_scale.py` 那一份。
+# 「只是措辞」不构成自己定一套的理由：这几句话和闸门的周期判定挨着进同一份简报
+# （`jobs/sources.py` 先倒 `describe()`，再把同一个快照交给闸门），切点差一点，
+# 读的人看到的就是系统对着同一个炸板率自相矛盾。
 
 # 首封时间的早/晚分界。10:00 前封住 = 开盘半小时内就有资金把它按在板上，
 # 主动性买盘；尾盘才封的多是偷袭或跟风，次日的接力意愿是两回事。
 #
 # 这条线和下面的占比分档只用于措辞，同 STREAK / BLOWUP 两组，不参与打分。
+# 它们没有第二个调用方，所以留在本模块。
 EARLY_SEAL_BEFORE = "10:00"
 EARLY_SEAL_STRONG = 0.5
 
@@ -168,11 +168,15 @@ class LimitPoolSnapshot:
         用中位数不用均值：封单金额是长尾分布，2026-08-07 实测最大 6.51 亿、
         中位只有 0.72 亿——均值会被那一两只独苗拉起来，把「全场封板普遍很薄」
         这个事实盖掉，而薄不薄才是次日会不会被砸开的那个量。
+
+        走 `numeric.median_of` 而不是自己排一遍取中间那个：这两个属性此前各写了
+        一份**逐字相同**的「排序、空判、取 `len // 2`」，而那个写法与全仓另外
+        14 处中位数（`broad_index` / `momentum` / `predict` / `rotation`）**不是
+        同一个口径**——偶数个样本时它取上中位，`median_of` 取两个中位的均值。
+        差别只在偶数那一档、只落在简报的一行读数上，但「同一个词在同一个系统里
+        指两件事」正是这类读数最容易被误读的地方。
         """
-        funds = sorted(item.seal_fund for item in self.limit_up if item.seal_fund is not None)
-        if not funds:
-            return None
-        return funds[len(funds) // 2]
+        return median_of(item.seal_fund for item in self.limit_up)
 
     @property
     def median_turnover(self) -> float | None:
@@ -186,10 +190,7 @@ class LimitPoolSnapshot:
         同样用中位数：换手率的上下限差了 20 倍（1.21% ~ 24.12%），均值说不出
         「大多数板是什么样」。
         """
-        rates = sorted(item.turnover for item in self.limit_up if item.turnover is not None)
-        if not rates:
-            return None
-        return rates[len(rates) // 2]
+        return median_of(item.turnover for item in self.limit_up)
 
     def sector_distribution(self, top: int = SECTOR_TOP) -> list[tuple[str, int]]:
         """涨停按东财行业分组，只数从多到少。并列时按行业名排序，保证可 diff。"""
@@ -217,7 +218,7 @@ class LimitPoolSnapshot:
                 verdict = "封板结实"
             lines.append(f"炸板率 {rate:.0%}（{verdict}）")
         if self.max_streak:
-            if self.max_streak >= STREAK_STRONG:
+            if self.max_streak >= STREAK_MOMENTUM:
                 verdict = "有资金愿意接力"
             elif self.max_streak <= STREAK_WEAK:
                 verdict = "没有持续性资金"
@@ -344,11 +345,12 @@ class LimitPoolAdapter:
 
     def _fetch_pool(self, pool: str, stamp: str) -> tuple[list[LimitStock], date | None]:
         url = BASE_URL.format(pool=pool, size=self.page_size, date=stamp)
-        request = urllib.request.Request(
-            url, headers={"User-Agent": USER_AGENT, "Referer": REFERER}
+        payload = json.loads(
+            fetch_text(
+                self._opener, url, timeout=self.timeout, referer=REFERER,
+                user_agent=BROWSER_USER_AGENT,
+            )
         )
-        with self._opener(request, timeout=self.timeout) as response:
-            payload = json.loads(response.read().decode("utf-8", "ignore"))
 
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):

@@ -13,8 +13,15 @@
 项目内的 `leadership_rank` 只表示同一板块内的相对量价与流动性名次。它不是产业
 地位、胜率、预期收益，也不是买入建议。产业龙头身份必须由外部一手资料核验。
 
-系统不下单、不撤单、不接管账户。下面三个工具里只有 `refresh_sector_leaders` 会
-联网并写一个 JSON 文件，其余两个只读已落盘的结果。系统替你记着的名单只有**持仓**
+读事实包时另有三条不能越的线：
+
+- `as_of` 与 `session_date` 不一致时，那份数据只能用于结构回顾，不能当实时行情；
+- 缺失字段是 `null` 或空集合，表示**未知**，不是零、也不是否定；
+- 基本面、估值、真实筹码分布、两融余额尚无稳定数据源，模型不得代为补造。
+
+系统不下单、不撤单、不接管账户。下面八个工具里只有 `preopen_research_context`
+和 `refresh_sector_leaders` 可能联网；其中 `refresh_sector_leaders` 会写一个 JSON
+文件，其余工具只读或组合已落盘的结果。系统替你记着的名单只有**持仓**
 （`ashare-ds position open <代码> --cost <成本价>`）——自选股与候选池已删，事实包里的候选是当天晨报的
 结论，不是一份持续维护的清单。
 
@@ -27,11 +34,16 @@ python3 -m pip install -e ".[tickflow]"
 仓库已包含 Codex 的 `.codex/config.toml` 和 Claude Code 的 `.mcp.json`。两份配置都
 用 `python3 -m ashare_decision_support.mcp_server`（`PYTHONPATH=src`）拉起同一个
 STDIO 服务，装过包之后 `ashare-ds-mcp` 是同一个入口。重新进入项目会话后，客户端
-可看到三个工具：
+可看到八个工具：
 
 | 工具 | 是否联网/写盘 | 用途 |
 |---|---|---|
 | `get_facts` | 否 | 读取盘前、盘中、盘后、台账和策略扫描事实 |
+| `daily_sector_analysis` | 否 | 读取最近一次 `morning` 生成的每日板块分析 |
+| `sector_forecast` | 否 | 输出主题簇情景、拥挤度、校准状态和盘中证伪协议 |
+| `sector_confirmation` | 否 | 用当天已落盘板块截面确认或否决最新盘前情景 |
+| `sector_baseline_backtest` | 否 | 用本地行业指数验证四种固定价格基线的1/3/5日相对收益 |
+| `preopen_research_context` | 可能 | 组合 A 股落盘事实与隔夜外盘研究资料；不生成交易指令 |
 | `refresh_sector_leaders` | 是 | 扫全市场日线，生成每个行业/概念的量价龙头候选 |
 | `monthly_outlook_context` | 否 | 组合月度事实、龙头、轮动记忆、事件窗口和外部研究任务 |
 
@@ -66,6 +78,10 @@ STDIO 服务，装过包之后 `ashare-ds-mcp` 是同一个入口。重新进入
 ```
 
 省掉的块名同样写进 `notes`——**少给数据可以，让你以为「就这些」不行**。
+
+盘中和盘后调用 `get_facts` 时，统一事实包会自动增加 `板块预测盘中验证`：它把最新
+盘前主题与当天已落盘板块截面对齐。只要先运行过 `monitor --once`，外部模型无需再
+拼接两个工具结果；没有有效截面时该块明确返回“等待数据”。
 
 Codex 也可以用官方 CLI 手工登记：
 

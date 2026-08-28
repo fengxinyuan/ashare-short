@@ -14,10 +14,10 @@
 
 - 只解析、不执行。这条闸门管的是「这条命令存不存在、参数拼没拼错」，
   不打网络、不碰状态目录。
-- 三份文档不在范围内，因为它们**按用途就不是用法文档**：`ROADMAP.md` /
-  `REWORK.md` 写的是还没做的设计，`DECISIONS.md` 记的是已经删掉的东西——两者
-  里面的命令解析失败都是正确结果。范围按文档的用途划，不是按一份「这几行豁免」
-  的清单：豁免清单三个月内就会长成第二份没人读的文档。
+- 两份文档不在范围内，因为它们**按用途就不是用法文档**：`ROADMAP.md` 写的是还没做的
+  设计，`DECISIONS.md` 记的是已经删掉的东西——两者里面的命令解析失败都是正确结果。
+  范围按文档的用途划，不是按一份「这几行豁免」的清单：豁免清单三个月内就会长成第二份
+  没人读的文档。
 - 带 `<占位符>` 的模板行跳过。`ashare-ds position open <代码> --cost <成本价>`
   按定义就不是一条能执行的命令，它是在告诉你要填什么。
 
@@ -38,8 +38,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-# 不是用法文档：ROADMAP / REWORK 写将来要做的，DECISIONS 记已经删掉的。
-NOT_USAGE_DOCS = {"ROADMAP.md", "REWORK.md", "DECISIONS.md"}
+# 不是用法文档：ROADMAP 写将来要做的，DECISIONS 记已经删掉的。
+NOT_USAGE_DOCS = {"ROADMAP.md", "DECISIONS.md"}
 
 # 占位符模板：`<代码>` / `<成本价>` 这类，按定义不是一条能执行的命令。
 _PLACEHOLDER = re.compile(r"[<>]")

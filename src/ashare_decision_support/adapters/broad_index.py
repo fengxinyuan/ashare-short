@@ -42,14 +42,11 @@ from __future__ import annotations
 
 import urllib.request
 from dataclasses import dataclass, field
-from statistics import median
 from typing import Any
 
-from ashare_decision_support.numeric import positive
+from ashare_decision_support.adapters.http import SINA_QUOTE_URL, SINA_REFERER, fetch_text
+from ashare_decision_support.numeric import median_of, positive
 
-SINA_URL = "https://hq.sinajs.cn/list="
-SINA_REFERER = "https://finance.sina.com.cn"
-USER_AGENT = "Mozilla/5.0"
 DEFAULT_TIMEOUT = 10.0
 
 # 覆盖大中小盘与两个科技板。**必须同时含大盘与小盘**：这一层存在的意义就是
@@ -133,8 +130,7 @@ class BroadIndexRead:
 
     @property
     def median_ret(self) -> float | None:
-        rets = self._rets()
-        return median(rets) if rets else None
+        return median_of(self._rets())
 
     @property
     def advancing(self) -> int:
@@ -186,7 +182,7 @@ class BroadIndexAdapter:
     def fetch(self) -> BroadIndexRead:
         read = BroadIndexRead()
         try:
-            body = self._get(SINA_URL + ",".join(code for code, _name in self.indices))
+            body = self._get(SINA_QUOTE_URL + ",".join(code for code, _name in self.indices))
         except Exception as exc:
             read.notes.append(f"宽基指数不可用（{type(exc).__name__}），本次无市值加权口径读数")
             return read
@@ -220,11 +216,10 @@ class BroadIndexAdapter:
         }
 
     def _get(self, url: str) -> str:
-        request = urllib.request.Request(
-            url, headers={"Referer": SINA_REFERER, "User-Agent": USER_AGENT}
+        return fetch_text(
+            self._opener, url, timeout=self.timeout, referer=SINA_REFERER,
+            encoding="gbk", errors="replace",
         )
-        with self._opener(request, timeout=self.timeout) as response:
-            return response.read().decode("gbk", errors="replace")
 
 
 def _parse(body: str, names: dict[str, str]) -> list[IndexQuote]:

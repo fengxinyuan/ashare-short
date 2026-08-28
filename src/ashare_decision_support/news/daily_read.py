@@ -50,13 +50,13 @@ note，调用方照常出简报。和这个包里其余模块同一条约定。
 
 from __future__ import annotations
 
-import json
-import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
 from ashare_decision_support.factcheck import review_output
+from ashare_decision_support.llmreply import anchor_text, parse_object
 from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.dedup import parse_published
 
@@ -192,8 +192,6 @@ MIN_ANCHOR_CHARS = 5
 
 DIRECTIONS = ("bullish", "bearish", "mixed")
 
-_NORM_PATTERN = re.compile(r"[\s　【】\[\]（）()《》「」“”\"':：,，.。!！?？、|]+")
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # 纯文本型分节（chains 与 holdings 结构不同，单独处理）。
 TEXT_SECTIONS = ("mainlines", "risks")
@@ -378,7 +376,7 @@ class DailyNewsReader:
         except Exception as exc:
             return DailyRead(notes=[f"舆情通读调用失败（{type(exc).__name__}），本次跳过"])
 
-        payload = _parse_json_object(raw or "")
+        payload = parse_object(raw or "")
         if not payload:
             return DailyRead(notes=["舆情通读返回的不是 JSON，本次丢弃"])
 
@@ -557,8 +555,8 @@ def _harvest(
     symbol_docs: dict[str, list[NewsDoc]],
 ) -> DailyRead:
     """把模型的 JSON 变成结论，逐条核对引用。引用不到原文的整条丢弃。"""
-    corpus = [_norm(doc.title) for doc in docs]
-    corpus += [_norm(doc.title) for items in symbol_docs.values() for doc in items]
+    corpus = [anchor_text(doc.title) for doc in docs]
+    corpus += [anchor_text(doc.title) for items in symbol_docs.values() for doc in items]
     known_symbols = set(symbol_docs)
 
     result = DailyRead()
@@ -598,30 +596,9 @@ def _harvest(
             symbol=symbol,
         )
 
-    chains: list[Chain] = []
-    for row in _as_list(payload.get("chains")):
-        if not isinstance(row, dict):
-            continue
-        trigger = str(row.get("trigger") or "").strip()
-        if not trigger:
-            continue
-        evidence = cited(row)
-        if not evidence:
-            dropped += 1
-            continue
-        direction = row.get("direction")
-        chains.append(
-            Chain(
-                trigger=trigger,
-                mechanism=str(row.get("mechanism") or "").strip()[:24],
-                targets=tuple(
-                    str(t) for t in _as_list(row.get("targets")) if isinstance(t, str)
-                )[:3],
-                direction=direction if direction in DIRECTIONS else "mixed",
-                evidence=evidence,
-            )
-        )
+    chains, dropped_chains = _chains(payload.get("chains"), cited)
     result.chains = chains
+    dropped += dropped_chains
 
     for name in TEXT_SECTIONS:
         items = [build(row) for row in _as_list(payload.get(name))]
@@ -639,9 +616,47 @@ def _harvest(
     return result
 
 
+def _chains(rows: Any, cited: Callable[[dict], tuple[str, ...]]) -> tuple[list[Chain], int]:
+    """传导链一段：返回（链条，丢弃条数）。
+
+    从 `_harvest` 里切出来，是因为它是那三段里唯一**不走 `build()`** 的一段：
+    链条的必填字段是 `trigger` 不是 `text`，产物是 `Chain` 不是 `ReadItem`，
+    而且它还多一个 `direction` 要收窄。混在一起时，那个 `dropped` 计数器同时
+    被两套字段规则改写，读的人得先分清哪一段在管哪一类。
+
+    **丢弃条数往回带而不是在这里记 note。** 「丢了几条」是整份通读的一个数，
+    三段各记一句的话，简报里会出现三行说同一件事的提示。
+    """
+    chains: list[Chain] = []
+    dropped = 0
+    for row in _as_list(rows):
+        if not isinstance(row, dict):
+            continue
+        trigger = str(row.get("trigger") or "").strip()
+        if not trigger:
+            continue
+        evidence = cited(row)
+        if not evidence:
+            dropped += 1
+            continue
+        direction = row.get("direction")
+        chains.append(
+            Chain(
+                trigger=trigger,
+                mechanism=str(row.get("mechanism") or "").strip()[:24],
+                targets=tuple(str(t) for t in _as_list(row.get("targets")) if isinstance(t, str))[
+                    :3
+                ],
+                direction=direction if direction in DIRECTIONS else "mixed",
+                evidence=evidence,
+            )
+        )
+    return chains, dropped
+
+
 def _cites(anchor: str, corpus: list[str]) -> bool:
     """模型回抄的前缀能不能在原文里找到。"""
-    needle = _norm(anchor)[:ANCHOR_CHARS]
+    needle = anchor_text(anchor)[:ANCHOR_CHARS]
     if len(needle) < MIN_ANCHOR_CHARS:
         return False
     return any(title.startswith(needle) or needle in title for title in corpus)
@@ -653,27 +668,6 @@ def _all_text(result: DailyRead) -> str:
     for name in (*TEXT_SECTIONS, "holdings"):
         parts.extend(item.text for item in getattr(result, name))
     return " ".join(part for part in parts if part)
-
-
-def _parse_json_object(text: str) -> dict:
-    candidate = text.strip()
-    fenced = _FENCE.search(candidate)
-    if fenced:
-        candidate = fenced.group(1).strip()
-    if not candidate.startswith("{"):
-        start, end = candidate.find("{"), candidate.rfind("}")
-        if start == -1 or end <= start:
-            return {}
-        candidate = candidate[start : end + 1]
-    try:
-        parsed = json.loads(candidate)
-    except ValueError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _norm(text: str) -> str:
-    return _NORM_PATTERN.sub("", text or "")
 
 
 def _as_list(value: Any) -> list:

@@ -10,10 +10,10 @@ from __future__ import annotations
 import math
 import random
 
+from ashare_decision_support.sectors.panel import pearson
 from ashare_decision_support.sectors.seesaw import (
     MIN_HALF_POINTS,
     SeesawRead,
-    _pearson,
     _returns,
     explain_divergence,
     read_seesaw,
@@ -210,7 +210,7 @@ def test_returns_are_paired_by_trade_date_not_by_index() -> None:
     left = list(_returns(dict(payload.values()).get("甲") or [], 60).values())
     right = list(_returns(dict(payload.values()).get("乙") or [], 60).values())
     size = min(len(left), len(right))
-    by_index = _pearson(left[-size:], right[-size:])
+    by_index = pearson(left[-size:], right[-size:])
     assert by_index is not None
     assert by_index > pair.correlation + 0.3
 

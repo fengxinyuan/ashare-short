@@ -443,6 +443,36 @@ ashare-ds preopen-research --output briefs/preopen-research.json
 - 深挖问答：`src/ashare_decision_support/ask/runner.py`
 - 多空裁判：`src/ashare_decision_support/agents/debate.py`
 
+### 六.1 动态买卖点裁决：唯一带程序校验的那条
+
+上面的模板都靠模型自律，只有这条的输出会被代码逐字核对。买入、止损、目标不是写死的
+一组数字：每次实时分析都从当时的分时均价、日内高低、日线结构与盘口生成一个候选集，
+模型只能**从候选集里选 key**，不能自己造价。候选随新 facts 重算，不能跨时段复用。
+
+```bash
+ashare-ds facts --symbols 600519.SH --output /tmp/live-facts.json
+ashare-ds codex-adjudication-packet --facts /tmp/live-facts.json --output /tmp/packet.json
+```
+
+把 `packet.json` 和这段要求一起交给模型：
+
+```text
+仅针对 packet.symbols 中的标的作答。每只标的只返回一条 decisions 项：
+action 为 select 或 abstain；select 必须从 candidates 的 key 中选择 entry、stop，
+target 可为 null；abstain 时三者均为 null。不得输出价格、仓位、下单或候选外标的。
+reason 不超过 120 字，数字必须原样来自 packet。信息不足、风险警告或盘口失真时应 abstain。
+```
+
+返回内容存成 `decision.json` 后过校验：
+
+```bash
+ashare-ds codex-adjudication-validate \
+  --packet /tmp/packet.json --decision decision.json
+```
+
+校验通过只说明「这次选择落在当前事实与时效边界内」，**不是交易授权**——系统不生成
+订单，也不连券商。判据见下面 §七 最后一行。
+
 ## 七、这些提示词里，哪几条真的被执行
 
 **提示词是请求，闸门才是约束。** 上面每一份都写着「不许编数字」「不许给概率」
@@ -456,5 +486,5 @@ ashare-ds preopen-research --output briefs/preopen-research.json
 | 不得改变已经算好的结论（仓位上限、情绪周期、时段） | `factcheck.py:OutputGuard.stance_conflicts` | 同上 |
 | 裁决只能在候选集里选，不能造价 | `advice/adjudicate.py`（模型输出候选 key，再过一道精确相等） | 该标的弃权 |
 
-后两条 2026-08-15 才接上；在那之前它们只写在提示词里，没有任何执行。判据与边界见
-[`PEER_DAILY_STOCK_ANALYSIS.md`](PEER_DAILY_STOCK_ANALYSIS.md) §2.1。
+后两条 2026-08-15 才接上；在那之前它们只写在提示词里，没有任何执行。
+判据与边界见 [`DECISIONS.md`](DECISIONS.md) §二十三。

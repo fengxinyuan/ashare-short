@@ -3,22 +3,17 @@
 from __future__ import annotations
 
 import email.utils
-import urllib.request
 import xml.etree.ElementTree as element_tree
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any
 
-from ashare_decision_support.news.balance import collect_by_feed
-from ashare_decision_support.news.base import NewsDoc, NewsSource
-from ashare_decision_support.news.cache import NewsCache, cached_docs
-from ashare_decision_support.news.health import probe_feeds
+from ashare_decision_support.news.base import NewsDoc
+from ashare_decision_support.news.cache import NewsCache
+from ashare_decision_support.news.feed_source import TIMEOUT_SECONDS, FeedNewsSource
 from ashare_decision_support.schedule.timezone import to_beijing_naive
 
-USER_AGENT = "Mozilla/5.0"
-TIMEOUT_SECONDS = 15
-PER_FEED_LIMIT = 30
 MAX_RESPONSE_BYTES = 1_000_000
 
 
@@ -52,10 +47,13 @@ OFFICIAL_GLOBAL_FEEDS: tuple[RssFeed, ...] = (
 )
 
 
-class RssNewsSource(NewsSource):
+class RssNewsSource(FeedNewsSource):
     """Curated feeds with the same partial-failure contract as other sources."""
 
     name = "official_global"
+    cache_prefix = "rss"
+    unreachable_note = "海外官方信息源 {names} 不可用，本次跳过"
+    empty_note = "海外官方宏观信息源未返回可用条目"
 
     def __init__(
         self,
@@ -64,48 +62,16 @@ class RssNewsSource(NewsSource):
         feeds: tuple[RssFeed, ...] = OFFICIAL_GLOBAL_FEEDS,
         cache: NewsCache | None = None,
     ) -> None:
-        self._opener = opener or urllib.request.urlopen
-        self.timeout = timeout
-        self.feeds = feeds
-        self.cache = cache
-        self.last_market_stats: dict[str, object] = {}
+        super().__init__(opener=opener, timeout=timeout, feeds=feeds, cache=cache)
 
-    def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
-        # 每个 feed 一个独立往返，且都在盘前链路上——并发跑，慢的那个决定这一段。
-        retained, notes, stats = collect_by_feed(
-            self.feeds,
-            lambda feed: self._feed_docs(trade_date, feed),
-            limit=limit,
-            unreachable_note="海外官方信息源 {names} 不可用，本次跳过",
-            empty_note="海外官方宏观信息源未返回可用条目",
-        )
-        if stats:
-            self.last_market_stats = stats
-        return retained, notes
-
-    def fetch_for_symbols(
-        self, symbols: list[str], limit: int = 10
-    ) -> tuple[dict[str, list[NewsDoc]], list[str]]:
-        return {}, []
-
-    def health_check(self) -> dict[str, Any]:
-        return probe_feeds("official_global", self.feeds, lambda f: f.name, self._fetch_feed)
-
-    def _feed_docs(self, trade_date: date, feed: RssFeed) -> list[NewsDoc]:
-        return cached_docs(
-            self.cache, trade_date, f"rss_{feed.source}", lambda: self._fetch_feed(feed)
-        )
-
-    def _fetch_feed(self, feed: RssFeed) -> list[NewsDoc]:
-        request = urllib.request.Request(feed.url, headers={"User-Agent": USER_AGENT})
-        with self._opener(request, timeout=self.timeout) as response:
-            payload = response.read(MAX_RESPONSE_BYTES)
+    def fetch_one(self, feed: RssFeed) -> list[NewsDoc]:
+        payload = self.open_bytes(feed.url, MAX_RESPONSE_BYTES)
         # Curated, fixed HTTPS feeds and a strict size cap keep this stdlib-only
         # adapter bounded. The source is independently guarded at feed level.
         root = element_tree.fromstring(payload)  # noqa: S314
         return [
             NewsDoc(title=title, summary=summary, source=feed.source, published_at=published_at, url=url)
-            for title, summary, published_at, url in _rss_items(root)[:PER_FEED_LIMIT]
+            for title, summary, published_at, url in _rss_items(root)[: self.per_feed_limit]
         ]
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from typing import Any
 from ashare_decision_support.adapters.base import fetch_daily_bars
 from ashare_decision_support.adapters.ths_taxonomy import ThsTaxonomySource
 from ashare_decision_support.adapters.tickflow_adapter import TickFlowAdapter
+from ashare_decision_support.artifacts import LEADERS_LATEST_NAME
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.sectors import ThsConceptTaxonomy, ThsIndustryTaxonomy
@@ -24,7 +26,6 @@ from ashare_decision_support.signals.series import change, series
 from ashare_decision_support.symbols import normalize_symbol
 
 LEADERS_SCHEMA = "ashare-sector-leaders-v1"
-LEADERS_LATEST_NAME = "sector_leaders_latest.json"
 DEFAULT_LOOKBACK_DAYS = 180
 DEFAULT_MIN_BARS = 65
 DEFAULT_TOP_PER_SECTOR = 3
@@ -143,6 +144,7 @@ def refresh_sector_leaders(
     min_bars: int = DEFAULT_MIN_BARS,
     adapter: Any | None = None,
     taxonomy_source: Any | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """刷新全市场日线并落一份供外部 AI 使用的板块龙头事实包。"""
     wanted = {str(level).lower() for level in levels}
@@ -151,11 +153,13 @@ def refresh_sector_leaders(
         raise ValueError(f"unsupported levels: {sorted(unknown)}")
 
     source = taxonomy_source or ThsTaxonomySource()
+    report = progress or (lambda message: None)
     definitions: list[SectorDefinition] = []
     if "industry" in wanted:
         definitions.extend(ThsIndustryTaxonomy(source, level=industry_level).list_sectors())
     if "concept" in wanted:
         definitions.extend(ThsConceptTaxonomy(source).list_sectors())
+    report(f"分类加载完成：{len(definitions)} 个板块")
 
     snapshot = source.load()
     symbols = sorted(
@@ -168,12 +172,16 @@ def refresh_sector_leaders(
     )
     today = beijing_today()
     market = adapter or TickFlowAdapter()
+    fetch_notes: list[str] = []
+    report(f"开始读取 {len(symbols)} 只股票的日线")
     bars = fetch_daily_bars(
         market,
         symbols,
         today - timedelta(days=max(90, int(lookback_days))),
         today,
+        notes=fetch_notes,
     )
+    report(f"日线读取完成：{sum(bool(rows) for rows in bars.values())}/{len(symbols)} 只有数据")
     payload = build_sector_leaders(
         bars,
         definitions,
@@ -182,7 +190,8 @@ def refresh_sector_leaders(
         top_per_sector=top_per_sector,
         min_bars=min_bars,
     )
-    payload["data_notes"] = list(snapshot.notes)
+    report(f"板块内排名完成：{payload['sector_count']} 个板块")
+    payload["data_notes"] = [*snapshot.notes, *fetch_notes]
     target = Path(output_dir) / LEADERS_LATEST_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

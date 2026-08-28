@@ -15,18 +15,28 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
+import sys
+from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 
 from ashare_decision_support.adapters.akshare_adapter import AkshareAdapter
-from ashare_decision_support.adapters.base import fetch_daily_bars
+from ashare_decision_support.adapters.base import SUPPORTED_PERIODS, fetch_daily_bars
 from ashare_decision_support.adapters.freshness import check_intraday_freshness
 from ashare_decision_support.adapters.global_market import GlobalMarketAdapter
+from ashare_decision_support.adapters.overseas_history import OverseasHistoryAdapter
 from ashare_decision_support.adapters.qmt_xtdata import QmtAdapterError, QmtXtDataAdapter
 from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
-from ashare_decision_support.adapters.sina_intraday import SUPPORTED_PERIODS, SinaIntradayAdapter
+from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter
+from ashare_decision_support.adapters.ths_sector_index import (
+    BACKFILL_START_YEAR,
+    ThsSectorIndexAdapter,
+    load_all_series,
+)
 from ashare_decision_support.adapters.tickflow_adapter import TickFlowAdapter
 from ashare_decision_support.adapters.tickflow_intraday import build_intraday_adapter
 from ashare_decision_support.advice import (
@@ -35,6 +45,12 @@ from ashare_decision_support.advice import (
     validate_external_decisions,
 )
 from ashare_decision_support.agents.debate import DebatePanel
+from ashare_decision_support.artifacts import (
+    LEADERS_LATEST_NAME,
+    MORNING_LATEST_NAME,
+    POST_CLOSE_LATEST_NAME,
+    STRATEGY_SCREEN_LATEST_NAME,
+)
 from ashare_decision_support.ask import run_ask
 from ashare_decision_support.chat import run_chat
 from ashare_decision_support.chat.session import ChatResponder
@@ -62,11 +78,23 @@ from ashare_decision_support.monitor import (
 from ashare_decision_support.monitor.sector_triggers import fired_sectors_today
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.feishu import FeishuNotifier
-from ashare_decision_support.research import build_monthly_context, refresh_sector_leaders
-from ashare_decision_support.research.leaders import LEADERS_LATEST_NAME
+from ashare_decision_support.research import (
+    build_monthly_context,
+    load_daily_sector_analysis,
+    refresh_sector_leaders,
+    render_daily_sector_analysis,
+)
+from ashare_decision_support.research.preopen import (
+    build_preopen_research,
+    render_preopen_research,
+)
+from ashare_decision_support.research.sector_confirmation import build_sector_confirmation
+from ashare_decision_support.research.sector_forecast import build_sector_forecast
 from ashare_decision_support.schedule import TradingCalendar
 from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_now, beijing_today
 from ashare_decision_support.sectors import ThsIndustryTaxonomy, static_taxonomies
+from ashare_decision_support.sectors.backtest import backtest_price_baselines
+from ashare_decision_support.sectors.confirmation_ledger import SectorConfirmationLedger
 from ashare_decision_support.signals import WyckoffAnalyzer
 from ashare_decision_support.state import Positions, state_home
 from ashare_decision_support.strategy.overnight import (
@@ -212,6 +240,37 @@ def _parser_morning(subparsers) -> None:
     _add_tickflow_args(morning)
 
 
+def _parser_sector_analysis(subparsers) -> None:
+    sector = subparsers.add_parser(
+        "sector-analysis",
+        help="只读最近一次每日板块分析，不重新取数",
+    )
+    sector.add_argument("--output-dir", default="briefs")
+    sector.add_argument("--format", choices=["markdown", "text", "json"], default="markdown")
+    sector.add_argument("--output", help="写入文件；不传则同时打印到控制台")
+
+    backtest = subparsers.add_parser(
+        "sector-backtest",
+        help="板块预测校准：历史价格基线的滚动样本外评价",
+    )
+    backtest.add_argument("--top", type=int, default=5, help="每天选择排名前几的板块")
+    backtest.add_argument("--output", help="写入 JSON；省略则打印")
+
+    forecast = subparsers.add_parser(
+        "sector-forecast",
+        help="板块预测：主题簇情景、盘中确认条件与历史校准状态",
+    )
+    forecast.add_argument("--output-dir", default="briefs")
+    forecast.add_argument("--output", help="写入 JSON；省略则打印")
+
+    confirmation = subparsers.add_parser(
+        "sector-confirmation",
+        help="用当天盘中截面确认或否决最新板块预测",
+    )
+    confirmation.add_argument("--output-dir", default="briefs")
+    confirmation.add_argument("--output", help="写入 JSON；省略则打印")
+
+
 def _parser_monitor(subparsers) -> None:
     monitor = subparsers.add_parser(
         "monitor", help="[需求3] 盘中监控：持仓卖点 + 板块状态，按跃迁告警"
@@ -304,11 +363,17 @@ def _parser_facts(subparsers) -> None:
     facts.add_argument("--period", default="5", choices=list(SUPPORTED_PERIODS))
     facts.add_argument("--no-live", action="store_true", help="盘中也不现算价位，只读已落盘的")
     facts.add_argument(
+        "--phase",
+        choices=["pre_open", "intraday", "post_close", "off_hours"],
+        help="强制按指定时段装配，便于自动化与复现；省略则按北京时间判断",
+    )
+    facts.add_argument(
         "--format",
         default="json",
         choices=["json", "text"],
         help="json=结构化事实包；text=直接输出人类可读摘要",
     )
+    facts.add_argument("--full", action="store_true", help="text 模式输出完整事实；默认输出精简摘要")
     facts.add_argument(
         "--sections",
         nargs="+",
@@ -334,7 +399,7 @@ def _parser_preopen_research(subparsers) -> None:
         "preopen-research",
         help="[Codex] 导出盘前研报包：已落盘 facts + 海外市场快照 + 固定研判要求",
     )
-    research.add_argument("--output-dir", default="briefs", help="读取 morning_latest.json 的目录")
+    research.add_argument("--output-dir", default="briefs", help=f"读取 {MORNING_LATEST_NAME} 的目录")
     research.add_argument("--output", help="写入 JSON 研报包；省略则打印到控制台")
     research.add_argument("--format", choices=["json", "markdown"], default="json")
     research.add_argument(
@@ -413,7 +478,7 @@ def _parser_post_close(subparsers) -> None:
 def _parser_pre_open(subparsers) -> None:
     pre_open = subparsers.add_parser("pre-open-brief", help="次日盘前：把昨日执行卡复述一遍")
     pre_open.add_argument(
-        "--payload", help="盘后落盘的 post_close_latest.json，省略则读 briefs/ 下最新一份"
+        "--payload", help=f"盘后落盘的 {POST_CLOSE_LATEST_NAME}，省略则读 briefs/ 下最新一份"
     )
     pre_open.add_argument("--output-dir")
     pre_open.add_argument("--refresh", action="store_true", help="重新取价而非复用盘后快照")
@@ -454,7 +519,7 @@ def _parser_strategy_screen(subparsers) -> None:
     screen.add_argument("--days", type=int, default=240, help="日线回溯天数")
     screen.add_argument("--min-history-bars", type=int, default=65, help="最少有效日线根数")
     screen.add_argument("--output-dir", default="briefs")
-    screen.add_argument("--output", help="另写一份 JSON；省略则写 output-dir/strategy_screen_latest.json")
+    screen.add_argument("--output", help=f"另写一份 JSON；省略则写 output-dir/{STRATEGY_SCREEN_LATEST_NAME}")
     screen.add_argument("--min-atr-pct", type=float)
     screen.add_argument("--max-atr-pct", type=float)
     screen.add_argument("--min-range-position", type=float)
@@ -480,8 +545,14 @@ def _parser_external_research(subparsers) -> None:
         "--level", choices=["industry", "concept", "all"], default="all"
     )
     leaders.add_argument("--industry-level", choices=["SW1", "SW2", "SW3"], default="SW1")
-    leaders.add_argument("--top", type=int, default=3, help="每个板块保留几只")
-    leaders.add_argument("--days", type=int, default=180, help="日线回溯自然日")
+    leaders.add_argument(
+        "--top", "--top-per-sector", dest="top", type=int, default=3,
+        help="每个板块保留几只",
+    )
+    leaders.add_argument(
+        "--days", "--lookback-days", dest="days", type=int, default=180,
+        help="日线回溯自然日",
+    )
     leaders.add_argument("--min-history-bars", type=int, default=65)
     leaders.add_argument("--output", help="另写一份 JSON")
     _add_tickflow_args(leaders)
@@ -527,6 +598,20 @@ def _parser_diagnostics(subparsers) -> None:
     )
     _add_tickflow_args(calendar_refresh)
 
+    history = subparsers.add_parser(
+        "history-refresh",
+        help="刷新历史缓存：同花顺板块指数 + 海外指数，用于外盘映射基准率",
+    )
+    history.add_argument(
+        "--only",
+        choices=["all", "sector-index", "overseas"],
+        default="all",
+        help="默认两类历史都刷新",
+    )
+    history.add_argument("--since-year", type=int, default=None, help="板块指数回填起始年份")
+    history.add_argument("--until-year", type=int, default=None, help="板块指数回填截止年份")
+    history.add_argument("--keys", nargs="*", help="只刷新这些海外品种 key；省略即全部")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -538,6 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     _parser_daemon(subparsers)
     # 主链路各段（可单独跑）
     _parser_morning(subparsers)
+    _parser_sector_analysis(subparsers)
     _parser_monitor(subparsers)
     _parser_advise(subparsers)
     _parser_ask(subparsers)
@@ -564,13 +650,28 @@ def build_parser() -> argparse.ArgumentParser:
 # ---- helpers -------------------------------------------------------------
 
 
-def _dump_json(payload: object, output_path: str | None = None) -> None:
+def _dump_json(
+    payload: object, output_path: str | None = None, *, echo_when_written: bool = False
+) -> None:
+    """写 JSON 产物；指定文件后不再把同一份大对象重复输出到终端。"""
     rendered = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
     if output_path:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as handle:
             handle.write(rendered)
             handle.write("\n")
+        if not echo_when_written:
+            return
+    print(rendered)
+
+
+def _write_text(rendered: str, output_path: str | None = None) -> None:
+    """写文本产物；未指定路径时才输出到终端。"""
+    if output_path:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered + "\n", encoding="utf-8")
+        return
     print(rendered)
 
 
@@ -578,10 +679,34 @@ def _trim(summary: dict, drop: set[str] = frozenset({"content", "facts"})) -> di
     return {key: value for key, value in summary.items() if key not in drop}
 
 
-def _tickflow(args) -> TickFlowAdapter:
-    return TickFlowAdapter(
-        api_key=getattr(args, "api_key", None), base_url=getattr(args, "base_url", None)
+def _morning_cli_summary(summary: dict) -> dict:
+    """Return the operational receipt; the full auditable payload is already on disk."""
+    keys = (
+        "title", "trade_date", "market_direction", "market_score", "limit_up",
+        "blowups", "blowup_rate", "max_streak", "sectors_ranked", "sectors_selected",
+        "industry_sectors_selected", "concept_sectors_selected", "candidates",
+        "candidate_symbols", "funnel", "diagnostic", "diagnostic_mode",
+        "suggested_position_factor", "position_factor", "rotation_regime",
+        "rotation_switch", "rotation_adjacent", "turnover_total_change", "journal_records",
+        "writer", "used_fallback", "delivered", "payload_path", "brief_path",
     )
+    compact = {key: summary.get(key) for key in keys if key in summary}
+    notes = summary.get("data_notes") or []
+    compact["data_notes"] = notes[:8]
+    compact["data_notes_omitted"] = max(0, len(notes) - 8)
+    compact["full_payload"] = summary.get("payload_path")
+    return compact
+
+
+def _tickflow(args) -> TickFlowAdapter:
+    # The free TickFlow SDK prints an informational banner to stdout during
+    # construction. CLI commands often emit machine-readable JSON, so third-party
+    # chatter must not share that stream. Capability notes still surface through
+    # our own data_notes/health payloads.
+    with contextlib.redirect_stdout(io.StringIO()):
+        return TickFlowAdapter(
+            api_key=getattr(args, "api_key", None), base_url=getattr(args, "base_url", None)
+        )
 
 
 def _writer(args):
@@ -715,11 +840,37 @@ def _morning_facts(adapter) -> dict:
             Path(tmp),
             config=MorningConfig(top_sectors=8, candidates_per_sector=2),
         )
-        return json.loads((Path(tmp) / "morning_latest.json").read_text(encoding="utf-8"))
+        return json.loads((Path(tmp) / MORNING_LATEST_NAME).read_text(encoding="utf-8"))
 
 
 def _security_master_reference() -> SecurityMasterAdapter:
     return SecurityMasterAdapter()
+
+
+def _live_facts(args) -> Callable[[list[str]], dict] | None:
+    """`ask` / `facts` 用来现算标的价位的回调，`--no-live` 时是 None。
+
+    两条命令要的是同一份东西：给一组代码，回来一份 `advise` 的 facts。此前两边
+    各写了一份逐字相同的闭包——同样的适配器、同样的 `period`、同样的空
+    `notifiers`。分开写没有让任何一边多表达什么，只是让「盘中现算走的是哪条
+    链路」变成了要对着读两处才能确认的事。
+
+    闭包而不是直接算：只有真的问到标的时才构造适配器。盘前问「今天板块怎么排」
+    不该因为建一个数据源失败而答不出来。
+    """
+    if args.no_live:
+        return None
+
+    def compute(symbols: list[str]) -> dict:
+        return run_advise(
+            adapter=_tickflow(args),
+            symbols=symbols,
+            period=args.period,
+            notifiers=[],
+            security_master_adapter=_security_master_reference(),
+        )["facts"]
+
+    return compute
 
 
 # ---- dispatch ------------------------------------------------------------
@@ -777,11 +928,10 @@ def _cmd_morning(args) -> None:
             use_broad_index=not args.no_broad_index,
             use_trade_flow=not args.no_trade_flow,
             use_concepts=not args.no_concepts,
-            explain=args.explain,
         ),
         progress=_progress(args),
     )
-    _dump_json(_trim(summary))
+    _dump_json(_morning_cli_summary(summary))
     if args.explain:
         funnel = summary.get("funnel") or {}
         labels = (
@@ -791,6 +941,43 @@ def _cmd_morning(args) -> None:
             ("final_candidates", "最终候选"),
         )
         print("筛选漏斗：" + " → ".join(f"{label} {funnel.get(key, 0)}" for key, label in labels))
+        # 对照样本单独一行，不串进上面那条箭头链：它不是漏斗的下一档，是**紧邻
+        # 落选**的平行一组（只记台账不推送）。串进「→」里会读成「最终候选又被
+        # 筛掉一批」，方向正好是反的。`review` 的 edge 就是拿它跟入选组比出来的，
+        # 所以它是这条漏斗里唯一一个「越多越说明对照组够用」的数。
+        print(
+            f"对照样本：{funnel.get('control_sample', 0)}"
+            "（紧邻落选，只记不推；`review` 用它算 edge）"
+        )
+
+
+def _cmd_sector_analysis(args) -> None:
+    try:
+        payload = load_daily_sector_analysis(args.output_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    if args.format == "json":
+        _dump_json(payload, args.output)
+        return
+    rendered = render_daily_sector_analysis(payload)
+    _write_text(rendered, args.output)
+
+
+def _cmd_sector_backtest(args) -> None:
+    _dump_json(backtest_price_baselines(load_all_series(), top=args.top), args.output)
+
+
+def _cmd_sector_forecast(args) -> None:
+    _dump_json(build_sector_forecast(args.output_dir), args.output)
+
+
+def _cmd_sector_confirmation(args) -> None:
+    payload = build_sector_confirmation(args.output_dir)
+    if payload.get("as_of"):
+        payload["ledger"] = SectorConfirmationLedger().record(payload)
+    else:
+        payload["ledger"] = SectorConfirmationLedger().summary()
+    _dump_json(payload, args.output)
 
 
 def _cmd_monitor(args) -> None:
@@ -840,25 +1027,11 @@ def _cmd_advise(args) -> None:
 
 
 def _cmd_ask(args) -> None:
-    # 盘中才需要现算价位，而且只在真的问到标的时才建适配器——盘前问
-    # 「今天板块怎么排」不该因为构造一个数据源失败而答不出来。
-    compute = None
-    if not args.no_live:
-
-        def compute(symbols: list[str]) -> dict:
-            return run_advise(
-                adapter=_tickflow(args),
-                symbols=symbols,
-                period=args.period,
-                notifiers=[],
-                security_master_adapter=_security_master_reference(),
-            )["facts"]
-
     summary = run_ask(
         question=" ".join(args.question).strip() or None,
         symbols=_explicit_symbols(args) or None,
         output_dir=args.output_dir,
-        compute_symbols=compute,
+        compute_symbols=_live_facts(args),
         client=LlmClient(provider=args.llm_provider, model=args.llm_model) if args.llm else None,
         is_trading_day=TradingCalendar().is_trading_day(beijing_today()),
         deep=args.deep,
@@ -869,110 +1042,33 @@ def _cmd_ask(args) -> None:
 
 
 def _cmd_facts(args) -> None:
-    compute = None
-    if not args.no_live:
-
-        def compute(symbols: list[str]) -> dict:
-            return run_advise(
-                adapter=_tickflow(args),
-                symbols=symbols,
-                period=args.period,
-                notifiers=[],
-                security_master_adapter=_security_master_reference(),
-            )["facts"]
-
     bundle = build_facts_bundle(
         moment=beijing_now(),
         symbols=_explicit_symbols(args) or None,
         output_dir=args.output_dir,
-        compute_symbols=compute,
+        compute_symbols=_live_facts(args),
+        phase=args.phase,
         is_trading_day=TradingCalendar().is_trading_day(beijing_today()),
         focus=_explicit_symbols(args) or None,
         sections=args.sections,
     )
     if args.format == "text":
-        print(bundle.rendered)
-        if bundle.notes:
-            print("\n".join(f"（{note}）" for note in bundle.notes))
+        print(bundle.rendered if args.full else getattr(bundle, "compact_rendered", bundle.rendered))
         return
     _dump_json(bundle.to_dict(), args.output)
 
 
-_PREOPEN_RESEARCH_REQUIREMENTS = """基于 facts 和 overseas_snapshot 写盘前先手观察清单，不能补造数据。
-依次判断：海外风险偏好与 A 股映射；政策/地缘/国家队；国内外财报与公告；昨日情绪与新题材。
-输出不超过 700 字：总判断、1-3 条先手观察（催化→映射→竞价确认→失效）、只等确认、最多 3 条风险。
-每项证据标注已发生、市场预期或推演。没有竞价/开盘数据时，不写正在走强，也不写直接买卖建议。"""
-
-
 def _cmd_preopen_research(args) -> None:
     """生成每日交给 Codex 的固定输入，避免手工拼接与遗漏外盘时点。"""
-    moment = beijing_now()
-    bundle = build_facts_bundle(
-        moment=moment,
+    payload = build_preopen_research(
         output_dir=args.output_dir,
-        is_trading_day=TradingCalendar().is_trading_day(moment.date()),
+        market_adapter=None if args.no_global else GlobalMarketAdapter(),
     )
-    overseas = None if args.no_global else GlobalMarketAdapter().fetch_snapshot().to_dict()
-    payload = {
-        "as_of": moment.isoformat(timespec="seconds"),
-        "task": "A股盘前先手研报",
-        "requirements": _PREOPEN_RESEARCH_REQUIREMENTS,
-        "facts": bundle.to_dict(),
-        "overseas_snapshot": overseas,
-    }
     if args.format == "markdown":
-        rendered = _render_preopen_research(payload)
-        if args.output:
-            Path(args.output).write_text(rendered + "\n", encoding="utf-8")
-        print(rendered)
+        rendered = render_preopen_research(payload)
+        _write_text(rendered, args.output)
         return
     _dump_json(payload, args.output)
-
-
-def _render_preopen_research(payload: dict) -> str:
-    """只根据包内事实排版，不把条件预案写成方向预测。"""
-    facts = payload["facts"]["facts"]
-    morning = facts.get("盘前主链路") if isinstance(facts, dict) else None
-    lines = ["# A股盘前情景报告", "", f"数据时点：{payload['as_of']}"]
-    lines.extend(["", "## 数据边界"])
-    lines.extend(f"- {note}" for note in payload["facts"].get("notes", []))
-    overseas = payload.get("overseas_snapshot") or {}
-    lines.extend(["", "## 海外隔夜"])
-    if overseas.get("readings"):
-        for item in overseas["readings"]:
-            if item.get("last") is None:
-                lines.append(f"- {item['name']}：未覆盖（{item.get('note') or '无可用读数'}）")
-            else:
-                lines.append(
-                    f"- {item['name']}：{item['last']}，较前收 {item.get('change_pct')}%，"
-                    f"来源 {item.get('source', '未知')}，时点 {item.get('as_of') or '未知'}"
-                )
-    else:
-        lines.append("- 未请求海外快照；不对隔夜风险偏好作数值判断。")
-    lines.extend(["", "## A股盘前事实"])
-    if not isinstance(morning, dict):
-        lines.append("- 尚无当日盘前主链路落盘结果，不能生成主线排序。")
-    else:
-        market = morning.get("market") or {}
-        lines.append(
-            f"- 系统市场读数：{market.get('direction', '未覆盖')}；原因：{'；'.join(market.get('reasons') or ['未覆盖'])}"
-        )
-        for sector in (morning.get("sectors") or [])[:3]:
-            lines.append(
-                f"- 关注方向：{sector.get('name')}（{sector.get('direction', '未覆盖')}）。依据：{'；'.join(sector.get('reasons') or ['未覆盖'])}"
-            )
-        for warning in market.get("warnings") or []:
-            lines.append(f"- 风险：{warning}")
-    lines.extend(
-        [
-            "",
-            "## 开盘预案",
-            "- 仅当催化、A 股映射与竞价/开盘承接同时出现时，才将方向列入先手观察。",
-            "- 高开而没有成交扩散、龙头承接或板块跟随时，按兑现风险处理，不追高。",
-            "- 地缘、政策与国家队信息只以原始公告或多源快讯为证；缺证据时保留“未覆盖”。",
-        ]
-    )
-    return "\n".join(lines)
 
 
 def _cmd_chat(args) -> None:
@@ -1052,11 +1148,19 @@ def _cmd_post_close(args) -> None:
 
 
 def _cmd_pre_open(args) -> None:
-    summary = run_pre_open(
-        payload_path=args.payload,
-        output_dir=args.output_dir,
-        adapter=_tickflow(args) if args.refresh else None,
-    )
+    try:
+        summary = run_pre_open(
+            payload_path=args.payload,
+            output_dir=args.output_dir,
+            adapter=_tickflow(args) if args.refresh else None,
+        )
+    except FileNotFoundError as exc:
+        source = args.payload or f"briefs/{POST_CLOSE_LATEST_NAME}"
+        raise SystemExit(
+            f"未找到盘后执行卡 {source}；先运行 `ashare-ds post-close-brief`"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"盘后执行卡不是有效 JSON：{exc.msg}") from exc
     _dump_json(_trim(summary))
 
 
@@ -1075,9 +1179,18 @@ def _cmd_strategy_screen(args) -> None:
     taxonomy = ThsIndustryTaxonomy(level="SW1")
     profiles = taxonomy.snapshot.profiles
     end = beijing_today()
-    bars = fetch_daily_bars(
-        _tickflow(args), sorted(profiles), end - timedelta(days=max(90, args.days)), end
+    print(
+        f"正在读取 {len(profiles)} 只股票的日线并运行策略筛选；全市场模式通常需要 1–2 分钟…",
+        file=sys.stderr,
+        flush=True,
     )
+    fetch_notes: list[str] = []
+    bars = fetch_daily_bars(
+        _tickflow(args), sorted(profiles), end - timedelta(days=max(90, args.days)), end,
+        notes=fetch_notes,
+    )
+    usable = sum(bool(rows) for rows in bars.values())
+    print(f"日线读取完成：{usable}/{len(profiles)} 只有数据，正在计算候选…", file=sys.stderr, flush=True)
     names = {symbol: profile.name for symbol, profile in profiles.items()}
     sectors = {symbol: profile.industry("SW1") for symbol, profile in profiles.items()}
     common = {
@@ -1114,8 +1227,13 @@ def _cmd_strategy_screen(args) -> None:
             config=StrategyScreenConfig(profile=args.profile, **common),
         ).to_dict()
     payload["as_of"] = str(end)
-    payload["data_notes"] = screen_notes(args.days, list(taxonomy.notes))
-    _dump_json(payload, args.output or str(Path(args.output_dir) / "strategy_screen_latest.json"))
+    payload["data_notes"] = screen_notes(args.days, [*taxonomy.notes, *fetch_notes])
+    _dump_json(
+        payload,
+        args.output or str(Path(args.output_dir) / STRATEGY_SCREEN_LATEST_NAME),
+        # 默认模式既落最新缓存又给人看；显式 --output 通常是脚本调用，不重复刷 JSON。
+        echo_when_written=args.output is None,
+    )
 
 
 def _cmd_sector_leaders(args) -> None:
@@ -1129,6 +1247,7 @@ def _cmd_sector_leaders(args) -> None:
             lookback_days=args.days,
             min_bars=args.min_history_bars,
             adapter=_tickflow(args),
+            progress=lambda message: print(message, file=sys.stderr, flush=True),
         )
     else:
         path = Path(args.output_dir) / LEADERS_LATEST_NAME
@@ -1208,9 +1327,37 @@ def _cmd_calendar_refresh(args) -> None:
     )
 
 
+def _cmd_history_refresh(args) -> None:
+    """刷新历史序列缓存，让外盘映射基准率有样本可查。"""
+    tasks: list[str] = []
+    notes: list[str] = []
+    payload: dict[str, object] = {"tasks": tasks, "notes": notes}
+    if args.only in ("all", "sector-index"):
+        sector = ThsSectorIndexAdapter()
+        result = sector.backfill(
+            since_year=args.since_year or BACKFILL_START_YEAR,
+            until_year=args.until_year,
+        )
+        payload["sector_index"] = result.to_dict()
+        tasks.append("sector-index")
+        notes.extend(result.notes)
+
+    if args.only in ("all", "overseas"):
+        result = OverseasHistoryAdapter().refresh(args.keys)
+        payload["overseas"] = result.to_dict()
+        tasks.append("overseas")
+        notes.extend(result.notes)
+
+    _dump_json(payload)
+
+
 COMMANDS = {
     "daemon": _cmd_daemon,
     "morning": _cmd_morning,
+    "sector-analysis": _cmd_sector_analysis,
+    "sector-backtest": _cmd_sector_backtest,
+    "sector-forecast": _cmd_sector_forecast,
+    "sector-confirmation": _cmd_sector_confirmation,
     "monitor": _cmd_monitor,
     "advise": _cmd_advise,
     "ask": _cmd_ask,
@@ -1233,6 +1380,7 @@ COMMANDS = {
     "qmt-health": _cmd_qmt_health,
     "state": _cmd_state,
     "calendar-refresh": _cmd_calendar_refresh,
+    "history-refresh": _cmd_history_refresh,
 }
 
 
@@ -1243,7 +1391,13 @@ def main() -> None:
     args = build_parser().parse_args()
     # `required=True` 的 subparsers 保证 command 一定在表里；真取不到就抛，
     # 那是接线漏了一条命令，不该悄悄什么都不做。
-    COMMANDS[args.command](args)
+    try:
+        COMMANDS[args.command](args)
+    except RuntimeError as exc:
+        # 数据源不可用时，用户需要的是「哪一路失败」和退出码，不是内部调用栈。
+        # 详细异常已经在各层 notes 中保留；手工调试仍可直接调用对应 Python API。
+        print(f"错误：{exc}", file=sys.stderr)
+        raise SystemExit(2) from None
 
 
 def _position_command(args) -> dict:
@@ -1297,6 +1451,9 @@ def _cached_security_master(entries: list):
 
 
 def _state_report() -> dict:
+    from collections import Counter
+
+    from ashare_decision_support.journal.records import VERIFIABLE_KINDS
     from ashare_decision_support.state import AlertState, DaemonState
 
     today = beijing_today()
@@ -1305,7 +1462,12 @@ def _state_report() -> dict:
     daemon = DaemonState.load(today)
     calendar = TradingCalendar()
     journal = Journal()
+    journal_rows = journal.rows()
+    pending_rows = journal.pending(today)
     outcomes = journal.outcomes()
+    journal_kinds = Counter(str(row.get("kind") or "unknown") for row in journal_rows)
+    pending_kinds = Counter(str(row.get("kind") or "unknown") for row in pending_rows)
+    outcome_stats = summarize(outcomes)
     return {
         "state_home": str(state_home()),
         "env_files_loaded": loaded_files(),
@@ -1318,10 +1480,20 @@ def _state_report() -> dict:
         "sector_alerts_today": fired_sectors_today(today)[:20],
         "daemon_tasks": daemon.tasks,
         "journal": {
-            "recommendations": len(journal.recommendations()),
+            # 三类原始样本都会兑现。此前这里只拿 recommendation 和 pending 比，
+            # 885 > 356 看起来像重复记录，实际多出来的是 control/vetoed 对照样本。
+            "recommendations": journal_kinds["recommendation"],
+            "controls": journal_kinds["control"],
+            "vetoed": journal_kinds["vetoed"],
+            "verifiable_total": sum(journal_kinds[kind] for kind in VERIFIABLE_KINDS),
             "outcomes": len(outcomes),
-            "pending": len(journal.pending(today)),
-            "model_ready_gap": summarize(outcomes)["model_ready_gap"],
+            "pending_verification": len(pending_rows),
+            "pending_by_kind": {
+                kind: pending_kinds[kind]
+                for kind in VERIFIABLE_KINDS
+            },
+            "model_samples": outcome_stats["samples"],
+            "model_ready_gap": outcome_stats["model_ready_gap"],
         },
         "feishu_configured": FeishuNotifier().configured,
         "checked_at": beijing_now().isoformat(timespec="seconds"),

@@ -199,4 +199,14 @@ def _stat_line(row: dict) -> str:
 
 
 def _pct(value: float | None) -> str:
-    return "—" if value is None else f"{value:+.1%}" if abs(value) < 1 and value < 0 else f"{value:.1%}"
+    """百分比，缺失显示破折号。
+
+    原来这里有一个三分支：`abs(value) < 1 and value < 0` 时走 `:+.1%`，否则走
+    `:.1%`。**两条分支的输出逐字相同**——`+` 只给正数补符号，而这个条件只在
+    负数上成立，负数本来就带 `-`。看得出想做的是「MFE/MAE 这类收益要带符号，
+    进场率这类比率不带」，但那个判据落在了取值范围上，从来没生效过。
+
+    这里收成实际在跑的那一条。要区分收益与比率，得由调用方说明是哪一种，
+    不能靠猜数值大小——`entry_rate` 和 `median_mfe_pct` 的取值范围是重叠的。
+    """
+    return "—" if value is None else f"{value:.1%}"

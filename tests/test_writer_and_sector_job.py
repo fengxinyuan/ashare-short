@@ -523,6 +523,30 @@ def test_an_ebb_tape_still_picks_but_flags_leaders_only(tmp_path) -> None:
     assert all(item.get("playbook") == "回踩" for item in payload["candidates"])
 
 
+def test_sampled_morning_is_marked_as_diagnostic_mode(tmp_path) -> None:
+    summary = _run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=FakeNewsSource(),
+        top_sectors=1,
+        candidates_per_sector=2,
+        max_constituents=6,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+    )
+
+    payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
+
+    assert summary["diagnostic_mode"] is True
+    assert summary["diagnostic"]["mode"] == "sampled"
+    assert summary["diagnostic"]["max_constituents"] == 6
+    assert payload["diagnostic"]["sampled_symbols"] == summary["funnel"]["universe"]
+    assert any("诊断模式" in note and "不可视为正式全量结论" in note for note in summary["data_notes"])
+
+
 def test_morning_ranks_sectors_then_picks_stocks_inside_them(tmp_path) -> None:
     adapter = FakeSectorAdapter()
     summary = _run_morning(

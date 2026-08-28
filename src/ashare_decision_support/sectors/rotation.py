@@ -54,10 +54,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from statistics import median
 from typing import Any
 
+from ashare_decision_support.numeric import median_of
 from ashare_decision_support.sectors import panel
+from ashare_decision_support.sectors.panel import MIN_SECTORS
 
 # 窗口。5 日 = 一周，20 日 = 一个月，与「过去一周到一个月」这个提法对齐。
 SHORT_WINDOW = 5
@@ -70,10 +71,6 @@ RANK_LOOKBACK = 5
 # 参与排序所需的最少序列长度。要同时算 20 日涨幅和 5 日前的 20 日涨幅，
 # 所以至少 LONG_WINDOW + RANK_LOOKBACK + 1 根。
 MIN_BARS = LONG_WINDOW + RANK_LOOKBACK + 1
-
-# 低于这个板块数就不给结论。横截面统计在小样本上毫无意义——20 个板块算出的
-# 秩相关，随便两个板块换位就能翻号。
-MIN_SECTORS = 20
 
 # 高低切换的判定分界。秩相关落在 [-0.2, 0.2] 之间时**不给方向**：那个区间里
 # 的相关系数说明不了任何事，而给一个标签会让「测不出关系」读起来像「没有轮动」。
@@ -249,10 +246,10 @@ def read_rotation(
             )
         )
 
-    median_5d = _median_of([item[2] for item in rows])
-    median_20d = _median_of([item[3] for item in rows])
-    median_prior = _median_of([item[4] for item in rows])
-    median_prev = _median_of([item[5] for item in rows])
+    median_5d = median_of(item[2] for item in rows)
+    median_20d = median_of(item[3] for item in rows)
+    median_prior = median_of(item[4] for item in rows)
+    median_prev = median_of(item[5] for item in rows)
 
     now_pairs = [(item[0], _excess(item[2], median_5d)) for item in rows]
     prev_pairs = [(item[0], _excess(item[5], median_prev)) for item in rows]
@@ -515,37 +512,16 @@ def _switch_label(correlation: float | None) -> str:
 
 def _spearman(left: list[float], right: list[float]) -> float | None:
     """秩相关。用秩而不是原值，因为板块涨幅的尾部很重——2026 实测单板块
-    20 日涨幅极值可以是中位数的十几倍，皮尔逊相关会被那一两个板块支配。"""
+    20 日涨幅极值可以是中位数的十几倍，皮尔逊相关会被那一两个板块支配。
+
+    **这一层自己剩下的只有 `MIN_SECTORS` 那道下限**：秩与相关都在
+    `panel` 里（斯皮尔曼的定义就是「先转秩、再求皮尔逊」）。下限留在这里，
+    因为 20 是**横截面**的样本要求——`seesaw` 拿同一个 `pearson()` 算的是时间
+    序列上的一对板块，它的下限是另一件事。
+    """
     if len(left) != len(right) or len(left) < MIN_SECTORS:
         return None
-    ranks_left = _ranks(left)
-    ranks_right = _ranks(right)
-    n = float(len(left))
-    mean_left = sum(ranks_left) / n
-    mean_right = sum(ranks_right) / n
-    cov = sum((a - mean_left) * (b - mean_right) for a, b in zip(ranks_left, ranks_right, strict=True))
-    var_left = sum((a - mean_left) ** 2 for a in ranks_left)
-    var_right = sum((b - mean_right) ** 2 for b in ranks_right)
-    if var_left <= 0 or var_right <= 0:
-        return None
-    return cov / (var_left**0.5 * var_right**0.5)
-
-
-def _ranks(values: list[float]) -> list[float]:
-    """平均秩，并列取均值。并列不处理的话，一堆同值会按输入顺序拿到不同的秩，
-    让相关系数带上一点与数据无关的信息。"""
-    order = sorted(range(len(values)), key=lambda i: values[i])
-    ranks = [0.0] * len(values)
-    index = 0
-    while index < len(order):
-        end = index
-        while end + 1 < len(order) and values[order[end + 1]] == values[order[index]]:
-            end += 1
-        average = (index + end) / 2.0 + 1.0
-        for position in range(index, end + 1):
-            ranks[order[position]] = average
-        index = end + 1
-    return ranks
+    return panel.pearson(panel.ranks(left), panel.ranks(right))
 
 
 def _rank_map(pairs: list[tuple[str, float | None]]) -> dict[str, int]:
@@ -570,8 +546,3 @@ def _excess(value: float | None, benchmark: float | None) -> float | None:
     if value is None or benchmark is None:
         return None
     return value - benchmark
-
-
-def _median_of(values: list[float | None]) -> float | None:
-    usable = [value for value in values if value is not None]
-    return median(usable) if usable else None

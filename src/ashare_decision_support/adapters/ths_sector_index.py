@@ -33,17 +33,24 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 
+from ashare_decision_support.adapters.http import BROWSER_USER_AGENT, fetch_text
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.jsoncache import read_stamped, write_stamped
 from ashare_decision_support.numeric import finite
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_home
 
 BASE_URL = "https://d.10jqka.com.cn/v6/line/bk_{code}/01/last.js"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
+# 按年的那一路。**与 `last.js` 逐字同格式**（11 列、含成交额），只是 payload 里
+# 没有 `name` 字段——见 `backfill` 的 docstring，那里写了为什么走这条路而不是
+# 一次就能回全部 4600 根的 `all.js`。
+YEAR_URL = "https://d.10jqka.com.cn/v6/line/bk_{code}/01/{year}.js"
 REFERER = "https://q.10jqka.com.cn/"
+
+# 同花顺板块指数最早一根。2026-08-20 实测 881101（种植业与林业）起于 20070801，
+# `all.js` 自报 `start=20070801`、`total=4600`。回填从这一年开始扫，早于它的年份
+# 返回空，多打的那几次是一次性成本。
+BACKFILL_START_YEAR = 2007
 
 # 同花顺行业板块代码区间。2026-08-02 实测 881101..881419 里有 90 个有效板块，
 # 其余返回空。扫一遍就把有效码缓存下来，之后只打这 90 个。
@@ -119,6 +126,35 @@ class SectorIndexReading:
         if self.ret_1d < 0 and self.close_position <= LOW_CLOSE:
             return "跌且收在日内低位（无承接）"
         return "日内震荡"
+
+
+@dataclass
+class BackfillResult:
+    """一次历史回填的战果。产物是序列文件，这里只交代覆盖到了什么。"""
+
+    codes: int = 0
+    years: tuple[int, ...] = ()
+    bars_after: int = 0
+    earliest: str | None = None
+    latest: str | None = None
+    failures: int = 0
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.bars_after > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "codes": self.codes,
+            "years": list(self.years),
+            "bars_after": self.bars_after,
+            "earliest": self.earliest,
+            "latest": self.latest,
+            "failures": self.failures,
+            "notes": list(self.notes),
+        }
 
 
 @dataclass
@@ -309,6 +345,84 @@ class ThsSectorIndexAdapter:
         )
         return SectorIndexSnapshot(readings=readings, notes=notes, ok=True)
 
+    def backfill(
+        self,
+        codes: Iterable[str] | None = None,
+        since_year: int = BACKFILL_START_YEAR,
+        until_year: int | None = None,
+    ) -> BackfillResult:
+        """按年把整段历史并进序列文件。**这是基准率层样本量的唯一来源。**
+
+        日常跑批走 `last.js`，它只回**最近 140 根**（实测 2026-01-21..08-19）。
+        140 根算得了 20 日窗口，算不了「过去费半跌 2% 之后电子板块怎么走」——
+        那种条件一年只成立十几次，样本量得按年攒。
+
+        **为什么不用 `all.js`。** 它一次就回全部 4600 根（2007 年起），但那是
+        另一种编码：价格按 `priceFactor=1000` 缩放并做了增量存储，而且
+        **没有成交额那一列**。成交额是 `sectors/turnover.py` 与量比读数的输入，
+        缺了它这段历史只有一半能用；至于自己解那段增量编码——解错一位不会报错，
+        只会让 18 年的价格静默偏掉，那正是这套系统最怕的一类错。
+
+        按年的 `{year}.js` 与 `last.js` **逐字同格式**（11 列、含成交额），
+        于是这条路复用同一个解析器（`_parse_bars`），多付的只是请求数：
+        90 个板块 × 20 年 = 1800 次。同花顺不限流，而且这是一次性成本——
+        回填过一次之后，日常那条 `last.js` 每天自动往上并。
+
+        失败按 (板块, 年) 计。**某一年取不到不影响别的年份落盘**：序列本来就允许
+        有洞，而「2015 年缺失」和「整个板块没有历史」在下游是两件事——前者由
+        基准率层的样本量报出来，后者是取数彻底失败。
+        """
+        wanted = list(codes) if codes is not None else self._codes([])
+        if not wanted:
+            return BackfillResult(notes=["同花顺行业指数：没有可用板块代码，无法回填"])
+
+        last_year = until_year if until_year is not None else beijing_today().year
+        years = tuple(range(max(since_year, BACKFILL_START_YEAR), last_year + 1))
+        if not years:
+            return BackfillResult(notes=[f"回填年份区间为空（{since_year}..{last_year}）"])
+
+        jobs = [(code, year) for code in wanted for year in years]
+        done, errors = gather(jobs, self._fetch_year, max_workers=self.max_workers)
+
+        by_code: dict[str, list[dict]] = {code: [] for code in wanted}
+        for (code, _year), bars in done:
+            if bars:
+                by_code[code].extend(bars)
+
+        root = self.history_dir()
+        written = 0
+        for code, bars in by_code.items():
+            if not bars:
+                continue
+            # 名字取序列文件里已有的那个（`last.js` 那次写入的）。回填这条路
+            # 拿不到板块名，用代码顶替会把「电子」写成「881105」，而那个名字
+            # 是排行榜和驱动映射两处都要读的。
+            if _write_series(root, code, _series_name(root, code) or code, bars):
+                written += 1
+
+        stored = load_all_series(root)
+        stamps = [bar["date"] for _name, bars in stored.values() for bar in bars[:1]]
+        tails = [bars[-1]["date"] for _name, bars in stored.values() if bars]
+        result = BackfillResult(
+            codes=written,
+            years=years,
+            bars_after=sum(len(bars) for _name, bars in stored.values()),
+            earliest=min(stamps) if stamps else None,
+            latest=max(tails) if tails else None,
+            failures=len(errors),
+        )
+        result.notes.append(
+            f"回填 {written}/{len(wanted)} 个板块，{years[0]}..{years[-1]} 共 {len(jobs)} 次取数，"
+            f"落盘后合计 {result.bars_after} 根（{result.earliest}..{result.latest}）"
+        )
+        if errors:
+            kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors})[:4])
+            result.notes.append(
+                f"{len(errors)}/{len(jobs)} 次按年取数失败（{kinds}）——"
+                "序列允许有洞，缺哪几年由基准率层的样本量报出来"
+            )
+        return result
+
     # ---- internals -------------------------------------------------------
 
     def _codes(self, notes: list[str]) -> list[str]:
@@ -334,13 +448,20 @@ class ThsSectorIndexAdapter:
         return alive
 
     def _fetch_one(self, code: str) -> tuple[str, list[dict]] | None:
-        request = urllib.request.Request(
-            BASE_URL.format(code=code),
-            headers={"User-Agent": USER_AGENT, "Referer": REFERER},
+        text = fetch_text(
+            self._opener, BASE_URL.format(code=code), timeout=self.timeout,
+            referer=REFERER, user_agent=BROWSER_USER_AGENT,
         )
-        with self._opener(request, timeout=self.timeout) as response:
-            text = response.read().decode("utf-8", "ignore")
         return _parse_line_js(text)
+
+    def _fetch_year(self, job: tuple[str, int]) -> list[dict]:
+        """一个 (板块, 年份) 的日线。上市之前的年份返回空列表，不算失败。"""
+        code, year = job
+        text = fetch_text(
+            self._opener, YEAR_URL.format(code=code, year=year), timeout=self.timeout,
+            referer=REFERER, user_agent=BROWSER_USER_AGENT,
+        )
+        return _parse_year_js(text) or []
 
     def _cache_path(self) -> Path | None:
         return None if self.cache_dir is None else self.cache_dir / CACHE_NAME
@@ -383,6 +504,13 @@ class ThsSectorIndexAdapter:
 
 def _series_path(root: Path, code: str) -> Path:
     return root / f"{code}.json"
+
+
+def _series_name(root: Path, code: str) -> str | None:
+    """已落盘序列里记着的板块名。回填那条路拿不到名字，只能回读这一份。"""
+    payload = read_stamped(_series_path(root, str(code)), HISTORY_SCHEMA)
+    name = str((payload or {}).get("name") or "").strip()
+    return name or None
 
 
 def _write_series(root: Path, code: str, name: str, bars: list[dict]) -> bool:
@@ -451,6 +579,34 @@ def _parse_line_js(text: str) -> tuple[str, list[dict]] | None:
 
     自己解析而不是用现成封装：上游改字段时这里是**解析失败**，不是静默错值。
     """
+    payload = _parse_callback(text)
+    if payload is None:
+        return None
+
+    name = str(payload.get("name") or "").strip()
+    raw = payload.get("data")
+    if not name or not isinstance(raw, str):
+        return None
+    return name, _parse_bars(raw)
+
+
+def _parse_year_js(text: str) -> list[dict] | None:
+    """按年那一路。**只有 `data` 一个键**，没有 `name`。
+
+    与 `_parse_line_js` 分开而不是把 name 判空放宽：板块名缺失在**当日读数**那条
+    路上是解析失败（排行榜要报名字），在回填这条路上是正常的——序列文件里的名字
+    由 `last.js` 那次写入，回填只往里并日线。同一个判断在两条路上语义相反，
+    合成一个带开关的函数只会让下次改动挑错分支。
+    """
+    payload = _parse_callback(text)
+    if payload is None:
+        return None
+    raw = payload.get("data")
+    return _parse_bars(raw) if isinstance(raw, str) else None
+
+
+def _parse_callback(text: str) -> dict[str, Any] | None:
+    """剥掉 JSONP 外壳，拿到里面那个对象。"""
     match = _CALLBACK.search(text.strip())
     if not match:
         return None
@@ -458,14 +614,11 @@ def _parse_line_js(text: str) -> tuple[str, list[dict]] | None:
         payload = json.loads(match.group(1))
     except json.JSONDecodeError:
         return None
-    if not isinstance(payload, dict):
-        return None
+    return payload if isinstance(payload, dict) else None
 
-    name = str(payload.get("name") or "").strip()
-    raw = payload.get("data")
-    if not name or not isinstance(raw, str):
-        return None
 
+def _parse_bars(raw: str) -> list[dict]:
+    """``20260819,4453.911,4540.915,...;...`` -> 日线列表。"""
     bars: list[dict] = []
     for row in raw.split(";"):
         cells = row.split(",")
@@ -488,7 +641,7 @@ def _parse_line_js(text: str) -> tuple[str, list[dict]] | None:
                 "amount": amount,
             }
         )
-    return name, bars
+    return bars
 
 
 def _measure(code: str, name: str, bars: list[dict]) -> SectorIndexReading | None:

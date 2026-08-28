@@ -25,6 +25,10 @@ from typing import Any
 
 from ashare_decision_support.schedule.timezone import beijing_today
 
+# 浮动盈亏的公式只有一份，在持有成本价的那一层。`HoldingView` 是 `state.Position`
+# 的投影，这个数在两边必须逐位相同——所以取的是同一个函数，不是同一段代码。
+from ashare_decision_support.state.positions import unrealised_pct as position_gain
+
 # 低吸的自然持有期是 2–5 个交易日（等回调结束 → 反弹到前高）。超过这个窗口还没
 # 有像样的反弹，说明当初的判断没兑现——继续持有是在等一个已经没有依据的结果。
 #
@@ -87,9 +91,7 @@ class HoldingView:
         )
 
     def unrealised_pct(self, price: float | None) -> float | None:
-        if not self.cost_price or not price:
-            return None
-        return round(float(price) / float(self.cost_price) - 1.0, 6)
+        return position_gain(self.cost_price, price)
 
     def describe(self, price: float | None) -> list[str]:
         """给告警正文用。持仓告警不带成本和浮盈，等于让你自己去翻账户。"""

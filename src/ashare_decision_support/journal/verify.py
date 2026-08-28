@@ -9,14 +9,14 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from ashare_decision_support.adapters.base import fetch_daily_bars
 from ashare_decision_support.journal.records import KIND_RECOMMENDATION, Outcome
 from ashare_decision_support.journal.store import Journal
 from ashare_decision_support.numeric import finite
-from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.schedule.timezone import beijing_from_epoch, beijing_today
 
 DEFAULT_HORIZON_SESSIONS = 5
 
@@ -40,8 +40,9 @@ def verify_pending(
     symbols = sorted({row["symbol"] for row in pending if row.get("symbol")})
     earliest = min(_as_date(row["trade_date"]) for row in pending)
     start = earliest - timedelta(days=10)
+    notes: list[str] = []
     try:
-        bars = fetch_daily_bars(adapter, symbols, start, now)
+        bars = fetch_daily_bars(adapter, symbols, start, now, notes)
     except Exception as exc:
         return {
             "checked": len(pending),
@@ -51,7 +52,6 @@ def verify_pending(
         }
 
     outcomes: list[Outcome] = []
-    notes: list[str] = []
     for row in pending:
         rows = bars.get(row["symbol"]) or []
         outcome = _resolve(row, rows, now, horizon)
@@ -76,18 +76,16 @@ def _resolve(row: dict, bars: list[dict], today: date, horizon: int) -> Outcome 
     if trade_date is None or not bars:
         return None
 
+    dated = _dated_bars(bars)
     anchor = next(
-        (bar for bar in reversed(bars) if _as_date(bar.get("date")) and _as_date(bar["date"]) <= trade_date),
+        (bar for bar, stamp in reversed(dated) if stamp <= trade_date),
         None,
     )
     if anchor is None or not anchor.get("close"):
         return None
     base = float(anchor["close"])
 
-    forward = [
-        bar for bar in bars
-        if _as_date(bar.get("date")) and _as_date(bar["date"]) > trade_date
-    ][:horizon]
+    forward = [bar for bar, stamp in dated if stamp > trade_date][:horizon]
     if not forward:
         return None
 
@@ -181,9 +179,49 @@ def _level(pct: Any, base: float) -> float | None:
 
 
 def _as_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, (int, float)):
+        try:
+            timestamp = float(value)
+            if timestamp > 1e12:
+                timestamp /= 1000.0
+            return beijing_from_epoch(timestamp).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        try:
+            return datetime.strptime(text, "%Y%m%d").date()
+        except ValueError:
+            return None
     try:
-        return date.fromisoformat(str(value)[:10])
+        return date.fromisoformat(text[:10].replace("/", "-"))
     except (TypeError, ValueError):
         return None
+
+
+def _bar_date(bar: dict[str, Any]) -> date | None:
+    """Read the date contract shared by daily adapters.
+
+    Most adapters return normalized rows with ``timestamp``. Older fixtures and
+    a few external sources use ``date`` or Chinese aliases, so verification must
+    accept the same field family as the rest of the daily-bar pipeline.
+    """
+    for key in ("timestamp", "date", "datetime", "日期", "时间"):
+        stamp = _as_date(bar.get(key))
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def _dated_bars(bars: list[dict]) -> list[tuple[dict, date]]:
+    dated: list[tuple[dict, date]] = []
+    for bar in bars:
+        stamp = _bar_date(bar)
+        if stamp is not None:
+            dated.append((bar, stamp))
+    dated.sort(key=lambda item: item[1])
+    return dated

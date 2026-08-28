@@ -27,6 +27,23 @@ from ashare_decision_support.symbols import normalize_symbol
 POSITIONS_FILE = "positions.json"
 
 
+def unrealised_pct(cost_price: float | None, price: float | None) -> float | None:
+    """浮动盈亏。没有成本价或没有现价就返回 None，不猜。
+
+    收成自由函数是因为**它此前有两份逐字相同的**：`Position.unrealised_pct` 与
+    `monitor/holdings.py` 的 `HoldingView.unrealised_pct`——后者是前者的投影，
+    连 `round(..., 6)` 都一样。两份的失效方式是安静的：改一处的取整位数或
+    「成本价缺失怎么办」，另一处照旧，于是同一笔持仓在盘中告警里和在 `ask`
+    的上下文里显示的浮盈**差最后一位**，两边都不报错。
+
+    公式放在持有 `cost_price` 的这一层：浮动盈亏是成本价的派生量，不是监控层
+    的判断。
+    """
+    if not cost_price or not price:
+        return None
+    return round(float(price) / float(cost_price) - 1.0, 6)
+
+
 def _today() -> date:
     """今天（北京时区）。
 
@@ -86,9 +103,7 @@ class Position:
 
     def unrealised_pct(self, price: float | None) -> float | None:
         """浮动盈亏。没有成本价就返回 None，不猜。"""
-        if not self.cost_price or not price:
-            return None
-        return round(float(price) / float(self.cost_price) - 1.0, 6)
+        return unrealised_pct(self.cost_price, price)
 
 
 class Positions:

@@ -29,6 +29,7 @@ from ashare_decision_support.news.base import NewsDoc, NewsSource
 from ashare_decision_support.news.cache import NewsCache
 from ashare_decision_support.news.health import probe_feeds
 from ashare_decision_support.numeric import first_finite
+from ashare_decision_support.symbols import bare_code
 from ashare_decision_support.tabular import records, text
 
 # Per-stock news is one call per symbol. Matching `sina_intraday.py`'s pool size
@@ -216,7 +217,7 @@ class AkshareNewsSource(NewsSource):
             return {}, []
 
         def fetch(symbol: str) -> list[NewsDoc]:
-            table = self.ak.stock_news_em(symbol=_bare_code(symbol))
+            table = self.ak.stock_news_em(symbol=bare_code(symbol))
             return [
                 NewsDoc(
                     title=text(row, "新闻标题"),
@@ -365,9 +366,3 @@ class AkshareNewsSource(NewsSource):
         if self.cache is not None:
             self.cache.write(trade_date, key, rows)
         return rows, None
-
-
-
-
-def _bare_code(symbol: str) -> str:
-    return symbol.split(".", maxsplit=1)[0].strip()

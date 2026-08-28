@@ -1,5 +1,9 @@
 """External-AI research packs built only from deterministic project facts."""
 
+from ashare_decision_support.research.daily_sector import (
+    load_daily_sector_analysis,
+    render_daily_sector_analysis,
+)
 from ashare_decision_support.research.leaders import (
     LEADERS_SCHEMA,
     build_sector_leaders,
@@ -15,5 +19,7 @@ __all__ = [
     "MONTHLY_SCHEMA",
     "build_monthly_context",
     "build_sector_leaders",
+    "load_daily_sector_analysis",
     "refresh_sector_leaders",
+    "render_daily_sector_analysis",
 ]

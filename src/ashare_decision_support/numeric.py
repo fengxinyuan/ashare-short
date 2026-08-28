@@ -16,6 +16,8 @@ NaN，有的连 `True` 都会算成 1.0。
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
+from statistics import median
 from typing import Any
 
 # 数据源用来表示「这一格没有值」的几种写法。挡在这里，是因为它们全都能骗过
@@ -79,6 +81,36 @@ def first_finite(row: dict[str, Any], *keys: str) -> float | None:
         if number is not None:
             return number
     return None
+
+
+def mean(values: Iterable[Any]) -> float | None:
+    """有限值的算术平均；一个有限值都没有时返回 None。
+
+    这里也曾经是各写一份：`signals/stabilise.py` 的那份跳过非正数（它的成交量
+    列里，0 是 `_clean` 填的「这一格没取到」）、`sectors/turnover.py` 的那份在
+    空序列上返回 **0.0**、`signals/series.py` 的那份不做任何收窄（它的入参已经
+    过了 `series()` 的 `finite`，所以两者在实际调用点上逐值相同——但那是**调用
+    方碰巧干净**，不是这个函数的口径）。三种空值语义撞在一起就是 `positive()`
+    那段注释说的情形——0.0 会一路参与除法与比较，把「没有样本」变成「均值为零」。
+
+    收到这里之后只有一条判据，和 `finite` 一致：**收得成有限实数的才进分子，
+    也才进分母**。要「跳过 0」的调用方自己先过一遍 `positive()`——那是取数
+    口径，不是求平均这一步该替它决定的事。
+    """
+    usable = [number for number in (finite(value) for value in values) if number is not None]
+    return sum(usable) / len(usable) if usable else None
+
+
+def median_of(values: Iterable[Any]) -> float | None:
+    """有限值的中位数；一个有限值都没有时返回 None。
+
+    和 `mean` 同一条判据。单独收在这里是因为 `median()` 对坏值的反应比 `sum()`
+    更难看出来：NaN 不会让它报错，只会让它**悄悄给错数**——`journal/stats.py`
+    里记着实测的那一例，`median([0.1, nan, 0.9, 0.2, 0.3])` 返回 0.2，去掉 NaN
+    之后的真值是 0.25。先过 `finite` 就没有这条路径。
+    """
+    usable = [number for number in (finite(value) for value in values) if number is not None]
+    return median(usable) if usable else None
 
 
 def clamp(value: float, low: float, high: float) -> float:

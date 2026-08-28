@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ashare_decision_support.jobs.post_close import POST_CLOSE_LATEST_NAME, SNAPSHOT_LATEST_NAME
+from ashare_decision_support.artifacts import POST_CLOSE_LATEST_NAME, SNAPSHOT_LATEST_NAME
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_pre_open_brief
 from ashare_decision_support.notify.base import Notifier, publish, written_path

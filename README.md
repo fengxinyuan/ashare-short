@@ -20,6 +20,10 @@ A 股超短线事实采集与分析辅助系统。只做采集、整理、提醒
 | 场景 | 命令 | 结果 |
 |---|---|---|
 | 趋势分析 | `ashare-ds morning` / `ashare-ds ask "今天板块趋势怎么样"` | 盘前大盘、板块排序、当日候选 |
+| 每日板块复看 | `ashare-ds sector-analysis` | 只读最近一次板块事实，不重复取数 |
+| 板块情景预测 | `ashare-ds sector-forecast` | 按主题簇去重，给出排序、盘中确认与失效条件 |
+| 盘中验证预测 | `ashare-ds sector-confirmation` | 用当天板块截面逐项确认或否决盘前情景 |
+| 板块基线验证 | `ashare-ds sector-backtest` | 用本地行业历史验证固定价格基线的1/3/5日相对收益 |
 | 参数化选股 | `ashare-ds strategy-screen --profile all` | TickFlow 全市场日线筛选，多策略结果供 AI 比较 |
 | 股价分析 | `ashare-ds advise 600519.SH` / `ashare-ds ask "600519 现在怎么看"` | 单票结构、分时、成交量、盘口、买卖点 |
 | 盘中监控 | `ashare-ds monitor --once` | 板块状态 + 持仓卖点；不传代码就只盯持仓 |
@@ -48,6 +52,9 @@ ashare-ds position open 600519.SH --cost 1350.6 --stop 1330 --target 1430
 ashare-ds position list
 
 ashare-ds morning
+ashare-ds sector-forecast
+ashare-ds sector-confirmation
+ashare-ds sector-backtest --output briefs/sector_backtest_latest.json
 ashare-ds monitor --once
 ashare-ds monitor --feishu
 ashare-ds advise 600519.SH
@@ -68,10 +75,14 @@ ashare-ds strategy-screen --profile all --all-a --price-max 40
 
 如果你想让系统保持完全确定性，直接用默认值即可：`writer` 默认就是 `template`，
 `ask` / `chat` 默认就是 facts-only。只有显式加 `--llm` 或 `--writer llm` 才会走模型。
+`facts --format text` 默认输出精简摘要；需要完整文本时加 `--full`，JSON 导出始终保留
+完整结构，并带有顶层 `data_status`。
 
 ## 推荐工作流
 
-1. 用 `morning` / `advise` / `monitor` 先把事实和结构化结论跑出来。
+1. 用 `morning` 采集事实，再用 `sector-forecast` 生成可证伪的板块情景；盘中由
+   `monitor` 确认或否决，盘后用 `review` 记录结果。`sector-backtest` 只提供历史基线，
+   不把排名分数包装成胜率。
 2. 用 `facts` 导出统一 bundle，直接在 Codex / Claude 窗口里粘贴或引用这些 facts / briefs 做后续分析。包内同时有当前事实和最近 20/60 个交易日的验证结果，避免只根据单次晨报下结论。JSON 包带有 `schema: "ashare-facts-v1"` 和 `contract` 字段：`as_of` 是统一数据时点，缺失值保持为 `null`/空集合，不能由分析者补猜；数值由确定性规则层产生，模型只负责解释和取舍。
 3. 如果只是想在命令行里让模型代写，再显式加 `--llm` 或 `--writer llm`。最终交易判断和执行由你自行决定。
 
@@ -80,8 +91,7 @@ ashare-ds strategy-screen --profile all --all-a --price-max 40
 | 文档 | 内容 |
 |---|---|
 | [`docs/USAGE.md`](docs/USAGE.md) | 场景到命令的对应表，优先看这个 |
-| [`docs/CODEX_WORKFLOW.md`](docs/CODEX_WORKFLOW.md) | Codex 做链路、板块与个股分析的事实包工作流与边界 |
-| [`docs/EXTERNAL_AI_TOOLS.md`](docs/EXTERNAL_AI_TOOLS.md) | Codex / Claude Code 的 MCP 接入、月度展望与全板块龙头工具 |
+| [`docs/EXTERNAL_AI_TOOLS.md`](docs/EXTERNAL_AI_TOOLS.md) | Codex / Claude Code 的 MCP 接入、月度展望与全板块龙头工具，以及读事实包的边界 |
 | [`docs/SOLUTION.md`](docs/SOLUTION.md) | 总览 · 需求拆解 · 运行链路 · 设计约束 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图 · 调度 · 状态 · 失败模式 |
 | [`docs/INVENTORY.md`](docs/INVENTORY.md) | **功能接线清单**：哪个模块今天真的跑、哪些建成但未接线 |
@@ -89,11 +99,8 @@ ashare-ds strategy-screen --profile all --all-a --price-max 40
 | [`docs/PIPELINE.md`](docs/PIPELINE.md) | 舆情 → 板块 → 选股 → 买卖点的计算细节 |
 | [`docs/KNOWLEDGE_VOLUME_PRICE.md`](docs/KNOWLEDGE_VOLUME_PRICE.md) | 量价与形态知识库：白皮书提炼、尾盘打法、K 线词汇与各自的落点 |
 | [`docs/PROMPT_TEMPLATES.md`](docs/PROMPT_TEMPLATES.md) | **交给外部模型的提示词都在这里**：每日盘前固定版、研究版、多 Agent 编排与数字闸门口径 |
-| [`docs/PEER_TRADINGAGENTS.md`](docs/PEER_TRADINGAGENTS.md) | 同类开源项目对照：哪些做法值得抄、哪些不适用 |
-| [`docs/PEER_DAILY_STOCK_ANALYSIS.md`](docs/PEER_DAILY_STOCK_ANALYSIS.md) | 同类开源项目对照（daily_stock_analysis）：护栏 · 降级读数 · 组合层 |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | 设计取舍、被否决方案、已删除内容 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | **下一轮**：体检结论、七个真缺口、量价形态/轮动/记忆层设计与实施顺序 |
-| [`docs/REWORK.md`](docs/REWORK.md) | **本轮改造方案**：主链路清理 · 量价策略 · 筹码与元数据 · 行情记忆 |
 
 ## 约束
 
@@ -121,6 +128,7 @@ python3 scripts/check.py --fast  # 跳过 pytest，只跑三道静态闸门
 python3 -m pytest -q         # 单元测试，不打外网
 ruff check .                 # 静态检查
 ruff check . --fix           # 只应用安全修复
+ashare-ds history-refresh    # 回填板块/海外历史缓存，供盘前基准率读取
 
 python3 scripts/inventory_audit.py   # 六条接线口径，见 docs/INVENTORY.md
 python3 scripts/docs_audit.py        # 文档里的每条 `ashare-ds` 命令都还跑得通

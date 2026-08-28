@@ -4,11 +4,31 @@ from abc import ABC, abstractmethod
 from datetime import date
 from typing import Any
 
+from ashare_decision_support.adapters.daily_cache import cache_for
 from ashare_decision_support.numeric import positive
 from ashare_decision_support.symbols import normalize_symbol
 
 SECURITY_LIST_FIELDS = ("industries", "concepts")
 SECURITY_SCALAR_FIELDS = ("industry", "industry_leaf", "industry_path", "name_en")
+
+# 分钟线周期的仓内写法。**两个盘中适配器必须认同一张表**：`build_intraday_adapter`
+# 在运行时才决定给出付费档（TickFlow）还是免费档（新浪），而 `cli.py` 把这张表
+# 当成六条命令 `--period` 的 `choices` 用——校验发生在**解析参数时**，取数发生在
+# **另一个适配器里**。两份各自演化的话，分叉不会在改动那天报错：它表现为某个周期
+# 在 CLI 上能敲进去，跑到一半被适配器以 ValueError 顶回来，或者反过来，付费档明明
+# 支持的周期敲不进去。同 `tickflow_intraday.py` 对两个适配器签名的那条要求。
+SUPPORTED_PERIODS: tuple[str, ...] = ("1", "5", "15", "30", "60")
+
+# 取多少天日线。240 个自然日约等于一个交易年，是 `DailyTechnicalAnalyzer` 与
+# `WyckoffAnalyzer` 那几个 60/120 日窗口能算满所需的量。
+#
+# 和 `fetch_daily_bars` 收在一起是因为**它们坏的方式一样**：那个函数的 docstring
+# 说的是四份逐字相同的取数实现改一处改不全，这个数原来也是三份（`monitor/session`、
+# `agents/collectors`、`jobs/advise`），而它比取数实现更隐蔽——三处不一致不表现为
+# 「慢」，表现为**同一只票经 `advise` 和经盘中监控算出来的均线与分位不一样**，
+# 两个数都不报错。（`jobs/advise` 那一份 2026-08-15 清理时发现是**定义了从没被
+# 读过**的：接线审计按名字数引用，另外两处的同名常量替它顶了账。）
+DAILY_LOOKBACK_DAYS = 240
 
 
 class MarketDataAdapter(ABC):
@@ -216,7 +236,7 @@ def _reference_security_rows(reference_adapter: Any | None) -> dict[str, dict[st
 
 
 def fetch_daily_bars(
-    adapter: Any, symbols: list[str], start: date, end: date
+    adapter: Any, symbols: list[str], start: date, end: date, notes: list[str] | None = None
 ) -> dict[str, list[dict]]:
     """取日线。适配器有批量接口就走批量，没有就走逐只那条。
 
@@ -229,6 +249,35 @@ def fetch_daily_bars(
     剩下三条路仍然逐只打——而且只表现为「慢」，不表现为「错」。
     """
     batch = getattr(adapter, "get_historical_bars_batch", None)
-    if callable(batch):
-        return batch(symbols, start, end)
-    return adapter.get_historical_bars(symbols, start, end)
+    cache = cache_for(adapter)
+    try:
+        result = batch(symbols, start, end) if callable(batch) else adapter.get_historical_bars(symbols, start, end)
+    except Exception as exc:
+        result = {}
+        recovered: list[str] = []
+        for symbol in symbols:
+            rows = cache.read(symbol, start, end)
+            if rows:
+                result[symbol] = rows
+                recovered.append(symbol)
+        if recovered:
+            latest = max(
+                (cache.latest_date(result[symbol]) for symbol in recovered),
+                default=None,
+            )
+            if notes is not None:
+                notes.append(
+                    f"行情源失败（{type(exc).__name__}），已回退日线缓存："
+                    f"{len(recovered)}/{len(symbols)} 只，缓存截止 {latest or '未知'}；结果不可视为实时"
+                )
+            return {symbol: result.get(symbol, []) for symbol in symbols}
+        raise
+
+    for symbol, rows in result.items():
+        if rows:
+            try:
+                cache.write(symbol, rows)
+            except OSError:
+                if notes is not None:
+                    notes.append("日线缓存写入失败，本次仍使用在线行情")
+    return result

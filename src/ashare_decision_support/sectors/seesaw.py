@@ -50,6 +50,7 @@ from statistics import NormalDist
 from typing import Any
 
 from ashare_decision_support.sectors import panel
+from ashare_decision_support.sectors.panel import MIN_SECTORS
 
 # 相关系数的窗口（交易日）。60 日 ≈ 三个月，短到能反映当前这轮行情的结构，
 # 长到不被一两周的行情主导。与 ROADMAP §5.2 定的窗口一致。
@@ -71,10 +72,6 @@ MIN_HALF_POINTS = 20
 # 榜上最多列几对。不是性能考虑——4005 对算完只要几十毫秒；是**可读性**：
 # 一份印了 200 对相关系数的简报，读的人会从里面挑一个支持自己看法的。
 TOP_PAIRS = 12
-
-# 少于这么多板块不给结论。同 `rotation.py:MIN_SECTORS` / `turnover.py:MIN_SECTORS`
-# 的理由与取值：横截面统计在小样本上不可信。
-MIN_SECTORS = 20
 
 LABEL_CONSISTENT = "与历史关系一致"
 LABEL_UNKNOWN = "两者历史上没有稳定关系"
@@ -395,12 +392,12 @@ def _measure(
         return None
     left_series = [a[day] for day in days]
     right_series = [b[day] for day in days]
-    whole = _pearson(left_series, right_series)
+    whole = panel.pearson(left_series, right_series)
     if whole is None:
         return None
     half = size // 2
-    first = _pearson(left_series[:half], right_series[:half])
-    second = _pearson(left_series[half:], right_series[half:])
+    first = panel.pearson(left_series[:half], right_series[:half])
+    second = panel.pearson(left_series[half:], right_series[half:])
     if first is None or second is None:
         return None
     if first >= 0.0 or second >= 0.0:
@@ -413,26 +410,6 @@ def _measure(
         second_half=round(second, 4),
         points=size,
     )
-
-
-def _pearson(a: list[float], b: list[float]) -> float | None:
-    """皮尔逊相关。任一侧方差为 0（整段不动）时返回 None，不返回 0。
-
-    方差为 0 的含义是「这个板块这段时间没有报价变化」，那是数据问题；返回 0 会
-    让它读起来像「实测无关」，而那两件事该导向不同的动作。同 `numeric` 那一层
-    对「拿不到」与「等于零」的区分。
-    """
-    size = len(a)
-    if size < 2 or size != len(b):
-        return None
-    mean_a = sum(a) / size
-    mean_b = sum(b) / size
-    cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b, strict=True))
-    var_a = sum((x - mean_a) ** 2 for x in a)
-    var_b = sum((y - mean_b) ** 2 for y in b)
-    if var_a <= 0.0 or var_b <= 0.0:
-        return None
-    return cov / (var_a * var_b) ** 0.5
 
 
 def _observations(read: SeesawRead) -> list[str]:

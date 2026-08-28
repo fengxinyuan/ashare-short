@@ -11,20 +11,15 @@ from __future__ import annotations
 
 import html
 import re
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
 from typing import Any
 from urllib.parse import urljoin
 
-from ashare_decision_support.news.balance import collect_by_feed
-from ashare_decision_support.news.base import NewsDoc, NewsSource
-from ashare_decision_support.news.cache import NewsCache, cached_docs
-from ashare_decision_support.news.health import probe_feeds
+from ashare_decision_support.news.base import NewsDoc
+from ashare_decision_support.news.cache import NewsCache
+from ashare_decision_support.news.feed_source import TIMEOUT_SECONDS, FeedNewsSource
 
-USER_AGENT = "Mozilla/5.0"
-TIMEOUT_SECONDS = 15
 PER_LISTING_LIMIT = 30
 
 # 标题长度上限。这三个栏目里**真实**标题实测 12–63 字（最长的一条是证监会那种
@@ -85,10 +80,14 @@ _TAGS = re.compile(r"<[^>]+>")
 _SPACE = re.compile(r"\s+")
 
 
-class OfficialNewsSource(NewsSource):
+class OfficialNewsSource(FeedNewsSource):
     """Public policy and regulatory listings, each independently degradable."""
 
     name = "official_cn"
+    cache_prefix = "official"
+    unreachable_note = "官方信息源 {names} 不可用，本次跳过"
+    empty_note = "官方政策与监管信息源未返回可用条目"
+    per_feed_limit = PER_LISTING_LIMIT
 
     def __init__(
         self,
@@ -97,50 +96,15 @@ class OfficialNewsSource(NewsSource):
         listings: tuple[OfficialListing, ...] = DEFAULT_LISTINGS,
         cache: NewsCache | None = None,
     ) -> None:
-        self._opener = opener or urllib.request.urlopen
-        self.timeout = timeout
-        self.listings = listings
-        self.cache = cache
-        self.last_market_stats: dict[str, object] = {}
+        # 参数名保留 `listings`：这一路取的是**列表页**，不是 feed。基类内部统一
+        # 叫 `feeds`，那是取数机制的名字；这里是调用方看到的名字。
+        super().__init__(opener=opener, timeout=timeout, feeds=listings, cache=cache)
 
-    def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
-        # 三个栏目是三个独立的网络往返，串行等于把三次超时相加。
-        retained, notes, stats = collect_by_feed(
-            self.listings,
-            lambda listing: self._listing_docs(trade_date, listing),
-            limit=limit,
-            unreachable_note="官方信息源 {names} 不可用，本次跳过",
-            empty_note="官方政策与监管信息源未返回可用条目",
-        )
-        if stats:
-            self.last_market_stats = stats
-        return retained, notes
-
-    def fetch_for_symbols(
-        self, symbols: list[str], limit: int = 10
-    ) -> tuple[dict[str, list[NewsDoc]], list[str]]:
-        return {}, []
-
-    def health_check(self) -> dict[str, Any]:
-        return probe_feeds(
-            "official_cn", self.listings, lambda listing: listing.name, self._fetch_listing
-        )
-
-    def _listing_docs(self, trade_date: date, listing: OfficialListing) -> list[NewsDoc]:
-        return cached_docs(
-            self.cache,
-            trade_date,
-            f"official_{listing.source}",
-            lambda: self._fetch_listing(listing),
-        )
-
-    def _fetch_listing(self, listing: OfficialListing) -> list[NewsDoc]:
-        request = urllib.request.Request(listing.url, headers={"User-Agent": USER_AGENT})
-        with self._opener(request, timeout=self.timeout) as response:
-            page = response.read().decode("utf-8", "ignore")
+    def fetch_one(self, feed: OfficialListing) -> list[NewsDoc]:
+        page = self.open_bytes(feed.url).decode("utf-8", "ignore")
         return [
-            NewsDoc(title=title, source=listing.source, published_at=published_at, url=url)
-            for title, published_at, url in _listing_items(page, listing.url)[:PER_LISTING_LIMIT]
+            NewsDoc(title=title, source=feed.source, published_at=published_at, url=url)
+            for title, published_at, url in _listing_items(page, feed.url)[: self.per_feed_limit]
         ]
 
 

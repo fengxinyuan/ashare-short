@@ -166,12 +166,21 @@ adapters/   数据接入与能力探测
   ratelimit           滑动窗口令牌桶 + 服务端等待时长退避
   freshness           分钟线盘中时效实测
   validate            跨源交叉校验 · 量纲 · 浮点卫生 · 时效戳
+  http                取文本这一步：浏览器头 + 站点编码（七个适配器共用）
+                      新浪/腾讯的端点地址与 Referer 也收在这里——同一个端点被两个
+                      适配器打，地址各存一份的话，改一处不会让另一处报错
 
 agents/     base(并行+失败隔离) · collectors(L1 确定性算子) · debate(L3 多空辩论)
 news/       采集 · 词典情绪 · 大模型归因 · 跨源去重与时效折权 · **持久语料库**
+            · feed_source(分路取数源的共用骨架：官方列表页与海外 RSS 只差
+              「给定一路怎么取」这一件事)
 sectors/    申万分类 · 成分股动量 · 板块排序 · 大盘方向
             · rotation(轮动：排名变化 + 长/等长两个窗口的切换判定)
             · turnover(成交额迁移四象限 + 总量)　—— 两者都**只出读数、不进打分**
+            · overseas_link(外盘 → A 股板块的显式映射：44 个真实价格读数 → 带机制
+              说明的板块链路。**按品种设异动阈值**——主题 ETF ±3% 是常态而美元
+              人民币 ±0.5% 就是大事，一个全局阈值只对其中一半品种有效。
+              同一板块被反向链路同时指向时并排保留，不压成净方向)
             · intraday(**盘中**截面：全市场扫描按行业+概念归并，排超额涨幅)
               前三层都是日频/盘后定格的，只有这一层回答「现在」
 screens/    可交易性 · 致命公告否决 · 业绩风险
@@ -196,11 +205,24 @@ ask/        单入口问答：question(解析) · context(装配) · verdict(决
             · plan(研究计划) · runner(分步执行) · report(组织) · visual(价位轴)
 writer/     模板（默认）· LLM + 数字闸门
 notify/     渲染 + 控制台/文件/飞书 · publish(投递，单渠道失败不阻断)
+research/   给外部 AI 的资料包：**只组织事实与研究要求，不生成预测**
+            preopen(每日盘前) · monthly(月度展望) · leaders(全板块量价龙头)
+            三份的边界一致：把已经算好的事实摆出来，判断留给读它的模型
 jobs/       daily_cycle · morning · monitor · advise · post_close · pre_open · review
+            盘前主链路按**判定阶段**分文件，`morning.py` 只剩 `run_morning` 那六行
+            编排与不做取舍的前两段（板块成分股 · 并行采集）：
+              morning_stages   调参项 · 外部通道 · 六个阶段之间的五张交接单
+              morning_fuse     ③ 舆情归因 → 大盘方向 → 板块排序 → 仓位闸门
+              morning_select   ④ 板块内选股：三道筛 → 打分 → 配额取前 N
+              morning_record   ⑤ 台账（**被否的也记**，否则无从验证那条规则）
+              morning_publish  ⑥ 渲染与推送，不做任何判断
+              morning_facts    事实包组装，同样不做判断
 
 numeric.py  数字收口：能变成有限实数就要，否则一律 None（全仓唯一一份）
+            含 mean/median_of——空集合一律 None，不是 0.0
 symbols.py  代码归一化
 envfile.py  .env 装载
+artifacts.py 落盘产物的文件名：写的那端和读的那端认同一个字符串
 ```
 
 ### 选股段只有一份代码
@@ -238,7 +260,7 @@ envfile.py  .env 装载
 改造前 `post_close` 走的是另一条管线（`research.py:ResearchPipeline` →
 `DecisionMatrix`），自带一套阶跃式仓位算法与四档市场状态字符串，与 `EmotionCycle`
 七档互不映射——**盘后给出的次日候选，用的正是盘前明确否定过的逻辑**，而两边没有
-任何地方对账。那条管线已删除，见 [`REWORK.md`](REWORK.md) §三。
+任何地方对账。那条旧管线已删除，具体取舍见 [`DECISIONS.md`](DECISIONS.md) 的已删除内容章节。
 
 ### 卖点分两处，按数据口径分
 

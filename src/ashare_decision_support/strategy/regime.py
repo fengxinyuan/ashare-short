@@ -4,33 +4,29 @@
 2026-07-31 实测半导体 +4.23% 收在当日最低正是这种情况。「昨天封住的板今天还
 封得住吗」只有炸板率回答，别的读数一个都看不到。
 
-**阈值与台账分层共用同一组切点**（`journal/stats.py` 从这里 import）。两边各定
-一套是个隐蔽的坑：闸门按 0.50 切、统计按 0.55 切，那么「退潮期这套规则管不管
-用」这个问题的样本，和真正被闸门拦下的那些日子对不上，闸门就永远无法被自己的
-台账验证。
-
-这些数是**先验设定**，来自超短交易里通用的情绪刻度，不是回测出来的。回测框架
-建起来之前，它们的作用是让「今天不该做」这件事第一次能被表达出来，而不是精确。
+**切点不在这里定，在 `emotion_scale.py`。** 这一层出的是判定阶梯，尺子是全仓
+共用的一把——同一组切点还被简报措辞（`adapters/limit_pool.py`）、打分斜坡
+（`sectors/predict.py`）和台账分层（`journal/stats.py`）读着。各定一套是个隐蔽
+的坑，那个坑的实际长相记在 `emotion_scale.py` 的模块注释里。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ashare_decision_support.emotion_scale import (
+    BLOWUP_FROZEN,
+    BLOWUP_HEALTHY,
+    BLOWUP_STRESSED,
+    STREAK_CLIMAX,
+    STREAK_MOMENTUM,
+    STREAK_WEAK,
+)
 from ashare_decision_support.models.enums import EmotionCycle, Playbook
 
-# 炸板率切点。低于 HEALTHY 封板结实，高于 STRESSED 封板意愿崩塌，高于 FROZEN
-# 且没有连板高度就是冰点。`journal/stats.py` 复用前两个做分层。
-BLOWUP_HEALTHY = 0.30
-BLOWUP_STRESSED = 0.50
-BLOWUP_FROZEN = 0.60
-
-# 连板高度：有没有资金愿意接力。能出 5 板说明主线在发酵，7 板以上通常已是高潮段。
-STREAK_WEAK = 2
-STREAK_MOMENTUM = 5
-STREAK_CLIMAX = 7
-
 # 涨停家数。太少说明没有赚钱效应，太多且伴随高连板是情绪透支。
+#
+# 这三个留在本模块：只有闸门读它们，不构成跨层的那把尺子。
 LIMIT_UP_THIN = 15
 LIMIT_UP_CROWDED = 80
 

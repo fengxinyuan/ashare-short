@@ -235,7 +235,21 @@ def _closes_by_date(bars: list[dict]) -> dict[str, float]:
 
 
 def _window_return(closes: list[float], window: int) -> float | None:
-    """窗口收益。需要 `window + 1` 根——N 日收益是 N+1 个收盘价之间的事。"""
+    """窗口收益。需要 `window + 1` 根——N 日收益是 N+1 个收盘价之间的事。
+
+    **这个算式在仓里有三份，三份都是有意留着的**：这里、`signals/series.py:change`
+    和 `sectors/panel.py:pct`。`panel.pct` 的 docstring 记着不并的理由（入参密度
+    不同，两边的「近 5 根」不是同一个 5 根），这里补上第三份的位置：
+
+    - `series.change` 收的是过 `series()` 的个股日线，取不到值的根被跳过，长度
+      可能小于 bars；它还**收一次小数位**，另外两份不收。
+    - 这一份的入参是两条序列按日期取交集之后的结果（见 `common`），密度由交集
+      决定，而且**两条必须同下标对齐**——对齐是这一层的全部意义，合并到任何一个
+      不知道「有两条序列」的通用函数里，这条约束就没有地方可写。
+
+    并到 `panel.pct` 还会**把依赖方向倒过来**：`sectors/` 引 `signals/`（见
+    `sectors/momentum.py`），反过来一次都没有。
+    """
     if len(closes) < window + 1:
         return None
     base = closes[-(window + 1)]

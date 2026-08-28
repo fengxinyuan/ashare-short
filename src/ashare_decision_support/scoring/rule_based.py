@@ -413,7 +413,7 @@ class RuleBasedScoreProvider(ScoreProvider):
         floor = max(MIN_RRR_DENOMINATOR_ATR * unit, MIN_RRR_DENOMINATOR_PCT)
         if downside < floor:
             warnings.append(
-                f"止损距离仅 {downside:.2%}，不足一个日波幅，"
+                f"日线评分口径：止损距离仅 {downside:.2%}，不足一个日波幅，"
                 "按最小有效止损重算盈亏比（否则会算出虚高的比值）"
             )
             downside = floor
@@ -422,7 +422,7 @@ class RuleBasedScoreProvider(ScoreProvider):
         # 1.0 无分，2.5 满分；低于 0.8 起负分，0.3 处触底。不再在 2.0 处跳 8 分。
         points = 8.0 * _ramp(rrr, 1.0, 2.5) - 8.0 * _ramp(-rrr, -0.8, -0.3)
         if rrr < 0.8:
-            warnings.append(f"盈亏比仅 {rrr:.2f}，风险收益不划算")
+            warnings.append(f"日线评分口径：盈亏比仅 {rrr:.2f}，风险收益不划算")
         if abs(points) >= 0.5:
             reasons.append(f"盈亏比 {rrr:.2f}（{points:+.1f}）")
         return points
@@ -688,5 +688,4 @@ def _bars_return(bars: list[dict], window: int) -> float | None:
     if len(closes) <= window:
         return None
     return closes[-1] / closes[-window - 1] - 1.0
-
 

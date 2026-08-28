@@ -237,8 +237,8 @@ class AdviceEngine:
             advice.warnings.append("日线快照与分钟线对不上（疑似不同交易日或不同标的），日线位置未纳入价位计算")
 
         self._levels(advice, daily, intraday, factor, book)
-        self._adjudicate(advice, intraday)
-        self._scenarios(advice, daily, intraday, factor)
+        self._adjudicate(advice)
+        self._scenarios(advice, intraday)
         self._shortline(advice, daily, intraday)
         self._reasons(advice, daily, intraday, wyckoff)
         return advice
@@ -348,8 +348,13 @@ class AdviceEngine:
 
     # ---- L3 裁决 ---------------------------------------------------------
 
-    def _adjudicate(self, advice: StockAdvice, intraday: IntradaySnapshot) -> None:
-        """让模型在候选集里做取舍。没有裁决器时这里只是记录规则的默认选择。"""
+    def _adjudicate(self, advice: StockAdvice) -> None:
+        """让模型在候选集里做取舍。没有裁决器时这里只是记录规则的默认选择。
+
+        不收 `IntradaySnapshot`：裁决器要的是**事实包**（`advice.intraday`，由
+        `_intraday_facts` 摊平成 dict），不是快照对象。两者同名不同物，一起出现
+        在签名里只会让人以为可以随手换一个传。
+        """
         candidates = advice.candidates
         if candidates is None:
             return
@@ -392,9 +397,7 @@ class AdviceEngine:
     def _scenarios(
         self,
         advice: StockAdvice,
-        daily: DailyTechnicalSnapshot | None,
         intraday: IntradaySnapshot,
-        factor: float | None,
     ) -> None:
         vwap = intraday.vwap
         high = intraday.session_high
@@ -781,7 +784,7 @@ def _shortline_score_verdict(
 
 
 def risk_reward(advice: StockAdvice) -> float | None:
-    """盈亏比。**用最远的那个目标**——`targets` 已排序，取 [-1]。
+    """执行盈亏比使用最近目标；更远目标必须先穿过它，不能提前计入收益。
 
     `monitor/session.py` 原来自己有一份逐字相同的实现，用来在锁定价位之后重算。
     两份公式各自独立漂移是迟早的事，而它们必须相等：告警里报的盈亏比和它旁边
@@ -790,7 +793,7 @@ def risk_reward(advice: StockAdvice) -> float | None:
     if not (advice.entry_low and advice.stop and advice.targets):
         return None
     downside = advice.entry_low - advice.stop
-    upside = advice.targets[-1] - advice.entry_low
+    upside = advice.targets[0] - advice.entry_low
     if downside <= 0 or upside <= 0:
         return None
     return round(upside / downside, 2)

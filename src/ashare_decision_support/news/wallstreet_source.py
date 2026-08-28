@@ -29,18 +29,19 @@ from __future__ import annotations
 import json
 import urllib.request
 from collections.abc import Callable
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.news.balance import retain_market_docs
 from ashare_decision_support.news.base import NewsDoc, NewsSource
 from ashare_decision_support.news.cache import NewsCache
+from ashare_decision_support.news.feed_source import USER_AGENT
 from ashare_decision_support.news.health import probe_feeds
+from ashare_decision_support.schedule.timezone import BEIJING_TZ
 
 BASE_URL = "https://api-one.wallstcn.com/apiv1/content/lives?channel={channel}&limit={limit}"
 CURSOR_SUFFIX = "&cursor={cursor}"
-USER_AGENT = "Mozilla/5.0"
 
 CHANNEL_GLOBAL = "global-channel"
 CHANNEL_A_SHARE = "a-stock-channel"
@@ -57,7 +58,10 @@ DEFAULT_LOOKBACK_HOURS = 72
 MAX_PAGES = 16           # 失控保护：单频道最多翻 1200 条
 TIMEOUT_SECONDS = 15
 
-CN_TZ = timezone(timedelta(hours=8))
+# 交易所时钟。**不在这里另立一份**：`schedule/timezone.py` 写着「时钟只有这一个
+# 来源」，而这一行原来是它的第二份私有副本（第三份在
+# `adapters/tickflow_adapter.py`）。固定 +08:00 与 `Asia/Shanghai` 在 1992 年以后
+# 的每一天都相等，只有 1986-1991 那几年的夏令时不同——快讯时间戳到不了那里。
 
 
 class WallstreetNewsSource(NewsSource):
@@ -91,7 +95,7 @@ class WallstreetNewsSource(NewsSource):
         # 无论几点跑，取回的窗口都一样，盘前跑两次不会得到两份不同的输入。
         cutoff = int(
             (
-                datetime.combine(trade_date, datetime.min.time(), tzinfo=CN_TZ)
+                datetime.combine(trade_date, datetime.min.time(), tzinfo=BEIJING_TZ)
                 + timedelta(days=1)
                 - timedelta(hours=self.lookback_hours)
             ).timestamp()
@@ -242,6 +246,6 @@ def _to_doc(item: Any) -> NewsDoc | None:
 
 def _stamp(value: Any) -> str:
     try:
-        return datetime.fromtimestamp(int(value), CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(int(value), BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError, OSError):
         return ""

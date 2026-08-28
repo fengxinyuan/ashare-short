@@ -99,7 +99,7 @@ def _advice_price_parts(item: Any) -> list[str]:
         parts.append(f"止损 {_fmt(stop)}")
     targets = getattr(item, "targets", []) or []
     if targets:
-        parts.append(f"目标 {_fmt(targets[-1])}")
+        parts.append(f"首目标 {_fmt(targets[0])}")
     rrr = getattr(item, "rrr", None)
     if rrr is not None:
         parts.append(f"盈亏比 {rrr}")

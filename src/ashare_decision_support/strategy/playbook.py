@@ -166,7 +166,7 @@ def evaluate_playbooks(
 
     `volume_price` 为 None 时量价门槛**全部放行并标注**，不是判负。取不到读数
     和读数不合格是两件事，用「没测到」当否决理由等于让数据缺失冒充风险判断
-    （同 `jobs/morning.py:_market_scan` 的口径）。
+    （同 `jobs/sources.py:fetch_market_scan` 的口径）。
     """
     trend = getattr(snapshot, "trend_state", None)
     by_trend = playbooks_for_trend(trend)

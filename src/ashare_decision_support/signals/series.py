@@ -90,13 +90,6 @@ def change(closes: list[float], window: int) -> float | None:
     return round(closes[-1] / previous - 1.0, 6)
 
 
-def mean(values: list[float]) -> float | None:
-    """均值。空序列返回 None，不返回 0——「没有样本」和「均值是零」不是一回事。"""
-    if not values:
-        return None
-    return sum(values) / len(values)
-
-
 def volume_ratio(volumes: list[float], window: int, *, digits: int | None = None) -> float | None:
     """最新一根的量 ÷ 前 `window` 根的均量。样本不够或基线取不出来时返回 None。
 

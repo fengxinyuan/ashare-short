@@ -18,6 +18,7 @@ from ashare_decision_support.sectors.intraday import (
     take_snapshot,
 )
 from ashare_decision_support.sectors.momentum import SectorMomentum
+from ashare_decision_support.sectors.outcomes import SectorForecastOutcomeStore
 from ashare_decision_support.sectors.predict import MarketSentiment, SectorPredictor
 from ashare_decision_support.sectors.rotation import (
     RotationRead,
@@ -52,6 +53,7 @@ __all__ = [
     "RotationRead",
     "RotationSummary",
     "SectorDefinition",
+    "SectorForecastOutcomeStore",
     "SectorMetrics",
     "SectorMomentum",
     "SectorOutlook",

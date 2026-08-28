@@ -296,6 +296,31 @@ def test_next_session_readings_are_recorded_separately_from_the_five_day_window(
     assert outcome["mfe_pct"] >= outcome["next_high_pct"]
 
 
+def test_verification_accepts_normalized_timestamp_bars(tmp_path) -> None:
+    """适配器标准输出是 timestamp，不应因为没有 date 而丢掉兑现结果。"""
+    book = Journal(root=tmp_path)
+    book.record(make_record("600000.SH", KIND_RECOMMENDATION, tmp_path))
+    rows = [
+        {
+            "timestamp": f"2026-06-{day:02d}T15:00:00",
+            "open": 100.0,
+            "high": 104.0,
+            "low": 98.0,
+            "close": 100.0 if day == 1 else 102.0,
+        }
+        for day in range(1, 10)
+    ]
+
+    class Adapter:
+        def get_historical_bars(self, symbols, start, end):
+            return {symbol: list(reversed(rows)) for symbol in symbols}
+
+    result = verify_pending(book, Adapter(), today=date(2026, 6, 20))
+
+    assert result["resolved"] == 1
+    assert result["outcomes"][0]["next_close_pct"] == 0.02
+
+
 # ---- 持仓表 ---------------------------------------------------------------
 
 

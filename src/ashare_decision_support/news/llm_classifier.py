@@ -17,12 +17,11 @@
 
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from ashare_decision_support.fanout import gather
+from ashare_decision_support.llmreply import anchor_text, parse_array
 from ashare_decision_support.news.base import NewsDoc, SentimentAnalyzer, SentimentScore
 from ashare_decision_support.news.dedup import dedup_key
 
@@ -286,7 +285,7 @@ class LlmNewsClassifier:
             ]
         )
 
-        rows = _parse_json_array(raw or "")
+        rows = parse_array(raw or "")
         if not rows:
             return {}
 
@@ -295,7 +294,7 @@ class LlmNewsClassifier:
         # 实测：模型的 `i` 会整体偏一位，于是「法国森林火灾」拿到了「动画电影票房
         # 超预期」的归因，整批标签错行——而且在加上 `why` 之前完全看不出来，每条
         # 都"看着挺合理"。序号是模型说的，标题前缀是可以拿原文核对的，只信后者。
-        normalized = [(_norm(doc.title), key) for key, doc in batch]
+        normalized = [(anchor_text(doc.title), key) for key, doc in batch]
 
         mapping: dict[str, DocLabel] = {}
         unmatched = 0
@@ -453,28 +452,6 @@ class LabelBackedSentiment(SentimentAnalyzer):
 
 # ---- parsing -------------------------------------------------------------
 
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-
-
-def _parse_json_array(text: str) -> list:
-    """从模型输出里抠出 JSON 数组。围栏、前后废话都容忍，格式不对就返回空。"""
-    candidate = text.strip()
-    fenced = _FENCE.search(candidate)
-    if fenced:
-        candidate = fenced.group(1).strip()
-    if not candidate.startswith("["):
-        start = candidate.find("[")
-        end = candidate.rfind("]")
-        if start == -1 or end <= start:
-            return []
-        candidate = candidate[start : end + 1]
-    try:
-        parsed = json.loads(candidate)
-    except ValueError:
-        return []
-    return parsed if isinstance(parsed, list) else []
-
-
 def _match_anchor(anchor: Any, normalized: list[tuple[str, str]]) -> str | None:
     """用模型回抄的标题前缀找回它说的是哪一条。
 
@@ -482,16 +459,11 @@ def _match_anchor(anchor: Any, normalized: list[tuple[str, str]]) -> str | None:
     """
     if not isinstance(anchor, str) or not anchor.strip():
         return None
-    needle = _norm(anchor)[:ANCHOR_CHARS]
+    needle = anchor_text(anchor)[:ANCHOR_CHARS]
     if len(needle) < MIN_ANCHOR_CHARS:
         return None
     hits = [key for title, key in normalized if title.startswith(needle)]
     return hits[0] if len(hits) == 1 else None
-
-
-def _norm(text: str) -> str:
-    """归一化标题用于对齐比对：去掉空白与常见装饰，模型抄漏一个标点也能对上。"""
-    return re.sub(r"[\s　【】\[\]（）()《》「」“”\"':：,，.。!！?？、|]+", "", text or "")
 
 
 def _as_list(value: Any) -> list:

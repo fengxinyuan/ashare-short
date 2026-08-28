@@ -30,11 +30,20 @@ from ashare_decision_support.monitor.sector_triggers import (
 )
 from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.notify.render import render_sector_alerts, sector_alert_title
+from ashare_decision_support.schedule.clock import is_continuous_session
 from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.sectors import intraday
 from ashare_decision_support.sectors.intraday import SectorSnapshot
 
 # 个股监控每跑这么多轮，做一次板块截面。个股 2 分钟一轮，所以默认约 10 分钟。
+#
+# 降到这一档而不是每轮都做，理由有两条：板块 pass 是一次全市场扫描（56 页并发），
+# 比个股那轮贵得多；而板块排名在两分钟里的移动基本是噪声。
+#
+# **这是这个数唯一的定义处。** `monitor/loop.py` 原来自己也写了一份 `= 5`，用作
+# `run_monitor_loop` 的签名默认值，而 `monitor/__init__` 转出去给 CLI 与 jobs 的
+# 是这一份——两份都对的时候看不出区别，改一份的时候 CLI 的默认值和函数签名的
+# 默认值会从此差一档，谁都不报错。
 SECTOR_EVERY = 5
 
 
@@ -104,6 +113,8 @@ class SectorSession:
         `notify/base.py:publish` 的处置。
         """
         moment = now or beijing_naive_now()
+        if not is_continuous_session(moment):
+            return SectorPassResult(notes=["当前不在连续竞价时段，跳过全市场板块扫描"])
         try:
             snapshot = intraday.take_snapshot(
                 self.taxonomies,

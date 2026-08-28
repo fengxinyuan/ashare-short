@@ -36,16 +36,18 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from ashare_decision_support.adapters.http import (
+    SINA_QUOTE_URL,
+    SINA_REFERER,
+    TENCENT_REFERER,
+    fetch_text,
+)
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import positive
-from ashare_decision_support.symbols import normalize_symbol
+from ashare_decision_support.symbols import normalize_symbol, prefixed_code
 
-SINA_URL = "https://hq.sinajs.cn/list="
-SINA_REFERER = "https://finance.sina.com.cn"
 TENCENT_URL = "https://qt.gtimg.cn/q="
-TENCENT_REFERER = "https://gu.qq.com"
 
-USER_AGENT = "Mozilla/5.0"
 DEFAULT_TIMEOUT = 10.0
 
 # 腾讯的量纲和新浪不一样：成交量与五档挂单量记**手**，成交额记**万元**。
@@ -195,7 +197,7 @@ class SnapshotAdapter:
     # ---- fetchers --------------------------------------------------------
 
     def _fetch_sina(self, codes: list[str]) -> tuple[dict[str, Snapshot], list[str]]:
-        return self._fetch(codes, SINA_URL, SINA_REFERER, "新浪", _parse_sina)
+        return self._fetch(codes, SINA_QUOTE_URL, SINA_REFERER, "新浪", _parse_sina)
 
     def _fetch_tencent(self, codes: list[str]) -> tuple[dict[str, Snapshot], list[str]]:
         return self._fetch(codes, TENCENT_URL, TENCENT_REFERER, "腾讯", _parse_tencent)
@@ -214,7 +216,7 @@ class SnapshotAdapter:
         （`fetch = self._fetch_sina if ... else self._fetch_tencent`），`health_check`
         也直接点名新浪那一路。差异收在参数里，取数与「截断即缺失」那段循环只有一份。
         """
-        query = ",".join(_sina_code(code) for code in codes)
+        query = ",".join(prefixed_code(code) for code in codes)
         try:
             body = self._get(f"{url}{query}", referer, encoding="gbk")
         except Exception as exc:
@@ -229,19 +231,13 @@ class SnapshotAdapter:
         return parsed, []
 
     def _get(self, url: str, referer: str, encoding: str) -> str:
-        request = urllib.request.Request(
-            url, headers={"Referer": referer, "User-Agent": USER_AGENT}
+        return fetch_text(
+            self._opener, url, timeout=self.timeout, referer=referer, encoding=encoding,
+            errors="replace",
         )
-        with self._opener(request, timeout=self.timeout) as response:
-            return response.read().decode(encoding, errors="replace")
 
 
 # ---- parsing -------------------------------------------------------------
-
-
-def _sina_code(symbol: str) -> str:
-    code, _, suffix = normalize_symbol(symbol).partition(".")
-    return f"{suffix.lower()}{code}" if suffix else code
 
 
 def _parse_sina(line: str, symbol: str) -> Snapshot | None:

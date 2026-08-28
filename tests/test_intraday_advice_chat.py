@@ -4,7 +4,7 @@ import json
 from datetime import date, datetime, timedelta
 
 from ashare_decision_support.adapters.freshness import check_intraday_freshness, in_session
-from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter, sina_symbol
+from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter
 from ashare_decision_support.advice import AdviceEngine
 from ashare_decision_support.chat.session import (
     ChatResponder,
@@ -16,17 +16,21 @@ from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, PriceLevel
 from ashare_decision_support.schedule.clock import minutes_since_open
 from ashare_decision_support.signals.intraday import IntradayAnalyzer, _minutes_since_open
+from ashare_decision_support.symbols import prefixed_code
 
 # ---- symbol normalization ------------------------------------------------
 
 
-def test_sina_symbol_covers_every_input_shape() -> None:
-    assert sina_symbol("600519.SH") == "sh600519"
-    assert sina_symbol("000001.SZ") == "sz000001"
-    assert sina_symbol("300750") == "sz300750"
-    assert sina_symbol("688981") == "sh688981"
-    assert sina_symbol("sh600519") == "sh600519"
-    assert sina_symbol("830799.BJ") == "bj830799"
+def test_prefixed_code_covers_every_input_shape() -> None:
+    assert prefixed_code("600519.SH") == "sh600519"
+    assert prefixed_code("000001.SZ") == "sz000001"
+    assert prefixed_code("300750") == "sz300750"
+    assert prefixed_code("688981") == "sh688981"
+    assert prefixed_code("sh600519") == "sh600519"
+    assert prefixed_code("830799.BJ") == "bj830799"
+    # 分歧点：`sina_intraday` 那份自抄的前缀表少了 730/731/732/733，把它判成
+    # 北交所。三路取数认的是同一张表之后，这里和 `SH_PREFIXES` 只能一起改。
+    assert prefixed_code("730001") == "sh730001"
 
 
 # ---- intraday fetch ------------------------------------------------------

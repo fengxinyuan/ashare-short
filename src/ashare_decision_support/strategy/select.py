@@ -353,8 +353,9 @@ def _funnel_notes(
         if primary is not None:
             tally[primary.value] = tally.get(primary.value, 0) + 1
     breakdown = "、".join(f"{name} {count} 只" for name, count in sorted(tally.items()))
+    breakdown_text = f"（{breakdown}）" if breakdown else ""
     notes = [
-        (f"{cycle}：{len(scope)} 只入围中 {len(qualified)} 只满足入场判据（{breakdown}），"
+        (f"{cycle}：{len(scope)} 只入围中 {len(qualified)} 只满足入场判据{breakdown_text}，"
         f"其余 {len(scope) - len(qualified)} 只无可用打法")
     ]
     if len(qualified) < MIN_SETUP_CANDIDATES:

@@ -7,8 +7,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.artifacts import LEADERS_LATEST_NAME
 from ashare_decision_support.facts import build_facts_bundle
-from ashare_decision_support.research.leaders import LEADERS_LATEST_NAME
 from ashare_decision_support.schedule.timezone import beijing_now
 from ashare_decision_support.sectors import DEFAULT_LEVEL, SectorRotationStore
 
@@ -34,7 +34,7 @@ def build_monthly_context(
     now = moment or beijing_now()
     horizon = max(7, min(int(horizon_days), 93))
     bundle = build_facts_bundle(moment=now, symbols=symbols, output_dir=output_dir)
-    facts_payload = bundle.to_dict()
+    facts_payload = bundle.to_dict(compact_rendered=True)
     facts = facts_payload.get("facts", {})
     historical_validation = {
         "journal_stats": facts.get("台账统计"),
@@ -46,6 +46,7 @@ def build_monthly_context(
     }
     sector_rotation_memory, rotation_notes = _load_sector_rotation_memory(now.date())
     leaders, leader_notes = _load_json(Path(output_dir) / LEADERS_LATEST_NAME)
+    leaders = _compact_leaders(leaders)
     end = now.date() + timedelta(days=horizon)
     events = _event_window(now.date(), end)
     return {
@@ -114,6 +115,52 @@ def _load_json(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     if not isinstance(payload, dict):
         return None, [f"{path.name} 不是 JSON 对象"]
     return payload, []
+
+
+def _compact_leaders(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Keep research identities and decisive metrics; full audit stays in its own artifact."""
+    if not isinstance(payload, dict):
+        return payload
+    sectors = []
+    for sector in payload.get("sectors") or []:
+        if not isinstance(sector, dict):
+            continue
+        leaders = []
+        for item in (sector.get("leaders") or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            keep = (
+                "symbol", "name", "leadership_rank", "signal_date", "last_close",
+                "return_5d", "return_20d", "return_60d", "average_amount_20d_yi",
+                "trend_state",
+            )
+            leaders.append({key: item.get(key) for key in keep if key in item})
+        sectors.append(
+            {
+                key: value
+                for key, value in {
+                    "name": sector.get("name"),
+                    "level": sector.get("level"),
+                    "coverage_ratio": sector.get("coverage_ratio"),
+                    "leaders": leaders,
+                    "warnings": sector.get("warnings") or [],
+                }.items()
+                if value not in (None, [], {})
+            }
+        )
+    return {
+        "schema": payload.get("schema"),
+        "view": "summary",
+        "as_of": payload.get("as_of"),
+        "contract": payload.get("contract"),
+        "methodology": payload.get("methodology"),
+        "sector_count": payload.get("sector_count", len(sectors)),
+        "sectors": sectors,
+        "omitted": {
+            "leader_fields": ["rank_components", "volume_ratio_20d", "range_position_60d", "ma20", "ma60", "trend_quality"],
+            "hint": "完整字段见 sector_leaders_latest.json",
+        },
+    }
 
 
 def _event_window(start: date, end: date) -> list[dict[str, Any]]:
