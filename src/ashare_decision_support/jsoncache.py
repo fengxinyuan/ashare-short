@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -72,15 +73,20 @@ def merge_series(
     """
     if not bars or path is None:
         return False
-    try:
-        with file_lock(path):
-            payload = read_stamped(path, schema)
-            merged = {str(bar["date"]): bar for bar in series_bars(payload)}
-            merged.update({str(bar["date"]): bar for bar in bars})
-            return write_stamped(
-                path,
-                {**header(payload), "bars": [merged[stamp] for stamp in sorted(merged)]},
-                schema,
-            )
-    except OSError:
-        return False
+    for attempt in range(5):
+        try:
+            with file_lock(path):
+                payload = read_stamped(path, schema)
+                merged = {str(bar["date"]): bar for bar in series_bars(payload)}
+                merged.update({str(bar["date"]): bar for bar in bars})
+                return write_stamped(
+                    path,
+                    {**header(payload), "bars": [merged[stamp] for stamp in sorted(merged)]},
+                    schema,
+                )
+        except OSError:
+            if attempt < 4:
+                time.sleep(0.02 * (attempt + 1))
+                continue
+            return False
+    return False

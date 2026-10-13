@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ashare_decision_support.adapters.market_scan import MIN_AMOUNT_YI, MIN_FLOAT_CAP_YI
+from ashare_decision_support.scoring.liquidity_factor import calculate_liquidity_factor
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class LiquidityStats:
     missing_fields: int = 0
     # 成交额门槛因为扫描取自盘中而没开。它和「没测到」不同：市值这一半仍然筛了。
     amount_gate_off: bool = False
+    turnover_yi: float | None = None
 
     def note(self) -> str | None:
         if (
@@ -64,6 +66,7 @@ class LiquidityScreen:
         scan: Any | None,
         min_float_cap_yi: float = MIN_FLOAT_CAP_YI,
         min_amount_yi: float = MIN_AMOUNT_YI,
+        market_turnover_yi: float | None = None,
     ) -> None:
         self.scan = scan
         self.min_float_cap_yi = min_float_cap_yi
@@ -71,7 +74,10 @@ class LiquidityScreen:
         # 2026-09-14 实测剔了 958 只——比正常盘前多出六百只，全是正常票。那时成交额
         # 门槛不能用，只留流通市值（它不随时间走）。
         self.amount_gate_off = bool(getattr(scan, "session_in_progress", False))
-        self.min_amount_yi = 0.0 if self.amount_gate_off else min_amount_yi
+        turnover = market_turnover_yi or getattr(scan, "total_turnover_yi", None)
+        self.liquidity_regime = calculate_liquidity_factor(turnover)
+        scaled_amount = self.liquidity_regime.scale_threshold(min_amount_yi)
+        self.min_amount_yi = 0.0 if self.amount_gate_off else scaled_amount
 
     @property
     def available(self) -> bool:
@@ -123,5 +129,6 @@ class LiquidityScreen:
                 unmeasured=unmeasured,
                 missing_fields=missing_fields,
                 amount_gate_off=self.amount_gate_off,
+                turnover_yi=self.liquidity_regime.turnover_yi,
             ),
         )

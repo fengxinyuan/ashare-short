@@ -32,6 +32,36 @@ from ashare_decision_support.schedule.calendar import TradingCalendar
 from ashare_decision_support.schedule.timezone import BEIJING_TZ, beijing_now, to_beijing_naive
 from ashare_decision_support.sectors.baserate import align_sessions, base_rate, build_panel
 from ashare_decision_support.sectors.overseas_link import read_overseas_links
+from ashare_decision_support.signals.call_auction import (
+    AuctionItem,
+    scan_call_auction,
+)
+
+
+def auction_research_summary(items: list[AuctionItem]) -> dict[str, Any]:
+    """组织集合竞价盘前异动事实包，供盘前研报核验竞价确认。"""
+    scan = scan_call_auction(items)
+    return {
+        "market_avg_change": scan.market_avg_change,
+        "rush_bidding_count": scan.rush_bidding_count,
+        "nuclear_drop_count": scan.nuclear_drop_count,
+        "weak_to_strong_count": scan.weak_to_strong_count,
+        "strong_to_weak_count": scan.strong_to_weak_count,
+        "top_rush": [
+            {
+                "symbol": s.symbol,
+                "name": s.name,
+                "change_pct": s.change_pct,
+                "amount_ratio": s.amount_ratio,
+                "tags": list(s.tags),
+                "intensity": s.intensity,
+                "reason": s.reason,
+            }
+            for s in scan.top_rush_stocks(top=5)
+        ],
+        "notes": scan.notes,
+    }
+
 
 PREOPEN_RESEARCH_REQUIREMENTS = """基于 facts、overseas_snapshot 和 hypotheses 写盘前先手观察清单，不能补造数据。
 依次判断：海外风险偏好与 A 股映射；政策/地缘/国家队；国内外财报与公告；昨日情绪与新题材。
@@ -97,6 +127,12 @@ def build_preopen_research(
     overseas = _overseas_payload(market_adapter)
     facts = bundle.to_dict(compact_rendered=True)
     morning = facts.get("facts", {}).get("盘前主链路")
+    auction_items = facts.get("facts", {}).get("auction_items")
+    auction = (
+        auction_research_summary(auction_items)
+        if isinstance(auction_items, list) and auction_items
+        else None
+    )
     return {
         "schema": SCHEMA,
         "as_of": now.isoformat(timespec="seconds"),
@@ -104,6 +140,7 @@ def build_preopen_research(
         "requirements": PREOPEN_RESEARCH_REQUIREMENTS,
         "facts": facts,
         "overseas_snapshot": overseas,
+        "auction_snapshot": auction,
         # 假设链：主题簇情景 × 外盘映射 × 基准率，每条自带证伪条件。外部 AI 拿到的
         # 不再是三段并排的原料，而是已经对齐到同一个簇名上的「先手观察」草稿——
         # 它要做的是审、补、删，不是从头拼。

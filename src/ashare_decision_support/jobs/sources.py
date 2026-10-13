@@ -12,6 +12,7 @@ from typing import Any
 
 from ashare_decision_support.adapters.broad_index import default_broad_index_adapter
 from ashare_decision_support.adapters.earnings import default_earnings_adapter
+from ashare_decision_support.adapters.fallback_chain import ResilientMarketAdapter
 from ashare_decision_support.adapters.lhb_seats import LhbSeatAdapter
 from ashare_decision_support.adapters.limit_pool import LimitPoolAdapter
 from ashare_decision_support.adapters.market_scan import MarketScanAdapter
@@ -32,6 +33,7 @@ from ashare_decision_support.news import (
 )
 from ashare_decision_support.schedule.calendar import session_forming
 from ashare_decision_support.schedule.timezone import beijing_naive_now
+from ashare_decision_support.sectors.ladder_cycle import analyze_ladder_and_cycle
 
 
 def fetch_limit_pool(
@@ -60,7 +62,22 @@ def fetch_limit_pool(
     notes.extend(snapshot.notes)
     if snapshot.ok:
         notes.extend(snapshot.describe())
+        ladder = analyze_ladder_and_cycle(snapshot)
+        notes.extend(ladder.notes)
+        for prog in ladder.progressions:
+            notes.append(
+                f"{prog.from_streak}板进{prog.to_streak}板：昨日{prog.yesterday_count}只/今日{prog.today_count}只（晋级率{prog.rate:.1%}）"
+            )
     return snapshot
+
+
+def resilient_market_adapter(
+    primary: tuple[str, Any],
+    fallback: tuple[str, Any] | None = None,
+) -> ResilientMarketAdapter:
+    """构造具备自动故障转移与熔断的高可用行情适配器。"""
+    fallbacks = [fallback] if fallback else []
+    return ResilientMarketAdapter.create(primary, fallbacks)
 
 
 def fetch_trade_flow(
@@ -256,7 +273,9 @@ def default_market_scan(data_adapter: Any) -> Any:
     client = getattr(data_adapter, "client", None)
     if client is None or not getattr(data_adapter, "supports_realtime", False):
         return sina
-    return CompositeMarketScanAdapter(TickFlowMarketScanAdapter(client), sina)
+    primary = TickFlowMarketScanAdapter(client)
+    resilient_market_adapter(("tickflow", primary), ("sina", sina))
+    return CompositeMarketScanAdapter(primary, sina)
 
 
 def fetch_sector_index(
