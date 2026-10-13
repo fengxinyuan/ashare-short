@@ -1,59 +1,24 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from datetime import date
 from typing import Any
 
-from ashare_decision_support.adapters.daily_cache import cache_for
+from ashare_decision_support.adapters.daily_cache import DailyBarsCache, cache_for
 from ashare_decision_support.numeric import positive
 from ashare_decision_support.symbols import normalize_symbol
 
-SECURITY_LIST_FIELDS = ("industries", "concepts")
-SECURITY_SCALAR_FIELDS = ("industry", "industry_leaf", "industry_path", "name_en")
+SECURITY_LIST_FIELDS = ("concepts",)
+SECURITY_SCALAR_FIELDS = ("industry", "name_en")
 
-# 分钟线周期的仓内写法。**两个盘中适配器必须认同一张表**：`build_intraday_adapter`
-# 在运行时才决定给出付费档（TickFlow）还是免费档（新浪），而 `cli.py` 把这张表
-# 当成六条命令 `--period` 的 `choices` 用——校验发生在**解析参数时**，取数发生在
-# **另一个适配器里**。两份各自演化的话，分叉不会在改动那天报错：它表现为某个周期
-# 在 CLI 上能敲进去，跑到一半被适配器以 ValueError 顶回来，或者反过来，付费档明明
-# 支持的周期敲不进去。同 `tickflow_intraday.py` 对两个适配器签名的那条要求。
+# CLI 参数校验与两条分钟线适配器共用的周期。
 SUPPORTED_PERIODS: tuple[str, ...] = ("1", "5", "15", "30", "60")
 
-# 取多少天日线。240 个自然日约等于一个交易年，是 `DailyTechnicalAnalyzer` 与
-# `WyckoffAnalyzer` 那几个 60/120 日窗口能算满所需的量。
-#
-# 和 `fetch_daily_bars` 收在一起是因为**它们坏的方式一样**：那个函数的 docstring
-# 说的是四份逐字相同的取数实现改一处改不全，这个数原来也是三份（`monitor/session`、
-# `agents/collectors`、`jobs/advise`），而它比取数实现更隐蔽——三处不一致不表现为
-# 「慢」，表现为**同一只票经 `advise` 和经盘中监控算出来的均线与分位不一样**，
-# 两个数都不报错。（`jobs/advise` 那一份 2026-08-15 清理时发现是**定义了从没被
-# 读过**的：接线审计按名字数引用，另外两处的同名常量替它顶了账。）
+# 日线回看自然日数；各任务共用，保证均线和分位的输入窗口一致。
 DAILY_LOOKBACK_DAYS = 240
 
 
-class MarketDataAdapter(ABC):
-    @abstractmethod
-    def get_security_master(self, symbols: list[str]) -> dict[str, dict]:
-        """Fetch static symbol metadata."""
-
-    @abstractmethod
-    def get_historical_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[dict]]:
-        """Fetch historical OHLCV bars."""
-
-    @abstractmethod
-    def get_trading_calendar(self) -> list[date]:
-        """Fetch trading days."""
-
 def security_names(adapter: Any, symbols: list[str]) -> dict[str, str | None]:
-    """代码 → 简称。拿不到就返回空表。
-
-    名字是**纯展示字段**：没有它简报里显示的是代码，有它显示的是「贵州茅台」。
-    所以这里三道防线全部退化成空表而不是抛异常——为了一个不影响任何判定的
-    字段中断整轮跑批，是把展示层的故障升级成了链路故障。
-
-    收在这里而不是各 job 各写一份：`morning` / `post_close` / `monitor` 原来
-    有三份逐字相同的实现，而它们对同一个适配器提同一个问题。
-    """
+    """代码到简称的映射；元数据不可用时返回空表。"""
     return metadata_names(_adapter_security_rows(adapter, symbols))
 
 
@@ -62,13 +27,10 @@ def security_metadata(
     symbols: list[str],
     reference_adapter: Any | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """代码 → 合并后的静态画像。
+    """代码到静态画像的映射。
 
-    基础信息优先取行情适配器自己的 `get_security_master`；如果调用方**显式**提供
-    `reference_adapter`，再把中文名 / 行业路径 / 概念标签补进来。这里故意不默认
-    创建远端 reference 源——默认行为必须保持纯本地/现有适配器，不把一个展示增强
-    悄悄升级成新的外网依赖。
-    """
+    优先读取行情适配器的 get_security_master；仅在显式提供 reference_adapter 时
+    补充名称、行业和概念，避免名称查询隐式增加远端依赖。"""
     normalized_map = {
         raw_symbol: normalize_symbol(raw_symbol)
         for raw_symbol in symbols
@@ -98,9 +60,7 @@ def metadata_names(
     wanted = symbols if symbols is not None else list(metadata)
     return {
         symbol: (
-            metadata.get(symbol, {}).get("name")
-            if isinstance(metadata.get(symbol), dict)
-            else None
+            metadata.get(symbol, {}).get("name") if isinstance(metadata.get(symbol), dict) else None
         )
         for symbol in wanted
     }
@@ -150,18 +110,10 @@ def apply_security_metadata_rows(
 
 
 def float_shares(adapter: Any, symbols: list[str]) -> dict[str, float]:
-    """代码 → 流通股本（**股**）。拿不到的标的直接不出现在结果里。
+    """代码到流通股本（股）的映射；缺失或无效标的不进入结果。
 
-    这个字段决定两样读数能不能算：`signals/volume_price.py` 的换手率，和
-    `signals/chips.py` 的筹码分布（换手率就是它的衰减速度）。两者在缺失时都整体
-    弃权，所以这里**宁可少给一只，也不能给错一只**——猜一个股本会让换手率错到
-    没边，而错误的换手率不会报错，只会让每只票看起来都在天量或地量。
-
-    字段位置按源不同：TickFlow 放在 `ext.float_shares`（实测 600519 的 ext 里
-    同时有 `total_shares`），别的源可能放在顶层。**只认流通股本，不拿总股本顶替**
-    ——两者对茅台恰好相等，对绝大多数有限售股的票差很多，而「恰好相等」正是这类
-    错误最容易被漏掉的原因。
-    """
+    支持顶层字段及 TickFlow 的 ext 字段。只读取流通股本，不用总股本代替，
+    供换手率和筹码估算使用。"""
     getter = getattr(adapter, "get_security_master", None)
     if not callable(getter):
         return {}
@@ -221,63 +173,94 @@ def _reference_security_rows(reference_adapter: Any | None) -> dict[str, dict[st
         normalized = normalize_symbol(symbol)
         if not normalized:
             continue
-        industries = tuple(getattr(info, "industries", ()) or ())
         rows[normalized] = {
             "symbol": normalized,
             "name": getattr(info, "name", None),
             "name_en": getattr(info, "name_en", None),
-            "industries": list(industries),
-            "industry": industries[0] if industries else None,
-            "industry_leaf": industries[-1] if industries else None,
-            "industry_path": "·".join(item for item in industries if item) or None,
+            "industry": getattr(info, "industry", None),
             "concepts": list(getattr(info, "concepts", ()) or ()),
         }
     return rows
 
 
 def fetch_daily_bars(
-    adapter: Any, symbols: list[str], start: date, end: date, notes: list[str] | None = None
+    adapter: Any,
+    symbols: list[str],
+    start: date,
+    end: date,
+    notes: list[str] | None = None,
+    *,
+    reuse_through: date | None = None,
 ) -> dict[str, list[dict]]:
-    """取日线。适配器有批量接口就走批量，没有就走逐只那条。
+    """获取日线，优先使用适配器的批量接口。
 
-    `get_historical_bars_batch` 不在 `MarketDataAdapter` 里，因为不是每个源都
-    有——TickFlow 一次请求能带一串代码，新浪只能一只一只问。**能省一轮网络往返
-    的适配器不该被接口拉平到最慢的那个**，所以按能力探测，而不是按类型分支。
-
-    原来 `collectors` / `morning` / `verify` / `monitor.session` 各有一份逐字
-    相同的实现。四份的问题不在重复，在于哪天多一个源支持批量，改一处改不全，
-    剩下三条路仍然逐只打——而且只表现为「慢」，不表现为「错」。
-    """
+    在线成功后保存缓存；请求失败时尝试覆盖所需日期的缓存，并记录覆盖与截止日。
+    无可用缓存时保留原异常，缓存写入失败不丢弃在线结果。"""
     batch = getattr(adapter, "get_historical_bars_batch", None)
-    cache = cache_for(adapter)
     try:
-        result = batch(symbols, start, end) if callable(batch) else adapter.get_historical_bars(symbols, start, end)
-    except Exception as exc:
-        result = {}
-        recovered: list[str] = []
+        cache = cache_for(adapter)
+    except OSError:
+        cache = None
+        if notes is not None:
+            notes.append("日线缓存目录不可用，本次只使用在线行情")
+    reused: dict[str, list[dict]] = {}
+    if cache is not None and reuse_through is not None:
         for symbol in symbols:
             rows = cache.read(symbol, start, end)
-            if rows:
-                result[symbol] = rows
-                recovered.append(symbol)
-        if recovered:
+            if rows and cache.latest_date(rows) >= reuse_through:
+                reused[symbol] = rows
+    missing = [symbol for symbol in symbols if symbol not in reused]
+    if reused and notes is not None:
+        notes.append(
+            f"已复用完整收盘日日线缓存 {len(reused)}/{len(symbols)} 只，截止要求 {reuse_through}"
+        )
+    if not missing:
+        return reused
+    try:
+        fetched = (
+            batch(missing, start, end)
+            if callable(batch)
+            else adapter.get_historical_bars(missing, start, end)
+        )
+        result = {**reused, **fetched}
+    except Exception as exc:
+        result = _cached_daily_bars(cache, symbols, start, end)
+        if result and cache is not None:
             latest = max(
-                (cache.latest_date(result[symbol]) for symbol in recovered),
+                (cache.latest_date(rows) for rows in result.values()),
                 default=None,
             )
             if notes is not None:
                 notes.append(
                     f"行情源失败（{type(exc).__name__}），已回退日线缓存："
-                    f"{len(recovered)}/{len(symbols)} 只，缓存截止 {latest or '未知'}；结果不可视为实时"
+                    f"{len(result)}/{len(symbols)} 只，缓存截止 {latest or '未知'}；结果不可视为实时"
                 )
             return {symbol: result.get(symbol, []) for symbol in symbols}
         raise
 
+    _cache_daily_bars(cache, fetched, notes)
+    return result
+
+
+def _cached_daily_bars(
+    cache: DailyBarsCache | None, symbols: list[str], start: date, end: date
+) -> dict[str, list[dict]]:
+    if cache is None:
+        return {}
+    return {symbol: rows for symbol in symbols if (rows := cache.read(symbol, start, end))}
+
+
+def _cache_daily_bars(
+    cache: DailyBarsCache | None, result: dict[str, list[dict]], notes: list[str] | None
+) -> None:
+    if cache is None:
+        return
+    failed = 0
     for symbol, rows in result.items():
         if rows:
             try:
                 cache.write(symbol, rows)
-            except OSError:
-                if notes is not None:
-                    notes.append("日线缓存写入失败，本次仍使用在线行情")
-    return result
+            except (OSError, TypeError, ValueError):
+                failed += 1
+    if failed and notes is not None:
+        notes.append(f"日线缓存写入失败（{failed} 只），本次仍使用在线行情")

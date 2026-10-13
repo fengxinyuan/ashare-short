@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from dataclasses import replace
+from datetime import date, datetime
 
 from ashare_decision_support.advice import AdviceEngine, LevelAdjudicator
 from ashare_decision_support.advice.adjudicate import offending_numbers, rule_default
@@ -19,36 +20,18 @@ from ashare_decision_support.advice.candidates import (
     SIDE_STOP,
     build_candidates,
 )
+from ashare_decision_support.advice.engine import StockAdvice
+from ashare_decision_support.jobs.advise import _risk_qualified_plan
 from ashare_decision_support.models.enums import Playbook, TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, PriceLevel
 from ashare_decision_support.notify.render import render_advice_brief
 from ashare_decision_support.signals.intraday import IntradayAnalyzer
 from ashare_decision_support.signals.orderflow import read_order_book
 from ashare_decision_support.strategy.playbook import PlaybookMatch, SetupVerdict
-from tests.test_intraday_advice_chat import bars_from
+from tests.test_intraday_advice_chat import bars_from, minute_rows
 from tests.test_orderflow import snapshot as book_snapshot
 
-# ---- fixtures ------------------------------------------------------------
-
-
-def minute_rows(day: str, count: int, start_price: float = 10.0, step: float = 0.01) -> list[dict]:
-    rows = []
-    moment = datetime.strptime(f"{day} 09:30:00", "%Y-%m-%d %H:%M:%S")
-    price = start_price
-    for index in range(count):
-        price += step
-        rows.append(
-            {
-                "day": (moment + timedelta(minutes=5 * index)).strftime("%Y-%m-%d %H:%M:%S"),
-                "open": round(price - step, 3),
-                "high": round(price + 0.02, 3),
-                "low": round(price - 0.02, 3),
-                "close": round(price, 3),
-                "volume": 1000.0,
-                "amount": 1000.0 * price,
-            }
-        )
-    return rows
+# fixtures
 
 
 def intraday_for(rows=None, today=date(2026, 7, 31)):
@@ -114,7 +97,7 @@ class BoomClient:
         raise RuntimeError("provider down")
 
 
-# ---- L2 候选集 -----------------------------------------------------------
+# L2 候选集
 
 
 def test_rank_zero_reproduces_the_rule_engine_exactly() -> None:
@@ -258,6 +241,54 @@ def test_breakout_uses_the_nearby_session_high_as_its_default_trigger() -> None:
     assert any(item.basis == BASIS_VWAP for item in advice.candidates.entries[1:])
 
 
+def test_breakout_high_is_not_also_a_profit_target() -> None:
+    """突破触发价等于首目标时没有正向收益空间，不能再写「可跟随」。"""
+    daily = daily_for(
+        10.48,
+        supports=[9.5],
+        resistances=[],
+        ma5=10.2,
+        ma10=10.1,
+        ma20=10.0,
+        ma60=9.9,
+        volume_ratio_20d=1.5,
+    )
+    intraday = replace(intraday_for(), volume_ratio=1.2)
+    match = PlaybookMatch(
+        trend=TrendState.UPTREND,
+        matched=[SetupVerdict(Playbook.BREAKOUT, True, ["突破确认"])],
+    )
+
+    advice = AdviceEngine().build("600519.SH", daily, intraday, match=match)
+
+    assert advice.entry_low == intraday.session_high
+    assert advice.targets == []
+    assert advice.rrr is None
+    assert advice.shortline.action == "wait_trigger"
+    assert "暂不构成买点" in advice.shortline.summary
+    assert any("没有有效目标位" in warning for warning in advice.warnings)
+
+
+def test_advice_count_separates_levels_from_risk_qualified_plans() -> None:
+    item = StockAdvice(
+        symbol="600519.SH",
+        entry_low=10.0,
+        stop=9.0,
+        targets=[10.1],
+        rrr=0.1,
+        playbook="突破",
+        is_current_session=True,
+    )
+    assert item.has_actionable_levels
+    assert not _risk_qualified_plan(item)
+    item.rrr = 1.8
+    assert not _risk_qualified_plan(item), "汇总计数必须复核目标与止损，不能只相信缓存的比值"
+    item.targets = [12.0]
+    assert _risk_qualified_plan(item)
+    item.book = {"at_limit_up": True}
+    assert not _risk_qualified_plan(item)
+
+
 def test_candidates_far_from_the_last_price_are_dropped() -> None:
     """现价下方 6% 以外的「买入位」不是今天的价位，是下周的愿望。"""
     candidates = build_candidates(
@@ -275,7 +306,7 @@ def test_candidates_far_from_the_last_price_are_dropped() -> None:
     assert all(item.price >= 20.0 * 0.94 for item in candidates.entries)
 
 
-# ---- L3 数字闸门 ---------------------------------------------------------
+# L3 数字闸门
 
 
 def test_the_price_gate_rejects_a_neighbouring_price_that_rounding_would_accept() -> None:
@@ -317,7 +348,7 @@ def test_the_price_gate_lets_list_ordinals_through() -> None:
     assert offending_numbers("第 3 档买盘最厚", candidates, facts) == []
 
 
-# ---- L3 裁决 -------------------------------------------------------------
+# L3 裁决
 
 
 def advice_with(client, rows=None, book=None):
@@ -331,9 +362,7 @@ def test_the_model_can_override_the_rules_ordering_within_the_candidate_set() ->
         "600519.SH", daily_for(10.48, supports=[9.5], resistances=[11.0]), intraday_for()
     )
     assert base.candidates is not None
-    alternative = next(
-        item for item in base.candidates.entries if item.price != base.entry_low
-    )
+    alternative = next(item for item in base.candidates.entries if item.price != base.entry_low)
     stop_key = base.candidates.default("stop").key()
 
     reply = json.dumps(
@@ -504,18 +533,16 @@ def test_rule_default_needs_no_network_and_no_key() -> None:
 def test_the_monitor_never_gets_an_adjudicator_by_default() -> None:
     """盘中告警要秒级时效。每标的一次 LLM 调用会把一轮 20 只变成几十秒。
 
-    见 `docs/ARCHITECTURE.md` §五：越紧急的输出，越不经过 LLM。
+    见 `docs/ARCHITECTURE.md` 的“输出闸门”：越紧急的输出，越不经过 LLM。
     """
     from ashare_decision_support.monitor.session import MonitorSession
 
-    session = MonitorSession(
-        adapter=None, intraday_adapter=None, session_date=date(2026, 7, 31)
-    )
+    session = MonitorSession(adapter=None, intraday_adapter=None, session_date=date(2026, 7, 31))
     assert session.advice_engine.adjudicator is None
 
 
-# ---- 出处进简报 ----------------------------------------------------------
-#
+# 出处进简报
+
 # basis 存进了 facts 和台账，但读简报的人两样都看不到。不印出来的话，
 # 「22.95 是从分时均价来的还是从买盘墙来的」在唯一会被真人读到的那份产物里
 # 仍然是缺的——而那正是把买卖点改成候选集的初衷。
@@ -583,8 +610,8 @@ def test_an_abstention_reaches_the_brief_as_an_abstention() -> None:
     assert "今天不该买入" in brief
 
 
-# ---- 盘口进简报 ----------------------------------------------------------
-#
+# 盘口进简报
+
 # 监控那一侧早就会说「封涨停：此刻买不进」（`OrderBookReading.describe`），
 # 买卖点简报却只在 warnings 里间接提一句委比退化。同一个事实在两份产物里，
 # 一份是操作结论、一份是统计脚注——而简报恰恰是你照着去挂单的那一份。

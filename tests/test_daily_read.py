@@ -41,7 +41,7 @@ def doc(title: str, published: str = "2026-08-02 09:00:00", **kwargs) -> NewsDoc
     return NewsDoc(title=title, published_at=published, **kwargs)
 
 
-# ---- 相关性闸门 -----------------------------------------------------------
+# 相关性闸门
 
 
 def test_a_sector_roundup_is_not_this_company_s_own_news():
@@ -91,7 +91,7 @@ def test_a_two_character_stem_is_not_shortened_further():
     assert is_about(doc("6只股收盘价创历史新高"), "600900.SH", "长江电力") is False
 
 
-# ---- 通读：路由与配额 -----------------------------------------------------
+# 通读：路由与配额
 
 
 def test_routing_sends_each_headline_to_the_section_that_explains_it():
@@ -112,12 +112,8 @@ def test_overseas_headlines_survive_a_corpus_dominated_by_a_share_chatter():
     挤到个位数——而当天最关键的传导链（韩股存储涨停 → A 股半导体）恰恰在海外节里，
     且发生在更早的交易日。让这一层读不到海外，等于白做。
     """
-    corpus = [
-        doc(f"A股盘面快讯{i}", published=f"2026-08-02 1{i % 10}:00:00") for i in range(400)
-    ]
-    corpus += [
-        doc(f"韩国首尔综指涨超{i}%", published="2026-07-31 15:00:00") for i in range(30)
-    ]
+    corpus = [doc(f"A股盘面快讯{i}", published=f"2026-08-02 1{i % 10}:00:00") for i in range(400)]
+    corpus += [doc(f"韩国首尔综指涨超{i}%", published="2026-07-31 15:00:00") for i in range(30)]
     reader = DailyNewsReader(FakeClient(reply="{}"))
     reader.read(corpus, date(2026, 8, 2))
 
@@ -127,7 +123,7 @@ def test_overseas_headlines_survive_a_corpus_dominated_by_a_share_chatter():
     assert prompt.count("A股盘面快讯") <= MAX_MARKET_HEADLINES
 
 
-# ---- 通读：核对与丢弃 -----------------------------------------------------
+# 通读：核对与丢弃
 
 
 def _reader(reply: str) -> DailyNewsReader:

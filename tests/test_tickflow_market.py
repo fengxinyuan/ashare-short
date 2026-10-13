@@ -1,4 +1,4 @@
-"""付费档 TickFlow 行情：单位口径、涨跌停判定、两路合并。
+"""付费档 TickFlow 行情：单位口径、全市场扫描、两路合并。
 
 这个文件的重心是**单位**。付费档和免费档对同一件事用了不同的量纲：
 
@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from ashare_decision_support.adapters.market_scan import MarketRow, MarketScan
 from ashare_decision_support.adapters.tickflow_market import (
     CompositeMarketScanAdapter,
     TickFlowMarketScanAdapter,
-    TickFlowSnapshotAdapter,
 )
 
 # 贵州茅台 2026-07-31 收盘实测值。
@@ -31,12 +32,12 @@ MAOTAI_QUOTE = {
     "open": 1330.03,
     "high": 1355.72,
     "low": 1325.77,
-    "volume": 55128,                     # 手
+    "volume": 55128,  # 手
     "amount": 7373462600.0,
     "timestamp": 1785481202000,
     "ext": {
         "name": "贵州茅台",
-        "change_pct": -0.008195276700740278,   # 比值
+        "change_pct": -0.008195276700740278,  # 比值
         "turnover_rate": 0.0044099521147979845,
     },
 }
@@ -50,16 +51,7 @@ MAOTAI_INSTRUMENT = {
         "limit_down": 1225.58,
     },
 }
-MAOTAI_DEPTH = {
-    "symbol": "600519.SH",
-    "timestamp": 1785483056001,
-    "bid_prices": [1350.6, 1350.55, 1350.5, 1350.4, 1350.35],
-    "bid_volumes": [1, 1, 5, 1, 1],      # 手
-    "ask_prices": [1350.67, 1350.7, 1350.88, 1350.98, 1351.0],
-    "ask_volumes": [31, 1, 11, 3, 6],
-}
-
-# 宁德时代：创业板 20% 涨停，用来验证「不是所有票都是 10%」。
+# 第二只标的，用来验证缺失股本时的降级说明。
 CATL_QUOTE = {
     "symbol": "300750.SZ",
     "last_price": 395.3,
@@ -67,16 +59,6 @@ CATL_QUOTE = {
     "volume": 394149,
     "amount": 15602984000.0,
     "ext": {"name": "宁德时代", "change_pct": -0.016373, "turnover_rate": 0.009252},
-}
-CATL_INSTRUMENT = {
-    "symbol": "300750.SZ",
-    "name": "宁德时代",
-    "ext": {
-        "total_shares": 4400000000.0,
-        "float_shares": 4260081019.0,
-        "limit_up": 482.26,              # 20%，不是 10%
-        "limit_down": 321.5,
-    },
 }
 
 
@@ -109,22 +91,10 @@ class FakeInstruments:
         return [self.rows[s] for s in symbols if s in self.rows]
 
 
-class FakeDepth:
-    def __init__(self, rows, boom: bool = False) -> None:
-        self.rows = {row["symbol"]: row for row in rows}
-        self.boom = boom
-
-    def batch(self, *, symbols, **_):
-        if self.boom:
-            raise RuntimeError("depth down")
-        return {s: self.rows[s] for s in symbols if s in self.rows}
-
-
 class FakeClient:
-    def __init__(self, quotes=None, instruments=None, depth=None) -> None:
+    def __init__(self, quotes=None, instruments=None) -> None:
         self.quotes = quotes or FakeQuotes([MAOTAI_QUOTE])
         self.instruments = instruments or FakeInstruments([MAOTAI_INSTRUMENT])
-        self.depth = depth or FakeDepth([MAOTAI_DEPTH])
 
 
 def _scan(**kwargs) -> MarketScan:
@@ -132,7 +102,7 @@ def _scan(**kwargs) -> MarketScan:
     return TickFlowMarketScanAdapter(client).fetch()
 
 
-# ---- 单位口径 -------------------------------------------------------------
+# 单位口径
 
 
 def test_volume_is_converted_from_lots_to_shares() -> None:
@@ -164,7 +134,7 @@ def test_float_cap_is_computed_in_yuan_not_in_wan() -> None:
     row = _scan().get("600519")
 
     assert row.float_cap == pytest.approx(1250081601.0 * 1350.6)
-    assert row.float_cap_yi == pytest.approx(16883.6, abs=0.1)   # 实测 16883.6 亿
+    assert row.float_cap_yi == pytest.approx(16883.6, abs=0.1)  # 实测 16883.6 亿
 
 
 def test_the_liquidity_threshold_actually_bites_at_the_right_magnitude() -> None:
@@ -172,73 +142,8 @@ def test_the_liquidity_threshold_actually_bites_at_the_right_magnitude() -> None
     small = MarketRow(code="000001", name="小票", price=10.0, float_cap=15e8, amount=1e8)
     big = MarketRow(code="000002", name="大票", price=10.0, float_cap=150e8, amount=1e8)
 
-    assert small.tradable() is False       # 15 亿 < 20 亿门槛
+    assert small.tradable() is False  # 15 亿 < 20 亿门槛
     assert big.tradable() is True
-
-
-# ---- 涨跌停 ---------------------------------------------------------------
-
-
-def test_real_limit_prices_replace_the_nine_point_five_percent_guess() -> None:
-    """此前用「涨幅 ≥ 9.5%」近似涨停，分不清主板 10% 和创业板 20%。"""
-    client = FakeClient(
-        quotes=FakeQuotes([MAOTAI_QUOTE, CATL_QUOTE]),
-        instruments=FakeInstruments([MAOTAI_INSTRUMENT, CATL_INSTRUMENT]),
-        depth=FakeDepth([]),
-    )
-    snapshots, _ = TickFlowSnapshotAdapter(client).get_snapshots(["600519.SH", "300750.SZ"])
-
-    maotai_pct = snapshots["600519.SH"].limit_up / MAOTAI_QUOTE["prev_close"] - 1
-    catl_pct = snapshots["300750.SZ"].limit_up / CATL_QUOTE["prev_close"] - 1
-    assert maotai_pct == pytest.approx(0.10, abs=1e-3)     # 主板
-    assert catl_pct == pytest.approx(0.20, abs=1e-3)       # 创业板
-
-
-def test_at_limit_up_is_decided_by_the_real_price() -> None:
-    sealed = dict(CATL_QUOTE, last_price=482.26)
-    client = FakeClient(
-        quotes=FakeQuotes([sealed]),
-        instruments=FakeInstruments([CATL_INSTRUMENT]),
-        depth=FakeDepth([]),
-    )
-    snapshots, _ = TickFlowSnapshotAdapter(client).get_snapshots(["300750.SZ"])
-
-    assert snapshots["300750.SZ"].at_limit_up is True
-
-
-def test_missing_instruments_leave_the_limit_verdict_unknown_not_false() -> None:
-    """三态是刻意的：读不到涨停价时说「不知道」，不许退回百分比猜测。"""
-    client = FakeClient(
-        quotes=FakeQuotes([MAOTAI_QUOTE]),
-        instruments=FakeInstruments([], boom=True),
-        depth=FakeDepth([]),
-    )
-    snapshots, notes = TickFlowSnapshotAdapter(client).get_snapshots(["600519.SH"])
-
-    assert snapshots["600519.SH"].at_limit_up is None
-    assert any("涨跌停价" in note for note in notes)
-
-
-# ---- 盘口 -----------------------------------------------------------------
-
-
-def test_order_book_volumes_are_also_lots() -> None:
-    """盘口量和成交量是同一个量纲陷阱，实测 TickFlow [1,1,5] 对新浪 [100,100,500]。"""
-    snapshots, _ = TickFlowSnapshotAdapter(FakeClient()).get_snapshots(["600519.SH"])
-    book = snapshots["600519.SH"]
-
-    assert [level.volume for level in book.bids[:3]] == [100.0, 100.0, 500.0]
-
-
-def test_depth_failure_degrades_to_a_quote_without_a_book() -> None:
-    """缺盘口不是缺价格——快照照发，只是价差读不到。"""
-    client = FakeClient(depth=FakeDepth([], boom=True))
-    snapshots, notes = TickFlowSnapshotAdapter(client).get_snapshots(["600519.SH"])
-
-    snapshot = snapshots["600519.SH"]
-    assert snapshot.last_price == 1350.6
-    assert snapshot.bids == [] and snapshot.spread_pct is None
-    assert any("五档" in note for note in notes)
 
 
 def test_a_halted_symbol_is_reported_missing_not_priced_at_zero() -> None:
@@ -249,7 +154,7 @@ def test_a_halted_symbol_is_reported_missing_not_priced_at_zero() -> None:
     assert not scan.ok
 
 
-# ---- 全市场扫描 -----------------------------------------------------------
+# 全市场扫描
 
 
 def test_scan_uses_the_all_a_universe_in_one_request() -> None:
@@ -282,11 +187,11 @@ def test_symbols_without_share_counts_are_counted_and_announced() -> None:
     )
 
     assert scan.get("300750").float_cap is None
-    assert scan.get("300750").tradable() is True          # 未测到 → 放行
+    assert scan.get("300750").tradable() is True  # 未测到 → 放行
     assert any("可交易性筛选对它们不生效" in note for note in scan.notes)
 
 
-# ---- 两路合并 -------------------------------------------------------------
+# 两路合并
 
 
 class StubScan:
@@ -312,8 +217,8 @@ def test_fallback_only_fills_gaps_it_does_not_override() -> None:
     merged = CompositeMarketScanAdapter(StubScan(primary), StubScan(fallback)).fetch()
     row = merged.get("600519")
 
-    assert row.float_cap == 100e8      # 主源已有，不被覆盖
-    assert row.pe == 32.5              # 主源为空，用兜底补上
+    assert row.float_cap == 100e8  # 主源已有，不被覆盖
+    assert row.pe == 32.5  # 主源为空，用兜底补上
 
 
 def test_merge_takes_the_union_of_symbols() -> None:
@@ -323,6 +228,24 @@ def test_merge_takes_the_union_of_symbols() -> None:
     merged = CompositeMarketScanAdapter(StubScan(primary), StubScan(fallback)).fetch()
 
     assert set(merged.rows) == {"600519", "000001"}
+
+
+def test_merge_preserves_partial_status_and_oldest_quote_time() -> None:
+    primary = MarketScan(
+        rows={"600519": _row("600519")},
+        complete=False,
+        as_of=datetime(2026, 9, 14, 13, 51),
+    )
+    fallback = MarketScan(
+        rows={"000001": _row("000001")},
+        complete=False,
+        as_of=datetime(2026, 9, 14, 13, 48),
+    )
+
+    merged = CompositeMarketScanAdapter(StubScan(primary), StubScan(fallback)).fetch()
+
+    assert not merged.complete
+    assert merged.as_of == datetime(2026, 9, 14, 13, 48)
 
 
 def test_a_dead_primary_falls_back_instead_of_failing() -> None:
@@ -351,8 +274,8 @@ def test_both_dead_is_reported_as_not_ok() -> None:
     assert merged.ok is False
 
 
-# ---- 跨源校验 -------------------------------------------------------------
-#
+# 跨源校验
+
 # 合并有个盲区：**两路都有的字段从来没被比过**。主源某个字段悄悄换了量纲、喂了
 # 昨天的数、或者标的映射错位，合并会照单全收，而兜底那一路就摆在旁边。
 # docs/DATA_SOURCES.md 写着「两路逐字段吻合到新浪的取整精度，可以互为校验」——
@@ -361,8 +284,8 @@ def test_both_dead_is_reported_as_not_ok() -> None:
 
 def test_a_hundred_fold_unit_gap_between_the_two_paths_is_flagged() -> None:
     """volume 手/股搞混是记录在案的三处量纲陷阱之一，且**两路都有这个字段**。"""
-    primary = MarketScan(rows={"600519": _row("600519", volume=55128.0)})       # 手
-    fallback = MarketScan(rows={"600519": _row("600519", volume=5512800.0)})    # 股
+    primary = MarketScan(rows={"600519": _row("600519", volume=55128.0)})  # 手
+    fallback = MarketScan(rows={"600519": _row("600519", volume=5512800.0)})  # 股
 
     merged = CompositeMarketScanAdapter(StubScan(primary), StubScan(fallback)).fetch()
     notes = " / ".join(merged.notes)

@@ -1,25 +1,7 @@
-"""盘前海外市场快照，按“主源批量取数、备用源可插拔、缺失可见”设计。
+"""盘前海外指数、行业 ETF、期货与汇率快照。
 
-新浪行情是默认主源：一次请求覆盖美股指数、**美股行业与主题 ETF**、商品期货、
-汇率及韩国指数，已在本机出口实测。Yahoo Finance 不作为默认调用：它在当前出口
-返回 429，只保留为可显式替换的备用接口，避免一个受限端点拖慢整份盘前报告。
-
-## 为什么品种表可以铺这么宽
-
-`_fetch_sina` 把所有代码拼成**一个** `list=` 请求，所以品种数不影响网络往返次数
-——45 个品种和 9 个品种同样是一次 HTTP。铺宽的成本只在响应体大小上，而收益是
-**外盘映射的粒度**：只有指数时，能说的最细一句话是「隔夜美股偏弱」；有了行业与
-主题 ETF 之后，说得出「太阳能 ETF +1.2%、锂价指数 +0.7%、铜矿 +3.2%」——
-这三条各自对得上 A 股的一个真实板块，而「美股偏弱」对不上任何一个。
-
-## 品种的取舍标准：有没有一条说得出口的 A 股映射
-
-宽不等于全。收进来的每一个品种都要能回答「它动了，A 股哪个板块该被多看一眼」，
-映射表本身在 `sectors/overseas_link.py`，不在这里——**这一层只负责把数取回来，
-不负责说它意味着什么**。所以本模块没有任何方向判断，只有读数与分组。
-
-分组（`group`）的用途是呈现与聚合：45 行读数平铺进简报没人看得完，按组折叠之后
-「指数说风险偏好、板块说方向、商品说成本与资源品」是三句各自成立的话。
+默认通过新浪单次批量请求取数，Yahoo 为可显式选择的备用源。
+按各市场字段布局解析并保留分组、时点及缺失信息；A 股映射由 sectors/overseas_link.py 负责。
 """
 
 from __future__ import annotations
@@ -44,18 +26,18 @@ YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d
 TIMEOUT_SECONDS = 10
 
 # 分组。呈现与聚合用，不参与任何判断。
-GROUP_INDEX = "index"          # 宽基与风险偏好
+GROUP_INDEX = "index"  # 宽基与风险偏好
 GROUP_US_SECTOR = "us_sector"  # 美股行业与主题 ETF
 GROUP_COMMODITY = "commodity"  # 商品与期货
-GROUP_FX = "fx"                # 汇率
+GROUP_FX = "fx"  # 汇率
 
 # 品种表：key -> (新浪代码, 中文名, 解析口径, 分组)。
-#
+
 # **解析口径（第三项）决定读哪几个字段**，三种布局的字段数分别是 30/36（gb_）、
 # 13（b_）、若干（hf_/fx_），见 `_sina_reading`。口径填错不会报错，只会让前收
 # 和时间戳静默取到别的字段——这个坑真实发生过，判据记在 `_sina_reading` 上。
 SINA_INSTRUMENTS: dict[str, tuple[str, str, str, str]] = {
-    # ---- 指数：风险偏好与直接映射 ----
+    # 指数：风险偏好与直接映射
     "sp500": ("gb_inx", "标普500", "equity", GROUP_INDEX),
     "nasdaq": ("gb_ixic", "纳斯达克", "equity", GROUP_INDEX),
     "dow": ("gb_dji", "道琼斯", "equity", GROUP_INDEX),
@@ -78,8 +60,7 @@ SINA_INSTRUMENTS: dict[str, tuple[str, str, str, str]] = {
     # 而那件事在 A 股这边没有任何一个盘前读数回答得了。
     "fxi": ("gb_fxi", "富时中国大盘ETF", "equity", GROUP_INDEX),
     "kweb": ("gb_kweb", "中概网络股ETF", "equity", GROUP_INDEX),
-
-    # ---- 美股行业与主题 ETF：这一组才是「板块级」映射的来源 ----
+    # 美股行业与主题 ETF：这一组才是「板块级」映射的来源
     "smh": ("gb_smh", "半导体ETF", "equity", GROUP_US_SECTOR),
     "xlk": ("gb_xlk", "科技ETF", "equity", GROUP_US_SECTOR),
     # 主题 ETF 比宽行业 ETF 更值钱：`tan`/`lit`/`botz`/`ura` 各自对得上 A 股一个
@@ -100,8 +81,7 @@ SINA_INSTRUMENTS: dict[str, tuple[str, str, str, str]] = {
     "xlb": ("gb_xlb", "材料ETF", "equity", GROUP_US_SECTOR),
     "xli": ("gb_xli", "工业ETF", "equity", GROUP_US_SECTOR),
     "xlf": ("gb_xlf", "金融ETF", "equity", GROUP_US_SECTOR),
-
-    # ---- 商品与期货：成本端与资源品 ----
+    # 商品与期货：成本端与资源品
     "wti": ("hf_CL", "WTI原油", "future", GROUP_COMMODITY),
     "brent": ("hf_OIL", "布伦特原油", "future", GROUP_COMMODITY),
     "natgas": ("hf_NG", "天然气", "future", GROUP_COMMODITY),
@@ -118,8 +98,7 @@ SINA_INSTRUMENTS: dict[str, tuple[str, str, str, str]] = {
     "corn": ("hf_C", "CBOT玉米", "future", GROUP_COMMODITY),
     "wheat": ("hf_W", "CBOT小麦", "future", GROUP_COMMODITY),
     "cotton": ("hf_CT", "ICE棉花", "future", GROUP_COMMODITY),
-
-    # ---- 汇率 ----
+    # 汇率
     "usdcny": ("fx_susdcny", "美元/人民币", "fx", GROUP_FX),
 }
 YAHOO_INSTRUMENTS = {"vix": ("^VIX", "VIX"), "us10y": ("^TNX", "美国10年期国债收益率")}
@@ -267,6 +246,13 @@ def _at(values: list[str], index: int) -> str | None:
     return values[index] if 0 <= index < len(values) else None
 
 
+def _change_pct(last: float | None, previous: float | None) -> float | None:
+    """现价相对前收的涨跌幅（百分数）；缺失或无有效前收时返回 None。"""
+    if last is None or previous in (None, 0):
+        return None
+    return round((last / previous - 1) * 100, 4)
+
+
 def _sina_reading(
     key: str, name: str, symbol: str, kind: str, raw: str, group: str = GROUP_INDEX
 ) -> GlobalMarketReading:
@@ -303,18 +289,10 @@ def _sina_reading(
         )
     elif kind == "future":
         last, previous, as_of = finite(values[0]), finite(values[7]), f"{values[12]} {values[6]}"
-        change_pct = (
-            round((last / previous - 1) * 100, 4)
-            if last is not None and previous not in (None, 0)
-            else None
-        )
+        change_pct = _change_pct(last, previous)
     elif kind == "fx":
         last, previous, as_of = finite(values[1]), finite(values[2]), f"{values[17]} {values[0]}"
-        change_pct = (
-            round((last / previous - 1) * 100, 4)
-            if last is not None and previous not in (None, 0)
-            else None
-        )
+        change_pct = _change_pct(last, previous)
     else:
         last, change_pct, as_of, previous = (
             finite(values[1]),
@@ -362,7 +340,7 @@ def _yahoo_reading(key: str, name: str, symbol: str, payload: Any) -> GlobalMark
     previous = finite(meta.get("previousClose") if isinstance(meta, dict) else None)
     if last is None:
         raise ValueError("missing market price")
-    change_pct = round((last / previous - 1) * 100, 4) if previous not in (None, 0) else None
+    change_pct = _change_pct(last, previous)
     stamp = meta.get("regularMarketTime")
     as_of = (
         datetime.fromtimestamp(stamp, UTC).isoformat() if isinstance(stamp, (int, float)) else None

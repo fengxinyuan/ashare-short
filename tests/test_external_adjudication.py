@@ -23,16 +23,17 @@ def facts_bundle(*, current: bool = True) -> dict:
                     "last_price": 10.1,
                     "session_date": "2026-08-07",
                     "is_current_session": current,
-                    "intraday": {"is_current_session": current, "last_timestamp": "2026-08-07T10:00:00"},
+                    "intraday": {
+                        "is_current_session": current,
+                        "last_timestamp": "2026-08-07T10:00:00",
+                    },
                     "warnings": [],
                     "candidates": {
                         "entries": [
                             {"key": "entry:分时均价回踩:10.000", "side": "entry", "price": 10.0},
                             {"key": "entry:日内低点:9.900", "side": "entry", "price": 9.9},
                         ],
-                        "stops": [
-                            {"key": "stop:结构破位:9.500", "side": "stop", "price": 9.5}
-                        ],
+                        "stops": [{"key": "stop:结构破位:9.500", "side": "stop", "price": 9.5}],
                         "targets": [
                             {"key": "target:日线压力:10.800", "side": "target", "price": 10.8}
                         ],
@@ -67,9 +68,7 @@ def test_external_packet_exposes_dynamic_candidates_and_rule_default() -> None:
 
 def test_external_selection_can_override_default_but_never_invent_a_price() -> None:
     packet = build_adjudication_packet(facts_bundle())
-    result = validate_external_decisions(
-        packet, select_response(), now=datetime(2026, 8, 7, 10, 5)
-    )
+    result = validate_external_decisions(packet, select_response(), now=datetime(2026, 8, 7, 10, 5))
 
     assert result.accepted is True
     assert result.selections[0]["entry"]["price"] == 9.9
@@ -145,8 +144,8 @@ def test_cli_parser_accepts_external_adjudication_commands() -> None:
     assert validate.max_age_minutes == 15
 
 
-# ---- 拒绝路径 ---------------------------------------------------------------
-#
+# 拒绝路径
+
 # 这一层是**唯一**挡住「外部分析者自己编一个价」的地方，而它的拒绝分支此前几乎
 # 没有测试（实测 182 条语句里 50 条未覆盖，绝大多数是 `reasons.append(); return`）。
 # 校验代码最危险的失效方式不是报错，是**悄悄放行**——所以每条拒绝都要有测试钉住。
@@ -207,9 +206,7 @@ def test_reason_is_length_capped_and_may_not_carry_untraceable_numbers() -> None
     assert not check.accepted
     assert any("超过 120 字" in reason for reason in check.reasons)
 
-    check = validate_external_decisions(
-        packet, select_response(reason="目标看到 12.345"), now=now
-    )
+    check = validate_external_decisions(packet, select_response(reason="目标看到 12.345"), now=now)
     assert not check.accepted
     assert any("无法追溯的数字" in reason for reason in check.reasons)
 
@@ -235,9 +232,7 @@ def test_abstain_must_leave_every_price_null() -> None:
     assert check.accepted, check.reasons
     assert check.selections[0]["action"] == "abstain"
 
-    check = validate_external_decisions(
-        packet, select_response(action="abstain"), now=now
-    )
+    check = validate_external_decisions(packet, select_response(action="abstain"), now=now)
     assert not check.accepted
     assert any("必须全部为 null" in reason for reason in check.reasons)
 
@@ -283,9 +278,7 @@ def test_a_stale_or_future_packet_is_refused() -> None:
     assert not stale.accepted
     assert any("滞后" in reason for reason in stale.reasons)
 
-    ahead = validate_external_decisions(
-        packet, select_response(), now=datetime(2026, 8, 7, 9, 0)
-    )
+    ahead = validate_external_decisions(packet, select_response(), now=datetime(2026, 8, 7, 9, 0))
     assert not ahead.accepted
     assert any("晚于校验时间" in reason for reason in ahead.reasons)
 

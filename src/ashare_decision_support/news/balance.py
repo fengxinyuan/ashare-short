@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from datetime import datetime
+from operator import itemgetter
 from typing import Any
 
 from ashare_decision_support.fanout import gather
@@ -29,25 +30,10 @@ def collect_by_feed(
     unreachable_note: str,
     empty_note: str,
 ) -> tuple[list[NewsDoc], list[str], dict[str, Any]]:
-    """并发跑完每一路，按路记账，再交给 `retain_market_docs` 截断。
+    """并发采集各路并均衡截断，返回 (retained, notes, stats)。
 
-    返回 `(retained, notes, stats)`。`feeds` 里的每一项只要求有 `.name`（写进
-    不可用 note）与 `.source`（记账用的键）。`unreachable_note` 用 `{names}` 占位。
-
-    **一条都没采到时 `stats` 是空 dict，调用方要照着 `if stats:` 赋值。** 这不是
-    风格问题：`last_market_stats` 是「上一次成功采集的构成」，全挂的那一轮把它
-    覆盖成空，`agents/collectors.py` 那条覆盖率 note 就从「这一路挂了」变成
-    「这一路不存在」——而前者才是真的，后者会让人以为源被摘掉了。
-
-    **收口的理由和 `retain_market_docs` 是同一条，只是更靠前一步。** 那个函数收的
-    是「留下多少」的字段名，这个收的是**「采到多少」那一行**——
-    `raw_by_source[feed.source] = len(rows)`。`official_source` 与 `rss_source`
-    此前各写一遍：谁漏了这一行，`agents/collectors.py` 拼出来的「市场舆情来源
-    覆盖」里那一路就**静默消失**，而不是报错。一路取回 0 条和一路根本没跑，在
-    文档里长得一模一样，只有取数方分得清——所以这一行必须在取数方，也就必须
-    只有一份。
-
-    串行取数等于把每一路的超时相加，而这几路都在盘前链路上，所以走 `gather`。
+    feed.name 用于提示，feed.source 用于来源计数，unreachable_note 支持 {names} 占位符。
+    全部无数据时 stats 为空；调用方只在非空时更新上次成功采集的统计。
     """
     docs: list[NewsDoc] = []
     notes: list[str] = []
@@ -74,16 +60,9 @@ def retain_market_docs(
     limit: int,
     raw_by_source: dict[str, int] | None = None,
 ) -> tuple[list[NewsDoc], dict[str, Any]]:
-    """均衡截断 + 「采到多少 / 留下多少」的记账，一次做完。
+    """均衡截断并记录原始、保留的来源数量。
 
-    这段此前在**五个**源里逐字重复（akshare / 华尔街见闻 / 官方 / RSS / composite）。
-    值得收口的不是那四行，是 `last_market_stats` 的**字段名**：`agents/collectors.py`
-    靠 `raw_by_source` / `retained_by_source` 拼那条「市场舆情来源覆盖」的 note，
-    任何一个源把键名写岔，症状不是报错，是那一路在覆盖率里静默消失。
-
-    `raw_by_source` 给 None 表示按文档自报的 `source` 字段数——这是聚合型源
-    （composite、华尔街见闻的双频道）的口径；分路取数的源自己数，因为**一路取回
-    0 条**和**一路根本没跑**在文档里长得一模一样，只有取数方分得清。
+    raw_by_source 为 None 时按文档 source 计数；独立来源可显式记录零条，区分无内容与未采集。
     """
     retained, retained_by_source = balance_by_source(docs, limit)
     counts = source_counts(docs) if raw_by_source is None else dict(sorted(raw_by_source.items()))
@@ -100,37 +79,30 @@ def balance_by_source(
     docs: list[NewsDoc],
     limit: int,
 ) -> tuple[list[NewsDoc], dict[str, int]]:
-    """Retain a recent, source-balanced slice of market documents.
+    """按来源轮流分配配额，再按发布时间倒序返回。
 
-    A plain ``docs[:limit]`` makes source order a hidden weighting parameter:
-    the first feed can consume the whole budget before policy or industry feeds
-    are seen. Quotas are allocated round-robin and any unused quota is
-    redistributed, then the retained documents are put back into time order.
+    两次排序共用时间键；同时间文档按来源名称及输入顺序稳定排列。
     """
     if limit <= 0 or not docs:
         return [], {}
 
-    grouped: dict[str, list[NewsDoc]] = defaultdict(list)
+    grouped: dict[str, list[tuple[tuple[bool, datetime], NewsDoc]]] = defaultdict(list)
     for doc in docs:
         if doc.title:
-            grouped[doc.source.strip() or "unknown"].append(doc)
+            grouped[doc.source.strip() or "unknown"].append((_published_sort_key(doc), doc))
 
-    ordered_groups: dict[str, list[NewsDoc]] = {
-        source: sorted(items, key=_published_sort_key, reverse=True)
-        for source, items in grouped.items()
-    }
-    sources = sorted(ordered_groups)
+    for items in grouped.values():
+        items.sort(key=itemgetter(0), reverse=True)
+    sources = sorted(grouped)
     if not sources:
         return [], {}
 
     quotas = dict.fromkeys(sources, 0)
-    remaining = min(limit, sum(len(items) for items in ordered_groups.values()))
-    # Round-robin is intentionally simple and deterministic. It gives every
-    # reachable source a chance before a large feed receives its second slot.
+    remaining = min(limit, sum(len(items) for items in grouped.values()))
     while remaining:
         progressed = False
         for source in sources:
-            if quotas[source] >= len(ordered_groups[source]):
+            if quotas[source] >= len(grouped[source]):
                 continue
             quotas[source] += 1
             remaining -= 1
@@ -140,13 +112,11 @@ def balance_by_source(
         if not progressed:
             break
 
-    selected = [
-        doc
-        for source in sources
-        for doc in ordered_groups[source][: quotas[source]]
-    ]
-    selected.sort(key=_published_sort_key, reverse=True)
-    return selected, source_counts(selected)
+    selected = [item for source in sources for item in grouped[source][: quotas[source]]]
+    selected.sort(key=itemgetter(0), reverse=True)
+    return [doc for _key, doc in selected], {
+        source: count for source, count in quotas.items() if count
+    }
 
 
 def _published_sort_key(doc: NewsDoc) -> tuple[bool, datetime]:

@@ -1,25 +1,12 @@
-"""每条 CLI 命令真的能调起它那条主链路吗。
+"""验证 CLI 参数解析、真实任务签名与命令分派。
 
-**为什么单独测这个。** `tests/test_daily_cycle_wiring.py` 已经为 daemon 那一侧
-立过这条标准：`daily_cycle` 和 `cli` 各有一组调用点，签名一旦漂移，没被测的那
-一侧要到真正跑的时候才炸。当时只补了 daemon 一侧。
-
-CLI 这一侧是同一个洞，而且大 20 倍——21 个 `_cmd_*` 里此前只有
-`_cmd_strategy_screen` 有测试引用，`cli.py` 覆盖率 66%，未覆盖的那 188 行正好
-是这批 handler。它们不是薄薄一层转发：`_cmd_morning` 往 `MorningConfig` 传 14
-个关键字、往 `Sources` 传 5 个，`_cmd_monitor` 往 `run_monitor` 传 11 个。而测
-试全都自己构造 `MorningConfig`，于是**改一个字段名，整套测试照绿，
-`ashare-ds morning` 当场炸**。
-
-下面的用例不测业务结果，只测接线：命令行参数能不能解析成 handler 要的形状、
-传过去的实参在**真实签名**下是否合法、以及 `COMMANDS` 表里有没有命令没人管。
-"""
+各命令的依赖和返回值均使用测试替身，避免接线测试访问真实数据源。"""
 
 from __future__ import annotations
 
 import inspect
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +14,7 @@ import pytest
 
 from ashare_decision_support import cli
 from ashare_decision_support.journal import Journal, Recommendation
+from ashare_decision_support.schedule.timezone import beijing_today
 
 # argv 里的这个占位符会被换成 tmp_path。默认的 `--output-dir briefs` 是**相对
 # 当前目录**的，跑测试时会在仓库根上长出一个 briefs/。
@@ -46,7 +34,7 @@ class _Bundle:
 
 
 # 命令 → (argv, 应该被调起的符号, 替身的返回值)
-#
+
 # 返回值不是随便填的：handler 拿到结果之后还要用它（`_trim` 要 dict、
 # `_cmd_ask` 要读 `notes` 和 `mode`、`_cmd_morning --explain` 要读 `funnel`），
 # 形状不对的话失败会指向替身而不是接线。
@@ -64,7 +52,7 @@ CASES: dict[str, tuple[list[str], str, Any]] = {
     "facts": (["facts", "--no-live"], "build_facts_bundle", _Bundle()),
     "preopen-research": (
         ["preopen-research", "--no-global"],
-        # 盘前研报的组包已经搬进 `research/preopen.py`（DECISIONS §17.2 那条判据），
+        # 盘前研报组包由 `research/preopen.py` 负责，
         # 所以这里盯的是 `cli` 真正调起的那个入口，而不是它内部再往下调的
         # `build_facts_bundle`——盯里面那层的话，命令改成调别的组包函数也不会红。
         "build_preopen_research",
@@ -81,8 +69,8 @@ CASES: dict[str, tuple[list[str], str, Any]] = {
 }
 
 # 不调主链路的命令：只读状态目录或只做诊断。它们在下面另有用例，或者需要外网。
-STATE_ONLY = {"position", "journal", "state", "qmt-health"}
-NEEDS_NETWORK = {"tick-health", "intraday-check", "wyckoff-scan"}
+STATE_ONLY = {"position", "journal", "state"}
+NEEDS_NETWORK = {"tick-health", "intraday-check"}
 # 单独写了用例（要打桩适配器，塞不进上面那张表驱动的形状）
 OWN_CASES = {"calendar-refresh", "history-refresh"}
 COVERED_ELSEWHERE = {
@@ -138,6 +126,35 @@ def test_every_cli_command_calls_its_chain_with_a_valid_signature(
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("kind", ["json", "text"])
+def test_cli_export_failure_preserves_previous_file_and_can_retry(
+    kind, tmp_path, monkeypatch, capsys
+) -> None:
+    from ashare_decision_support.state import store
+
+    target = tmp_path / "exports" / "report"
+    target.parent.mkdir()
+    target.write_text("previous report\n", encoding="utf-8")
+    export = cli._dump_json if kind == "json" else cli._write_text
+    payload = {"title": "当前事实"} if kind == "json" else "当前事实"
+
+    def fail_replace(source, destination):
+        raise OSError("replacement failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store.os, "replace", fail_replace)
+        with pytest.raises(OSError, match="replacement failed"):
+            export(payload, str(target))
+
+    assert target.read_text(encoding="utf-8") == "previous report\n"
+    assert list(target.parent.iterdir()) == [target]
+    assert capsys.readouterr().out == ""
+
+    export(payload, str(target))
+    content = target.read_text(encoding="utf-8")
+    assert (json.loads(content) if kind == "json" else content.rstrip("\n")) == payload
+
+
 def test_handlers_pass_keywords_that_the_chain_actually_declares(monkeypatch, tmp_path) -> None:
     """逐个关键字对一遍真实签名的参数名。
 
@@ -164,7 +181,48 @@ def test_handlers_pass_keywords_that_the_chain_actually_declares(monkeypatch, tm
     # handler 真的把它构造出来了，而不是传了个 None 过去。
     config = sink["kwargs"]["config"]
     assert isinstance(config, cli.MorningConfig)
-    assert config.sector_level == "SW1"
+    assert sink["args"][0].industry_taxonomy.name == "ths-industry"
+    sources = sink["args"][0]
+    assert sources.industry_taxonomy.source is sources.concept_taxonomy.source
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["morning", "--level", "SW1"], ["sector-leaders", "--industry-level", "SW2"]],
+)
+def test_retired_industry_hierarchy_flags_are_rejected(argv):
+    with pytest.raises(SystemExit) as error:
+        cli.build_parser().parse_args(argv)
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("news_flags", [[], ["--no-news"]])
+def test_monitor_cli_passes_output_dir_and_news_choice_to_the_intraday_job(
+    monkeypatch, tmp_path, news_flags
+) -> None:
+    sink: dict[str, Any] = {}
+    monkeypatch.setattr(
+        cli,
+        "run_monitor",
+        _bind_recorder(cli.run_monitor, sink, {}),
+    )
+    out = tmp_path / "briefs"
+    args = cli.build_parser().parse_args(
+        [
+            "monitor",
+            "--once",
+            "--quiet",
+            "--output-dir",
+            str(out),
+            *news_flags,
+        ]
+    )
+
+    cli.COMMANDS["monitor"](args)
+
+    assert sink["kwargs"]["output_dir"] == str(out)
+    assert sink["kwargs"]["news_cache_dir"] == str(out)
+    assert sink["kwargs"]["use_news"] is (not news_flags)
 
 
 def test_tickflow_adapter_banner_does_not_pollute_stdout(monkeypatch, capsys) -> None:
@@ -222,12 +280,22 @@ def test_explain_prints_the_control_sample_its_help_text_promises(
     assert "12" in control_line
 
 
-def test_text_output_writes_nested_path_without_printing_report(tmp_path, capsys, monkeypatch) -> None:
+def test_text_output_writes_nested_path_without_printing_report(
+    tmp_path, capsys, monkeypatch
+) -> None:
     target = tmp_path / "nested" / "sector.md"
     payload = {"trade_date": "2026-08-26", "market": {}, "sectors": []}
     monkeypatch.setattr(cli, "load_daily_sector_analysis", lambda output_dir: payload)
     args = cli.build_parser().parse_args(
-        ["sector-analysis", "--format", "text", "--output", str(target), "--output-dir", str(tmp_path)]
+        [
+            "sector-analysis",
+            "--format",
+            "text",
+            "--output",
+            str(target),
+            "--output-dir",
+            str(tmp_path),
+        ]
     )
     cli.COMMANDS[args.command](args)
 
@@ -238,10 +306,10 @@ def test_text_output_writes_nested_path_without_printing_report(tmp_path, capsys
 def test_state_only_commands_run_against_the_isolated_state_home(capsys) -> None:
     """只读状态的命令要能在空状态下跑完并给出合法 JSON。
 
-    空自选股、空台账是**第一次使用**时的正常状态，不是异常。这几条命令在那种
+    空持仓、空台账是**第一次使用**时的正常状态，不是异常。这几条命令在那种
     状态下崩掉的话，新用户遇到的第一个反馈就是一段栈。
     """
-    for argv in (["position", "list"], ["journal"], ["state"], ["qmt-health"]):
+    for argv in (["position", "list"], ["journal"], ["state"]):
         args = cli.build_parser().parse_args(argv)
         cli.COMMANDS[args.command](args)
         printed = capsys.readouterr().out
@@ -250,6 +318,7 @@ def test_state_only_commands_run_against_the_isolated_state_home(capsys) -> None
 
 def test_state_journal_counts_explain_control_and_veto_samples() -> None:
     journal = Journal()
+    trade_day = str(beijing_today() - timedelta(days=2))
     for kind, symbol in (
         ("recommendation", "600000.SH"),
         ("control", "600001.SH"),
@@ -257,7 +326,7 @@ def test_state_journal_counts_explain_control_and_veto_samples() -> None:
     ):
         row = Recommendation(
             symbol=symbol,
-            trade_date="2026-08-01",
+            trade_date=trade_day,
             source="morning",
             reference_price=10.0,
         )
@@ -328,21 +397,24 @@ def test_calendar_refresh_writes_the_holiday_table(monkeypatch, capsys) -> None:
     判定退化成「周末以外都算交易日」。这不是静默错误（`explain()` 会说「未经假期
     校验」），但除了手工编辑之外没有补上的办法。
     """
+
     class _Adapter:
         def get_trading_calendar(self):
-            # 只给 1 月：1/1 是假日，1/3(周六) 调休上班。
-            return ["2026-01-02", "2026-01-03", "2026-01-05"]
+            # 前一年末到 1/5 有覆盖：1/1 是假日，1/3 是源明确提供的开市日。
+            return ["2025-12-31", "2026-01-02", "2026-01-03", "2026-01-05"]
 
-    monkeypatch.setattr(cli, "AkshareAdapter", lambda: _Adapter())
+    monkeypatch.setattr(cli, "AkshareCalendarAdapter", lambda: _Adapter())
     args = cli.build_parser().parse_args(["calendar-refresh", "--year", "2026"])
     cli.COMMANDS[args.command](args)
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["trading_days"] == 3
+    assert "覆盖范围" in payload["note"]
     calendar = cli.TradingCalendar()
-    assert calendar.is_trading_day(date(2026, 1, 1)) is False      # 元旦
-    assert calendar.is_trading_day(date(2026, 1, 3)) is True       # 周六调休
+    assert calendar.is_trading_day(date(2026, 1, 1)) is False  # 元旦
+    assert calendar.is_trading_day(date(2026, 1, 3)) is True  # 周六调休
     assert calendar.is_trading_day(date(2026, 1, 2)) is True
+    assert calendar.is_trading_day(date(2026, 1, 6)) is True  # 未提供的未来日期不推断休市
 
 
 def test_calendar_refresh_keeps_the_old_table_when_the_feed_has_none(monkeypatch, capsys) -> None:
@@ -351,12 +423,13 @@ def test_calendar_refresh_keeps_the_old_table_when_the_feed_has_none(monkeypatch
     半张表比没有表更危险：`explain()` 会因为 `configured` 为真而不再提示「未经
     假期校验」，于是一张空表冒充成校验过的。
     """
+
     class _Adapter:
         def get_trading_calendar(self):
             return []
 
     cli.TradingCalendar().save(["2026-10-01"], ["2026-10-10"])
-    monkeypatch.setattr(cli, "AkshareAdapter", lambda: _Adapter())
+    monkeypatch.setattr(cli, "AkshareCalendarAdapter", lambda: _Adapter())
     args = cli.build_parser().parse_args(["calendar-refresh", "--year", "2026"])
     cli.COMMANDS[args.command](args)
 

@@ -1,17 +1,10 @@
-"""Measure every data source this system depends on: reachability, freshness, stability.
+"""采样部分 AkShare / TickFlow 接口的可达性、时效和重复调用延迟。
 
-Answers one question: **is the free tier good enough, and where exactly does it
-run out?** Three numbers per source, all measured on this host, never copied
-from a vendor doc:
+TickFlow 使用免费客户端，付费接口探针用于检查权限边界；主流程实际分钟线
+使用 ashare-ds intraday-check 检查。非交易时段的时间差不代表盘中延迟。
+这里只按工作日判断开市，不加载本地节假日表。有限次采样不代表持续可用。
 
-- **通** — does the call answer at all
-- **时效** — how old is the newest row it returns (lag vs now, and vs the last
-  session close)
-- **稳** — success rate and p50/p95 latency over N repeats
-
-Run it any day for reachability/stability. Run it *during a session* to also get
-true intraday lag — outside trading hours the lag figure only measures distance
-to the last close and is labelled as such.
+--only 选择探针；--symbols 的首只标的用于单票接口，批量接口使用完整列表。
 
     python3 scripts/source_audit.py --repeats 5 --json audit.json
 """
@@ -19,33 +12,32 @@ to the last close and is labelled as such.
 from __future__ import annotations
 
 import argparse
-import json
 import signal
 import statistics
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from datetime import time as dtime
+from pathlib import Path
 from typing import Any
 
-from ashare_decision_support.schedule.timezone import (
-    beijing_from_epoch,
-    beijing_naive_now,
-    beijing_today,
-)
+from ashare_decision_support.adapters.freshness import in_session
+from ashare_decision_support.schedule.clock import AFTERNOON_CLOSE
+from ashare_decision_support.schedule.timezone import BEIJING_TZ, beijing_naive_now, beijing_today
+from ashare_decision_support.signals.series import parse_bar_datetime
+from ashare_decision_support.state.store import write_json
+from ashare_decision_support.symbols import bare_code, normalize_symbol, prefixed_code
+from ashare_decision_support.tabular import records
 
 CALL_TIMEOUT_SECONDS = 45
-
-SESSION_CLOSE = 15 * 60  # minutes from midnight
-SESSION_OPEN = 9 * 60 + 30
 
 
 class ProbeTimeout(RuntimeError):
     pass
 
 
-def _timeout_handler(signum, frame):
+def _timeout_handler(_signum, _frame):
     raise ProbeTimeout(f"exceeded {CALL_TIMEOUT_SECONDS}s")
 
 
@@ -69,82 +61,60 @@ class Probe:
     critical: bool = False
 
 
-# --------------------------------------------------------------------------
 # helpers
-# --------------------------------------------------------------------------
 
 
 def run_once(probe: Probe) -> Result:
     start = time.perf_counter()
-    signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(CALL_TIMEOUT_SECONDS)
+    has_alarm = hasattr(signal, "SIGALRM") and hasattr(signal, "alarm")
+    previous_handler = signal.signal(signal.SIGALRM, _timeout_handler) if has_alarm else None
+    if has_alarm:
+        signal.alarm(CALL_TIMEOUT_SECONDS)
     try:
         result = probe.call()
         result.seconds = time.perf_counter() - start
         return result
     except Exception as exc:
-        return Result(ok=False, seconds=time.perf_counter() - start, error=f"{type(exc).__name__}: {exc}"[:200])
+        return Result(
+            ok=False,
+            seconds=time.perf_counter() - start,
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
     finally:
-        signal.alarm(0)
+        if has_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_handler)
 
 
 def parse_ts(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time())
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        ts = float(value)
-        if ts > 1e12:
-            ts /= 1000.0
-        if ts < 1e8:
-            return None
-        return beijing_from_epoch(ts)
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "nat", "none"}:
-        return None
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-        "%Y%m%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
-        "%m-%d %H:%M", "%H:%M:%S", "%H:%M",
-    ):
+    """完整日期复用行情解析；缺日期的时钟另按最近工作日锚定。"""
+    parsed = parse_bar_datetime(value)
+    if parsed is not None or not isinstance(value, str):
+        return parsed
+    text = value.strip()
+    now = beijing_naive_now()
+    for fmt in ("%H:%M:%S", "%H:%M"):
         try:
-            parsed = datetime.strptime(text, fmt)
+            clock = datetime.strptime(text, fmt).time()
         except ValueError:
             continue
-        # Bare times/dates carry no year: anchor them to today.
-        if parsed.year == 1900:
-            today = beijing_today()
-            parsed = parsed.replace(year=today.year, month=parsed.month or today.month, day=parsed.day or today.day)
-            if fmt in {"%H:%M:%S", "%H:%M"}:
-                parsed = anchor_bare_time(parsed.time(), beijing_naive_now())
-        return parsed
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        return None
+        return anchor_bare_time(clock, now)
 
-
-def frame_rows(table: Any) -> list[dict]:
-    if table is None:
-        return []
-    if isinstance(table, list):
-        return [row for row in table if isinstance(row, dict)]
-    to_dict = getattr(table, "to_dict", None)
-    if callable(to_dict):
+    # 月日没有年份时，取最近一次已发生的日期；跨年不能标成未来数据。
+    for year in (now.year, now.year - 1):
         try:
-            return list(table.to_dict(orient="records"))
-        except TypeError:
-            pass
-    return []
+            parsed = datetime.strptime(f"{year}-{text}", "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        if parsed <= now:
+            return parsed
+    return None
 
 
 def columnar(payload: Any) -> tuple[int, datetime | None]:
     """(bar count, newest timestamp) for TickFlow's column-array kline payload."""
     if not isinstance(payload, dict):
-        rows = frame_rows(payload)
+        rows = records(payload)
         return len(rows), newest(rows, "timestamp", "time", "date")
     stamps = payload.get("timestamp") or payload.get("time") or []
     if not isinstance(stamps, list):
@@ -166,83 +136,93 @@ def newest(rows: list[dict], *keys: str) -> datetime | None:
 
 
 def last_session_close(now: datetime) -> datetime:
-    """Most recent 15:00 close, weekends stepped over. Holidays not modelled."""
+    """最近一次工作日收盘，不加载本地节假日表。"""
     day = now.date()
-    if now.weekday() < 5 and now.hour * 60 + now.minute >= SESSION_CLOSE:
-        return datetime.combine(day, datetime.min.time()) + timedelta(minutes=SESSION_CLOSE)
+    close = datetime.combine(day, AFTERNOON_CLOSE)
+    if now.weekday() < 5 and now >= close:
+        return close
     while True:
         day -= timedelta(days=1)
         if day.weekday() < 5:
-            return datetime.combine(day, datetime.min.time()) + timedelta(minutes=SESSION_CLOSE)
+            return datetime.combine(day, AFTERNOON_CLOSE)
 
 
 def anchor_bare_time(clock: dtime, now: datetime) -> datetime:
-    """把只有 `HH:MM(:SS)` 的时间戳锚到它**真正属于**的那个交易日。
-
-    锚到 `date.today()` 是错的，而且错得恰好**看起来最新鲜**——而时效正是这份
-    脚本要测的三个数之一。2026-08-10（周一）08:22 实测：腾讯逐笔的「成交时间」
-    只有 `15:13:19`，源根本不给日期，于是上周五的数据被标成「今天 15:13」，一个
-    **还没发生的时刻**，lag 算出来是负的，读起来是「这一路最新」。
-
-    规则：今天是交易日、且这个时刻已经过了，才算今天；否则算上一个交易日。
-    三种情形都对——盘中（10:23 已过 → 今天）、周一盘前（15:13 未到 → 上周五）、
-    周末（不是交易日 → 上周五）。
-
-    节假日仍未建模，同 `last_session_close`：那需要交易日历，而这份脚本刻意不依赖
-    项目内部模块，好在链路整体坏掉时它还能跑。
-    """
+    """缺日期时只锚到已发生的工作日，避免周末和盘前产生未来时间戳。"""
     candidate = datetime.combine(now.date(), clock)
     if now.weekday() < 5 and candidate <= now:
         return candidate
     return datetime.combine(last_session_close(now).date(), clock)
 
 
-def in_session(now: datetime) -> bool:
-    minutes = now.hour * 60 + now.minute
-    if now.weekday() >= 5:
-        return False
-    return SESSION_OPEN <= minutes <= 11 * 60 + 30 or 13 * 60 <= minutes <= SESSION_CLOSE
-
-
-# --------------------------------------------------------------------------
 # probes
-# --------------------------------------------------------------------------
 
 
 def build_probes(ak: Any, tf_client: Any, symbols: list[str]) -> list[Probe]:
     probes: list[Probe] = []
-    bare = [s.split(".")[0] for s in symbols]
+    symbols = list(dict.fromkeys(normalize_symbol(symbol) for symbol in symbols))
+    code = bare_code(symbols[0])
+    prefixed = prefixed_code(symbols[0])
     today = beijing_today()
     close = last_session_close(beijing_naive_now()).date()
 
-    # ---- TickFlow free tier ------------------------------------------------
-    if tf_client is not None:
-        def tf_universes() -> Result:
-            payload = tf_client.universes.list()
-            rows = payload if isinstance(payload, list) else frame_rows(payload)
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
+    def ths_taxonomy() -> Result:
+        from ashare_decision_support.adapters.ths_taxonomy import ThsTaxonomySource
+        from ashare_decision_support.sectors import static_taxonomies
 
-        def tf_universe_get() -> Result:
-            payload = tf_client.universes.list()
-            rows = payload if isinstance(payload, list) else frame_rows(payload)
-            first = rows[0] if rows else None
-            uid = None
-            if isinstance(first, dict):
-                uid = first.get("id") or first.get("universe_id") or first.get("code")
-            else:
-                uid = getattr(first, "id", None)
-            members = tf_client.universes.get(uid)
-            count = len(members) if isinstance(members, list) else len(frame_rows(members))
-            if count == 0 and isinstance(members, dict):
-                inner = members.get("symbols") or members.get("constituents") or members.get("data") or []
-                count = len(inner)
-            return Result(ok=count > 0, seconds=0.0, rows=count, extra={"universe": str(uid)})
+        source = ThsTaxonomySource()
+        snapshot = source.load(force_refresh=True)
+        industry, concept = static_taxonomies(source)
+        industries, concepts = industry.list_sectors(), concept.list_sectors()
+        return Result(
+            ok=bool(industries and concepts) and not snapshot.from_cache,
+            seconds=0.0,
+            rows=len(snapshot.profiles),
+            extra={
+                "industries": len(industries),
+                "concepts": len(concepts),
+                "from_cache": snapshot.from_cache,
+                "notes": snapshot.notes,
+            },
+        )
+
+    probes.append(
+        Probe(
+            "ths_taxonomy",
+            "同花顺分类快照",
+            "industries.json / concepts.json（第三方托管）",
+            ths_taxonomy,
+            "行业、概念及成分股关系",
+            critical=True,
+        )
+    )
+
+    # TickFlow free tier
+    if tf_client is not None:
 
         def tf_klines_batch() -> Result:
-            end_ms = int(datetime.combine(today + timedelta(days=1), datetime.min.time()).timestamp() * 1000)
-            start_ms = int(datetime.combine(today - timedelta(days=40), datetime.min.time()).timestamp() * 1000)
+            end_ms = (
+                int(
+                    datetime.combine(
+                        today + timedelta(days=1), dtime.min, tzinfo=BEIJING_TZ
+                    ).timestamp()
+                    * 1000
+                )
+                - 1
+            )
+            start_ms = int(
+                datetime.combine(
+                    today - timedelta(days=40), dtime.min, tzinfo=BEIJING_TZ
+                ).timestamp()
+                * 1000
+            )
             payload = tf_client.klines.batch(
-                symbols, period="1d", start_time=start_ms, end_time=end_ms, count=64, adjust="forward"
+                symbols,
+                period="1d",
+                start_time=start_ms,
+                end_time=end_ms,
+                count=64,
+                adjust="forward",
             )
             total = 0
             latest = None
@@ -252,25 +232,40 @@ def build_probes(ak: Any, tf_client: Any, symbols: list[str]) -> list[Probe]:
                     total += count
                     if stamp and (latest is None or stamp > latest):
                         latest = stamp
-            return Result(ok=total > 0, seconds=0.0, rows=total, latest=latest,
-                          extra={"symbols": len(payload) if isinstance(payload, dict) else 0})
+            return Result(
+                ok=total > 0,
+                seconds=0.0,
+                rows=total,
+                latest=latest,
+                extra={"symbols": len(payload) if isinstance(payload, dict) else 0},
+            )
 
         def tf_instruments() -> Result:
             payload = tf_client.instruments.batch(symbols)
-            rows = payload if isinstance(payload, list) else frame_rows(payload)
+            rows = payload if isinstance(payload, list) else records(payload)
             has_limits = any(
                 isinstance(row, dict) and (row.get("ext") or {}).get("limit_up") for row in rows
             )
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows), extra={"limit_prices": has_limits})
+            return Result(
+                ok=bool(rows), seconds=0.0, rows=len(rows), extra={"limit_prices": has_limits}
+            )
 
         def tf_quotes() -> Result:
-            """Expected to fail on the free tier — that failure IS the paid-tier case."""
+            """使用免费客户端检查实时报价权限。"""
             # TickFlow's public client is keyword-only here. Keep this probe
             # valid so a service rejection is not confused with our own call bug.
             payload = tf_client.quotes.get(symbols=symbols[0])
-            rows = payload if isinstance(payload, list) else frame_rows(payload) or ([payload] if payload else [])
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows),
-                          latest=newest([r for r in rows if isinstance(r, dict)], "timestamp", "time"))
+            rows = (
+                payload
+                if isinstance(payload, list)
+                else records(payload) or ([payload] if payload else [])
+            )
+            return Result(
+                ok=bool(rows),
+                seconds=0.0,
+                rows=len(rows),
+                latest=newest([r for r in rows if isinstance(r, dict)], "timestamp", "time"),
+            )
 
         def tf_intraday() -> Result:
             payload = tf_client.klines.intraday(symbols[0], period="1m", count=240)
@@ -279,300 +274,307 @@ def build_probes(ak: Any, tf_client: Any, symbols: list[str]) -> list[Probe]:
 
         def tf_depth() -> Result:
             payload = tf_client.depth.get(symbols[0])
-            rows = payload if isinstance(payload, list) else frame_rows(payload) or ([payload] if payload else [])
+            rows = (
+                payload
+                if isinstance(payload, list)
+                else records(payload) or ([payload] if payload else [])
+            )
             return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
 
         probes += [
-            Probe("tf_universes", "TickFlow 免费档", "universes.list（申万分类）", tf_universes, "板块划分", critical=True),
-            Probe("tf_universe_get", "TickFlow 免费档", "universes.get（成分股）", tf_universe_get, "板块成分", critical=True),
-            Probe("tf_klines_batch", "TickFlow 免费档", "klines.batch（日线批量）", tf_klines_batch, "板块动量/个股日线", critical=True),
-            Probe("tf_instruments", "TickFlow 免费档", "instruments.batch（名称/涨跌停）", tf_instruments, "标的信息"),
-            Probe("tf_quotes", "TickFlow 付费闸", "quotes.get（实时报价）", tf_quotes, "盘中板块实时"),
-            Probe("tf_intraday", "TickFlow 付费闸", "klines 1m（分钟线）", tf_intraday, "盘中买卖点"),
+            Probe(
+                "tf_klines_batch",
+                "TickFlow 免费档",
+                "klines.batch（日线批量）",
+                tf_klines_batch,
+                "板块动量/个股日线",
+                critical=True,
+            ),
+            Probe(
+                "tf_instruments",
+                "TickFlow 免费档",
+                "instruments.batch（名称/涨跌停）",
+                tf_instruments,
+                "标的信息",
+            ),
+            Probe(
+                "tf_quotes", "TickFlow 付费闸", "quotes.get（实时报价）", tf_quotes, "盘中板块实时"
+            ),
+            Probe(
+                "tf_intraday", "TickFlow 付费闸", "klines 1m（分钟线）", tf_intraday, "盘中买卖点"
+            ),
             Probe("tf_depth", "TickFlow 付费闸", "depth.get（五档盘口）", tf_depth, "挂单档位"),
         ]
 
     if ak is None:
         return probes
 
-    # ---- Sina intraday (the free path for needs 2/3) -----------------------
+    # 新浪分钟线
     for period in ("1", "5", "60"):
+
         def sina_minute(period: str = period) -> Result:
-            table = ak.stock_zh_a_minute(symbol="sh600519", period=period, adjust="")
-            rows = frame_rows(table)
+            table = ak.stock_zh_a_minute(symbol=prefixed, period=period, adjust="")
+            rows = records(table)
             return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "day"))
 
         probes.append(
-            Probe(f"sina_min_{period}", "新浪分钟线", f"stock_zh_a_minute period={period}",
-                  sina_minute, "买卖点/止损/目标（不复权）", critical=(period == "1"))
+            Probe(
+                f"sina_min_{period}",
+                "新浪分钟线",
+                f"stock_zh_a_minute period={period}",
+                sina_minute,
+                "买卖点/止损/目标（不复权）",
+                critical=(period == "1"),
+            )
         )
 
-    # ---- Sina / Tencent bulk + tick: candidate replacements for dead push2 --
+    # 新浪快照、日线与腾讯逐笔
     def sina_spot_all() -> Result:
         table = ak.stock_zh_a_spot()
-        rows = frame_rows(table)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
 
     def sina_daily() -> Result:
-        table = ak.stock_zh_a_daily(symbol="sh600519", adjust="")
-        rows = frame_rows(table)
+        table = ak.stock_zh_a_daily(symbol=prefixed, adjust="")
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "date"))
 
     def tx_tick() -> Result:
-        table = ak.stock_zh_a_tick_tx_js(symbol="sh600519")
-        rows = frame_rows(table)
+        table = ak.stock_zh_a_tick_tx_js(symbol=prefixed)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "成交时间"))
 
     probes += [
-        Probe("sina_spot_all", "候选替代源", "stock_zh_a_spot（新浪全量快照）", sina_spot_all, "替代已死的东财批量行情"),
-        Probe("sina_daily", "候选替代源", "stock_zh_a_daily（新浪日线不复权）", sina_daily, "备份日线/复权校验"),
-        Probe("tx_tick", "候选替代源", "stock_zh_a_tick_tx_js（腾讯逐笔）", tx_tick, "替代已死的东财逐笔"),
+        Probe(
+            "sina_spot_all",
+            "候选替代源",
+            "stock_zh_a_spot（新浪全量快照）",
+            sina_spot_all,
+            "批量行情对照",
+        ),
+        Probe(
+            "sina_daily",
+            "候选替代源",
+            "stock_zh_a_daily（新浪日线不复权）",
+            sina_daily,
+            "备份日线/复权校验",
+        ),
+        Probe(
+            "tx_tick", "候选替代源", "stock_zh_a_tick_tx_js（腾讯逐笔）", tx_tick, "逐笔成交对照"
+        ),
     ]
 
-    # ---- AkShare news / flow ----------------------------------------------
+    # AkShare news / flow
     def cls_telegraph() -> Result:
         table = ak.stock_info_global_cls(symbol="全部")
-        rows = frame_rows(table)
+        rows = records(table)
         stamps = []
         for row in rows:
             merged = f"{row.get('发布日期', '')} {row.get('发布时间', '')}".strip()
             parsed = parse_ts(merged)
             if parsed:
                 stamps.append(parsed)
-        return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=max(stamps) if stamps else None)
+        return Result(
+            ok=bool(rows), seconds=0.0, rows=len(rows), latest=max(stamps) if stamps else None
+        )
 
     def em_global() -> Result:
         table = ak.stock_info_global_em()
-        rows = frame_rows(table)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "发布时间"))
 
     def cctv() -> Result:
         table = ak.news_cctv(date=close.strftime("%Y%m%d"))
-        rows = frame_rows(table)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "date"))
 
     def stock_news() -> Result:
-        table = ak.stock_news_em(symbol=bare[0])
-        rows = frame_rows(table)
+        table = ak.stock_news_em(symbol=code)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "发布时间"))
 
     def notices() -> Result:
         table = ak.stock_notice_report(symbol="全部", date=close.strftime("%Y%m%d"))
-        rows = frame_rows(table)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "公告日期"))
 
     def lhb() -> Result:
         table = ak.stock_lhb_detail_em(
-            start_date=(close - timedelta(days=7)).strftime("%Y%m%d"), end_date=close.strftime("%Y%m%d")
+            start_date=(close - timedelta(days=7)).strftime("%Y%m%d"),
+            end_date=close.strftime("%Y%m%d"),
         )
-        rows = frame_rows(table)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "上榜日"))
 
     probes += [
-        Probe("cls", "AkShare 舆情", "stock_info_global_cls（财联社电报）", cls_telegraph, "盘前舆情", critical=True),
-        Probe("em_global", "AkShare 舆情", "stock_info_global_em（东财快讯）", em_global, "盘前舆情"),
+        Probe(
+            "cls",
+            "AkShare 舆情",
+            "stock_info_global_cls（财联社电报）",
+            cls_telegraph,
+            "盘前舆情",
+            critical=True,
+        ),
+        Probe(
+            "em_global", "AkShare 舆情", "stock_info_global_em（东财快讯）", em_global, "盘前舆情"
+        ),
         Probe("cctv", "AkShare 舆情", "news_cctv（新闻联播）", cctv, "政策面"),
         Probe("stock_news", "AkShare 舆情", "stock_news_em（个股新闻）", stock_news, "个股舆情"),
-        Probe("notices", "AkShare 硬筛", "stock_notice_report（沪深公告）", notices, "致命公告否决", critical=True),
+        Probe(
+            "notices",
+            "AkShare 硬筛",
+            "stock_notice_report（沪深公告）",
+            notices,
+            "致命公告否决",
+            critical=True,
+        ),
         Probe("lhb", "AkShare 资金", "stock_lhb_detail_em（龙虎榜）", lhb, "资金确认"),
     ]
 
-    # ---- 东财 push2 family: re-verify the recorded outage --------------------
+    # 东财 push2
     def em_spot() -> Result:
         table = ak.stock_zh_a_spot_em()
-        rows = frame_rows(table)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
 
     def em_min() -> Result:
-        table = ak.stock_zh_a_hist_min_em(symbol=bare[0], period="1", adjust="")
-        rows = frame_rows(table)
+        table = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="")
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "时间"))
 
     def em_intraday() -> Result:
-        table = ak.stock_intraday_em(symbol=bare[0])
-        rows = frame_rows(table)
+        table = ak.stock_intraday_em(symbol=code)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "时间"))
 
     def em_bid_ask() -> Result:
-        table = ak.stock_bid_ask_em(symbol=bare[0])
-        rows = frame_rows(table)
+        table = ak.stock_bid_ask_em(symbol=code)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
 
     def em_board() -> Result:
         table = ak.stock_board_industry_name_em()
-        rows = frame_rows(table)
+        rows = records(table)
         return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
 
     probes += [
-        Probe("em_spot", "东财 push2（记录为不可达）", "stock_zh_a_spot_em", em_spot, "批量行情"),
-        Probe("em_min", "东财 push2（记录为不可达）", "stock_zh_a_hist_min_em", em_min, "分钟线"),
-        Probe("em_intraday", "东财 push2（记录为不可达）", "stock_intraday_em", em_intraday, "逐笔成交"),
-        Probe("em_bid_ask", "东财 push2（记录为不可达）", "stock_bid_ask_em", em_bid_ask, "五档盘口"),
-        Probe("em_board", "东财 push2（记录为不可达）", "stock_board_industry_name_em", em_board, "板块列表"),
+        Probe("em_spot", "东财 push2", "stock_zh_a_spot_em", em_spot, "批量行情"),
+        Probe("em_min", "东财 push2", "stock_zh_a_hist_min_em", em_min, "分钟线"),
+        Probe("em_intraday", "东财 push2", "stock_intraday_em", em_intraday, "逐笔成交"),
+        Probe("em_bid_ask", "东财 push2", "stock_bid_ask_em", em_bid_ask, "五档盘口"),
+        Probe("em_board", "东财 push2", "stock_board_industry_name_em", em_board, "板块列表"),
     ]
 
-    # ---- AkShare endpoints that DO answer despite the push2 outage ----------
-    # The outage is per-endpoint, not per-host: 涨停池 and 逐笔-adjacent calls on
-    # the same 东财 domains answer fine. Ultra-short work lives on these.
+    # 板块、资金与指数
     def ak_call(fn, *keys: str):
         def run() -> Result:
             table = fn()
-            rows = frame_rows(table)
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, *keys) if keys else None)
+            rows = records(table)
+            return Result(
+                ok=bool(rows),
+                seconds=0.0,
+                rows=len(rows),
+                latest=newest(rows, *keys) if keys else None,
+            )
+
         return run
 
     probes += [
-        Probe("zt_pool", "东财-仍可用", "stock_zt_pool_em（涨停板池）",
-              ak_call(lambda: ak.stock_zt_pool_em(date=close.strftime("%Y%m%d"))), "连板梯队/情绪温度", critical=True),
-        Probe("zt_zbgc", "东财-仍可用", "stock_zt_pool_zbgc_em（炸板池）",
-              ak_call(lambda: ak.stock_zt_pool_zbgc_em(date=close.strftime("%Y%m%d"))), "炸板率/情绪退潮"),
-        Probe("zt_strong", "东财-仍可用", "stock_zt_pool_strong_em（强势股池）",
-              ak_call(lambda: ak.stock_zt_pool_strong_em(date=close.strftime("%Y%m%d"))), "次级梯队"),
-        Probe("em_hist_daily", "东财-仍可用", "stock_zh_a_hist（日线）",
-              ak_call(lambda: ak.stock_zh_a_hist(symbol=bare[0], period="daily",
-                                                 start_date=(close - timedelta(days=60)).strftime("%Y%m%d"),
-                                                 end_date=close.strftime("%Y%m%d"), adjust=""), "日期"), "不复权日线交叉校验"),
-        Probe("em_flow_indiv", "东财-仍可用", "stock_individual_fund_flow（个股资金流）",
-              ak_call(lambda: ak.stock_individual_fund_flow(stock=bare[0], market="sh"), "日期"), "主力/超大单净流入"),
-        Probe("em_flow_market", "东财-仍可用", "stock_market_fund_flow（两市资金流）",
-              ak_call(lambda: ak.stock_market_fund_flow(), "日期"), "大盘资金面"),
-        Probe("hsgt", "东财-仍可用", "stock_hsgt_fund_flow_summary_em（北向）",
-              ak_call(lambda: ak.stock_hsgt_fund_flow_summary_em(), "交易日"), "外资流向"),
-        Probe("ths_industry_flow", "同花顺-全可用", "stock_fund_flow_industry（行业资金流·即时）",
-              ak_call(lambda: ak.stock_fund_flow_industry(symbol="即时")), "板块资金确认", critical=True),
-        Probe("ths_concept_flow", "同花顺-全可用", "stock_fund_flow_concept（概念资金流·即时）",
-              ak_call(lambda: ak.stock_fund_flow_concept(symbol="即时")), "题材资金确认"),
-        Probe("ths_industry_sum", "同花顺-全可用", "stock_board_industry_summary_ths（行业板块汇总）",
-              ak_call(lambda: ak.stock_board_industry_summary_ths()), "板块涨跌幅/涨跌家数", critical=True),
-        Probe("sina_index_spot", "新浪-仍可用", "stock_zh_index_spot_sina（指数实时）",
-              ak_call(lambda: ak.stock_zh_index_spot_sina()), "大盘基准"),
+        Probe(
+            "zt_pool",
+            "东财",
+            "stock_zt_pool_em（涨停板池）",
+            ak_call(lambda: ak.stock_zt_pool_em(date=close.strftime("%Y%m%d"))),
+            "连板梯队/情绪温度",
+            critical=True,
+        ),
+        Probe(
+            "zt_zbgc",
+            "东财",
+            "stock_zt_pool_zbgc_em（炸板池）",
+            ak_call(lambda: ak.stock_zt_pool_zbgc_em(date=close.strftime("%Y%m%d"))),
+            "炸板率/情绪退潮",
+        ),
+        Probe(
+            "zt_strong",
+            "东财",
+            "stock_zt_pool_strong_em（强势股池）",
+            ak_call(lambda: ak.stock_zt_pool_strong_em(date=close.strftime("%Y%m%d"))),
+            "次级梯队",
+        ),
+        Probe(
+            "em_hist_daily",
+            "东财",
+            "stock_zh_a_hist（日线）",
+            ak_call(
+                lambda: ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=(close - timedelta(days=60)).strftime("%Y%m%d"),
+                    end_date=close.strftime("%Y%m%d"),
+                    adjust="",
+                ),
+                "日期",
+            ),
+            "不复权日线交叉校验",
+        ),
+        Probe(
+            "em_flow_indiv",
+            "东财",
+            "stock_individual_fund_flow（个股资金流）",
+            ak_call(lambda: ak.stock_individual_fund_flow(stock=code, market=prefixed[:2]), "日期"),
+            "主力/超大单净流入",
+        ),
+        Probe(
+            "em_flow_market",
+            "东财",
+            "stock_market_fund_flow（两市资金流）",
+            ak_call(lambda: ak.stock_market_fund_flow(), "日期"),
+            "大盘资金面",
+        ),
+        Probe(
+            "hsgt",
+            "东财",
+            "stock_hsgt_fund_flow_summary_em（北向）",
+            ak_call(lambda: ak.stock_hsgt_fund_flow_summary_em(), "交易日"),
+            "外资流向",
+        ),
+        Probe(
+            "ths_industry_flow",
+            "同花顺",
+            "stock_fund_flow_industry（行业资金流·即时）",
+            ak_call(lambda: ak.stock_fund_flow_industry(symbol="即时")),
+            "板块资金确认",
+            critical=True,
+        ),
+        Probe(
+            "ths_concept_flow",
+            "同花顺",
+            "stock_fund_flow_concept（概念资金流·即时）",
+            ak_call(lambda: ak.stock_fund_flow_concept(symbol="即时")),
+            "题材资金确认",
+        ),
+        Probe(
+            "ths_industry_sum",
+            "同花顺",
+            "stock_board_industry_summary_ths（行业板块汇总）",
+            ak_call(lambda: ak.stock_board_industry_summary_ths()),
+            "板块涨跌幅/涨跌家数",
+            critical=True,
+        ),
+        Probe(
+            "sina_index_spot",
+            "新浪",
+            "stock_zh_index_spot_sina（指数实时）",
+            ak_call(lambda: ak.stock_zh_index_spot_sina()),
+            "大盘基准",
+        ),
     ]
 
     return probes
 
 
-def build_library_probes(symbols: list[str]) -> list[Probe]:
-    """Third-party libraries that reach hosts AkShare does not.
-
-    These are the candidates that decide the paid-tier question: if a free
-    library already serves the whole-market snapshot with a 5-level book, the
-    paid TickFlow depth feed buys much less than the docs assume.
-    """
-    probes: list[Probe] = []
-    bare = [s.split(".")[0] for s in symbols]
-
-    try:
-        import easyquotation as eq
-    except Exception:
-        eq = None
-    if eq is not None:
-        sina = eq.use("sina")
-        tencent = eq.use("tencent")
-
-        def eq_sina_depth() -> Result:
-            payload = sina.stocks(bare)
-            first = next(iter(payload.values()), {})
-            stamp = parse_ts(f"{first.get('date', '')} {first.get('time', '')}".strip())
-            has_book = all(f"bid{i}" in first and f"ask{i}" in first for i in range(1, 6))
-            return Result(ok=bool(payload), seconds=0.0, rows=len(payload), latest=stamp,
-                          extra={"five_level_book": has_book})
-
-        def eq_sina_market() -> Result:
-            payload = sina.market_snapshot(prefix=True)
-            first = next(iter(payload.values()), {})
-            stamp = parse_ts(f"{first.get('date', '')} {first.get('time', '')}".strip())
-            return Result(ok=bool(payload), seconds=0.0, rows=len(payload), latest=stamp,
-                          extra={"five_level_book": "bid5" in first})
-
-        def eq_tencent() -> Result:
-            payload = tencent.stocks(bare)
-            first = next(iter(payload.values()), {})
-            return Result(ok=bool(payload), seconds=0.0, rows=len(payload),
-                          latest=parse_ts(first.get("datetime")),
-                          extra={"limit_prices": "涨停价" in first, "volume_ratio": "量比" in first})
-
-        probes += [
-            Probe("eq_sina_depth", "easyquotation（新浪 hq）", "sina.stocks（个股五档）", eq_sina_depth,
-                  "挂单档位/买卖点", critical=True),
-            Probe("eq_sina_market", "easyquotation（新浪 hq）", "sina.market_snapshot（全市场五档）", eq_sina_market,
-                  "板块实时聚合/全市场扫描", critical=True),
-            Probe("eq_tencent", "easyquotation（腾讯 qt）", "tencent.stocks（含涨跌停/量比/委差）", eq_tencent,
-                  "涨停判定/量比"),
-        ]
-
-    try:
-        import efinance as ef
-    except Exception:
-        ef = None
-    if ef is not None:
-        def ef_spot() -> Result:
-            table = ef.stock.get_realtime_quotes()
-            rows = frame_rows(table)
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
-
-        def ef_boards() -> Result:
-            table = ef.stock.get_realtime_quotes("行业板块")
-            rows = frame_rows(table)
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows))
-
-        probes += [
-            Probe("ef_spot", "efinance（东财）", "get_realtime_quotes（全市场快照）", ef_spot, "全市场实时"),
-            Probe("ef_boards", "efinance（东财）", "get_realtime_quotes('行业板块')", ef_boards, "东财板块实时行情"),
-        ]
-
-    try:
-        import adata
-    except Exception:
-        adata = None
-    if adata is not None:
-        def adata_five() -> Result:
-            table = adata.stock.market.get_market_five(stock_code=bare[0])
-            rows = frame_rows(table)
-            filled = bool(rows) and any(str(rows[0].get(key, "")).strip() not in {"", "nan"} for key in ("b1", "s1"))
-            return Result(ok=filled, seconds=0.0, rows=len(rows), extra={"values_present": filled})
-
-        def adata_min() -> Result:
-            table = adata.stock.market.get_market_min(stock_code=bare[0])
-            rows = frame_rows(table)
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=newest(rows, "trade_time"))
-
-        probes += [
-            Probe("adata_five", "adata（多源聚合）", "get_market_five（五档）", adata_five, "五档备份"),
-            Probe("adata_min", "adata（多源聚合）", "get_market_min（分时）", adata_min, "分时备份"),
-        ]
-
-    try:
-        import baostock as bs
-
-        bs.login()
-    except Exception:
-        bs = None
-    if bs is not None:
-        def bao_5min() -> Result:
-            end = last_session_close(beijing_naive_now()).date()
-            rs = bs.query_history_k_data_plus(
-                "sh.600519", "date,time,code,open,high,low,close,volume",
-                start_date=(end - timedelta(days=7)).isoformat(), end_date=end.isoformat(),
-                frequency="5", adjustflag="3",
-            )
-            rows = []
-            while rs.next():
-                rows.append(rs.get_row_data())
-            stamp = parse_ts(rows[-1][0]) if rows else None
-            return Result(ok=bool(rows), seconds=0.0, rows=len(rows), latest=stamp)
-
-        probes.append(
-            Probe("bao_5min", "baostock（独立 TCP）", "query_history_k_data_plus 5min", bao_5min,
-                  "历史分钟线/回测底座")
-        )
-
-    return probes
-
-
-
-# --------------------------------------------------------------------------
 # driver
-# --------------------------------------------------------------------------
 
 
 def audit(probes: list[Probe], repeats: int) -> dict:
@@ -633,180 +635,61 @@ def _line(entry: dict) -> str:
     )
 
 
-def watch(symbols: list[str], seconds: int, interval: float) -> dict:
-    """Poll the live feeds on a loop.
-
-    Two questions at once. **In session** it answers "how stale is the feed and
-    how often does it actually advance" — the number that decides whether the
-    free path can carry an intraday entry. **Outside session** the staleness
-    figure is meaningless but the failure rate is not: a feed that starts
-    refusing after 200 rapid requests is a feed you cannot poll during a
-    session, and that is a rate-limit measurement you can take any day.
-    """
-    feeds: dict[str, Any] = {}
-    bare = [s.split(".")[0] for s in symbols]
-
-    try:
-        import easyquotation as eq
-
-        sina = eq.use("sina")
-        tencent = eq.use("tencent")
-
-        def sina_one() -> tuple[int, datetime | None]:
-            payload = sina.stocks(bare)
-            row = next(iter(payload.values()), {})
-            return len(payload), parse_ts(f"{row.get('date', '')} {row.get('time', '')}".strip())
-
-        def sina_all() -> tuple[int, datetime | None]:
-            payload = sina.market_snapshot(prefix=True)
-            row = next(iter(payload.values()), {})
-            return len(payload), parse_ts(f"{row.get('date', '')} {row.get('time', '')}".strip())
-
-        def tencent_one() -> tuple[int, datetime | None]:
-            payload = tencent.stocks(bare)
-            row = next(iter(payload.values()), {})
-            return len(payload), parse_ts(row.get("datetime"))
-
-        feeds["sina_quote"] = sina_one
-        feeds["sina_market_all"] = sina_all
-        feeds["tencent_quote"] = tencent_one
-    except Exception as exc:
-        print(f"easyquotation unavailable: {exc}")
-
-    try:
-        import akshare as ak
-
-        def sina_minute() -> tuple[int, datetime | None]:
-            table = ak.stock_zh_a_minute(symbol="sh" + bare[0], period="1", adjust="")
-            rows = frame_rows(table)
-            return len(rows), newest(rows, "day")
-
-        feeds["sina_minute_1m"] = sina_minute
-    except Exception as exc:
-        print(f"akshare unavailable: {exc}")
-
-    stats: dict[str, dict] = {
-        name: {"calls": 0, "ok": 0, "latencies": [], "staleness": [], "advances": 0, "last_stamp": None, "errors": []}
-        for name in feeds
-    }
-
-    deadline = time.monotonic() + seconds
-    print(f"# 轮询 {seconds}s，间隔 {interval}s，源={list(feeds)}\n")
-    while time.monotonic() < deadline:
-        for name, fetch in feeds.items():
-            entry = stats[name]
-            entry["calls"] += 1
-            start = time.perf_counter()
-            try:
-                signal.signal(signal.SIGALRM, _timeout_handler)
-                signal.alarm(CALL_TIMEOUT_SECONDS)
-                _count, stamp = fetch()
-                signal.alarm(0)
-                entry["ok"] += 1
-                entry["latencies"].append(time.perf_counter() - start)
-                if stamp is not None:
-                    entry["staleness"].append((beijing_naive_now() - stamp).total_seconds())
-                    if entry["last_stamp"] is not None and stamp > entry["last_stamp"]:
-                        entry["advances"] += 1
-                    entry["last_stamp"] = stamp
-            except Exception as exc:
-                signal.alarm(0)
-                entry["errors"].append(f"{type(exc).__name__}: {exc}"[:120])
-        time.sleep(interval)
-
-    now = beijing_naive_now()
-    report = {
-        "generated_at": now.isoformat(timespec="seconds"),
-        "in_session": in_session(now),
-        "window_seconds": seconds,
-        "interval_seconds": interval,
-        "feeds": {},
-    }
-    for name, entry in stats.items():
-        latencies = sorted(entry["latencies"])
-        stale = sorted(entry["staleness"])
-        summary = {
-            "calls": entry["calls"],
-            "ok": entry["ok"],
-            "success_rate": round(entry["ok"] / entry["calls"], 3) if entry["calls"] else 0.0,
-            "p50_seconds": round(latencies[len(latencies) // 2], 3) if latencies else None,
-            "p95_seconds": round(latencies[int(len(latencies) * 0.95)], 3) if latencies else None,
-            "median_staleness_seconds": round(stale[len(stale) // 2], 1) if stale else None,
-            "min_staleness_seconds": round(stale[0], 1) if stale else None,
-            "timestamp_advanced_times": entry["advances"],
-            "errors": sorted(set(entry["errors"]))[:3],
-        }
-        report["feeds"][name] = summary
-        print(
-            f"{name:<18} 成功 {summary['success_rate']:>5.0%} ({summary['ok']}/{summary['calls']})  "
-            f"p50={summary['p50_seconds']}s p95={summary['p95_seconds']}s  "
-            f"数据滞后中位={summary['median_staleness_seconds']}s  时间戳前进={summary['timestamp_advanced_times']}次"
-            + (f"  err={summary['errors'][0]}" if summary["errors"] else "")
-        )
-
-    if in_session(now):
-        print("\n判定依据：交易时段内，'数据滞后中位' 就是真实盘中延迟，'时间戳前进次数' 接近轮询次数才算真更新。")
-    else:
-        print("\n非交易时段：'数据滞后' 只反映距上次收盘的自然时间，无意义；"
-              "本次有效结论只有成功率与延迟——即这些源能否被高频轮询而不被拒。")
-    return report
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeats", type=int, default=3, help="calls per source (stability sample)")
-    parser.add_argument("--symbols", nargs="*", default=["600519.SH", "000001.SZ", "300750.SZ"])
+    parser.add_argument(
+        "--repeats", type=int, default=3, help="calls per source (stability sample)"
+    )
+    parser.add_argument("--symbols", nargs="+", default=["600519.SH", "000001.SZ", "300750.SZ"])
     parser.add_argument("--json", default="", help="write the full report here")
-    parser.add_argument("--only", nargs="*", default=[], help="probe keys to run (default: all)")
-    parser.add_argument("--watch", type=int, default=0, help="poll live feeds for N seconds instead of auditing")
-    parser.add_argument("--interval", type=float, default=3.0, help="seconds between polls in --watch mode")
+    parser.add_argument("--only", nargs="+", default=[], help="probe keys to run (default: all)")
     args = parser.parse_args()
 
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
-    if args.watch < 0:
-        parser.error("--watch must be non-negative")
-    if args.interval <= 0:
-        parser.error("--interval must be greater than 0")
 
-    if args.watch:
-        report = watch(args.symbols, args.watch, args.interval)
-        if args.json:
-            with open(args.json, "w", encoding="utf-8") as handle:
-                json.dump(report, handle, ensure_ascii=False, indent=2, default=str)
-            print(f"\nwrote {args.json}")
-        return
-
-    try:
-        import akshare as ak
-    except Exception as exc:
-        print(f"akshare unavailable: {exc}")
-        ak = None
+    selected = set(args.only)
+    ak = None
+    if not selected or any(not key.startswith("tf_") for key in selected):
+        try:
+            import akshare as ak
+        except Exception as exc:
+            print(f"akshare unavailable: {exc}")
 
     tf_client = None
-    try:
-        import tickflow
+    if not selected or any(key.startswith("tf_") for key in selected):
+        try:
+            import tickflow
 
-        tf_client = tickflow.TickFlow.free()
-        connect = getattr(tf_client, "connect", None)
-        if callable(connect):
-            connect()
-    except Exception as exc:
-        print(f"tickflow unavailable: {exc}")
+            tf_client = tickflow.TickFlow.free()
+            connect = getattr(tf_client, "connect", None)
+            if callable(connect):
+                connect()
+        except Exception as exc:
+            tf_client = None
+            print(f"tickflow unavailable: {exc}")
 
-    probes = build_probes(ak, tf_client, args.symbols) + build_library_probes(args.symbols)
-    if args.only:
-        probes = [p for p in probes if p.key in set(args.only)]
+    probes = build_probes(ak, tf_client, args.symbols)
+    unavailable = selected - {probe.key for probe in probes}
+    if unavailable:
+        parser.error("unknown or unavailable probe keys: " + ", ".join(sorted(unavailable)))
+    if selected:
+        probes = [probe for probe in probes if probe.key in selected]
+    if not probes:
+        parser.error(
+            "no available probes; install akshare or tickflow and check initialization errors"
+        )
 
     now = beijing_naive_now()
-    print(f"# 数据源实测 {now:%Y-%m-%d %H:%M:%S}  交易时段={in_session(now)}  "
-          f"上一收盘={last_session_close(now):%Y-%m-%d %H:%M}  repeats={args.repeats}\n")
+    print(
+        f"# 数据源实测 {now:%Y-%m-%d %H:%M:%S}  交易时段={in_session(now)}  "
+        f"上一收盘={last_session_close(now):%Y-%m-%d %H:%M}  repeats={args.repeats}\n"
+    )
 
     report = audit(probes, args.repeats)
 
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, ensure_ascii=False, indent=2, default=str)
+        write_json(Path(args.json), report)
         print(f"\nwrote {args.json}")
 
 

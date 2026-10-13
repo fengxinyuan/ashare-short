@@ -1,25 +1,10 @@
-"""四道闸门跑一遍，任意一道红就非零退出。
+"""统一运行 Ruff 静态与格式检查、接线审计、文档审计和 pytest。
 
-这个仓库有四条独立的口径，各自都有存在的理由：
+检查由快到慢执行，任一失败后仍继续其他检查；最终退出码为失败的检查数量。
+使用 --fast 跳过 pytest。检查范围、离线回归与手动验收见 docs/TESTING.md。
 
-    ruff check .                     静态规则（规则族与每条忽略的理由在 pyproject）
-    pytest -q                        行为
-    scripts/inventory_audit.py       六条接线口径：模块/符号/字段/方法/私有/常量
-    scripts/docs_audit.py            文档里的命令与链接还成不成立
-
-**没有 CI，没有 git 钩子，也没有 remote**——所以这四条只在有人记得的时候才跑。
-而它们恰恰是那种「不跑就完全看不出来」的检查：接线审计红了不影响任何测试，
-文档审计红了不影响任何代码，两者都能绿着烂上两个月（`INVENTORY.md` §0 的三个
-死符号、§5 那条照文档敲会直接报错的 `advise` 命令，都是这么攒出来的）。
-
-四条变一条，是为了让「全都跑一遍」不再是一次需要回忆的动作：
-
-    python3 scripts/check.py           # 四道全跑
-    python3 scripts/check.py --fast    # 跳过 pytest，只跑三道静态的
-
-顺序是**由快到慢**：ruff 秒级、两个审计各几秒、pytest 最久。先红的先报，
-但**不短路**——四条互相独立，一次把四个结论都给出来，比修一条重跑一次快。
-退出码是「有几道红」，不是第一道红的退出码。
+    python3 scripts/check.py
+    python3 scripts/check.py --fast
 """
 
 from __future__ import annotations
@@ -28,10 +13,14 @@ import argparse
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
 
 GATES: list[tuple[str, list[str], bool]] = [
-    # (名字, 命令, 是不是慢的那档)
-    ("ruff", [sys.executable, "-m", "ruff", "check", "."], False),
+    # (检查名, 命令, 是否在 --fast 时跳过)
+    ("Ruff 静态检查", [sys.executable, "-m", "ruff", "check", "."], False),
+    ("Ruff 格式检查", [sys.executable, "-m", "ruff", "format", "--check", "."], False),
     ("接线审计", [sys.executable, "scripts/inventory_audit.py"], False),
     ("文档审计", [sys.executable, "scripts/docs_audit.py"], False),
     ("pytest", [sys.executable, "-m", "pytest", "-q"], True),
@@ -40,27 +29,31 @@ GATES: list[tuple[str, list[str], bool]] = [
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fast", action="store_true", help="跳过 pytest，只跑三道静态的")
+    parser.add_argument("--fast", action="store_true", help="跳过 pytest，只运行静态检查")
     args = parser.parse_args()
 
     failed: list[str] = []
+    completed = 0
     for name, command, slow in GATES:
         if slow and args.fast:
-            print(f"—— {name}：--fast 跳过")
+            print(f"—— {name}：--fast 跳过", flush=True)
             continue
         started = time.monotonic()
-        # S603：命令全部来自上面那张字面量表，没有任何一段拼进了外部输入。
-        result = subprocess.run(command, check=False)  # noqa: S603
+        print(f"—— {name}：开始", flush=True)
+        # 命令来自固定检查列表。
+        result = subprocess.run(command, cwd=ROOT, check=False)  # noqa: S603
         elapsed = time.monotonic() - started
-        verdict = "通过" if result.returncode == 0 else "**红**"
-        print(f"—— {name}：{verdict}（{elapsed:.1f}s）\n")
+        completed += 1
+        verdict = "通过" if result.returncode == 0 else f"失败（退出码 {result.returncode}）"
+        print(f"—— {name}：{verdict}（{elapsed:.1f}s）\n", flush=True)
         if result.returncode != 0:
             failed.append(name)
 
     if failed:
-        print(f"{len(failed)} 道红：{'、'.join(failed)}")
+        print(f"{len(failed)}/{completed} 项检查失败：{'、'.join(failed)}")
     else:
-        print("四道全绿" if not args.fast else "三道静态口径全绿（pytest 未跑）")
+        suffix = "（pytest 未运行）" if args.fast else ""
+        print(f"{completed} 项检查全部通过{suffix}")
     return len(failed)
 
 

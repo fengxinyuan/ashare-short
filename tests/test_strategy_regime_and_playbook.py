@@ -66,7 +66,7 @@ class Wyckoff:
         self.upthrust = kw.get("upthrust", False)
 
 
-# ---- 情绪周期闸门 ---------------------------------------------------------
+# 情绪周期闸门
 
 
 def test_the_2026_08_03_reading_is_an_ebb_not_a_normal_day() -> None:
@@ -105,9 +105,7 @@ def test_too_few_limit_ups_is_freezing_even_with_a_low_blowup_rate() -> None:
 
     分母小的时候炸板率本身失去意义——2/10 和 200/1000 都是 20%。
     """
-    verdict = classify_regime(
-        blowup_rate=0.20, max_streak=2, limit_up_count=8, limit_down_count=0
-    )
+    verdict = classify_regime(blowup_rate=0.20, max_streak=2, limit_up_count=8, limit_down_count=0)
     assert verdict.cycle is EmotionCycle.FREEZING
 
 
@@ -159,7 +157,7 @@ def test_a_limit_pool_that_reports_not_ok_is_treated_as_missing() -> None:
     assert regime_from_limit_pool(None).cycle is EmotionCycle.UNKNOWN
 
 
-# ---- 趋势分支 -------------------------------------------------------------
+# 趋势分支
 
 
 def test_each_trend_gets_a_different_judgement_chain() -> None:
@@ -201,13 +199,19 @@ def test_a_close_below_ma20_is_a_breakdown_not_a_pullback() -> None:
 def test_a_breakout_needs_volume_and_is_blocked_when_volume_is_blown_off() -> None:
     at_high = dip(pullback_band="none", pullback_atr=0.2, volume_contraction=1.1)
 
-    quiet = evaluate_playbooks(snap(range_position_60d=0.95, volume_ratio_20d=0.9), at_high, None, None)
+    quiet = evaluate_playbooks(
+        snap(range_position_60d=0.95, volume_ratio_20d=0.9), at_high, None, None
+    )
     assert not quiet.ok, "无量突破不成立"
 
-    good = evaluate_playbooks(snap(range_position_60d=0.95, volume_ratio_20d=1.8), at_high, None, None)
+    good = evaluate_playbooks(
+        snap(range_position_60d=0.95, volume_ratio_20d=1.8), at_high, None, None
+    )
     assert good.primary is Playbook.BREAKOUT
 
-    blown = evaluate_playbooks(snap(range_position_60d=0.95, volume_ratio_20d=5.0), at_high, None, None)
+    blown = evaluate_playbooks(
+        snap(range_position_60d=0.95, volume_ratio_20d=5.0), at_high, None, None
+    )
     assert not blown.ok, "量比 5.0 是情绪透支，不是突破确认"
 
 
@@ -228,8 +232,11 @@ def test_a_downtrend_needs_a_reversal_trigger_not_just_depth() -> None:
 def test_a_volume_engulf_also_triggers_a_reversal() -> None:
     falling = snap(trend_state=TrendState.DOWNTREND, ma20=104.0, ma60=110.0)
     engulf = dip(
-        pullback_band="deep", pullback_atr=5.5, dist_to_ma20_pct=-0.05,
-        ret_1d=0.04, volume_contraction=1.6,
+        pullback_band="deep",
+        pullback_atr=5.5,
+        dist_to_ma20_pct=-0.05,
+        ret_1d=0.04,
+        volume_contraction=1.6,
     )
 
     match = evaluate_playbooks(falling, engulf, None, None)
@@ -247,8 +254,12 @@ def test_a_shallow_downtrend_name_never_reaches_the_reversal_check() -> None:
 
 def test_a_range_name_can_only_be_bought_at_the_low_end() -> None:
     support = PriceLevel(
-        side="support", price=94.0, touches=3, strength=0.8,
-        distance_pct=-0.06, label="区间下沿",
+        side="support",
+        price=94.0,
+        touches=3,
+        strength=0.8,
+        distance_pct=-0.06,
+        label="区间下沿",
     )
     ranged = snap(trend_state=TrendState.RANGE, range_position_60d=0.20, supports=[support])
 
@@ -259,7 +270,7 @@ def test_a_range_name_can_only_be_bought_at_the_low_end() -> None:
     assert not evaluate_playbooks(high_in_range, dip(), None, None).ok
 
 
-# ---- 两层求交集 -----------------------------------------------------------
+# 两层求交集
 
 
 def test_the_regime_can_veto_a_setup_the_trend_would_allow() -> None:

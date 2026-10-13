@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 import traceback
 from collections.abc import Callable
@@ -24,7 +25,9 @@ from typing import Any
 
 from ashare_decision_support.notify.base import Notifier, publish
 from ashare_decision_support.schedule.calendar import TradingCalendar
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.state import STATUS_FAILED, STATUS_OK, DaemonState
+from ashare_decision_support.state.runtime import exclusive_run
 
 # 守护进程查表周期。比最短任务间隔小一个量级即可，纯等待不耗资源。
 TICK_SECONDS = 30
@@ -52,12 +55,13 @@ class DaemonReport:
     notes: list[str] = field(default_factory=list)
 
 
+@exclusive_run("daemon")
 def run_daemon(
     tasks: list[ScheduledTask],
     notifiers: list[Notifier] | None = None,
     calendar: TradingCalendar | None = None,
     day: date | None = None,
-    now_fn: Callable[[], datetime] = datetime.now,
+    now_fn: Callable[[], datetime] = beijing_naive_now,
     sleep: Callable[[float], None] = time.sleep,
     tick_seconds: int = TICK_SECONDS,
     max_ticks: int | None = None,
@@ -97,12 +101,8 @@ def run_daemon(
                 run_state.attempts(task.key) >= MAX_ATTEMPTS for task in remaining
             ):
                 break
-            if max_ticks is None:
+            if max_ticks is None or ticks < max_ticks:
                 sleep(tick_seconds)
-                continue
-            if ticks >= (max_ticks or 0):
-                break
-            sleep(tick_seconds)
             continue
 
         task = pending[0]
@@ -110,9 +110,11 @@ def run_daemon(
             summary = task.run()
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
-            run_state.record(task.key, STATUS_FAILED, moment, error=detail)
+            _record_task_state(run_state, report, task.key, STATUS_FAILED, moment, error=detail)
             report.failed.append(task.key)
-            report.notes.append(f"{task.label} 失败（第 {run_state.attempts(task.key)} 次）：{detail}")
+            report.notes.append(
+                f"{task.label} 失败（第 {run_state.attempts(task.key)} 次）：{detail}"
+            )
             publish(
                 notifiers or [],
                 f"任务失败：{task.label}",
@@ -122,7 +124,9 @@ def run_daemon(
                 f"```\n{traceback.format_exc(limit=3)}\n```",
             )
         else:
-            run_state.record(task.key, STATUS_OK, moment, summary=_summarize(summary))
+            _record_task_state(
+                run_state, report, task.key, STATUS_OK, moment, summary=_summarize(summary)
+            )
             report.ran.append(task.key)
 
         if max_ticks is None:
@@ -143,5 +147,26 @@ def _summarize(value: Any) -> Any:
     return {
         key: item
         for key, item in value.items()
-        if isinstance(item, (int, float, str, bool)) and key != "content"
+        if isinstance(item, (int, float, str, bool))
+        and key != "content"
+        and (not isinstance(item, float) or math.isfinite(item))
     }
+
+
+def _record_task_state(
+    state: DaemonState,
+    report: DaemonReport,
+    task: str,
+    status: str,
+    now: datetime,
+    summary: Any = None,
+    error: str | None = None,
+) -> None:
+    try:
+        state.record(task, status, now, summary=summary, error=error)
+    except (OSError, TypeError, ValueError) as exc:
+        # record 已更新内存，当前进程仍遵守完成/重试上限；重启恢复需要磁盘记录。
+        report.notes.append(
+            f"{task} 调度状态落盘失败（{type(exc).__name__}），"
+            "当前进程保留执行进度，重启后可能重复执行"
+        )

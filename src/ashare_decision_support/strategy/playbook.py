@@ -1,27 +1,10 @@
-"""趋势分支：这只票**能用哪些打法**，以及每条打法的入场判据。
+"""按个股趋势检查允许的打法及入场条件。
 
-改造前趋势是权重（UPTREND +12 / DOWNTREND −15），不是分支。权重的问题是它可以
-被别的项买回来——下跌趋势扣 15 分，只要威科夫和盈亏比加够，照样进候选。所以
-「下跌趋势什么样的可以买」这个问题从来没有被回答，它只是被打了个折。
+上升趋势允许突破、回踩，反弹只允许回踩，震荡只允许区间下沿，
+下跌趋势只允许有明确触发的超跌反转。市场情绪周期可进一步限制允许集合。
 
-现在每种趋势走**不同的判据链**：
-
-```text
-UPTREND    突破买（创新高 + 放量）      回踩买（缩量回踩不破 MA20）
-REBOUND    只允许回踩买
-RANGE      只允许区间下沿买
-DOWNTREND  只允许超跌反转——且必须有反转触发，跌得多本身不是理由
-```
-
-**最要紧的一处修正在 PULLBACK。** 改造前「缩量」只是 ±6 分的权重，压不过趋势
-与威科夫的 50 分，结果 2026-08-03 的 60 条建议里 52 条是**放量回调**——而模块
-自己写着「回调放量意味着出货」。现在缩量是**门槛**：`volume_contraction ≤ 0.90`
-不过就不是回踩，无论别的项多好看。
-
-0.90 这个数标定自 2026-08-03 当日 120 只入围票的分布（中位数 1.066，即中位候选
-其实是**放量**的）：≤0.75 只剩 13%、≤0.90 剩 25%、≤1.0 剩 38%。取 0.90 是为了
-挡掉明确放量的那 31%（>1.2）同时留下够填满候选的样本。**这是先验校准，不是
-收益验证**——哪个切点真的更值得买，要等回测和台账回答。
+回踩缩量是门槛，不能由其他因子加分抵消。0.90 来自 2026-08-03 候选截面的
+先验校准，未作收益验证；其余阈值与具体判据在各常量和检查函数中维护。
 """
 
 from __future__ import annotations
@@ -43,32 +26,32 @@ TREND_PLAYBOOKS: dict[TrendState, frozenset[Playbook]] = {
 # 而这套系统给不出概率，只能在风险侧择优。
 _PRIORITY = (Playbook.PULLBACK, Playbook.BREAKOUT, Playbook.RANGE_LOW, Playbook.REVERSAL)
 
-# --- PULLBACK 回踩 ---
+# PULLBACK 回踩
 # 缩量门槛。见模块 docstring 的标定说明。
 PULLBACK_CONTRACTION_MAX = 0.90
 # 更严的一档，只作为质量标注，不参与门槛。等同 `signals/dipbuy.py:CONTRACTION_FULL`。
 PULLBACK_CONTRACTION_GOOD = 0.75
 
-# --- BREAKOUT 突破 ---
+# BREAKOUT 突破
 BREAKOUT_POSITION_MIN = 0.85
 BREAKOUT_VOLUME_MIN = 1.2
 # 超过这个量比是情绪透支不是突破确认，两端都要挡。
 BREAKOUT_VOLUME_MAX = 4.0
 
-# --- RANGE_LOW 区间下沿 ---
+# RANGE_LOW 区间下沿
 RANGE_POSITION_MAX = 0.35
 RANGE_VOLUME_MAX = 1.2
 
-# --- REVERSAL 超跌反转 ---
+# REVERSAL 超跌反转
 # 反包所需的放量程度。反转必须有量，缩量阴跌不是反转。
 REVERSAL_VOLUME_MIN = 1.2
 
-# --- 量价门槛（`signals/volume_price.py`）---
-#
+# 量价门槛（`signals/volume_price.py`）
+
 # 这几条补的是「放量上涨 / 缩量下跌」里此前没有判据的那一半。它们全部做**门槛**
 # 不做权重，理由和缩量门槛完全一样：dip 在打分里占 10/85，靠加权永远压不过
 # 「趋势强、位置高」的票。
-#
+
 # 回踩要求近 20 日上涨日的量不小于下跌日的量。低于 1.0 意味着这段回调是**放着量
 # 砸下来**的，即使今天单日缩量也一样——单日量比看不到这件事。
 PULLBACK_UP_DOWN_VOL_MIN = 1.0
@@ -124,13 +107,7 @@ class PlaybookMatch:
 
     @property
     def reject_reasons(self) -> list[str]:
-        """**这只票为什么不能用这条打法。**
-
-        每条拒绝理由本身就是一句可读的回答——「超跌但无反转触发（无 Spring、无
-        放量反包、未收回 30 日成交成本）——只是跌得多，属于接刀」。这是低吸系统
-        最该说出口的一句话，而它此前只活在内存里：`to_dict()` 不带它，于是台账、
-        问答、盘后卡三处都看不到，人只能看到「这只票没入选」。
-        """
+        """汇总各打法未通过的具体原因，供问答和报告展示。"""
         return [text for item in self.rejected for text in item.reasons]
 
     def to_dict(self) -> dict:
@@ -192,15 +169,11 @@ def evaluate_playbooks(
     )
 
 
-# ---- 各打法的判据链 -------------------------------------------------------
+# 各打法的判据链
 
 
 def _check_pullback(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> SetupVerdict:
-    """回踩买：趋势还在 × 回调到位 × **缩量** × 这段回调不是放量砸的。
-
-    四个条件全是门槛。改造前只有第一个是门槛，后面是权重——那正是选出来的票
-    87% 在放量回调的原因。
-    """
+    """检查回踩门槛：趋势、回调深度、缩量和整段涨跌量比须同时满足。"""
     reasons: list[str] = []
     warnings: list[str] = []
 
@@ -215,8 +188,7 @@ def _check_pullback(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> Se
     if contraction > PULLBACK_CONTRACTION_MAX:
         return _no(
             Playbook.PULLBACK,
-            f"回调放量 {contraction:.2f}（>{PULLBACK_CONTRACTION_MAX}），"
-            "抛压未收敛，疑似出货",
+            f"回调放量 {contraction:.2f}（>{PULLBACK_CONTRACTION_MAX}），抛压未收敛，疑似出货",
         )
 
     # 单日/近三日缩量看不见「这一整段是怎么跌下来的」。近 20 日涨跌量比补的正是
@@ -236,7 +208,7 @@ def _check_pullback(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> Se
         # **收盘跌破 MA20 就不再是回踩，等站回去。** 这一条在盘前主链路上和
         # `TrendState` 是重合的（UPTREND / REBOUND 的定义本身就要求收在 MA20
         # 上方），留着是因为 `advise` 单票分析会传进别处构造的 snapshot。
-        #
+
         # 这是一个**刻意的保守偏置**：一只强势票回踩到 MA20 下方 0.5% 就被判出
         # 局，其中有一部分次日会收回。放宽多少合适是个实证问题，回测框架建起来
         # 之后才有资格调——现在宁可漏，不愿在结构已破的位置给出买点。
@@ -267,11 +239,7 @@ def _check_pullback(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> Se
 
 
 def _check_breakout(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> SetupVerdict:
-    """突破买：贴近区间上沿 + **持续**放量确认，且没有放到透支、没有顶背离。
-
-    这是系统此前结构上产不出的那一类买点（`advice/candidates.py` 直接不生成
-    高于现价的买入价）。它只在 UPTREND 且情绪周期允许时才会被验到。
-    """
+    """检查区间上沿、持续放量、量能上限与顶背离；适用趋势和周期由调用方筛选。"""
     reasons: list[str] = []
     warnings: list[str] = []
 
@@ -359,8 +327,7 @@ def _check_range_low(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> S
     supports = [
         level
         for level in (getattr(snapshot, "supports", None) or [])
-        if getattr(level, "price", None)
-        and float(level.price) < float(snapshot.last_close)
+        if getattr(level, "price", None) and float(level.price) < float(snapshot.last_close)
     ]
     if not supports:
         return _no(Playbook.RANGE_LOW, "下方无有效支撑，区间下沿无法界定")
@@ -403,7 +370,7 @@ def _check_reversal(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> Se
     spring = bool(getattr(wyckoff, "spring", False))
     ret_1d = getattr(dip, "ret_1d", None)
     contraction = getattr(dip, "volume_contraction", None)
-    engulf = (
+    volume_reversal = (
         ret_1d is not None
         and ret_1d > 0
         and contraction is not None
@@ -416,7 +383,7 @@ def _check_reversal(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> Se
         getattr(vp, "quadrant", None) == "放量上涨"
     )
 
-    if not (spring or engulf or reclaimed or dry_up_turn):
+    if not (spring or volume_reversal or reclaimed or dry_up_turn):
         return _no(
             Playbook.REVERSAL,
             "超跌但无反转触发（无 Spring、无放量反包、未收回 30 日成交成本、"
@@ -425,7 +392,7 @@ def _check_reversal(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> Se
 
     if spring:
         reasons.append("反转触发：威科夫 Spring，假跌破后收回")
-    if engulf:
+    if volume_reversal:
         reasons.append(f"反转触发：放量反包，当日 {ret_1d:+.1%} 且量能 {contraction:.2f}")
     if reclaimed:
         reasons.append("反转触发：盘中跌破 30 日成交成本后收盘站回")
@@ -434,9 +401,7 @@ def _check_reversal(snapshot: Any, dip: Any, wyckoff: Any, vp: Any = None) -> Se
 
     depth = getattr(dip, "pullback_atr", None) or 0.0
     reasons.append(f"超跌 {depth:.1f} 个日波幅（deep 档）")
-    warnings.append(
-        "逆势买入：仓位减半，目标只看前高的一半，跌破触发当日最低即无条件离场"
-    )
+    warnings.append("逆势买入：仓位减半，目标只看前高的一半，跌破触发当日最低即无条件离场")
     return SetupVerdict(Playbook.REVERSAL, True, reasons, warnings)
 
 

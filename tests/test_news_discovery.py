@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from ashare_decision_support.agents import AgentContext, NewsAgent
 from ashare_decision_support.news import (
     LexiconSentiment,
@@ -14,13 +16,35 @@ from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics
 from ashare_decision_support.sectors.predict import SectorPredictor
 
 
-def test_paper_supply_chain_terms_reach_light_manufacturing() -> None:
-    definition = SectorDefinition("轻工制造", "SW1", ("600001.SH",))
+@pytest.mark.parametrize(
+    ("headline", "industry"),
+    [
+        ("HBM订单超预期，存储芯片涨价", "半导体"),
+        ("电网投资增加，变压器订单超预期", "电网设备"),
+        ("面板价格上涨，OLED需求增长", "光学光电子"),
+    ],
+)
+def test_news_reaches_the_specific_industry_without_spilling_into_sibling_industries(
+    headline, industry
+):
+    definitions = [
+        SectorDefinition(name, "THS_INDUSTRY", ("600001.SH",))
+        for name in ("半导体", "电网设备", "光学光电子", "光伏设备")
+    ]
+    doc = NewsDoc(title=headline)
+
+    attributed = SectorPredictor(LexiconSentiment()).attribute_docs(definitions, [doc])
+
+    assert {name for name, docs in attributed.items() if docs} == {industry}
+
+
+def test_paper_supply_chain_terms_reach_paper_industry() -> None:
+    definition = SectorDefinition("造纸", "THS_INDUSTRY", ("600001.SH",))
     doc = NewsDoc(title="针叶浆价格回落，纸企成本改善")
 
     by_sector = SectorPredictor(LexiconSentiment()).attribute_docs([definition], [doc])
 
-    assert by_sector["轻工制造"] == [doc]
+    assert by_sector["造纸"] == [doc]
 
 
 def test_event_evidence_keeps_price_and_supply_signals_explainable() -> None:
@@ -32,10 +56,10 @@ def test_event_evidence_keeps_price_and_supply_signals_explainable() -> None:
 
 
 def test_coverage_snapshot_distinguishes_price_strength_from_news_blindness() -> None:
-    definition = SectorDefinition("轻工制造", "SW1", ("600001.SH",))
+    definition = SectorDefinition("造纸", "THS_INDUSTRY", ("600001.SH",))
     metrics = {
-        "轻工制造": SectorMetrics(
-            "轻工制造",
+        "造纸": SectorMetrics(
+            "造纸",
             constituents=1,
             covered=1,
             ret_5d=0.04,
@@ -45,19 +69,17 @@ def test_coverage_snapshot_distinguishes_price_strength_from_news_blindness() ->
         )
     }
 
-    snapshot = sector_coverage_snapshot(
-        [definition], metrics, [NewsDoc(title="大盘维持震荡")]
-    )
+    snapshot = sector_coverage_snapshot([definition], metrics, [NewsDoc(title="大盘维持震荡")])
 
-    assert snapshot["轻工制造"]["status"] == "行情强但新闻不足"
-    assert snapshot["轻工制造"]["doc_count"] == 0
+    assert snapshot["造纸"]["status"] == "行情强但新闻不足"
+    assert snapshot["造纸"]["doc_count"] == 0
 
 
 def test_strong_but_news_blind_sector_becomes_a_supplement_target() -> None:
-    definition = SectorDefinition("轻工制造", "SW1", ("600001.SH",))
+    definition = SectorDefinition("造纸", "THS_INDUSTRY", ("600001.SH",))
     metrics = {
-        "轻工制造": SectorMetrics(
-            "轻工制造",
+        "造纸": SectorMetrics(
+            "造纸",
             constituents=1,
             covered=1,
             ret_5d=0.04,
@@ -73,15 +95,15 @@ def test_strong_but_news_blind_sector_becomes_a_supplement_target() -> None:
         [NewsDoc(title="大盘维持震荡")],
     )
 
-    assert [target.name for target in targets] == ["轻工制造"]
+    assert [target.name for target in targets] == ["造纸"]
     assert targets[0].matched_docs == 0
 
 
 def test_targeted_news_pass_returns_new_paper_headlines() -> None:
-    definition = SectorDefinition("轻工制造", "SW1", ("600001.SH",))
+    definition = SectorDefinition("造纸", "THS_INDUSTRY", ("600001.SH",))
     metrics = {
-        "轻工制造": SectorMetrics(
-            "轻工制造",
+        "造纸": SectorMetrics(
+            "造纸",
             constituents=1,
             covered=1,
             ret_5d=0.04,

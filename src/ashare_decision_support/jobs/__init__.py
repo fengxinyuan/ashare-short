@@ -5,8 +5,9 @@ daily_cycle  全天时间表编排（`daemon` 命令）
 morning      盘前主链路：舆情 → 大盘 → 板块 → 选股 → 当日候选 → 台账
 monitor      盘中循环：时效闸门 → 跃迁触发 → 告警
 advise       个股买卖点与情景推演
-post_close   盘后：自选与持仓打分，产出次日执行卡
-pre_open     把执行卡复述一遍（仅 CLI；守护进程 09:15 跑的是 advise）
+post_close   盘后：给定标的（省略即持仓）打分，产出次日执行卡，并自动跑每日复盘
+daily_review 每日过程复盘：回放计划版本、盘中事件与新闻（`review --daily` 可补跑）
+pre_open     把执行卡与次日复查项复述一遍（仅 CLI；守护进程 09:15 跑的是 advise）
 review       兑现核对与统计
 ```
 

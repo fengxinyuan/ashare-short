@@ -16,6 +16,7 @@ from ashare_decision_support.adapters.broad_index import (
     IndexQuote,
     read_divergence,
 )
+from tests.fakes import FakeResponse
 
 
 class StubHttp:
@@ -25,19 +26,7 @@ class StubHttp:
 
     def __call__(self, request, timeout=None):
         self.calls += 1
-        body = self.body
-
-        class Response:
-            def read(self) -> bytes:
-                return body.encode("gbk", errors="replace")
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        return Response()
+        return FakeResponse(self.body, encoding="gbk")
 
 
 def line(code: str, name: str, prev: float, last: float, day: str = "2026-08-03") -> str:
@@ -58,7 +47,7 @@ def quotes(*rows: tuple[str, float]) -> BroadIndexRead:
     )
 
 
-# ---- 取数与解析 -----------------------------------------------------------
+# 取数与解析
 
 
 def test_parses_index_rows_and_computes_returns() -> None:
@@ -83,7 +72,9 @@ def test_parses_index_rows_and_computes_returns() -> None:
 
 def test_a_halted_index_is_dropped_instead_of_published_as_zero() -> None:
     """停牌/未开盘的指数返回 0。把 0.00 当点位发出去比报缺失更糟。"""
-    body = "\n".join([line("sh000001", "上证指数", 3832.0, 3809.0), line("sh000688", "科创50", 1635.0, 0.0)])
+    body = "\n".join(
+        [line("sh000001", "上证指数", 3832.0, 3809.0), line("sh000688", "科创50", 1635.0, 0.0)]
+    )
     read = BroadIndexAdapter(
         indices=(("sh000001", "上证指数"), ("sh000688", "科创50")), opener=StubHttp(body)
     ).fetch()
@@ -108,12 +99,14 @@ def test_mixed_trade_dates_void_the_whole_read() -> None:
     assert any("交易日不一致" in note for note in read.notes)
 
 
-# ---- 背离判据 -------------------------------------------------------------
+# 背离判据
 
 
 def test_high_breadth_with_falling_indices_is_flagged() -> None:
     """2026-08-03 的真实形状：七成成分股在涨，每一个宽基都在跌。"""
-    read = quotes(("上证指数", -0.0059), ("沪深300", -0.0098), ("科创50", -0.0508), ("中证1000", 0.0006))
+    read = quotes(
+        ("上证指数", -0.0059), ("沪深300", -0.0098), ("科创50", -0.0508), ("中证1000", 0.0006)
+    )
 
     reasons, warnings = read_divergence(read, breadth=0.7613, expected_date="2026-08-03")
 
@@ -175,7 +168,7 @@ def test_unknown_equal_weight_date_refuses_to_judge() -> None:
     assert not any("等权与市值加权背离" in text for text in warnings)
 
 
-# ---- 判定的单一真源 -------------------------------------------------------
+# 判定的单一真源
 
 
 def test_verdict_and_warning_never_disagree() -> None:

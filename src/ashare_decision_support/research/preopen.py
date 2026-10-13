@@ -1,15 +1,7 @@
-"""给外部 AI 的**每日**盘前研报输入包：组织事实与研究要求，不生成方向预测。
+"""外部 AI 的每日盘前研究输入包。
 
-和 `research/monthly.py` 是一对，只差周期——那份组织月度展望，这份组织当日盘前。
-两份的边界完全一样：**只把已经算好的事实摆出来，外加一段「你要按什么顺序判断」**，
-判断本身留给读它的模型，而模型的输出仍然要回到竞价与开盘去验证。
-
-这一整块此前在 `cli.py` 里：要求文本、组包、排版三样都在。搬出来的判据是
-`DECISIONS.md` §17.2 那条——**命令处理器里跨档次的那一个，装的通常不是命令而是
-领域逻辑**。`_render_preopen_research` 43 行，而同文件 helper 的中位长度是 7 行；
-它是一个 markdown 排版器，和「怎么解析命令行」没有任何关系。搬完之后
-`preopen-research` 那条命令只剩取参数、调用、落盘。
-"""
+组织当前事实、外盘读数、历史基线和研究要求，方向判断留给调用者；历史读数保留样本边界。
+与 monthly / leaders 共用研究格式，CLI 只负责参数、适配器构造、调用与落盘。"""
 
 from __future__ import annotations
 
@@ -32,14 +24,19 @@ from ashare_decision_support.adapters.overseas_history import (
 )
 from ashare_decision_support.adapters.ths_sector_index import load_all_series as load_sector_series
 from ashare_decision_support.facts import build_facts_bundle
+from ashare_decision_support.research.format import names, percent, score
+from ashare_decision_support.research.hypotheses import (
+    build_sector_hypotheses,
+)
 from ashare_decision_support.schedule.calendar import TradingCalendar
-from ashare_decision_support.schedule.timezone import beijing_now
+from ashare_decision_support.schedule.timezone import BEIJING_TZ, beijing_now, to_beijing_naive
 from ashare_decision_support.sectors.baserate import align_sessions, base_rate, build_panel
 from ashare_decision_support.sectors.overseas_link import read_overseas_links
 
-PREOPEN_RESEARCH_REQUIREMENTS = """基于 facts 和 overseas_snapshot 写盘前先手观察清单，不能补造数据。
+PREOPEN_RESEARCH_REQUIREMENTS = """基于 facts、overseas_snapshot 和 hypotheses 写盘前先手观察清单，不能补造数据。
 依次判断：海外风险偏好与 A 股映射；政策/地缘/国家队；国内外财报与公告；昨日情绪与新题材。
 输出不超过 700 字：总判断、1-3 条先手观察（催化→映射→竞价确认→失效）、只等确认、最多 3 条风险。
+先手观察以 hypotheses.items 为底稿：可以删、可以反驳，但保留每条的 invalidate 条件，不另写一版。
 每项证据标注已发生、市场预期或推演。没有竞价/开盘数据时，不写正在走强，也不写直接买卖建议。"""
 
 # 海外读数在简报里按组折叠的顺序与标题。
@@ -51,7 +48,7 @@ OVERSEAS_GROUPS = (
 )
 
 # 每组里最多印几个**动得最厉害**的（两端各取）。
-#
+
 # 品种表铺到 44 个之后，平铺全部等于把「隔夜发生了什么」埋进四十行里——一份没人
 # 读完的清单和没有这份清单，对判断的贡献是一样的。两端各取是因为**跌得最惨的那
 # 几个和涨得最猛的那几个同样是信息**，只取涨幅榜会让「昨夜费半 -2.1%」消失。
@@ -88,22 +85,31 @@ def build_preopen_research(
     适配器由调用方构造并传进来，取数失败不在这里兜：`cli` 是构造适配器的那一层，
     而这一层只组织内容。
     """
-    now = moment or beijing_now()
+    now = to_beijing_naive(moment or beijing_now()).replace(tzinfo=BEIJING_TZ)
     bundle = build_facts_bundle(
         moment=now,
         output_dir=output_dir,
         phase="pre_open",
         is_trading_day=TradingCalendar().is_trading_day(now.date()),
         sections=PREOPEN_FACT_SECTIONS,
+        allow_missing_sections=True,
     )
     overseas = _overseas_payload(market_adapter)
+    facts = bundle.to_dict(compact_rendered=True)
+    morning = facts.get("facts", {}).get("盘前主链路")
     return {
         "schema": SCHEMA,
         "as_of": now.isoformat(timespec="seconds"),
         "task": "A股盘前先手研报",
         "requirements": PREOPEN_RESEARCH_REQUIREMENTS,
-        "facts": bundle.to_dict(compact_rendered=True),
+        "facts": facts,
         "overseas_snapshot": overseas,
+        # 假设链：主题簇情景 × 外盘映射 × 基准率，每条自带证伪条件。外部 AI 拿到的
+        # 不再是三段并排的原料，而是已经对齐到同一个簇名上的「先手观察」草稿——
+        # 它要做的是审、补、删，不是从头拼。
+        "hypotheses": build_sector_hypotheses(
+            morning if isinstance(morning, dict) else None, overseas, session_date=now.date()
+        ),
     }
 
 
@@ -205,9 +211,7 @@ def _base_rates_for_link(
         item = read.to_dict()
         item["instrument"] = key
         item["instrument_name"] = instrument.name
-        item["alignment"] = (
-            "strictly_after" if instrument.after_a_share_close else "same_or_after"
-        )
+        item["alignment"] = "strictly_after" if instrument.after_a_share_close else "same_or_after"
         rows.append(item)
     return rows
 
@@ -338,35 +342,23 @@ def _base_rate_lines(payload: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _score(value: Any) -> str:
-    return "—" if value is None else f"{value:.1f}" if isinstance(value, float) else str(value)
-
-
-def _percent(value: Any) -> str:
-    return "—" if not isinstance(value, (int, float)) else f"{value:+.2%}"
-
-
-def _names(items: Any) -> str:
-    if not items:
-        return "—"
-    names = []
-    for item in items[:5]:
-        names.append(str(item.get("name") if isinstance(item, dict) else item))
-    return "、".join(names)
-
-
 def _turnover_items(turnover: dict[str, Any], quadrant: str) -> list[dict[str, Any]]:
     return [
-        item for item in turnover.get("rising", [])
+        item
+        for item in turnover.get("rising", [])
         if isinstance(item, dict) and item.get("quadrant") == quadrant
     ]
 
 
 def _risk_lines(payload: dict[str, Any], morning: Any, overseas: dict[str, Any]) -> list[str]:
     lines: list[str] = []
-    missing = [item.get("name") for item in overseas.get("readings", []) if item.get("last") is None]
+    missing = [
+        item.get("name") for item in overseas.get("readings", []) if item.get("last") is None
+    ]
     if missing:
-        lines.append(f"- 海外快照缺少 {'、'.join(str(item) for item in missing)}，风险偏好只做部分判断。")
+        lines.append(
+            f"- 海外快照缺少 {'、'.join(str(item) for item in missing)}，风险偏好只做部分判断。"
+        )
     facts = payload.get("facts") or {}
     for note in facts.get("notes", []):
         text = str(note)
@@ -380,6 +372,33 @@ def _risk_lines(payload: dict[str, Any], morning: Any, overseas: dict[str, Any])
     if not lines:
         lines.append("- 暂无额外风险提示；仍需用竞价、开盘承接和成交扩散确认。")
     return lines[:5]
+
+
+def _hypothesis_lines(payload: Any) -> list[str]:
+    """展示已校验日期的主题假设，复用生成时的确认与失效条件。"""
+    if not isinstance(payload, dict):
+        return ["- 尚无经过日期校验的盘前假设，请重新生成盘前研究资料。"]
+    items = payload.get("items") or []
+    if not items:
+        return [f"- {note}" for note in payload.get("notes") or ["暂无可用的当日盘前假设。"]]
+    lines: list[str] = []
+    for item in items:
+        lines.append(
+            f"- 观察 {item.get('name')}（{item.get('scenario') or '待验证'}）："
+            f"评分 {score(item.get('score'))}，"
+            f"1日 {percent(item.get('ret_1d'))}，5日 {percent(item.get('ret_5d'))}。"
+        )
+        lines.append(f"  - 关联板块：{names(item.get('members'))}")
+        lines.extend(
+            f"  - {evidence.get('kind')}：{evidence.get('text')}"
+            for evidence in item.get("evidence") or []
+        )
+        lines.append(
+            f"  - 确认（{item.get('confirm_after', '开盘')}后）："
+            + "；".join(item.get("confirm") or [])
+        )
+        lines.append("  - 失效：" + "；".join(item.get("invalidate") or []))
+    return lines
 
 
 def render_preopen_research(payload: dict) -> str:
@@ -403,41 +422,33 @@ def render_preopen_research(payload: dict) -> str:
         lines.extend(["", "## 总判断"])
         lines.append(
             f"- 市场读数：{market.get('direction', '未覆盖')}，"
-            f"综合分 {_score(market.get('score'))}，"
-            f"5日中位 {_percent(market.get('median_ret_5d'))}，"
-            f"广度 {_percent(market.get('breadth'))}"
+            f"综合分 {score(market.get('score'))}，"
+            f"5日中位 {percent(market.get('median_ret_5d'))}，"
+            f"广度 {percent(market.get('breadth'))}"
         )
         if rotation:
             lines.append(
                 f"- 轮动状态：{rotation.get('switch_label') or '未覆盖'}；"
-                f"近3样本反复出现：{_names(rotation.get('persistent') or rotation.get('recurring_leaders'))}"
+                f"近3样本反复出现：{names(rotation.get('persistent') or rotation.get('recurring_leaders'))}"
             )
         if turnover:
             lines.append(
-                f"- 成交额迁移：总量 {_percent(turnover.get('total_change'))}，"
-                f"最新一日 {_percent(turnover.get('total_trend'))}"
+                f"- 成交额迁移：总量 {percent(turnover.get('total_change'))}，"
+                f"最新一日 {percent(turnover.get('total_trend'))}"
             )
         if limit_pool:
             lines.append(
                 f"- 情绪旁证：涨停 {limit_pool.get('limit_up', '—')}，"
-                f"炸板率 {_percent(limit_pool.get('blowup_rate'))}，"
+                f"炸板率 {percent(limit_pool.get('blowup_rate'))}，"
                 f"最高连板 {limit_pool.get('max_streak', '—')}"
             )
 
-        lines.extend(["", "## 先手观察"])
-        for sector in (morning.get("sectors") or [])[:3]:
-            lines.append(
-                f"- 观察 {sector.get('name')}（{sector.get('direction', '未覆盖')}）："
-                f"评分 {_score(sector.get('score'))}，"
-                f"1日 {_percent(sector.get('ret_1d'))}，5日 {_percent(sector.get('ret_5d'))}；"
-                f"确认看量价延续，失效看冲高回落。"
-            )
         if turnover:
-            inflow = _names(_turnover_items(turnover, "放量上涨") or turnover.get("rising"))
-            distribution = _names(
+            inflow = names(_turnover_items(turnover, "放量上涨") or turnover.get("rising"))
+            distribution = names(
                 _turnover_items(turnover, "放量下跌") or turnover.get("distribution")
             )
-            fading = _names(turnover.get("falling"))
+            fading = names(turnover.get("falling"))
             if inflow != "—" or distribution != "—" or fading != "—":
                 lines.append(
                     f"- 资金迁移：{inflow}放量上涨，{distribution}放量下跌，"
@@ -445,6 +456,8 @@ def render_preopen_research(payload: dict) -> str:
                 )
         for warning in market.get("warnings") or []:
             lines.append(f"- 风险提示：{warning}")
+    lines.extend(["", "## 先手观察"])
+    lines.extend(_hypothesis_lines(payload.get("hypotheses")))
     lines.extend(
         [
             "",

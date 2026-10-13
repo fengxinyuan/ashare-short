@@ -110,13 +110,13 @@ class WyckoffAnalyzer:
             score += 8.0 if close_position >= 0.5 else -8.0
         elif effort_result == EffortResult.EXHAUSTION:
             # 衰竭出现在上涨末端偏空，出现在下跌末端偏多。
-            #
+
             # **方向取自涨跌本身，不取自收盘位置。** `_effort_result` 是用
             # `abs(short_move_pct) >= 1.2` 认出衰竭的——缩量而走出大幅波动，
             # 涨跌方向在识别那一步就被 `abs()` 丢掉了，所以打分这一步必须自己
             # 捡回来，否则「缩量急拉」和「缩量急杀」会拿到同一个分。邻近的
             # COMPRESSION 分支用的是同一个判据（`short_return_pct >= 0`）。
-            #
+
             # 2026-08-17 之前这里写的是 `8.0 if close_position >= 0.5 else 8.0`，
             # 两个分支同值，恒为 -8.0——`close_position` 是个死判据，靠一行
             # `noqa: RUF034` 压着。
@@ -180,7 +180,11 @@ class WyckoffAnalyzer:
         if score >= 35:
             return WyckoffBias.MARKUP
         if score >= 12:
-            return WyckoffBias.ACCUMULATION
+            # 与上面 Spring 分支同一条阈值：中期已经涨了 8% 以上的不是吸筹末端，
+            # 是主升段。此前这一档不看涨幅，2026-09-14 实测 20 日 +12.5%、60 日
+            # 分位 0.82 的票被判 ACCUMULATION 拿 +10，比 MARKUP 的 +7 还高——
+            # 打分层给吸筹更高权重的前提正是「它还没涨」。
+            return WyckoffBias.ACCUMULATION if medium_return_pct <= 8.0 else WyckoffBias.MARKUP
         if score <= -35:
             return WyckoffBias.MARKDOWN
         if score <= -12:
@@ -217,8 +221,7 @@ class WyckoffAnalyzer:
         recent = rows[-10:]
         body_pct = abs(last["close"] - last["open"]) / max(last["close"], 0.01) * 100.0
         body_baseline = median(
-            abs(row["close"] - row["open"]) / max(row["close"], 0.01) * 100.0
-            for row in recent
+            abs(row["close"] - row["open"]) / max(row["close"], 0.01) * 100.0 for row in recent
         )
         short_move_pct = self._return_pct(rows[-4]["close"], last["close"])
         if volume_ratio >= 1.4 and short_move_pct >= 1.5:

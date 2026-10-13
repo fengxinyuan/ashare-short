@@ -1,44 +1,8 @@
-"""龙虎榜席位：谁在买、谁在卖。
+"""龙虎榜席位身份、净额与占比读数。
 
-## 为什么单独一层
-
-`news/akshare_source.py:fetch_dragon_tiger` 已经在取龙虎榜，但只取到个股层面的
-**净买额**一个数，然后按板块汇总进 `sectors/predict.py` 的打分。净买额答不了超短
-真正关心的那句话——**这笔钱是谁的**。
-
-同样是净买 3 亿：
-- 一个游资营业部单吃 3.1 亿，是**一个人的方向**，明天可能就走；
-- 三个「机构专用」各买 1 亿，是**几家机构的建仓**，节奏完全不同；
-- 北向专用买 3 亿，那是外资的被动/主动配置，和游资打板不是一回事。
-
-席位构成把这三种情况分开，而净买额把它们压成同一个数。
-
-## 数据源与可达性
-
-走 `datacenter-web.eastmoney.com`，**与 `adapters/earnings.py` 同一台主机**。
-2026-08-04 本机实测 `http=200 / 0.28s`；同一时刻 `push2his.eastmoney.com`
-返回 `http=000`（被拒），与 `docs/DATA_SOURCES.md` 记录一致。所以这一层可以建，
-而按单笔金额分档的资金流（`stock_individual_fund_flow`，push2his 系）不可以——
-后者在同一次实测里退避重试 6 次才通过一次。
-
-## 这一层只出事实
-
-席位名称与净额是**交易所披露的事实**。「跟着某个游资买能赚钱」是**判断**，而且是
-一条未经本系统台账验证的先验。所以这里：
-
-- 记录席位身份、净额、占比，出可统计的结构化读数；
-- **不给任何「游资看多 → 买入」的信号**，不进打分、不改仓位系数。
-
-理由和 `adapters/broad_index.py` 那条一样：台账里的待兑现记录都是按现行公式算的，
-现在改公式会让新旧记录不可比。等 `journal/stats.py` 攒够样本，「某类席位的方向
-是否真的领先」本身就是一个可以被验证的假设——那时候再谈给分。
-
-## 上榜是有门槛的
-
-龙虎榜只收录触发交易所公开标准的票（涨跌幅偏离、振幅、换手、量比等）。**大市值
-蓝筹基本不会出现。** 2026-08-04 实测：牧原股份（流通市值 1248 亿）在 7/1–8/4
-整个区间**一次都没上榜**，而全市场同期有 2446 条记录。所以这一层对超短的小票池
-有用，对权重股恒为空——取不到不是故障，`covered` 字段说明的就是这件事。
+只报告交易所披露的席位构成，不参与评分或仓位计算。
+未触发上榜条件的标的可能没有记录，覆盖情况由 covered 标明。
+接口与去重口径见 docs/DATA_SOURCES.md。
 """
 
 from __future__ import annotations
@@ -53,7 +17,7 @@ from ashare_decision_support.tabular import records
 # akshare 里这一层唯一的入口函数。写成常量是因为它出现两次——`getattr` 的键和
 # 取不到时的说明文案，两处写死必然漂（改了键忘了文案，读的人就会去查一个根本不
 # 存在的函数名）。
-#
+
 # 原先这里还有一个 `LHB_SOURCE = "akshare.stock_lhb_stock_detail_em"` 的来源标签，
 # 已删：`SeatRead` 没有任何 provenance 字段，那个标签**无处可去**，从定义那天起
 # 就没有调用方。取数来源已经由下面的说明文案带出来了。
@@ -146,10 +110,14 @@ class SeatRead:
             lines.append(f"{category}净额 {net / 1e4:+.0f} 万")
         if self.top_buyer and self.top_buyer.net:
             tag = "（知名游资席位）" if self.top_buyer.known_hot_money else ""
-            lines.append(f"买方居首 {self.top_buyer.name}{tag} 净 {self.top_buyer.net / 1e4:+.0f} 万")
+            lines.append(
+                f"买方居首 {self.top_buyer.name}{tag} 净 {self.top_buyer.net / 1e4:+.0f} 万"
+            )
         if self.top_seller and self.top_seller.net:
             tag = "（知名游资席位）" if self.top_seller.known_hot_money else ""
-            lines.append(f"卖方居首 {self.top_seller.name}{tag} 净 {self.top_seller.net / 1e4:+.0f} 万")
+            lines.append(
+                f"卖方居首 {self.top_seller.name}{tag} 净 {self.top_seller.net / 1e4:+.0f} 万"
+            )
         if self.concentration is not None and self.concentration >= CONCENTRATION_THRESHOLD:
             lines.append(f"单一席位占当日成交 {self.concentration:.1%}，盘面由少数席位主导")
         lines.append("席位与净额是交易所披露的事实；「跟着某类席位做」是未经本系统验证的判断")
@@ -182,7 +150,9 @@ class LhbSeatAdapter:
                 ak_module = None
         self.ak = ak_module
 
-    def fetch(self, symbol: str, trade_date: date | str, market_amount: float | None = None) -> SeatRead:
+    def fetch(
+        self, symbol: str, trade_date: date | str, market_amount: float | None = None
+    ) -> SeatRead:
         day = trade_date if isinstance(trade_date, str) else trade_date.strftime("%Y%m%d")
         day_key = day.replace("-", "")
         code = "".join(ch for ch in str(symbol) if ch.isdigit())[:6]
@@ -214,7 +184,9 @@ class LhbSeatAdapter:
         self._fill_extremes(read, market_amount)
         return read
 
-    def _merge_rows(self, fn, code: str, day_key: str, read: SeatRead) -> dict[tuple, dict[str, Any]]:
+    def _merge_rows(
+        self, fn, code: str, day_key: str, read: SeatRead
+    ) -> dict[tuple, dict[str, Any]]:
         """买入榜 + 卖出榜合并去重。
 
         同一席位会同时出现在两张榜上，两边**整行数值完全一致**，不去重的话它的

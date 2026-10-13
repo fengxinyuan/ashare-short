@@ -1,26 +1,14 @@
-"""盘前主链路：舆情 → 大盘趋势 → 板块排序 → 板块内选股 → 候选 → 台账.
+"""盘前流程编排与板块、舆情采集。
 
-自上而下，和 `post_close.py` 相反：那个给你已经选好的票打分，这个从全市场出发，
-先判断该不该做、该做哪个方向的板块，再决定看哪些票。
-
-两段取数是免费档能跑通的关键：先用短窗口批量拉全部成分股（几千只）测板块行为，
-再只对通过筛选的几十只拉长历史。舆情采集与成分股日线在 agent 层并行，两条最慢的
-链路完全重叠。
-
-产出落一份台账（`journal/`）供事后核对，这让盘前结论不再是一次性的。候选**只是
-这份晨报的结论**：它进 facts、进简报、进台账，但不再写成一份名单让后面的命令
-默认去读（候选池已删，见 `state/positions.py`）。
-
-**这个文件只剩编排与前两段取数。** 六个阶段里做判定的那四段各自成文件
-（`morning_fuse` / `morning_select` / `morning_record` / `morning_publish`），
-交接单在 `morning_stages`。留在这里的是 `run_morning` 那六行、以及「板块与成分股」
-「并行采集」这两段——它们不做取舍，只是把数据取齐。
+先用成分股短窗口日线计算板块动量，再为入围标的获取长历史。
+融合、选股、台账与发布分别由 morning_fuse/select/record/publish 负责，
+通过 morning_stages 的数据结构交接。候选进入报告和台账，监控名单由用户指定。
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +19,7 @@ from ashare_decision_support.agents import (
     run_agents,
     timing_note,
 )
-from ashare_decision_support.jobs.morning_facts import news_source_counts
+from ashare_decision_support.jobs.morning_facts import metric_bar_freshness, news_source_counts
 from ashare_decision_support.jobs.morning_fuse import stage_fuse
 from ashare_decision_support.jobs.morning_publish import stage_publish
 from ashare_decision_support.jobs.morning_record import stage_record
@@ -50,8 +38,9 @@ from ashare_decision_support.news import (
     rank_news_targets,
     sector_coverage_snapshot,
 )
-from ashare_decision_support.schedule.timezone import beijing_today
-from ashare_decision_support.sectors import TickFlowSwTaxonomy
+from ashare_decision_support.schedule.clock import AUCTION_OPEN
+from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_today
+from ashare_decision_support.sectors import SectorTaxonomyError, ThsIndustryTaxonomy
 from ashare_decision_support.symbols import normalize_symbol
 
 # 每路舆情源取多少条。源的默认值是 200，对**板块归因**够用，对**通读**不够：
@@ -59,6 +48,7 @@ from ashare_decision_support.symbols import normalize_symbol
 # 当日 A 股盘面快讯——海外那一节被压到 21 条、宏观数据只剩 1 条。而海外与宏观正是
 # 通读存在的理由（`news/daily_read.py`）。取宽到 600。
 WIDE_MARKET_LIMIT = 600
+LIVE_QUOTE_MAX_AGE_SECONDS = 300
 
 
 def run_morning(
@@ -81,41 +71,99 @@ def run_morning(
     notes: list[str] = []
     report = progress_reporter(progress)
 
-    universe = _stage_universe(sources, cfg, output_path, notes, report)
+    universe = _stage_universe(sources, cfg, notes, report)
     collected = _stage_collect(sources, cfg, universe, today, output_path, notes, report)
     fusion = stage_fuse(sources, cfg, universe, collected, today, output_path, notes, report)
     selection = stage_select(sources, cfg, universe, collected, fusion, today, notes)
-    ledger = stage_record(sources, collected, fusion, selection, today, notes, report)
+    live_count = _attach_live_quotes(selection.candidates, fusion.market_scan, today)
+    metric_date, current_share = metric_bar_freshness(collected.metric_bars, today)
+    # Once auction starts, yesterday's complete daily bars remain useful for
+    # research, but must not become today's executable recommendations.
+    execution_blocks: list[str] = []
+    if today == beijing_today():
+        # After the auction starts, yesterday's completed bars cannot support a
+        # current-day entry, including at lunch and after the closing bell.
+        if beijing_naive_now().time() >= AUCTION_OPEN and current_share < 0.8:
+            execution_blocks.append(
+                f"选股结构日线主要截至 {metric_date or '未知'}，当日完整日线覆盖率 "
+                f"{current_share:.0%}，不足 80%；实时快照覆盖候选 {live_count}/{len(selection.candidates)} 只"
+            )
+        if fusion.market_scan is None or not getattr(fusion.market_scan, "ok", False):
+            execution_blocks.append("全市场扫描缺失，可交易性过滤没有可靠输入")
+        elif not getattr(fusion.market_scan, "complete", True):
+            execution_blocks.append("全市场扫描仅部分成功，宽度与可交易性覆盖不完整")
+    if execution_blocks:
+        notes.append("；".join(execution_blocks) + "；候选仅供观察，本轮不写入可执行建议台账")
+    ledger = stage_record(
+        sources,
+        collected,
+        fusion,
+        selection,
+        today,
+        notes,
+        report,
+        config=cfg,
+        output_path=output_path,
+        actionable=not execution_blocks,
+        execution_blocks=execution_blocks,
+        metric_date=metric_date,
+    )
     return stage_publish(
         sources, collected, fusion, selection, ledger, today, output_path, notes, report
     )
 
 
+def _attach_live_quotes(
+    candidates: list[dict], scan: Any, today: date, *, now: datetime | None = None
+) -> int:
+    """把盘中实时快照附到历史结构候选，不拿未收盘报价冒充完整日线。"""
+    stamp = getattr(scan, "as_of", None)
+    if not getattr(scan, "ok", False) or not getattr(scan, "session_in_progress", False):
+        return 0
+    if stamp is None or stamp.date() != today:
+        return 0
+    age = ((now or beijing_naive_now()) - stamp).total_seconds()
+    if not 0 <= age <= LIVE_QUOTE_MAX_AGE_SECONDS:
+        return 0
+    count = 0
+    for candidate in candidates:
+        row = scan.get(candidate["symbol"])
+        price = getattr(row, "price", None)
+        if isinstance(price, (int, float)) and price > 0:
+            candidate["live_price"] = float(price)
+            candidate["live_quote_as_of"] = stamp.isoformat(timespec="seconds")
+            count += 1
+    return count
+
+
 def _stage_universe(
     sources: Sources,
     cfg: MorningConfig,
-    output_path: Path,
     notes: list[str],
     report: Callable[[str], Any],
 ) -> Universe:
     """① 板块与成分股。"""
-    taxonomy, taxonomy_notes = _industry_taxonomy(sources, cfg, output_path)
-    notes.extend(taxonomy_notes)
-    industries = taxonomy.list_sectors()
+    taxonomy = sources.industry_taxonomy
+    if taxonomy is None:
+        taxonomy = ThsIndustryTaxonomy()
+    try:
+        industries = taxonomy.list_sectors()
+    except Exception as exc:
+        raise SectorTaxonomyError(f"同花顺行业分类不可用，无法执行盘前扫描：{exc}") from exc
     if not industries:
-        raise RuntimeError(f"行情源未返回 {cfg.sector_level} 板块分类，无法执行盘前扫描")
+        raise SectorTaxonomyError("同花顺行业分类为空，无法执行盘前扫描")
+    notes.extend(list(getattr(taxonomy, "notes", []) or []))
+    notes.append("板块分类来源：同花顺（第三方静态快照）")
 
     concepts = _concept_definitions(sources, cfg, taxonomy, industries, notes)
     definitions = [*industries, *concepts]
     report(
-        f"① 已读取 {len(industries)} 个 {cfg.sector_level} 板块"
+        f"① 已读取 {len(industries)} 个同花顺行业板块"
         + (f" + {len(concepts)} 个概念" if concepts else "")
         + "，正在并行采集舆情和板块动量"
     )
 
-    # 成分股取**两层的并集**。概念文件比行业文件多覆盖上百只票（华银电力、
-    # 华大智造这类不是还没归类的新股），只按行业循环会让它们整只消失——连概念
-    # 板块都进不去，简报里也查不到画像。理由同 `docs/ROADMAP.md` §3.1。
+    # 行业与概念取并集，保留只有概念信息的股票。
     all_symbols = list(dict.fromkeys(symbol for item in definitions for symbol in item.symbols))
     if cfg.max_constituents is not None:
         # **抽样只按行业分层。** 概念之间成分股大量重叠，拿它们做分层会让重叠区
@@ -148,8 +196,7 @@ def _concept_definitions(
 
     **同名的概念直接丢掉。** 板块的各层读数（动量、舆情、龙虎榜净额）全部按
     `name` 索引，重名会让两层的数据互相覆盖，而覆盖的方向取决于字典写入顺序——
-    那是一个没人声明过、也没法从代码里读出来的规则。2026-08-10 实测 31 个 SW1
-    行业与 346 个概念只撞了「家用电器」一个，丢掉它的代价远小于让一层读数错位。
+    因此保留同名行业、跳过概念，并在 notes 中记录被跳过的名称。
     """
     if not cfg.use_concepts:
         notes.append("已关闭概念板块（--no-concepts），本次只排行业")
@@ -214,7 +261,14 @@ def _stage_collect(
     )
     news_agent = NewsAgent(store=corpus, market_limit=WIDE_MARKET_LIMIT)
     findings = run_agents(
-        [news_agent, SectorMetricsAgent(universe.definitions, universe.all_symbols)],
+        [
+            news_agent,
+            SectorMetricsAgent(
+                universe.definitions,
+                universe.all_symbols,
+                reuse_completed=not cfg.force_refresh_daily,
+            ),
+        ],
         ctx,
         max_workers=2,
     )
@@ -318,34 +372,6 @@ def _sample_across_sectors(definitions: list, budget: int) -> list[str]:
     return list(dict.fromkeys(picked))
 
 
-def _industry_taxonomy(
-    sources: Sources,
-    cfg: MorningConfig,
-    output_path: Path,
-) -> tuple[Any, list[str]]:
-    static = sources.industry_taxonomy
-    if static is not None:
-        try:
-            definitions = static.list_sectors()
-        except Exception as exc:
-            notes = [f"静态分类不可用，回退 TickFlow（{type(exc).__name__}）"]
-        else:
-            if definitions:
-                notes = list(getattr(static, "notes", []) or [])
-                notes.append("板块分类来源：同花顺静态 taxonomy（核心链路优先走静态分类）")
-                return static, notes
-            notes = ["静态分类返回空结果，回退 TickFlow"]
-
-    return (
-        TickFlowSwTaxonomy(
-            getattr(sources.adapter, "client", sources.adapter),
-            level=cfg.sector_level,
-            cache_dir=output_path,
-        ),
-        notes if static is not None else [],
-    )
-
-
 def _taxonomy_metadata(
     taxonomy: Any,
     symbols: list[str],
@@ -359,15 +385,11 @@ def _taxonomy_metadata(
         profile = profiles.get(normalize_symbol(symbol))
         if profile is None:
             continue
-        industries = list(getattr(profile, "industries", ()) or ())
         concepts = list(getattr(profile, "concepts", ()) or ())
         rows[normalize_symbol(symbol)] = {
             "symbol": normalize_symbol(symbol),
             "name": getattr(profile, "name", None),
-            "industries": industries,
-            "industry": industries[0] if industries else None,
-            "industry_leaf": industries[-1] if industries else None,
-            "industry_path": "·".join(item for item in industries if item),
+            "industry": getattr(profile, "industry", None),
             "concepts": concepts,
         }
     return rows

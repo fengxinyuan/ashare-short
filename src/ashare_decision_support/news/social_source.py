@@ -61,7 +61,10 @@ class SocialSnapshotSource:
                     continue
                 published_at = str(row.get("published_at") or row.get("as_of") or "").strip()
                 published = parse_published(published_at)
-                if published is not None and (trade_date - published.date()).days > MAX_SNAPSHOT_AGE_DAYS:
+                if (
+                    published is not None
+                    and (trade_date - published.date()).days > MAX_SNAPSHOT_AGE_DAYS
+                ):
                     continue
                 docs.append(
                     NewsDoc(

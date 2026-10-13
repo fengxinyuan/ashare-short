@@ -126,7 +126,33 @@ def test_composite_overlaps_its_sources_and_names_the_dead_one() -> None:
     assert any("2/3 路源" in note for note in notes)
 
 
-# ---- health probes -------------------------------------------------------
+def test_expired_feed_does_not_consume_current_news_budget() -> None:
+    class _Feed(_Slow):
+        def __init__(self, name: str, published: str, count: int) -> None:
+            super().__init__(name, 0)
+            self.published = published
+            self.count = count
+
+        def fetch_market(self, trade_date: date, limit: int = 200):
+            return [
+                NewsDoc(title=f"{self.name}{index}", source=self.name, published_at=self.published)
+                for index in range(self.count)
+            ], []
+
+    stale = _Feed("旧源", "2026-07-29 10:00", 3)
+    fresh = _Feed("新源", "2026-08-02 11:00", 3)
+    source = CompositeNewsSource(stale, fresh)
+
+    docs, notes = source.fetch_market(date(2026, 8, 2), limit=2)
+
+    assert len(docs) == 2
+    assert {doc.source for doc in docs} == {"新源"}
+    assert source.last_market_stats["expired_before_budget"] == 3
+    assert source.last_market_stats["raw_by_source"]["旧源"] == 3
+    assert any("分配来源预算前剔除 3 条" in note for note in notes)
+
+
+# health probes
 
 
 def test_probe_reports_each_feed_separately() -> None:
@@ -165,12 +191,15 @@ def test_probe_calls_every_feed_dead_when_nothing_answers() -> None:
 
 def test_composite_health_rolls_up_and_admits_what_it_did_not_probe() -> None:
     """没实现 health_check 的源要列进 unprobed，不能算它健康。"""
+
     class _NoProbe(_Slow):
         health_check = None  # type: ignore[assignment]
 
     live = _Slow("甲", 0.0)
     live.health_check = lambda: {  # type: ignore[method-assign]
-        "source": "甲", "reachable": True, "unreachable_feeds": []
+        "source": "甲",
+        "reachable": True,
+        "unreachable_feeds": [],
     }
     blind = _NoProbe("乙", 0.0)
     composite = CompositeNewsSource(live, blind)

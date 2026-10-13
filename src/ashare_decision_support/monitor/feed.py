@@ -72,13 +72,17 @@ def assess_feed(
 
     if not latest_per_symbol:
         return FeedHealth(
-            verdict=VERDICT_STALE,
+            verdict=VERDICT_STALE if in_session else VERDICT_CLOSED,
             lag_minutes=None,
             session_date=None,
             latest=None,
             symbols_ok=ok,
             symbols_requested=requested,
-            reason="没有任何标的返回可用分钟线",
+            reason=(
+                "没有任何标的返回可用分钟线"
+                if in_session
+                else "当前不在交易时段，未取得分钟线；开盘后重新检查"
+            ),
         )
 
     latest = max(latest_per_symbol)
@@ -87,7 +91,7 @@ def assess_feed(
     # pass. Median rather than max because one symbol that happens to update
     # promptly must not vouch for a feed that is stale for everything else.
     lag = round(
-        median((now - stamp).total_seconds() / 60.0 for stamp in latest_per_symbol), 1
+        max(0.0, median((now - stamp).total_seconds() / 60.0 for stamp in latest_per_symbol)), 1
     )
     session_date = latest.date()
 
@@ -130,9 +134,15 @@ def assess_feed(
     if lag <= FRESH_LAG_MINUTES:
         verdict, reason = VERDICT_FRESH, f"最新数据 {latest:%H:%M}，滞后 {lag:.1f} 分钟"
     elif lag <= DEGRADED_LAG_MINUTES:
-        verdict, reason = VERDICT_DEGRADED, f"最新数据 {latest:%H:%M}，滞后 {lag:.1f} 分钟，告警照发但请核对时间戳"
+        verdict, reason = (
+            VERDICT_DEGRADED,
+            f"最新数据 {latest:%H:%M}，滞后 {lag:.1f} 分钟，告警照发但请核对时间戳",
+        )
     else:
-        verdict, reason = VERDICT_STALE, f"最新数据 {latest:%H:%M}，滞后 {lag:.1f} 分钟，超过 {DEGRADED_LAG_MINUTES:.0f} 分钟阈值"
+        verdict, reason = (
+            VERDICT_STALE,
+            f"最新数据 {latest:%H:%M}，滞后 {lag:.1f} 分钟，超过 {DEGRADED_LAG_MINUTES:.0f} 分钟阈值",
+        )
 
     notes = []
     if requested and ok < requested:

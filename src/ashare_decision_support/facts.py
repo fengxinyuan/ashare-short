@@ -59,6 +59,7 @@ def build_facts_bundle(
     is_trading_day: bool | None = None,
     focus: list[str] | None = None,
     sections: list[str] | None = None,
+    allow_missing_sections: bool = False,
 ) -> FactsBundle:
     """按当前时段装一份统一事实包。`sections` 只要其中几块。
 
@@ -73,6 +74,9 @@ def build_facts_bundle(
     少给可以，让人以为「就这些」不行：省掉的块名如实写进 `notes`。认不出来的块名
     直接报错，不静默返回一个空包（同 `research/leaders.py` 对 `levels`、
     `ask/context.py` 对 `phase` 的处置）。
+
+    内置研究模板可设 `allow_missing_sections=True`：固定模板包含尚未生成的缓存块时，
+    保留缺失说明并返回其余事实。用户直接指定 sections 时仍默认严格校验。
     """
     ctx = assemble(
         moment=moment or beijing_now(),
@@ -85,8 +89,10 @@ def build_facts_bundle(
     )
     if sections:
         unknown = [name for name in sections if name not in ctx.blocks]
-        if unknown:
+        if unknown and not allow_missing_sections:
             raise ValueError(f"unknown sections: {unknown}; available: {list(ctx.blocks)}")
+        if unknown:
+            ctx.notes.append(f"模板所需事实尚不可用：{unknown}；本次保留其余事实与缺失状态")
         dropped = [name for name in ctx.blocks if name not in sections]
         ctx.blocks = {name: value for name, value in ctx.blocks.items() if name in sections}
         if dropped:

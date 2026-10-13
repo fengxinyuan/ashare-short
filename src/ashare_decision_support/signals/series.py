@@ -1,60 +1,62 @@
-"""日线序列上的几个基本运算。
+"""共用的日线归一化、交易日解析和序列运算。
 
-`dipbuy` 和 `volume_price` 都要先把 bars 摊成一列收盘价、再问「近 N 日涨了多少」。
-两边原来各写了一份 `_series` / `_change` / `_mean`——而且**已经开始分叉**：
-`volume_price` 那份走 `numeric.finite`，`dipbuy` 那份还是裸的 `float()`，于是
-一个 NaN 收盘价在低吸判定里能一路穿过去（NaN 参与的比较恒为 False，「跌得够深」
-会静默答否），在量价画像里却会被挡住。
-
-同一个读数在两条链路上得到不同结论，是这类重复真正的代价。
-
-`bar_datetime` 在这里是同一条理由的第二例：`daily_technical` 与 `wyckoff` 各写了
-一份逐字相同的时间戳解析，而两份都把 `strptime` 排在 `fromisoformat` 前面。
-
-`normalize_bars` 是第三例，也是代价最大的一例——见它自己的 docstring。
-"""
+时间统一为北京时间；数字经 finite 过滤。缺失值的兜底由各入口明确约定。"""
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from statistics import fmean
 from typing import Any
 
 from ashare_decision_support.numeric import finite, first_finite
-from ashare_decision_support.schedule.timezone import beijing_from_epoch, beijing_naive_now
+from ashare_decision_support.schedule.timezone import (
+    beijing_from_epoch,
+    beijing_naive_now,
+    to_beijing_naive,
+)
 
 # `strptime` 认得而 `fromisoformat` 认不得的那几种写法：斜杠分隔，以及月/日不补零
 # 的 `2025-8-1`。**顺序不重要**——真正常见的两种（`2025-08-01` 与带时分秒的形式）
 # 在下面走的是 `fromisoformat` 那条快路，根本到不了这里。
-_FALLBACK_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d")
+# `%Y%m%d` 放在这里是兜底：3.11 起 `fromisoformat` 自己就认 `20250801`。
+_FALLBACK_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d",
+    "%Y%m%d",
+)
 
 
-def bar_datetime(value: Any) -> datetime:
-    """把一根 K 线的时间字段解析成 datetime。
+def parse_bar_datetime(value: Any) -> datetime | None:
+    """解析为北京墙上时间；无效输入返回 None，不用当前时间代替。
 
-    **`fromisoformat` 必须排在 `strptime` 前面。** 两个调用方原先都是先试
-    `"%Y-%m-%d %H:%M:%S"`、失败再试 `"%Y-%m-%d"`，于是最常见的日线日期
-    （`2025-08-01`）每根都要付**两次** `strptime`——而 `strptime` 每次调用都要
-    过一遍 locale 查询与正则。实测这条顺序在日线上是 **8.95μs/根**，换成
-    `fromisoformat` 优先是 **0.20μs/根**（44 倍）；400 只票 × 240 根 × 2 个
-    分析器，光这一处就是 4 秒多。
-
-    `strptime` 那几种格式仍然保留在后面兜底，所以 `2025/08/01` 与 `2025-8-1`
-    这类写法的行为一个字都没变——它们本来也不是热路径。
+    ISO 格式优先走 fromisoformat，斜杠等旧格式再用 strptime。
+    bar_datetime 保留归一化所需的缺失兜底，bar_date/bar_day 用于交易日对齐。
     """
+    if isinstance(value, bool):
+        return None
     if isinstance(value, datetime):
-        return value
+        return to_beijing_naive(value)
     if value is None or value == "":
-        return beijing_naive_now()
+        return None
+    # 八位整数是 `20250801` 这种写法，不是 epoch：当成秒数会落到 1970-08-23，
+    # 而且不报错——`daily_cache` 此前按字符串解析它是对的，这里不能退步。
+    # 真正的 epoch 秒在这个区间里对应 1970 年 8 月那几天，不会有 K 线。
+    if isinstance(value, int) and 19000101 <= value <= 21001231:
+        value = str(value)
     if isinstance(value, (int, float)):
-        ts = float(value)
-        if ts > 1e12:
-            ts /= 1000.0
-        return beijing_from_epoch(ts)
+        try:
+            ts = float(value)
+            if ts > 1e12:
+                ts /= 1000.0
+            return beijing_from_epoch(ts)
+        except (OverflowError, OSError, ValueError):
+            return None
 
-    text = str(value)
+    text = str(value).strip()
     try:
-        return datetime.fromisoformat(text)
+        return to_beijing_naive(datetime.fromisoformat(text))
     except ValueError:
         pass
     for fmt in _FALLBACK_FORMATS:
@@ -62,16 +64,24 @@ def bar_datetime(value: Any) -> datetime:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
-    # 全都不认时抛的是 `fromisoformat` 的 ValueError，与收口前完全一致。
-    return datetime.fromisoformat(text)
+    return None
+
+
+def bar_datetime(value: Any) -> datetime:
+    """解析 K 线时间；缺失值回退到北京时间当前时刻，无效文本抛 ValueError。
+
+    交易日对齐应使用 parse_bar_datetime 或 bar_date，避免把缺失日期当作今天。"""
+    if value is None or value == "":
+        return beijing_naive_now()
+    moment = parse_bar_datetime(value)
+    if moment is None:
+        # 全都不认时抛的是 `fromisoformat` 的 ValueError，与收口前完全一致。
+        return datetime.fromisoformat(str(value))
+    return moment
 
 
 def series(bars: list[dict] | None, key: str) -> list[float]:
-    """把 bars 摊成一列有限的数，跳过取不到值的那几根。
-
-    跳过而不是补 0：补 0 会让「那天没数据」变成「那天价格是 0」，接着算出一个
-    -100% 的涨跌幅。缺口在这里表现为序列变短，而长度是每个调用方都会检查的。
-    """
+    """提取一列有限数，跳过缺失值；不补零，调用方须检查有效样本数。"""
     values: list[float] = []
     for bar in bars or []:
         value = finite(bar.get(key))
@@ -91,23 +101,10 @@ def change(closes: list[float], window: int) -> float | None:
 
 
 def volume_ratio(volumes: list[float], window: int, *, digits: int | None = None) -> float | None:
-    """最新一根的量 ÷ 前 `window` 根的均量。样本不够或基线取不出来时返回 None。
+    """最新成交量除以前 window 根的正值均量；样本不足时返回 None。
 
-    **这是「量比」在本系统里的默认口径**，`daily_technical`（出
-    `volume_ratio_20d`）、`volume_price`（没有快照时自己补算同一个数）与
-    `sectors/momentum`（板块量比）三处共用。三处原来各写了一份，逐字相同——
-    而它们必须相同：`volume_price._volume_ratio` 的第一句就是「快照里有就直接用
-    快照的」，也就是说它那半份实现的全部职责，是在没有快照时**算出和
-    `daily_technical` 一模一样的数**。两份各自演化的话，同一只票的量比会随着
-    「这次有没有日线快照」在两个值之间跳，而两个值都不会报错。
-
-    基线只取正数：停牌日的 0 进了分母会把量比放大成一个吓人的数，而它量的是
-    停牌，不是放量。**最新那根不做这个过滤**——今天量确实是 0（全天停牌）时，
-    量比就该是 0，那是事实不是缺失。
-
-    `signals/wyckoff.py` 有意不用这一份，见它自己的 docstring：那一层要的是
-    中位数基线、不足 20 根也照算、取不出来退 1.0，三条都和这里相反。
-    """
+    基线排除零量，最新成交量为零时仍返回零。威科夫使用中位数基线和独立的
+    样本不足处理，不使用本函数。"""
     if len(volumes) < window + 1:
         return None
     baseline = [value for value in volumes[-(window + 1) : -1] if value > 0]
@@ -117,28 +114,17 @@ def volume_ratio(volumes: list[float], window: int, *, digits: int | None = None
     return round(ratio, digits) if digits is not None else ratio
 
 
-# 时间戳字段的候选名，按优先级。落空的（None / "" / 0）跳过继续往后试——
-# 一根 `timestamp=0` 而 `date="2025-08-01"` 的 K 线，答案显然是后者而不是 1970。
-_TIMESTAMP_KEYS = ("timestamp", "date", "日期", "时间")
+# 日线日期字段按优先级共用一张表，TickFlow 的 timestamp 优先。
+# 缓存、复盘、相对强度与隔夜策略均经 bar_date/bar_day 读取。
+# TickFlow 快照的 _source_datetime 单独按采集时刻排序，不属于日线日期口径。
+_TIMESTAMP_KEYS = ("timestamp", "date", "datetime", "日期", "time", "时间")
 
 
 def normalize_bars(bars: list[dict] | None) -> list[dict]:
-    """把任意来源的日线收成 `{timestamp, open, high, low, close, volume}` 并按时间排序。
+    """将日线归一为 timestamp/open/high/low/close/volume，并按时间排序。
 
-    **这是第三处、也是最贵的一处重复。** `daily_technical._normalize_rows` 与
-    `wyckoff._normalize_rows` 此前是两份语义完全相同的实现：同样五个字段、同样的
-    中英文别名、同样的缺失兜底、同样的排序。而 `analyze_universe`、
-    `monitor/session.py`、`agents/collectors.py` 三处都是**紧挨着调这两个分析器**，
-    于是同一批 bars 被逐根归一了两遍——实测 400 只 × 240 根时，光这一项就是 96 万
-    次 `first_finite`。
-
-    两份实现原先还差着一处：时间戳的取法。`daily_technical` 用 `or` 链（落空就往
-    后试），`wyckoff` 只跳过 `None` 与 `""`——于是一根 `timestamp=0` 的 K 线在前者
-    是「看 date 字段」，在后者是 1970-01-01。这里统一取前者，因为那才是对的。
-
-    缺失兜底的规则原样保留：没有收盘价的整根丢弃（收盘价是唯一不能猜的字段）；
-    开盘价缺就用收盘价；最高/最低缺就用开收的包络；成交量缺算 0。
-    """
+    兼容中英文字段名。缺少收盘价的记录丢弃；开盘缺失取收盘，最高/最低缺失
+    取开收包络，成交量缺失取零。时间字段按 _TIMESTAMP_KEYS 取首个非空值。"""
     rows: list[dict] = []
     for row in bars or ():
         if not isinstance(row, dict):
@@ -164,6 +150,29 @@ def normalize_bars(bars: list[dict] | None) -> list[dict]:
         )
     rows.sort(key=lambda item: item["timestamp"])
     return rows
+
+
+def parse_bar_date(value: Any) -> date | None:
+    """取北京时间对应的交易日；无效输入返回 None。"""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    moment = parse_bar_datetime(value)
+    return None if moment is None else moment.date()
+
+
+def bar_date(row: dict) -> date | None:
+    """按字段优先级取有效交易日，无法解析的字段继续尝试后续别名。"""
+    for key in _TIMESTAMP_KEYS:
+        value = row.get(key)
+        if value and (day := parse_bar_date(value)) is not None:
+            return day
+    return None
+
+
+def bar_day(row: dict) -> str | None:
+    """返回统一的 YYYY-MM-DD 交易日键，无法解析时返回 None。"""
+    day = bar_date(row)
+    return None if day is None else day.isoformat()
 
 
 def _first_present(row: dict, keys: tuple[str, ...]) -> Any:

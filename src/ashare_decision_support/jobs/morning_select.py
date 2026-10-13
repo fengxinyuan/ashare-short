@@ -1,12 +1,8 @@
-"""④ 板块内选股：候选池 → 三道筛 → 打分 → 配额取前 N。
-
-从 `jobs/morning.py` 搬出来的一段，判据同 `morning_fuse.py`。这一段只回答「在
-已经选定的板块里看哪几只票」——大盘方向与板块排序是上一段（`Fusion`）的结论，
-这里不复议。
-"""
+"""在 Fusion 选定的板块内执行风险筛选、个股评分和配额选择。"""
 
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
 from typing import Any
 
@@ -38,6 +34,7 @@ from ashare_decision_support.screens import (
     LiquidityScreen,
 )
 from ashare_decision_support.sectors import reverse_index
+from ashare_decision_support.sectors.overseas_link import BEARISH
 from ashare_decision_support.strategy.regime import RegimeVerdict
 from ashare_decision_support.strategy.select import analyze_universe, select_from
 from ashare_decision_support.symbols import normalize_symbol
@@ -112,12 +109,14 @@ def stage_select(
     _attach_earnings(candidates, earnings_verdicts)
     _attach_earnings(control, earnings_verdicts)
     _attach_theme_context(candidates, fusion.theme_radar)
+    _attach_overseas_context(candidates, fusion.overseas)
+    _attach_overseas_context(control, fusion.overseas)
 
     # 逐笔资金旁证。**只挂在最终候选上**，不参与打分也不参与排序——它是上一个
     # 交易日的成交明细，回答的是「昨天那波买盘里有没有大单、尾盘是不是在走」，
     # 而候选是按量价结构选出来的。两件事分开：结构决定选不选，逐笔只是在选完
     # 之后多给一眼。
-    #
+
     # 只对候选取数而不是全体入围：一只票要翻约 67 页，28 只并发已经是两分多钟，
     # 铺到粗排那几百只会把盘前链路拖垮。
     trade_flow = fetch_trade_flow(
@@ -154,12 +153,14 @@ def stage_select(
         diagnostic=diagnostic,
     )
 
+
 def _attach_trade_flow(rows: list[dict], flows: dict[str, dict]) -> None:
     """把逐笔摘要挂到候选行上。原地改，与 `_attach_earnings` 同一处置。"""
     for row in rows:
         payload = flows.get(str(row.get("symbol") or ""))
         if payload:
             row["trade_flow"] = dict(payload)
+
 
 def _apply_screens(
     symbols: list[str],
@@ -247,6 +248,40 @@ def _attach_theme_context(rows: list[dict], themes: list[Any]) -> None:
             }
             for item in matched
         ]
+
+
+def _attach_overseas_context(rows: list[dict], overseas: Any) -> None:
+    """把指向候选所属板块的外盘链路挂到行上。**不动 `score`，不改排序。**
+
+    利空链路进 `warnings`：它和「跌破止损」一样，是读的人决定要不要下手前必须
+    看到的一条。利多链路只进 `reasons` 末尾——外盘涨过了对 A 股是「已兑现的
+    预期」还是「还没跟的差价」，这一层答不了，不该以警告的分量出现。两者都完整
+    保留在 `overseas_context`，台账事后按方向分组回答「外盘同向那天胜率有没有差」。
+    """
+    if overseas is None:
+        return
+    by_sector = overseas.by_sector()
+    if not by_sector:
+        return
+    for row in rows:
+        # 按入选板块与同花顺行业各查一次：一只票常以概念入选（「东数西算」），
+        # 而映射表指向的是它的行业（「元件」）。**不查概念标签**——一只检测公司挂着
+        # 40 个概念，「核电」「芯片概念」都在里面，按概念匹配会把铀价、费半全挂到
+        # 它头上，那是噪声不是旁证。
+        keys = dict.fromkeys(
+            key for key in (str(row.get("sector") or ""), str(row.get("industry") or "")) if key
+        )
+        links = list(dict.fromkeys(link for key in keys for link in by_sector.get(key, ())))
+        if not links:
+            continue
+        row["overseas_context"] = [item.to_dict() for item in links]
+        for link in links:
+            line = f"外盘映射：{link.headline}"
+            if link.direction == BEARISH:
+                row.setdefault("warnings", []).append(line)
+            else:
+                row.setdefault("reasons", []).append(line)
+
 
 def _risk_for(risks: dict, symbol: str):
     return risks.get(symbol.split(".", maxsplit=1)[0])
@@ -353,23 +388,59 @@ def _rank_candidates(
     picked: list[dict] = []
     control: list[dict] = []
     per_sector_count: dict[str, int] = {}
+    thin_reward = 0
     for item in fine.selected:
         sector = sector_of.get(item.symbol, "未分类")
+        row = item.to_row()
+        row["sector"] = sector
+        # 盈亏比门槛在配额之前：一只目标价只比现价高 0.4% 的票（盈亏比 0.06）
+        # 此前照样占着板块名额、进晨报候选表，风险栏写着「不划算」。不划算就
+        # 不是候选；它退回对照组，事后照样能回答「这道门拦对了没有」。
+        if _thin_reward_risk(row):
+            thin_reward += 1
+            control.append(row)
+            continue
         over_quota = per_sector_count.get(sector, 0) >= per_sector
         if not over_quota:
             per_sector_count[sector] = per_sector_count.get(sector, 0) + 1
-        row = item.to_row()
-        row["sector"] = sector
         (control if over_quota else picked).append(row)
+    if thin_reward:
+        sink.append(
+            f"盈亏比低于 {REWARD_RISK_FLOOR:.1f} 的 {thin_reward} 只不进候选，退回对照组"
+            "（止损距离按最小有效止损重算后仍不划算）"
+        )
 
     # 对照组取和入选组等量的落选样本。等量是为了让两组的统计噪声量级可比；
     # 取紧挨着的（分数最高的落选者）是因为这才是真正的边缘对照——拿全市场
     # 垫底的票做对照，差出来的是「好票 vs 烂票」，不是「这套规则有没有用」。
     control = control[: len(picked)]
-    return (
-        apply_security_metadata_rows(picked, metadata_by_symbol or {}, prefer_name=True),
-        apply_security_metadata_rows(control, metadata_by_symbol or {}, prefer_name=True),
-    )
+    sink.extend(_empty_sector_notes(coarse, sector_of, picked, symbols))
+    picked = apply_security_metadata_rows(picked, metadata_by_symbol or {}, prefer_name=True)
+    control = apply_security_metadata_rows(control, metadata_by_symbol or {}, prefer_name=True)
+    _flag_st(picked)
+    _flag_st(control)
+    return picked, control
+
+
+# 打分层在盈亏比低于这个值时写的警告句；`monitor/triggers.py` 也按同一句话识别。
+# 阈值本身在 `scoring/rule_based.py:_score_risk_reward`，这里不另存一份数字。
+REWARD_RISK_FLOOR = 0.8
+REWARD_RISK_REJECT_MARK = "风险收益不划算"
+
+
+def _thin_reward_risk(row: dict) -> bool:
+    return any(REWARD_RISK_REJECT_MARK in str(item) for item in row.get("warnings") or [])
+
+
+def _flag_st(rows: list[dict]) -> None:
+    """为名称含 ST 或「退」的候选补充风险提示；该函数不作筛除。"""
+    for row in rows:
+        name = str(row.get("name") or "").upper()
+        if "ST" in name or "退" in name:
+            row.setdefault("warnings", []).append(
+                "ST/退市风险标的：涨跌幅限制 5%，退市与流动性风险高于普通标的"
+            )
+
 
 def _symbol_names(
     adapter: Any,
@@ -381,6 +452,60 @@ def _symbol_names(
     if missing:
         names.update(security_names(adapter, missing))
     return names
+
+
+def _empty_sector_notes(
+    coarse: Any, sector_of: dict[str, str], picked: list[dict], scope: list[str]
+) -> list[str]:
+    """主攻板块一只候选都没出时，说出是在哪一道被挡掉的。
+
+    2026-09-14 实测：简报「先看 元件、培育钻石、汽车整车」，候选表里这三个板块
+    一只都没有，读的人只能猜。原因其实很具体——情绪周期「分歧」不允许突破打法，
+    而排名第一的板块正处在突破位。这句话不说，「先看元件」就成了空话。
+    """
+    picked_sectors = {str(row.get("sector") or "") for row in picked}
+    in_scope = set(scope)
+    notes: list[str] = []
+    for sector in dict.fromkeys(sector_of.values()):
+        if sector in picked_sectors:
+            continue
+        members = [s for s, name in sector_of.items() if name == sector and s in in_scope]
+        if not members:
+            continue
+        matches = [coarse.matches[s] for s in members if s in coarse.matches]
+        qualified = sum(1 for m in matches if m.ok)
+        blocked: dict[str, int] = {}
+        reasons: dict[str, int] = {}
+        for match in matches:
+            if match.ok:
+                continue
+            for playbook in match.blocked_by_regime:
+                blocked[playbook.value] = blocked.get(playbook.value, 0) + 1
+            for text in match.reject_reasons:
+                key = _reject_reason_key(text)
+                reasons[key] = reasons.get(key, 0) + 1
+        parts = [f"入围 {len(members)} 只，{qualified} 只满足入场判据"]
+        if blocked:
+            top = max(blocked.items(), key=lambda kv: kv[1])
+            parts.append(f"{top[1]} 只的「{top[0]}」打法被情绪周期挡掉")
+        if reasons:
+            top = max(reasons.items(), key=lambda kv: kv[1])
+            parts.append(f"最常见否决：{top[0]}（{top[1]} 只）")
+        if qualified:
+            parts.append("满足判据的在盈亏比门槛或精排后落选")
+        notes.append(f"主攻板块无候选 {sector}：" + "；".join(parts))
+    return notes
+
+
+def _reject_reason_key(text: str) -> str:
+    """否决理由去掉测量值，只留结论句，让同一条规则在不同票上能聚合。
+
+    「60 日分位 0.50（<0.60），尚未到突破位」→「尚未到突破位」；
+    「尚未回调（none），不是回踩位置」→「不是回踩位置」。
+    """
+    stripped = re.sub(r"（[^）]*）", "", text)
+    _, _, tail = stripped.partition("，")
+    return (tail or stripped).strip()
 
 
 def _take_per_sector(items: list, sector_of: dict[str, str], quota: int) -> list[str]:

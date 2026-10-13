@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ashare_decision_support.adapters.tencent_detail import TencentDetailAdapter
+from tests.fakes import FakeResponse
 
 
 class StubHttp:
@@ -11,21 +12,7 @@ class StubHttp:
         url = request.full_url
         page = int(url.rsplit("=", 1)[-1])
         body = self.pages.get(page, 'v_detail_data_sh600519=[0,""];')
-
-        class Response:
-            def __init__(self, payload: bytes) -> None:
-                self.payload = payload
-
-            def read(self) -> bytes:
-                return self.payload
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        return Response(body.encode("gbk", errors="replace"))
+        return FakeResponse(body, encoding="gbk")
 
 
 def test_tencent_detail_summarises_active_and_large_flow() -> None:

@@ -1,41 +1,8 @@
-"""宽基指数快照：市值加权口径的大盘，用来对照等权口径的宽度。
+"""市值加权宽基指数快照，与成分股等权宽度对照。
 
-## 为什么需要这一层
-
-`sectors/predict.py` 的大盘方向读数完全由**等权**量构成——板块涨幅中位数、
-上涨家数占比、站上 20 日均线占比。等权口径回答的是「今天多少股票在涨」，
-它结构上看不见**市值加权的指数在跌**，而这两件事经常同一天发生，且差得很远。
-
-实测 2026-08-03：31 个板块 4236 只成分股加权上涨占比 76%、板块当日涨幅中位数
-+1.66%，系统给出「偏多，综合读数 88.85／100」。同一天的宽基指数——
-
-| 指数 | 涨跌 | 指数 | 涨跌 |
-|---|---|---|---|
-| 科创50 | **-5.08%** | 上证指数 | -0.59% |
-| 上证50 | -1.23% | 深证成指 | -0.96% |
-| 沪深300 | -0.98% | 创业板指 | -1.24% |
-| 中证500 | -1.06% | 中证1000 | +0.06% |
-
-七成股票在涨，同时每一个宽基指数都在跌，科创50 跌掉 5%。两个读数都没算错，
-它们量的是不同的东西：小票普涨、权重股杀跌。但只报前者的话，「偏多 88.85」
-会在一个权重崩塌的日子里给出接近满分的方向读数——那是**方向性盲区**，不是噪声。
-
-## 这一层只出读数，不改分
-
-**刻意不进打分、不改仓位系数。** 除了「新读数先进简报、等 `review` 验证过再谈
-给分」这条通例，这里还有一条更硬的理由：台账里已经积了 82 条待兑现记录，它们
-的 `score` 与 `position_factor` 都是按现行公式算的。现在改公式，等于让新旧记录
-不可比——而那 82 条正是这套系统用来验证自己的全部样本。
-
-所以这一层做的事只有一件：把市值加权口径的事实摆出来，并在它与等权口径背离时
-出一条告警。判断留给读的人。
-
-## 口径
-
-- 取的是**指数**不是成分股聚合，所以它天然是市值加权的，不需要自己加权。
-- 数据源 `hq.sinajs.cn`，与 `adapters/snapshot.py` 同一路（本机实测通，见
-  `docs/DATA_SOURCES.md`）。指数与个股的字段布局一致，只是买卖五档恒为 0。
-- 涨跌幅由 `close / prev_close - 1` 现算，不取服务端字段——指数行没有涨跌幅列。
+新浪指数行沿用个股字段布局，涨跌幅由现价和前收计算。
+日期可比时输出背离标签与告警；结果用于展示和台账，不修改评分或仓位。
+数据源与字段口径见 docs/DATA_SOURCES.md。
 """
 
 from __future__ import annotations
@@ -217,8 +184,12 @@ class BroadIndexAdapter:
 
     def _get(self, url: str) -> str:
         return fetch_text(
-            self._opener, url, timeout=self.timeout, referer=SINA_REFERER,
-            encoding="gbk", errors="replace",
+            self._opener,
+            url,
+            timeout=self.timeout,
+            referer=SINA_REFERER,
+            encoding="gbk",
+            errors="replace",
         )
 
 
@@ -258,16 +229,9 @@ def divergence_verdict(
     breadth: float | None,
     expected_date: str | None = None,
 ) -> str:
-    """等权与市值加权的关系，判定成一个标签。
+    """生成等权宽度与加权指数的关系标签，供简报和台账共用。
 
-    **这是判据的单一真源**：`read_divergence` 的措辞由它决定，台账里存的也是它。
-    两边各写一遍判据的话，日后调 `BREADTH_STRONG` 只会改到其中一处，于是简报说
-    「背离」而台账记「一致」，事后统计再也对不上当天实际报出去的结论。
-
-    存标签而不是只存 `breadth` 与 `median_ret` 两个原始数，理由与
-    `journal/stats.py:_regime_bucket` 那条完全相同：阈值以后一定会调，而调完之后
-    **历史记录必须仍然按当天生效的那个判定分组**，否则分层统计描述的是一个从未
-    存在过的过去。
+    台账保存当时生效的标签，避免调整阈值后重新解释历史判断。
     """
     if read is None or not read.ok:
         return VERDICT_UNKNOWN
@@ -286,25 +250,10 @@ def read_divergence(
     breadth: float | None,
     expected_date: str | None = None,
 ) -> tuple[list[str], list[str]]:
-    """宽基读数 + 等权宽度 → `(reasons, warnings)`。
+    """返回宽基摘要与告警 `(reasons, warnings)`，判据由 divergence_verdict 提供。
 
-    **只出话，不出分。** 见模块开头：台账里的待兑现记录都是按现行公式打的，
-    改公式会让新旧记录不可比。
-
-    背离的判据是两条同时成立：等权宽度高（多数股票在涨）且宽基中位数为负
-    （市值加权在跌）。任何一条不成立都不叫背离——宽度低时指数跟着跌是一致，
-    宽度高时指数也涨更是一致。判定本身在 `divergence_verdict`，这里只负责措辞。
-
-    `expected_date` 是等权那一路的数据日期（`YYYY-MM-DD`）。**两边不同日就不比，
-    不知道是哪天也不比。**
-
-    这个闸门是必需的而不是保险：`hq.sinajs.cn` 给的是**实时**行情。盘前跑时它返回
-    的是上一个交易日的收盘，与等权那一路对得上；一旦盘中跑，它返回的是此刻的
-    实时点位，而板块动量仍是昨收——拿今天的指数和昨天的宽度算背离，正是这套
-    系统在别处一直防的跨时点比较。
-
-    `expected_date=None` 走「不知道」而不是「不用查」：把未知当成可比，等于在
-    调用方忘了传日期时**静默地**恢复成有 bug 的版本。事实照报，判断不给。
+    expected_date 是等权读数的日期；未知或与指数日期不同时只报事实。
+    宽基快照可能已更新至盘中，而等权日线仍停在昨收，不能跨日比较。
     """
     if read is None or not read.ok:
         return [], []
@@ -318,9 +267,7 @@ def read_divergence(
     )
 
     if not expected_date:
-        warnings.append(
-            "等权那一路的数据日期未知，无法确认与宽基是同一天，本次不做背离判断"
-        )
+        warnings.append("等权那一路的数据日期未知，无法确认与宽基是同一天，本次不做背离判断")
         return reasons, warnings
 
     if read.trade_date and read.trade_date != expected_date:

@@ -63,9 +63,7 @@ def snapshot(**overrides) -> DailyTechnicalSnapshot:
 
 def test_context_increases_score_only_when_multiple_layers_agree() -> None:
     provider = RuleBasedScoreProvider()
-    plain = provider.score(
-        ScoreInput(symbol="600000.SH", bars=bars(), snapshot=snapshot())
-    )
+    plain = provider.score(ScoreInput(symbol="600000.SH", bars=bars(), snapshot=snapshot()))
     context = StockFactorContext(
         sector=SectorFactorContext(
             name="电网设备",
@@ -109,7 +107,7 @@ def test_context_increases_score_only_when_multiple_layers_agree() -> None:
     assert enriched.components["capital_flow"] > 0
     assert enriched.components["volume_price"] > 0
     # 业绩**不产生分量**：它在理由里可见，但不进 components、不进 total。
-    # 见 `rule_based.py:_score_earnings` 与 `DECISIONS.md` §六b。
+    # 见 `rule_based.py:_score_earnings`；业绩利好只标注、不加分。
     assert "earnings" not in enriched.components
     assert any("业绩催化" in reason for reason in enriched.reasons)
 
@@ -132,12 +130,16 @@ def test_earnings_never_moves_the_score(tmp_path=None) -> None:
             )
         )
 
-    best = scored(SimpleNamespace(
-        is_strong_catalyst=True, catalysts=["预增 +1197%"], warnings=[], blocking=[]
-    ))
-    worst = scored(SimpleNamespace(
-        is_strong_catalyst=False, catalysts=[], warnings=["预减"], blocking=["首亏"]
-    ))
+    best = scored(
+        SimpleNamespace(
+            is_strong_catalyst=True, catalysts=["预增 +1197%"], warnings=[], blocking=[]
+        )
+    )
+    worst = scored(
+        SimpleNamespace(
+            is_strong_catalyst=False, catalysts=[], warnings=["预减"], blocking=["首亏"]
+        )
+    )
     absent = scored(None)
 
     assert best.score == worst.score == absent.score
@@ -148,9 +150,7 @@ def test_earnings_never_moves_the_score(tmp_path=None) -> None:
 
 def test_negative_flow_and_breakdown_override_positive_headline() -> None:
     provider = RuleBasedScoreProvider()
-    plain = provider.score(
-        ScoreInput(symbol="600000.SH", bars=bars(), snapshot=snapshot())
-    )
+    plain = provider.score(ScoreInput(symbol="600000.SH", bars=bars(), snapshot=snapshot()))
     context = StockFactorContext(
         sector=SectorFactorContext(
             name="热门题材",
@@ -274,9 +274,10 @@ def test_non_finite_upstream_readings_never_reach_the_score() -> None:
         )
     )
     assert scored.components["sector_relation"] == 0.0
-    assert scored.score == provider.score(
-        ScoreInput(symbol="600000.SH", bars=bars(), snapshot=snapshot())
-    ).score
+    assert (
+        scored.score
+        == provider.score(ScoreInput(symbol="600000.SH", bars=bars(), snapshot=snapshot())).score
+    )
 
 
 def test_catalyst_reader_separates_policy_price_and_risk() -> None:
@@ -354,10 +355,8 @@ def test_the_risk_vocabulary_has_exactly_one_home() -> None:
     assert definitions == ["news/lexicon.py", "news/lexicon.py"]
 
 
+# 板块反向索引
 
-
-# ---- 板块反向索引 ----------------------------------------------------------
-#
 # 这张表决定每只票在打分时继承**哪个**板块的热度、资金与排名
 # （`build_factor_contexts` 的 `sector_of` 入参）。一只票同属两个入选板块时，
 # 归给谁不是无关紧要的实现细节：两个板块的热度可以差一档。

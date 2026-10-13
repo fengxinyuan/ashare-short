@@ -27,19 +27,26 @@ from ashare_decision_support.advice.view import (
 )
 from ashare_decision_support.artifacts import (
     ADVICE_LATEST_NAME,
+    DAILY_REVIEW_LATEST_NAME,
     MORNING_LATEST_NAME,
     POST_CLOSE_LATEST_NAME,
     STRATEGY_SCREEN_LATEST_NAME,
 )
+from ashare_decision_support.notes import compact_notes
 from ashare_decision_support.runhealth import HealthLedger
-from ashare_decision_support.schedule.clock import AFTERNOON_CLOSE
+from ashare_decision_support.schedule.clock import (
+    AFTERNOON_CLOSE,
+    AUCTION_OPEN,
+    PHASE_INTRADAY,
+    PHASE_OFF_HOURS,
+    PHASE_POST_CLOSE,
+    PHASE_PRE_OPEN,
+)
 from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.sectors.panel import compact_reading
+from ashare_decision_support.signals.series import parse_bar_datetime
+from ashare_decision_support.state.store import read_json
 from ashare_decision_support.strategy.portfolio import MIN_CLUSTER_SYMBOLS, read_portfolio
-
-PHASE_PRE_OPEN = "pre_open"
-PHASE_INTRADAY = "intraday"
-PHASE_POST_CLOSE = "post_close"
-PHASE_OFF_HOURS = "off_hours"
 
 PHASE_LABELS = {
     PHASE_PRE_OPEN: "开盘前",
@@ -52,12 +59,9 @@ PHASES = tuple(PHASE_LABELS)
 # 时段边界。09:15 起算盘前是因为集合竞价从那一刻开始报价；15:00 收盘之后到
 # 次日 05:00 都算盘后，因为那段时间你问的仍然是「今天发生了什么」。
 PRE_OPEN_FROM = clock_time(5, 0)
-SESSION_OPEN = clock_time(9, 15)
-# 收盘时刻取 `schedule/clock.py` 那一份，不在这里再写一遍 `time(15, 0)`。
-#
-# 09:15 那个开盘时刻是**本层特有**的（集合竞价起算，不是 clock 的 09:30），所以
-# 它留在本地；收盘时刻则和全仓一致，没有第二种口径。共用的是取值，不是叫法——
-# 本层的时段判断读作 `SESSION_CLOSE` 更顺，别名保留这个词。
+# 开盘与收盘时刻都取 `schedule/clock.py` 那一份，不在这里再写一遍字面量。共用的
+# 是取值，不是叫法——本层的时段判断读作 `SESSION_OPEN` / `SESSION_CLOSE` 更顺。
+SESSION_OPEN = AUCTION_OPEN
 SESSION_CLOSE = AFTERNOON_CLOSE
 
 
@@ -150,23 +154,35 @@ def resolve_phase(moment: datetime, is_trading_day: bool | None = None) -> str:
 
 
 def load_known_names() -> dict[str, str]:
-    """简称 → 代码。只认持仓表里的名字。
-
-    **不去全市场查名字**：那要么是一次网络往返，要么是一份会过期的本地表，
-    而这一层的作用只是让「丸美生物低开了怎么办」里的名字能对上一个代码。对不上
-    的名字由 `question.py` 明确报出来，比猜一个更有用。
-    """
+    """简称 → 代码。优先使用持仓，补充已有的本地证券缓存，不触发网络请求。"""
+    names: dict[str, str] = {}
     try:
         from ashare_decision_support.state import Positions
 
         entries = list(Positions().entries)
     except Exception:
-        return {}
-    return {
-        str(entry.name): entry.symbol
-        for entry in entries
-        if getattr(entry, "name", None) and entry.symbol
-    }
+        entries = []
+    for entry in entries:
+        if getattr(entry, "name", None) and entry.symbol:
+            names[str(entry.name)] = entry.symbol
+
+    try:
+        from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
+
+        cached = SecurityMasterAdapter().cached()
+    except Exception:
+        return names
+    ambiguous: set[str] = set()
+    for info in cached.entries.values():
+        name = (info.name or "").strip()
+        if not name or name in ambiguous:
+            continue
+        if name in names and names[name] != info.symbol:
+            ambiguous.add(name)
+            names.pop(name, None)
+        else:
+            names[name] = info.symbol
+    return names
 
 
 def assemble(
@@ -204,36 +220,31 @@ def assemble(
     ctx.symbols = list(dict.fromkeys((symbols or []) + held))
     ctx.focus = [symbol for symbol in (focus or []) if symbol]
 
-    # 盘前 / 非交易时段：读最近一次主链路的产出。
-    if resolved in (PHASE_PRE_OPEN, PHASE_OFF_HOURS, PHASE_POST_CLOSE):
-        _load_payload(
-            ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路", trim=_trim_morning
-        )
-        _load_payload(
-            ctx,
-            output_dir,
-            STRATEGY_SCREEN_LATEST_NAME,
-            "参数化策略扫描",
-            trim=_trim_strategy_screen,
-        )
+    # 所有时段都需要这两份背景，不在各时段重复装配。
+    _load_payload(ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路", trim=_trim_morning)
+    _load_payload(
+        ctx,
+        output_dir,
+        DAILY_REVIEW_LATEST_NAME,
+        "每日归因复盘",
+        trim=_trim_daily_review,
+        until=moment,
+    )
+    _load_payload(
+        ctx,
+        output_dir,
+        STRATEGY_SCREEN_LATEST_NAME,
+        "参数化策略扫描",
+        trim=_trim_strategy_screen,
+    )
 
     if resolved == PHASE_INTRADAY:
-        _load_payload(
-            ctx, output_dir, MORNING_LATEST_NAME, "盘前主链路", trim=_trim_morning
-        )
-        _load_payload(
-            ctx,
-            output_dir,
-            STRATEGY_SCREEN_LATEST_NAME,
-            "参数化策略扫描",
-            trim=_trim_strategy_screen,
-        )
         _load_alerts(ctx, moment.date())
-        _load_sector_confirmation(ctx, output_dir)
+        _load_sector_confirmation(ctx, output_dir, moment.date())
         _load_live_levels(ctx, compute_symbols)
     elif resolved == PHASE_POST_CLOSE:
         _load_alerts(ctx, moment.date())
-        _load_sector_confirmation(ctx, output_dir)
+        _load_sector_confirmation(ctx, output_dir, moment.date())
         _load_payload(ctx, output_dir, POST_CLOSE_LATEST_NAME, "次日执行卡")
     else:
         # 盘前与非交易时段没有当日实时价位可谈，用最近一次算过的那份。
@@ -253,14 +264,22 @@ def assemble(
     return ctx
 
 
-def _load_sector_confirmation(ctx: AskContext, output_dir: str | Path | None) -> None:
+def _load_sector_confirmation(
+    ctx: AskContext,
+    output_dir: str | Path | None,
+    trade_date: date,
+) -> None:
     """Join two local artifacts; failure must not hide the rest of the facts bundle."""
     try:
-        ctx.blocks["板块预测盘中验证"] = _build_sector_confirmation(
-            output_dir or "briefs"
-        )
+        block = _build_sector_confirmation(output_dir or "briefs")
     except (FileNotFoundError, OSError, ValueError) as exc:
         ctx.notes.append(f"板块预测盘中验证不可用（{type(exc).__name__}: {exc}）")
+        return
+    target = block.get("target_session") if isinstance(block, dict) else None
+    if target and str(target) != str(trade_date):
+        ctx.notes.append(f"板块预测盘中验证归属 {target}，与当前交易日 {trade_date} 不一致，已跳过")
+        return
+    ctx.blocks["板块预测盘中验证"] = block
 
 
 def _build_sector_confirmation(output_dir: str | Path) -> dict[str, Any]:
@@ -282,25 +301,70 @@ SCREEN_KEEP_SHORTLIST = 10
 MORNING_KEEP_CANDIDATES = 12
 
 
+def _trim_daily_review(payload: Any) -> tuple[Any, list[str]]:
+    if not isinstance(payload, dict):
+        return payload, []
+    keep = (
+        "trade_date",
+        "as_of",
+        "original_plan_available",
+        "original_plan_id",
+        "strategy_version",
+        "plans",
+        "sector_confirmation",
+        "counts",
+        "coverage",
+        "next_checks",
+        "recent_coverage",
+        "data_notes",
+    )
+    trimmed = {key: payload.get(key) for key in keep if payload.get(key) is not None}
+    note = "每日归因复盘已压缩为计划、覆盖与次日复查项；完整候选和时间线见同日 daily-reviews/ 档案"
+    return trimmed, [note]
+
+
 def _trim_morning(payload: Any) -> tuple[Any, list[str]]:
     """Keep decision facts; leave large audit matrices in morning_latest.json."""
     if not isinstance(payload, dict):
         return payload, []
 
     keep = (
-        "trade_date", "news_as_of", "market", "rotation_price", "turnover_migration",
-        "seesaw", "sector_index", "limit_pool", "rotation", "position_factor",
-        "suggested_position_factor", "position_factor_reasons", "sectors", "candidates",
-        "theme_radar", "macro_links", "sector_forecast_validation", "sector_clusters", "data_notes",
+        "trade_date",
+        "data_date",
+        "execution_ready",
+        "execution_blocks",
+        "news_as_of",
+        "market",
+        "rotation_price",
+        "turnover_migration",
+        "plan_id",
+        "plan_revision",
+        "generated_at",
+        "strategy_version",
+        "strategy_parameters",
+        "seesaw",
+        "sector_index",
+        "limit_pool",
+        "rotation",
+        "position_factor",
+        "suggested_position_factor",
+        "position_factor_reasons",
+        "sectors",
+        "candidates",
+        "theme_radar",
+        "macro_links",
+        "sector_forecast_validation",
+        "sector_clusters",
+        "data_notes",
     )
     trimmed = {key: payload.get(key) for key in keep if payload.get(key) is not None}
     sectors = payload.get("sectors") or []
     trimmed["sectors"] = [_pick_sector(item) for item in sectors[:10]]
     candidates = payload.get("candidates") or []
     trimmed["candidates"] = [_pick_candidate(item) for item in candidates[:MORNING_KEEP_CANDIDATES]]
-    trimmed["data_notes"] = (payload.get("data_notes") or [])[:20]
+    trimmed["data_notes"] = compact_notes(payload.get("data_notes") or [], 20)
     for key in ("rotation_price", "turnover_migration", "seesaw", "sector_index"):
-        trimmed[key] = _trim_diagnostic(trimmed.get(key))
+        trimmed[key] = compact_reading(trimmed.get(key))
 
     dropped_candidates = max(0, len(candidates) - len(trimmed["candidates"]))
     dropped_notes = max(0, len(payload.get("data_notes") or []) - len(trimmed["data_notes"]))
@@ -319,8 +383,18 @@ def _pick_sector(item: Any) -> Any:
     if not isinstance(item, dict):
         return item
     keys = (
-        "name", "level", "score", "direction", "ret_1d", "ret_5d", "breadth",
-        "volume_ratio", "net_inflow", "reasons", "warnings", "headlines",
+        "name",
+        "level",
+        "score",
+        "direction",
+        "ret_1d",
+        "ret_5d",
+        "breadth",
+        "volume_ratio",
+        "net_inflow",
+        "reasons",
+        "warnings",
+        "headlines",
     )
     return {key: item[key] for key in keys if key in item}
 
@@ -329,25 +403,25 @@ def _pick_candidate(item: Any) -> Any:
     if not isinstance(item, dict):
         return item
     keys = (
-        "symbol", "name", "sector", "score", "last_close", "trend_state",
-        "stop_reference", "target_reference", "wyckoff_bias", "reasons", "warnings",
-        "score_components", "setup", "playbook", "industry_path", "concepts", "trade_flow",
+        "symbol",
+        "name",
+        "sector",
+        "score",
+        "last_close",
+        "trend_state",
+        "stop_reference",
+        "target_reference",
+        "wyckoff_bias",
+        "reasons",
+        "warnings",
+        "score_components",
+        "setup",
+        "playbook",
+        "industry",
+        "concepts",
+        "trade_flow",
     )
     return {key: item[key] for key in keys if key in item}
-
-
-def _trim_diagnostic(value: Any) -> Any:
-    if not isinstance(value, dict):
-        return value
-    result = {}
-    for key, item in value.items():
-        if key == "sectors":
-            continue
-        if isinstance(item, list):
-            result[key] = item[:3] if key in {"observations", "notes"} else item[:5]
-        else:
-            result[key] = item
-    return result
 
 
 def _trim_strategy_screen(payload: Any) -> tuple[Any, list[str]]:
@@ -393,7 +467,7 @@ def _trim_strategy_screen(payload: Any) -> tuple[Any, list[str]]:
     return trimmed, [note]
 
 
-# ---- blocks --------------------------------------------------------------
+# blocks
 
 
 def _load_positions(ctx: AskContext) -> list[str]:
@@ -415,7 +489,7 @@ def _load_positions(ctx: AskContext) -> list[str]:
     # 超过 160 字的条目截断，而 `asdict` 的字段顺序把成本价、计划止损、计划目标
     # 排在最后——正好是被截掉的那几个。没配 key 时 `render()` 就是全部输出，
     # 于是「我该不该卖」最需要的三个数恰恰看不见。
-    #
+
     # 组合层那几个字段摊在同一层（`**read.to_dict()`）而不是嵌一层「组合」：
     # 「三只票里两只是同一个题材」和「这三只分别是什么」是同一个问题的两半，
     # 中间隔一个键名会让读的人（和模型）把它当成另一块可选内容跳过去。
@@ -508,9 +582,7 @@ def _load_journal(ctx: AskContext) -> None:
         ctx.notes.append("近期验证按交易日切窗，只用于判断近期有效性，不自动改写策略")
 
 
-def _load_live_levels(
-    ctx: AskContext, compute_symbols: Callable[[list[str]], dict] | None
-) -> None:
+def _load_live_levels(ctx: AskContext, compute_symbols: Callable[[list[str]], dict] | None) -> None:
     targets = ctx.focus or ctx.symbols
     if not targets:
         return
@@ -523,7 +595,30 @@ def _load_live_levels(
             f"{len(ctx.symbols) - len(ctx.focus)} 只本次没有实时价位"
         )
     try:
-        ctx.blocks["实时买卖点"] = compute_symbols(targets)
+        payload = compute_symbols(targets)
+        if not isinstance(payload, dict):
+            raise ValueError("实时买卖点结果不是对象")
+        trade_date = payload.get("trade_date")
+        if trade_date is None:
+            ctx.notes.append("实时买卖点缺少交易日期，无法确认是今天，已跳过价位")
+            ctx.health.missing("实时买卖点", "计算结果缺少交易日期")
+            return
+        if str(trade_date) != ctx.health.today.isoformat():
+            ctx.notes.append(
+                f"实时买卖点交易日为 {trade_date}，不是今天 {ctx.health.today}，已跳过旧价位"
+            )
+            ctx.health.missing("实时买卖点", "计算结果不是当日数据")
+            return
+        rows = payload.get("symbols")
+        if not isinstance(rows, list) or not rows:
+            ctx.notes.append("实时买卖点没有返回任何标的，本次不含当日价位")
+            ctx.health.missing("实时买卖点", "计算结果没有标的")
+            return
+        returned = {item.get("symbol") for item in rows if isinstance(item, dict)}
+        absent = [symbol for symbol in targets if symbol not in returned]
+        if absent:
+            ctx.notes.append("实时买卖点未覆盖以下标的：" + "、".join(absent))
+        ctx.blocks["实时买卖点"] = payload
         ctx.health.live("实时买卖点")
     except Exception as exc:
         ctx.notes.append(f"实时买卖点计算失败（{type(exc).__name__}: {exc}），本次不含这一块")
@@ -536,6 +631,7 @@ def _load_payload(
     name: str,
     label: str,
     trim: Callable[[Any], tuple[Any, list[str]]] | None = None,
+    until: datetime | None = None,
 ) -> None:
     if output_dir is None:
         return
@@ -545,16 +641,31 @@ def _load_payload(
         ctx.health.missing(label, "尚无落盘结果")
         return
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = read_json(path)
+        if not isinstance(payload, dict):
+            raise ValueError("事实包损坏或顶层不是对象")
+        if until is not None:
+            stamp = parse_bar_datetime(payload.get("as_of"))
+            if stamp is None:
+                raise ValueError("复盘缺少有效截止时点")
+            if stamp > parse_bar_datetime(until):
+                ctx.notes.append(f"{label}截止时点晚于当前提问，未使用未来结果")
+                ctx.health.missing(label, "截止时点晚于当前提问")
+                return
+        source_stamp = (
+            payload.get("data_date")
+            if label == "盘前主链路" and "data_date" in payload
+            else payload.get("trade_date") or payload.get("as_of")
+        )
+        if trim is not None:
+            payload, trim_notes = trim(payload)
+            ctx.notes.extend(trim_notes)
     except Exception as exc:
         ctx.notes.append(f"{label}读取失败（{type(exc).__name__}）")
         ctx.health.failed(label, type(exc).__name__)
         return
-    if trim is not None:
-        payload, trim_notes = trim(payload)
-        ctx.notes.extend(trim_notes)
     ctx.blocks[label] = payload
-    stamp = payload.get("trade_date") if isinstance(payload, dict) else None
+    stamp = source_stamp
     read = ctx.health.stamped(label, stamp)
     if read.degraded:
         # 陈旧要在 notes 里也说一句：`render()`（没配 key 时的全部输出）是顺着读的，
@@ -594,12 +705,16 @@ def _render_compact_block(name: str, block: Any) -> list[str]:
         return special_renderer(block)
     if name == "盘前主链路":
         market = block.get("market") or {}
-        lines = [
-            (
-                f"  大盘：{market.get('direction', '—')}；评分 {short(market.get('score'))}；"
-                f"上涨宽度 {short(market.get('breadth'))}；5日中位 {short(market.get('median_ret_5d'))}"
+        lines = []
+        if block.get("execution_ready") is False:
+            lines.append(
+                "  执行状态：不可用于当前买入；"
+                + "；".join(block.get("execution_blocks") or ["缺少可执行数据确认"])
             )
-        ]
+        lines.append(
+            f"  大盘：{market.get('direction', '—')}；评分 {short(market.get('score'))}；"
+            f"上涨宽度 {short(market.get('breadth'))}；5日中位 {short(market.get('median_ret_5d'))}"
+        )
         sectors = block.get("sectors") or []
         if sectors:
             lines.append(
@@ -623,7 +738,7 @@ def _render_compact_block(name: str, block: Any) -> list[str]:
         lines.extend(f"  边界：{note}" for note in (block.get("data_notes") or [])[:4])
         return lines
     if name == "参数化策略扫描":
-        lines: list[str] = []
+        lines: list[str] = [f"  筛选截止：{block.get('as_of') or '日期未知'}"]
         for profile, item in (block.get("profiles") or {}).items():
             if not isinstance(item, dict):
                 continue
@@ -637,10 +752,21 @@ def _render_compact_block(name: str, block: Any) -> list[str]:
                 f"前列 {symbols or '—'}"
             )
         shortlist = block.get("diversified_shortlist") or []
+        if not block.get("profiles") and block.get("candidates"):
+            lines.append(
+                "  单策略候选："
+                + "、".join(
+                    str(row.get("symbol"))
+                    for row in block["candidates"][:8]
+                    if isinstance(row, dict)
+                )
+            )
         if shortlist:
             lines.append(
                 "  综合短名单："
-                + "、".join(str(row.get("symbol")) for row in shortlist[:8] if isinstance(row, dict))
+                + "、".join(
+                    str(row.get("symbol")) for row in shortlist[:8] if isinstance(row, dict)
+                )
             )
         return lines or ["  暂无筛选结果。"]
     if name in {"台账统计", "近期验证"}:

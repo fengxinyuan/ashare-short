@@ -73,7 +73,9 @@ class IntradayAnalyzer:
         # Injectable so tests do not depend on the wall clock.
         self.today = today
 
-    def analyze(self, symbol: str, bars: list[dict], prev_close: float | None = None) -> IntradaySnapshot | None:
+    def analyze(
+        self, symbol: str, bars: list[dict], prev_close: float | None = None
+    ) -> IntradaySnapshot | None:
         sessions = group_by_session(bars)
         if not sessions:
             return None
@@ -92,7 +94,9 @@ class IntradayAnalyzer:
         notes: list[str] = []
         is_current = session_date == today
         if not is_current:
-            notes.append(f"最新分钟数据为 {session_date}，非当日；结论按该日收盘状态给出，不代表盘中实时")
+            notes.append(
+                f"最新分钟数据为 {session_date}，非当日；结论按该日收盘状态给出，不代表盘中实时"
+            )
 
         open_price = opens[0]
         last_price = closes[-1]
@@ -101,10 +105,7 @@ class IntradayAnalyzer:
 
         vwap = _vwap(session)
         span = session_high - session_low
-        session_volume = sum(
-            float(bar.get("volume") or 0.0)
-            for bar in session
-        )
+        session_volume = sum(float(bar.get("volume") or 0.0) for bar in session)
         session_amount = sum(
             float(bar.get("amount") or ((bar.get("close") or 0.0) * (bar.get("volume") or 0.0)))
             for bar in session
@@ -186,9 +187,13 @@ def _window_return(session: list[dict], minutes: int, from_start: bool) -> float
         return None
     anchor = session[0]["timestamp"] if from_start else session[-1]["timestamp"]
     if from_start:
-        window = [bar for bar in session if (bar["timestamp"] - anchor).total_seconds() <= minutes * 60]
+        window = [
+            bar for bar in session if (bar["timestamp"] - anchor).total_seconds() <= minutes * 60
+        ]
     else:
-        window = [bar for bar in session if (anchor - bar["timestamp"]).total_seconds() <= minutes * 60]
+        window = [
+            bar for bar in session if (anchor - bar["timestamp"]).total_seconds() <= minutes * 60
+        ]
     if len(window) < 2:
         return None
     start = window[0].get("open") or window[0]["close"]
@@ -243,28 +248,11 @@ def _volume_ratio(sessions: dict[date, list[dict]], session_date: date) -> float
 
 
 def _closing_volume_ratio(sessions: dict[date, list[dict]], session_date: date) -> float | None:
-    """最近 `CLOSING_WINDOW_MINUTES` 分钟的成交量，对前几日**同一分钟区间**的均值。
+    """最近窗口成交量相对前几日同一分钟区间的均值。
 
-    这是 `closing_drive_pct` 缺的那一半。§2.3 那张尾盘意图表的四行里，头两行的
-    涨幅可以完全一样——「缓步拉升 + 量同步放大」是吸筹，「急拉冲高 + 量萎缩」是
-    为次日出货做 K 线——**区别全在量**。没有这个读数，两者在系统里不可分。
-
-    ## 分母为什么不用「当日分钟均量」
-
-    A 股日内成交是 U 形的，尾盘天然抬升。拿全天分钟均量做分母，几乎每只票都会读出
-    大于 1 的值，阈值因此失去分辨力。这和 `_volume_ratio` 当初弃用 `elapsed / 240`
-    线性折算是**同一个错误的两面**：都是拿一条「日内均匀分布」的假设，去比一个本来
-    就不均匀的东西。改用前几日同一分钟区间，基线自动带上这只票自己的尾盘节奏。
-
-    ## 窗口锚在最后一根 K 线，不是 15:00
-
-    盘中 14:00 调用，得到的是 13:30–14:00 那一段。**它是不是「尾盘」由调用方按时钟
-    判断**——同 `is_current_session` 的契约，也同 `closing_drive_pct` 现有的行为。
-    未来的 `Playbook.TAIL_END` 应当由 `schedule/timetable.py` 的时段来保证这件事，
-    而不是靠这里猜。
-
-    窗口不足 `CLOSING_WINDOW_MINUTES` 时返回 None：开盘 10 分钟时「最近 30 分钟」
-    并不存在，给一个数会让它冒充尾盘读数。
+    同时段比较保留日内 U 形成交节奏，避免全天均量低估尾盘基线。
+    窗口锚在最后一根 K 线；是否处于尾盘由调用方判断。
+    不足 `CLOSING_WINDOW_MINUTES` 分钟时返回 None。
     """
     ordered = sorted(sessions)
     index = ordered.index(session_date)

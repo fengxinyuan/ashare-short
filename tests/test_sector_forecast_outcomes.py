@@ -12,7 +12,7 @@ def _metric(name: str, ret: float) -> SectorMetrics:
 
 
 def _outlook(name: str, score: float) -> SectorOutlook:
-    return SectorOutlook(name=name, score=score, metrics=_metric(name, 0.0), level="SW1")
+    return SectorOutlook(name=name, score=score, metrics=_metric(name, 0.0), level="THS_INDUSTRY")
 
 
 def test_sector_forecasts_gain_forward_relative_outcomes(tmp_path) -> None:

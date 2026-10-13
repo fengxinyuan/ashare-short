@@ -32,9 +32,7 @@ LIVE_INSTRUMENTS = {
 
 
 def _of(snapshot, key):
-    """按 key 取一条读数。**测试本地的，不是适配器上的方法**——适配器上加一个
-    只有测试在调的 `get()`，正是 `docs/INVENTORY.md` 第四条口径要挡的东西。
-    """
+    """测试按 key 读取快照，避免为测试向适配器增加专用接口。"""
     return next(item for item in snapshot.readings if item.key == key)
 
 

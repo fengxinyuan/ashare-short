@@ -1,31 +1,8 @@
-"""L2 候选层：规则生成**一组带出处的价位**，而不是一个答案。
+"""L2 候选层：从事实生成带依据、证据和默认排序的价位集合。
 
-原来的 `advice/engine.py` 直接算出一组 entry/stop/target 就完事。它有两个毛病：
-
-- **没有出处。** 报出来的 22.95 是从分时均价来的、从日线支撑来的、还是从买盘墙
-  来的，事后谁也说不清。台账里存的只是一个数，兑现核对能回答「准不准」，回答
-  不了「哪一类依据准」。
-- **没有取舍空间。** 只有一个答案，模型要么原样复述，要么改数——而改数是被
-  数字闸门禁止的。结果是 LLM 在买卖点上完全没有位置，`SOLUTION.md` 里写的
-  「保留自主能力」落不了地。
-
-所以 L2 改成产出**候选集**：每个候选带 `basis`（这个价从哪来）、`evidence`
-（支撑它的 L1 读数）、`default_rank`（规则自己的排序）。
-
-三层的分工因此是清楚的：
-
-```text
-L1  只出数字，不做取舍          →  分时均价 22.90、日线支撑 22.31、买盘墙 22.80
-L2  把数字变成带出处的候选      →  entry 候选三个，规则默认选 rank 0
-L3  只在候选里挑，不造新数      →  「今天选 22.80，因为买盘墙在那里」或者弃权
-```
-
-**L3 造不出新价位**，因为它能选的东西是一个有限集合。这不是靠提示词约束的，
-是靠候选集本身是枚举的——`adjudicate.py` 的闸门做的是**精确相等**比对，不是
-「看起来像」。
-
-规则仍然给 `default_rank`：LLM 挂了、越界了、或者根本没配 key，取 rank 0 就是
-原来那套行为，链路照跑。
+每个候选保留 basis、evidence 和 default_rank，供报告、裁决和后续核对使用。
+L3 只能选择已有候选键；未启用模型、模型失败或越界时使用规则默认结果。
+事实、规则与模型的职责见 docs/ARCHITECTURE.md。
 """
 
 from __future__ import annotations
@@ -53,7 +30,7 @@ BASIS_STRUCTURE_BREAK = "结构破位"
 BASIS_NOISE_FLOOR = "日内波动下沿"
 
 # 候选价距现价超过这个比例就不再是「今天的价位」，是下周的愿望。
-#
+
 # **这两个上限不适用于规则自己的默认值。** 规则算出来的那个价必须无条件进候选
 # 集：`engine.py` 报的 `advice.stop` 就是它，一旦被距离过滤器筛掉，候选集里就
 # 没有引擎正在报的那个价——L3 的闸门会把引擎自己的数判成越界，台账里记的
@@ -148,12 +125,7 @@ def build_candidates(
     rule_stop: float | None = None,
     rule_stop_basis: str = BASIS_NOISE_FLOOR,
 ) -> CandidateSet:
-    """从 L1 读数生成候选集。
-
-    `entry_band` / `rule_stop` 是 `engine.py` 已经算好的那两个数，作为
-    rank 0 传进来——**候选集的默认答案必须和改造前逐位相同**，否则台账里
-    改造前后的记录就不可比，而那正是这套持续学习机制唯一的资产。
-    """
+    """从 L1 读数生成候选集，以传入的 entry_band 和 rule_stop 作为默认候选。"""
     result = CandidateSet(symbol=symbol)
     if not last_price or last_price <= 0:
         result.notes.append("无现价，无法生成任何候选")
@@ -178,7 +150,7 @@ def build_candidates(
     return result
 
 
-# ---- entry ---------------------------------------------------------------
+# entry
 
 
 def _entry_candidates(
@@ -309,7 +281,7 @@ def _breakout_entry(
     )
 
 
-# ---- stop ----------------------------------------------------------------
+# stop
 
 
 def _stop_candidates(
@@ -368,7 +340,7 @@ def _stop_candidates(
         result.notes.append("现价下方 9% 内没有可用止损位")
 
 
-# ---- target --------------------------------------------------------------
+# target
 
 
 def _target_candidates(

@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from ashare_decision_support.ask.plan import STEP_SYNTHESIS, ResearchPlan
-from ashare_decision_support.ask.question import QuestionSpec
+from ashare_decision_support.ask.question import INTENT_SCREEN, QuestionSpec
 from ashare_decision_support.ask.verdict import (
     LABEL_ACTIONABLE,
     LABEL_BLOCKED,
@@ -55,6 +55,8 @@ def render_report(
     notes: list[str] | None = None,
     source: str | None = None,
     position_factor: float | None = None,
+    screen: dict[str, Any] | None = None,
+    screen_health: str | None = None,
 ) -> str:
     lines: list[str] = [f"# 【{phase_label}】{as_of}"]
     if spec.raw:
@@ -63,10 +65,10 @@ def render_report(
     lines.append("")
 
     lines.append("## 先看结论")
-    lines.append(_verdict_line(decisions))
-    if source:
-        lines.append(f"价位来源：{source}")
+    lines.append(_verdict_line(decisions, screening=INTENT_SCREEN in spec.intents))
+    lines.extend([f"价位来源：{source}"] if source else [])
     lines.append("")
+    lines.extend(_screening_section(spec, screen, screen_health))
     if decisions:
         lines.append("## 速览表")
         lines.append(comparison_table(decisions))
@@ -96,9 +98,7 @@ def render_report(
         lines.extend(context_sections)
         lines.append("")
 
-    lines.append("## 研究过程")
-    lines.extend(_process_lines(plan, findings))
-    lines.append("")
+    lines.extend(_research_section(plan, findings))
 
     lines.append("## 纪律")
     lines.extend(f"- {item}" for item in DISCIPLINE)
@@ -122,12 +122,14 @@ def render_report(
     return "\n".join(lines)
 
 
-# ---- 段落 -----------------------------------------------------------------
+# 段落
 
 
-def _verdict_line(decisions: list[Decision]) -> str:
+def _verdict_line(decisions: list[Decision], screening: bool = False) -> str:
     """一句话结论。**先说有没有可执行的，再说是哪几只。**"""
     if not decisions:
+        if screening:
+            return "本轮没有经过当日价位验证的个股决策卡；先核对下方筛选结果与数据日期。"
         return "没有任何标的能被评估——上下文里没有可用的买卖点数据。"
     actionable = [item for item in decisions if item.label == LABEL_ACTIONABLE]
     blocked = [item for item in decisions if item.label == LABEL_BLOCKED]
@@ -140,6 +142,44 @@ def _verdict_line(decisions: list[Decision]) -> str:
     if blocked:
         tail += f"　被阻断 {len(blocked)} 只，理由见各自卡上的阻断项。"
     return f"{head}。{tail}"
+
+
+def _screening_section(
+    spec: QuestionSpec, screen: dict[str, Any] | None, status: str | None
+) -> list[str]:
+    if INTENT_SCREEN not in spec.intents:
+        return []
+    return [*_screening_lines(screen, status), ""]
+
+
+def _screening_lines(screen: dict[str, Any] | None, status: str | None) -> list[str]:
+    lines = ["## 选股结果"]
+    if not isinstance(screen, dict):
+        lines.append("没有本地筛选结果。先运行 `ashare-ds strategy-screen --profile all`。")
+        return lines
+    stamp = screen.get("as_of") or "日期未知"
+    if status != "当日":
+        lines.append(
+            f"最近一次筛选截止 {stamp}（{status or '时效未知'}），不能作为今天下午的候选。"
+            "请重新运行 `ashare-ds strategy-screen --profile all`，再用 `ashare-ds advise <代码>` "
+            "核对当日价位和风险。"
+        )
+        return lines
+    candidates = screen.get("diversified_shortlist") or screen.get("candidates") or []
+    if not candidates:
+        lines.append(f"筛选截止 {stamp}，本次没有符合参数条件的候选。")
+        return lines
+    names = "、".join(
+        f"{item.get('symbol', '—')} {item.get('name', '')}".strip()
+        for item in candidates[:8]
+        if isinstance(item, dict)
+    )
+    lines.append(
+        f"筛选截止 {stamp}；参数筛出的前列为 {names or '—'}。"
+        "这是形态观察名单，尚未通过当日分时、盘口与风险核对；"
+        "逐只运行 `ashare-ds advise <代码>` 后再判断。"
+    )
+    return lines
 
 
 def _decision_block(decision: Decision, findings: dict[str, Any]) -> list[str]:
@@ -202,3 +242,9 @@ def _process_lines(plan: ResearchPlan, findings: dict[str, Any]) -> list[str]:
             lines.append(f"- {step.title} — ⚠️ {finding.get('note') or '未执行'}")
     lines.extend(f"- （{note}）" for note in plan.notes)
     return lines
+
+
+def _research_section(plan: ResearchPlan, findings: dict[str, Any]) -> list[str]:
+    if not plan.runnable and not plan.notes:
+        return []
+    return ["## 研究过程", *_process_lines(plan, findings), ""]

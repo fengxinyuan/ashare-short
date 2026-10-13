@@ -48,6 +48,4 @@ def detect_events(texts: Iterable[str] | None) -> EventEvidence:
 
 
 def _match(table: dict[str, tuple[str, ...]], text: str) -> list[tuple[str, str]]:
-    return [
-        (category, term) for category, terms in table.items() for term in terms if term in text
-    ]
+    return [(category, term) for category, terms in table.items() for term in terms if term in text]

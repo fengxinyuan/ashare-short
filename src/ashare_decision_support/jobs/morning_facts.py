@@ -1,46 +1,36 @@
-"""盘前跑批的**产物组装**：把算完的一堆读数摊成 facts / market_state 两份字典。
+"""把盘前读数组装成事实包与台账市场快照。
 
-从 `jobs/morning.py` 里搬出来的，判据是一条：**这一层不做任何判断**。它是纯映射
-——每一行都是「某个读数存在就带上，不存在就写 None」，没有一处阈值、没有一处
-分支会改变结论。而它有 300 多行，夹在六段判定链路中间，读主链路的人要连着翻过
-一整屏字典字面量才能看到下一个真正在做决定的地方。
-
-搬出来之后 `morning.py` 少了约 310 行，而这一层的契约反而清楚了：
-
-- **`facts()`** —— 进写稿层 prompt、进 `ask` / `chat` 上下文、进 `facts_hash`。
-  它的每一个键都会被外部消费，所以**加键容易删键难**：`facts_hash` 是台账里
-  「当时到底看到了什么」的指纹，键集变了，新旧记录的指纹就不可比。
-- **`market_state()`** —— 只进台账。它回答的是「这条建议发出时市场什么样」，
-  存在的理由是让几个月后的统计能按情绪周期分层（见 `journal/records.py`）。
-
-两份分开而不是合并，因为**缺失语义不同**：facts 里一个 None 是「今天这一路没
-取到」，写稿层据此不提它；market_state 里一个 None 是「这条记录没有这个分层
-维度」，统计层据此把它排除出该分组，而不是当成一个中性值算进去。
+build_facts 的字段由写稿、问答和事实指纹消费；market_state 保留判断时的分层维度。
+缺失值保留 None，分别表示未取得事实或缺少统计维度，不补成中性读数。
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 from typing import Any
 
 from ashare_decision_support.sectors.clusters import cluster_ranked_sectors
+from ashare_decision_support.signals.series import bar_date, parse_bar_date
 from ashare_decision_support.strategy.regime import RegimeVerdict
 
 
+def metric_bar_freshness(bars_by_symbol: dict, expected: date) -> tuple[str | None, float]:
+    """Return the modal constituent bar date and today's share of dated symbols."""
+    latest = [day for rows in bars_by_symbol.values() if rows if (day := bar_date(rows[-1]))]
+    if not latest:
+        return None, 0.0
+    modal = Counter(latest).most_common(1)[0][0]
+    return modal.isoformat(), sum(day == expected for day in latest) / len(latest)
+
+
 def equal_weight_date(rotation_price: Any) -> str | None:
-    """等权那一路的数据日期，`YYYY-MM-DD`；判定不出来就返回 None。
+    """以板块指数序列日期作为等权日线的比较基准，缺失时返回 None。
 
-    板块动量本身不带 as-of，但它和板块指数序列取的是同一个「最后一个完整交易日」
-    的日线，所以用序列的 `trade_date` 当基准。它只用来和宽基的日期比对——宽基走
-    实时行情，盘中跑会取到当日的，那时两边不是同一天。
-
-    取不到就 None，`read_divergence` 会因此只报事实、不下背离判断。宁可少一条
-    结论，也不要拿今天的指数去和昨天的宽度比。
+    返回 YYYY-MM-DD，供宽基快照检查跨日差异。
     """
-    stamp = str(getattr(rotation_price, "trade_date", "") or "")
-    if len(stamp) == 8 and stamp.isdigit():
-        return f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:]}"
-    return None
+    day = parse_bar_date(getattr(rotation_price, "trade_date", None))
+    return day.isoformat() if day is not None else None
 
 
 def market_state(
@@ -54,15 +44,7 @@ def market_state(
     index_verdict: str | None = None,
     sizing: Any = None,
 ) -> dict[str, Any]:
-    """建议发出当时的大盘快照，原样存进每一条台账记录。
-
-    冗余存储是刻意的：台账是 JSONL，每条多带七八个数比事后按日期 join 便宜得多，
-    而且**记录自带分层维度**意味着任何一段区间的数据都能独立分析，不依赖别的文件
-    还在不在。
-
-    这里的每个字段都对应一个「超短线该不该出手」的判断维度，缺了就没法回答
-    「这套规则在退潮期到底管不管用」。
-    """
+    """将判断时的市场读数保存在每条台账中，支持独立回放和分层统计。"""
     ok = limit_pool is not None and getattr(limit_pool, "ok", False)
     rotation_ok = rotation_price is not None and getattr(rotation_price, "ok", False)
     turnover_ok = turnover is not None and getattr(turnover, "ok", False)
@@ -72,15 +54,7 @@ def market_state(
         "score": getattr(market, "score", None),
         "breadth": getattr(market, "breadth", None),
         "position_factor": position_factor,
-        # 仓位是**怎么得到**这个数的，不只是这个数本身。三条记录下来，事后才分得开
-        # 三种截然不同的决策——它们的 `position_factor` 可以完全一样：
-        #
-        #   系统建议 0.5、上限 0.5        → 规则没起作用，是系统自己就保守
-        #   系统建议 0.9、被上限压到 0.5  → **上限救了这一次**
-        #   系统建议 0.5、手工设成 0.5    → 人接管了，规则只是恰好同值
-        #
-        # 只存最终值的话，「仓位上限这条规则到底有没有用」永远没有样本，而那是
-        # 仓位这一层唯一能被 `review` 验证的方式。
+        # 分别记录原始建议、周期约束结果和手工值，供复盘判断约束是否生效。
         "suggested_factor": getattr(sizing, "suggested_factor", None),
         "capped_suggested_factor": getattr(sizing, "capped_suggested_factor", None),
         "manual_factor": getattr(sizing, "manual_factor", None),
@@ -92,19 +66,11 @@ def market_state(
         "limit_down_count": getattr(limit_pool, "limit_down_count", None) if ok else None,
         # 涨停池的数据日期可能早于请求日期（服务端对非交易日返回最近交易日）。
         "limit_pool_date": str(getattr(limit_pool, "trade_date", "")) or None if ok else None,
-        # 情绪周期的判定结论。存标签而不是只存原始读数，是为了让统计分组与当天
-        # 实际生效的闸门**用同一个判定**——否则「退潮期这套规则管不管用」的样本
-        # 会和真正被闸门拦下的日子对不上，闸门就永远无法被自己的台账验证。
+        # 保存当时的周期标签，避免阈值调整改变历史分组。
         "regime": regime.cycle.value if regime is not None else None,
         "regime_position_cap": regime.position_cap if regime is not None else None,
         "regime_trusted": regime.trusted if regime is not None else None,
-        # ---- 以下三层是「只出读数、不进打分」的那批，存进台账是它们**唯一**能
-        # 被验证的途径。不存的话它们永远停在读数状态：`review` 无法回答「高低切换
-        # 的日子里这套筛选的兑现率有没有差别」，于是也永远谈不上要不要给它们权重。
-        # 存的成本是每条记录多七个数，与上面那批同一条理由（见本函数开头）。
-        #
-        # 轮动的两个标签都存：它们用的窗口不同，2026-08-03 实测一个「强者恒强」
-        # 一个「高低切换」。只存一个的话，事后分组会把两种截然不同的盘面混进同一组。
+        # 研究读数用于台账分层；轮动的两组窗口分别记录。
         "rotation_switch": getattr(rotation_price, "switch_label", None) if rotation_ok else None,
         "rotation_adjacent": getattr(rotation_price, "adjacent_label", None)
         if rotation_ok
@@ -112,26 +78,18 @@ def market_state(
         "rotation_persistence": getattr(rotation_price, "persistence", None)
         if rotation_ok
         else None,
-        # 板块指数序列的交易日。可能早于建议发出的日期（跳过取数时读的是上一次
-        # 落盘的），不存的话事后分不清「那天没切换」和「那天读的是前天的数」。
+        # 保存序列日期，区分当前读数和沿用历史缓存。
         "rotation_date": str(getattr(rotation_price, "trade_date", "")) or None
         if rotation_ok
         else None,
-        # 全场成交额的相对变化。存量腾挪与增量入场下的同一个「高低切换」，对仓位
-        # 的含义相反——这是把两者分开的那个字段。
+        # 全场成交额变化用于区分总量变化与板块间占比迁移。
         "turnover_total_change": getattr(turnover, "total_change", None) if turnover_ok else None,
-        # 近端窗口**内部**的量能走向。必须和上面那个一起存：块均值对比在 V 形拐点
-        # 上会指反（2026-08-07 实测 -1.8% 对 +33.4%），只存前者的话，事后分组会把
-        # 「量能刚触底回升」的那几天归进「存量博弈」，而那正是两者含义相反的日子。
+        # 窗口内走向与窗口均值变化分别保存，拐点时两者可能异号。
         "turnover_total_trend": getattr(turnover, "total_trend", None) if turnover_ok else None,
-        # 市值加权口径。`breadth` 是等权的，两者背离时方向读数会系统性偏乐观，
-        # 而只有同时存下来，事后才能把「等权强、加权弱」的日子单独拎出来看。
+        # 与等权 breadth 并存，供复盘比较两种口径。
         "index_median_ret": getattr(broad_index, "median_ret", None) if index_ok else None,
         "index_date": getattr(broad_index, "trade_date", None) if index_ok else None,
-        # 背离的**判定标签**，不是让统计层拿上面两个数现算。判据的单一真源在
-        # `adapters/broad_index.py:divergence_verdict`；阈值以后一定会调，而调完
-        # 之后历史记录必须仍按当天生效的那个判定分组，否则分层统计描述的是一个
-        # 从未存在过的过去。同一条理由见 `journal/stats.py:_regime_bucket`。
+        # 沿用 divergence_verdict 的当日标签，不按新阈值重算历史。
         "index_divergence": index_verdict,
     }
 
@@ -161,9 +119,14 @@ def build_facts(
     theme_validation: dict[str, Any] | None = None,
     sector_forecast_validation: dict[str, Any] | None = None,
     sector_news_memory: list[dict[str, Any]] | None = None,
+    overseas: Any = None,
+    *,
+    metric_date: str | None,
 ) -> dict[str, Any]:
     return {
         "trade_date": str(today),
+        # 个股行情日期来自成分股日线，用于时效检查，独立于计划日和板块指数日期。
+        "data_date": metric_date,
         "news_as_of": news_as_of,
         "news_coverage": {
             "sources": market_source_counts or {},
@@ -174,31 +137,19 @@ def build_facts(
                 for target in (news_targets or [])
             ],
         },
-        # 价格序列口径的板块轮动。与下面的 `rotation`（系统排名的记忆）并列而不是
-        # 合并：两者的输入和起算日都不同，混成一个字段会让写稿层分不清「这个结论
-        # 是从指数价格算的还是从我自己的排名算的」。
+        # 价格轮动与系统排名记忆分别输出，保留各自的输入与起算日期。
         "rotation_price": (
             rotation_price.to_dict()
             if rotation_price is not None and getattr(rotation_price, "ok", False)
             else None
         ),
-        # 成交额迁移。与 `rotation_price` 同源（同一批板块指数序列）但口径不同：
-        # 那个用 close 回答「谁在涨」，这个用 amount 回答「谁在被交易、以及那是
-        # 在买还是在跑」。分成两个字段而不是合并，理由和上面一样——写稿层必须
-        # 能分清一个结论是从价格算的还是从成交额算的。
+        # 与价格轮动同源，但单独保留成交额口径。
         "turnover_migration": (
             turnover_migration.to_dict()
             if turnover_migration is not None and getattr(turnover_migration, "ok", False)
             else None
         ),
-        # 跷跷板。第三个从同一批序列算出来的读数，回答的是**两两之间**的关系，
-        # 而上面两个都是「全场一个数」的横截面读数——「今天银行涨、电子跌」这种
-        # 分歧，只有这一层答得了「这是结构性的还是偶然的」。
-        #
-        # **`trusted` 为假时也带出去**，与上面两个的处置刻意不同：那两个用 `ok`
-        # 过滤是因为算不出来时它们没什么可说的；这一层算不出来时 `notes` 里写着
-        # 原因（序列不够 61 根、板块数不够），而「没有跷跷板」本身是一条结论，
-        # 空 `pairs` 加一句 observation 正是它的表达方式。
+        # 即使证据不足也保留反向关系读数及原因，区分未发现关系和无法计算。
         "seesaw": seesaw.to_dict() if seesaw is not None else None,
         # 业绩层。只带聚合读数与被否决/被标注的名单，不带全市场那 1874 家——
         # facts 要进写稿层的 prompt，塞全量会把上下文挤爆而没有额外信息。
@@ -219,11 +170,12 @@ def build_facts(
             if daily_read is not None and getattr(daily_read, "ok", False)
             else None
         ),
-        # 选中板块的**跨日**舆情记忆。与上面 `news_coverage` 的分工：那个数
-        # 今天有多少条，这个答「这些消息是今天冒出来的还是已经发酵两天」——
-        # 同样一条利好，第一天和第三天对第二天的含义完全不同。
+        # 跨日记忆保留消息首次出现与持续传播情况。
         "sector_news_memory": sector_news_memory or [],
         "theme_radar": [item.to_dict() for item in (theme_radar or [])],
+        # 外盘 → 板块映射。候选行上已各自挂了指向本板块的那几条；这里是全量，
+        # 写稿层与外部 AI 据此回答「今天哪些板块有隔夜外盘背景」。
+        "overseas_links": overseas.to_dict() if overseas is not None else None,
         "theme_validation": theme_validation or {},
         "sector_forecast_validation": sector_forecast_validation or {},
         "sector_clusters": cluster_ranked_sectors(outlooks),
@@ -237,8 +189,7 @@ def build_facts(
                 "source": "同花顺行业指数",
                 "trade_date": sector_index.readings[0].trade_date,
                 "sectors": len(sector_index.readings),
-                # 只带这一层独有的字段。涨跌幅申万那边已经有了，重复带进来只会
-                # 让写稿层在两个口径的数字之间挑一个说，而它们本来就不该相等。
+                # 指数涨跌与成分股中位涨跌保留各自口径；指数额外提供日内收位。
                 "gainers": [
                     {
                         "name": item.name,

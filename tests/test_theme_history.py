@@ -16,9 +16,16 @@ def metrics(electronics: float, market: float) -> dict[str, SectorMetrics]:
 
 def signal() -> ThemeSignal:
     return ThemeSignal(
-        name="测试主题", stage="事件预警，等待价格确认", verified_docs=1, social_docs=0,
-        price_confirmed=False, sectors=("电子",), event_types=("订单",), transmission="测试传导",
-        invalidation="测试失效", headlines=("测试消息",),
+        name="测试主题",
+        stage="事件预警，等待价格确认",
+        verified_docs=1,
+        social_docs=0,
+        price_confirmed=False,
+        sectors=("电子",),
+        event_types=("订单",),
+        transmission="测试传导",
+        invalidation="测试失效",
+        headlines=("测试消息",),
     )
 
 

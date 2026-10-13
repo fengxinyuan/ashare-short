@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,6 +10,7 @@ from ashare_decision_support.artifacts import LEADERS_LATEST_NAME
 from ashare_decision_support.facts import build_facts_bundle
 from ashare_decision_support.schedule.timezone import beijing_now
 from ashare_decision_support.sectors import DEFAULT_LEVEL, SectorRotationStore
+from ashare_decision_support.state.store import read_json
 
 MONTHLY_SCHEMA = "ashare-monthly-research-context-v1"
 
@@ -106,12 +106,13 @@ def _load_sector_rotation_memory(trade_date: date) -> tuple[dict[str, Any], list
 
 
 def _load_json(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """读龙头缓存。解析走 `state.store.read_json`：损坏、不可读与含 NaN 的文件
+    一律按缺失处理，与其他落盘产物的读取口径相同。"""
     if not path.is_file():
         return None, [f"未找到 {path.name}；先调用 refresh_sector_leaders 再做全板块龙头比较"]
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, [f"{path.name} 读取失败（{type(exc).__name__}）"]
+    payload = read_json(path)
+    if payload is None:
+        return None, [f"{path.name} 读取失败"]
     if not isinstance(payload, dict):
         return None, [f"{path.name} 不是 JSON 对象"]
     return payload, []
@@ -130,8 +131,15 @@ def _compact_leaders(payload: dict[str, Any] | None) -> dict[str, Any] | None:
             if not isinstance(item, dict):
                 continue
             keep = (
-                "symbol", "name", "leadership_rank", "signal_date", "last_close",
-                "return_5d", "return_20d", "return_60d", "average_amount_20d_yi",
+                "symbol",
+                "name",
+                "leadership_rank",
+                "signal_date",
+                "last_close",
+                "return_5d",
+                "return_20d",
+                "return_60d",
+                "average_amount_20d_yi",
                 "trend_state",
             )
             leaders.append({key: item.get(key) for key in keep if key in item})
@@ -157,7 +165,14 @@ def _compact_leaders(payload: dict[str, Any] | None) -> dict[str, Any] | None:
         "sector_count": payload.get("sector_count", len(sectors)),
         "sectors": sectors,
         "omitted": {
-            "leader_fields": ["rank_components", "volume_ratio_20d", "range_position_60d", "ma20", "ma60", "trend_quality"],
+            "leader_fields": [
+                "rank_components",
+                "volume_ratio_20d",
+                "range_position_60d",
+                "ma20",
+                "ma60",
+                "trend_quality",
+            ],
             "hint": "完整字段见 sector_leaders_latest.json",
         },
     }
@@ -186,7 +201,13 @@ def _event_window(start: date, end: date) -> list[dict[str, Any]]:
                         "name": "美国联邦选举日",
                         "date": str(election),
                         "date_status": "statutory calendar rule",
-                        "possible_channels": ["全球风险偏好", "美元", "美债", "贸易政策", "科技限制"],
+                        "possible_channels": [
+                            "全球风险偏好",
+                            "美元",
+                            "美债",
+                            "贸易政策",
+                            "科技限制",
+                        ],
                         "status": "outcome, policy path, and A-share mapping require current external sources",
                     }
                 )
@@ -206,17 +227,33 @@ def _research_tasks(start: date, end: date, events: list[dict[str, Any]]) -> lis
         {
             "topic": "movable and newly announced events",
             "query_scope": f"{start}..{end}",
-            "must_verify": ["中秋/春节等农历节日", "两会及政策会议", "央行议息", "中外重要选举", "重大产品发布"],
+            "must_verify": [
+                "中秋/春节等农历节日",
+                "两会及政策会议",
+                "央行议息",
+                "中外重要选举",
+                "重大产品发布",
+            ],
             "required_sources": "official calendars, regulators, central banks, exchanges, and primary company releases",
         },
         {
             "topic": "event transmission",
             "events": [item["name"] for item in events],
-            "must_answer": ["事件是否已被定价", "映射到哪些 A 股行业/概念", "量价是否确认", "何种事实会证伪"],
+            "must_answer": [
+                "事件是否已被定价",
+                "映射到哪些 A 股行业/概念",
+                "量价是否确认",
+                "何种事实会证伪",
+            ],
         },
         {
             "topic": "business leadership verification",
-            "must_answer": ["候选公司的真实主营和行业地位", "订单/业绩/估值约束", "是否只是题材标签", "最近公告风险"],
+            "must_answer": [
+                "候选公司的真实主营和行业地位",
+                "订单/业绩/估值约束",
+                "是否只是题材标签",
+                "最近公告风险",
+            ],
             "note": "本项目给的是量价龙头候选，产业龙头身份必须由外部资料核验",
         },
     ]

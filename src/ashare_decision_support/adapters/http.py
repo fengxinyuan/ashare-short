@@ -1,22 +1,13 @@
-"""行情站点的取文本这一步：装浏览器头、按站点的编码解码。
+"""行情 HTTP 文本读取与 JSONP 解析。
 
-八个适配器（新浪快照、腾讯明细、宽基指数、全市场扫描、涨停池、同花顺板块指数与
-分类、盘前海外快照）各自写过一份**逐字相同**的四行：建一个带 `User-Agent` /
-`Referer` 的 `Request`、用注入的 `opener` 打开、`read()`、按站点编码 `decode`。连
-`USER_AGENT = "Mozilla/5.0"` 这个值都各自写了一遍——七处是同名常量，海外快照那处
-是直接内联的字面量，所以按常量名去搜只搜得到七份。
-
-四行本身不难写，收在这里是因为**它们之间的差别只有两个参数**——编码（新浪与
-腾讯是 gbk、海外快照那一路是 gb18030，东财与同花顺是 utf-8）和解码失败时是丢
-还是替换。差别摊在八个文件里的时候，看不出这是同一件事的八种取值，只看得出
-八段长得差不多的代码；真要改取数行为（比如加一个超时重试、换 UA），得先把
-八处都找齐。
-
-`opener` 仍由调用方注入并原样传入——测试桩替换的是它，这一层不碰。
+调用方注入 opener，并指定 Referer、编码及解码错误策略。
+JSONP 解析供同花顺板块指数和新浪海外日线共用。
 """
 
 from __future__ import annotations
 
+import json
+import re
 import urllib.request
 from collections.abc import Callable
 from typing import Any
@@ -65,3 +56,20 @@ def fetch_text(
     request = urllib.request.Request(url, headers=headers)
     with opener(request, timeout=timeout) as response:
         return response.read().decode(encoding, errors)
+
+
+_JSONP = re.compile(r"\((.*)\)\s*;?\s*$", re.DOTALL)
+
+
+def jsonp_payload(text: str) -> Any:
+    """剥掉 JSONP 外壳，拿到里面的 JSON 值；不是 JSONP 或壳里不是 JSON 时返回 None。
+
+    返回值不限类型——同花顺壳里是对象，新浪美股壳里是数组——形状由各调用方自己判。
+    """
+    match = _JSONP.search(text.strip())
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None

@@ -5,7 +5,7 @@
 08:20  morning    主链路：舆情 → 大盘 → 板块 → 选股 → 当日候选 → 台账
 09:15  preopen    持仓执行卡（昨收口径，明确标注）
 09:35  monitor    盘中循环，跑到 14:55（长任务，自己管时长）
-15:10  postclose  持仓打分、次日矩阵
+15:10  postclose  持仓打分、次日执行卡与每日复盘
 15:40  review     T-1..T-5 建议兑现核对
 ```
 
@@ -20,6 +20,7 @@ from datetime import date
 from datetime import time as clock_time
 from typing import Any
 
+from ashare_decision_support.schedule.clock import AUCTION_OPEN
 from ashare_decision_support.schedule.daemon import ScheduledTask
 from ashare_decision_support.schedule.timezone import beijing_today
 
@@ -33,7 +34,8 @@ TASK_REVIEW = "review"
 DEFAULT_TIMES: dict[str, clock_time] = {
     TASK_NEWS: clock_time(8, 0),
     TASK_MORNING: clock_time(8, 20),
-    TASK_PREOPEN: clock_time(9, 15),
+    # 执行卡在集合竞价开始报价那一刻出：时刻取 `schedule/clock.py` 那一份。
+    TASK_PREOPEN: AUCTION_OPEN,
     TASK_MONITOR: clock_time(9, 35),
     TASK_POSTCLOSE: clock_time(15, 10),
     TASK_REVIEW: clock_time(15, 40),
@@ -72,5 +74,8 @@ def build_timetable(
 
 def describe(tasks: list[ScheduledTask], day: date | None = None) -> str:
     header = f"交易日 {day or beijing_today()} 时间表"
-    rows = [f"  {task.at:%H:%M}  {task.key:<10} {task.label}" for task in sorted(tasks, key=lambda t: t.at)]
+    rows = [
+        f"  {task.at:%H:%M}  {task.key:<10} {task.label}"
+        for task in sorted(tasks, key=lambda t: t.at)
+    ]
     return "\n".join([header, *rows])

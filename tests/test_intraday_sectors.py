@@ -22,21 +22,25 @@ from ashare_decision_support.adapters.ths_taxonomy import (
     ThsTaxonomySource,
     is_tradable_concept,
 )
-from ashare_decision_support.jobs.monitor import run_monitor
+from ashare_decision_support.jobs.monitor import _load_morning_sector_plan, run_monitor
 from ashare_decision_support.monitor.loop import run_monitor_loop
 from ashare_decision_support.monitor.sector_session import SectorPassResult, SectorSession
 from ashare_decision_support.monitor.sector_triggers import (
     MAX_PER_HOUR,
+    SectorPlanContext,
     SectorTriggerEngine,
     _PushLedger,
     fired_sectors_today,
     load_sector_state,
 )
 from ashare_decision_support.notify.base import NotifierCapabilities
+from ashare_decision_support.notify.render import render_sector_alerts
+from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.sectors import intraday
 from ashare_decision_support.sectors.base import SectorDefinition
 from ashare_decision_support.sectors.intraday import SectorRead, SectorSnapshot
 from ashare_decision_support.sectors.ths_taxonomy import ThsConceptTaxonomy, ThsIndustryTaxonomy
+from tests.fakes import json_response
 
 
 class RecordingNotifier:
@@ -49,26 +53,13 @@ class RecordingNotifier:
         self.messages.append((title, content))
         return True
 
-# ---- 测试替身 --------------------------------------------------------------
 
-
-class JsonResponse:
-    def __init__(self, payload: object) -> None:
-        self.payload = json.dumps(payload).encode("utf-8")
-
-    def read(self) -> bytes:
-        return self.payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args) -> None:
-        return None
+# 测试替身
 
 
 def opener_for(files: dict[str, object]):
     def opener(request, timeout):
-        return JsonResponse(files[request.full_url.rsplit("/", 1)[-1]])
+        return json_response(files[request.full_url.rsplit("/", 1)[-1]])
 
     return opener
 
@@ -141,7 +132,7 @@ def snapshot_of(reads: list[SectorRead], when: datetime) -> SectorSnapshot:
     )
 
 
-# ---- 分类源：并集合并 ------------------------------------------------------
+# 分类源：并集合并
 
 
 def test_a_symbol_missing_from_the_industry_file_is_not_dropped(tmp_path) -> None:
@@ -163,7 +154,7 @@ def test_a_symbol_missing_from_the_industry_file_is_not_dropped(tmp_path) -> Non
     assert set(snapshot.profiles) == {"600000.SH", "600744.SH"}
     orphan = snapshot.profiles["600744.SH"]
     assert orphan.name == "华银电力"
-    assert orphan.industries == ()          # 行业缺失只是少一个维度
+    assert orphan.industry is None  # 行业缺失只是少一个维度
     assert orphan.concepts == ("虚拟电厂", "绿色电力")
     assert any("只在概念文件里有" in note for note in snapshot.notes)
 
@@ -172,14 +163,14 @@ def test_industry_grouping_ignores_symbols_without_an_industry(tmp_path) -> None
     """并集带进来的票没有行业，不能因此在行业分组里冒出一个空板块名。"""
     files = {
         "industries.json": [
-            {"symbol": "600000", "name": "测试银行", "industries": ["银行"]}
+            {"symbol": "600000", "name": "测试银行", "industries": ["金融", "银行"]}
         ],
         "concepts.json": [{"symbol": "600744.SH", "name": "华银电力", "concepts": ["核电"]}],
     }
     snapshot = ThsTaxonomySource(opener=opener_for(files), cache_dir=tmp_path).load(
         force_refresh=True
     )
-    assert snapshot.industry_groups("SW1") == {"银行": ["600000.SH"]}
+    assert snapshot.industry_groups() == {"银行": ["600000.SH"]}
 
 
 def test_cache_from_yesterday_is_refetched(tmp_path) -> None:
@@ -209,11 +200,9 @@ def test_shared_source_loads_one_snapshot_for_industry_and_concepts(tmp_path) ->
     """同一轮的行业/概念不能各下载一遍，也不能读到两个不同版本的分类。"""
     files = {
         "industries.json": [
-            {"symbol": "600000", "name": "测试银行", "industries": ["银行"]}
+            {"symbol": "600000", "name": "测试银行", "industries": ["金融", "银行"]}
         ],
-        "concepts.json": [
-            {"symbol": "600000", "name": "测试银行", "concepts": ["金融科技"]}
-        ],
+        "concepts.json": [{"symbol": "600000", "name": "测试银行", "concepts": ["金融科技"]}],
     }
     calls: list[str] = []
     base_opener = opener_for(files)
@@ -232,7 +221,7 @@ def test_shared_source_loads_one_snapshot_for_industry_and_concepts(tmp_path) ->
     assert len(calls) == 2  # industries.json + concepts.json，各一次
 
 
-# ---- 概念闸门 --------------------------------------------------------------
+# 概念闸门
 
 
 def test_a_large_concept_is_no_longer_excluded_by_size(tmp_path) -> None:
@@ -272,29 +261,31 @@ def test_the_literal_nan_tag_is_not_a_concept() -> None:
     """上游把 NaN 直接字符串化了，实测有 4 只票带着一个叫 `nan` 的「概念」。
     它此前靠规模下限被顺带挡住，那是巧合不是判断。"""
     assert is_tradable_concept("nan") is False
-    assert is_tradable_concept("融资融券") is False      # 交易资格，不是主题
-    assert is_tradable_concept("2026中报预增") is False   # 带年份的财报事件
+    assert is_tradable_concept("融资融券") is False  # 交易资格，不是主题
+    assert is_tradable_concept("2026中报预增") is False  # 带年份的财报事件
     assert is_tradable_concept("人形机器人") is True
 
 
-# ---- 截面归并 --------------------------------------------------------------
+# 截面归并
 
 
 def test_ranking_is_by_excess_not_by_absolute_move() -> None:
     """普涨日里 +1.5% 是落后。用绝对涨幅排出来的榜不会报错，只会开始说废话。"""
-    rows = [row(f"60000{i}", f"甲{i}", 8.0) for i in range(5)]      # 领涨板块
-    rows += [row(f"60010{i}", f"乙{i}", 5.0) for i in range(5)]     # 跟涨板块
-    rows += [row(f"60020{i}", f"丙{i}", 5.0) for i in range(90)]    # 大盘本身就在涨
+    rows = [row(f"60000{i}", f"甲{i}", 8.0) for i in range(5)]  # 领涨板块
+    rows += [row(f"60010{i}", f"乙{i}", 5.0) for i in range(5)]  # 跟涨板块
+    rows += [row(f"60020{i}", f"丙{i}", 5.0) for i in range(90)]  # 大盘本身就在涨
     scan = FakeScan(rows)
     taxonomy = FakeTaxonomy(
         [
-            SectorDefinition("领涨", "SW1", tuple(f"60000{i}.SH" for i in range(5))),
-            SectorDefinition("跟涨", "SW1", tuple(f"60010{i}.SH" for i in range(5))),
+            SectorDefinition("领涨", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(5))),
+            SectorDefinition("跟涨", "THS_INDUSTRY", tuple(f"60010{i}.SH" for i in range(5))),
         ]
     )
 
-    snapshot = intraday.take_snapshot({"SW1": taxonomy}, adapter=scan, now=datetime(2026, 8, 9, 10))
-    ranked = snapshot.ranked("SW1")
+    snapshot = intraday.take_snapshot(
+        {"THS_INDUSTRY": taxonomy}, adapter=scan, now=datetime(2026, 8, 9, 10)
+    )
+    ranked = snapshot.ranked("THS_INDUSTRY")
 
     assert snapshot.market_median_pct == pytest.approx(5.0)
     assert [item.name for item in ranked] == ["领涨", "跟涨"]
@@ -311,14 +302,14 @@ def test_a_suspended_constituent_is_left_out_of_the_denominator() -> None:
     rows += [row(f"60010{i}", f"其他{i}", 0.0) for i in range(10)]
     scan = FakeScan(rows)
     taxonomy = FakeTaxonomy(
-        [SectorDefinition("测试", "SW1", tuple(f"60000{i}.SH" for i in range(1, 7)))]
+        [SectorDefinition("测试", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(1, 7)))]
     )
 
     read = intraday.take_snapshot(
-        {"SW1": taxonomy}, adapter=scan, now=datetime(2026, 8, 9, 10)
+        {"THS_INDUSTRY": taxonomy}, adapter=scan, now=datetime(2026, 8, 9, 10)
     ).reads[0]
 
-    assert read.covered == 5          # 停牌那只不计入
+    assert read.covered == 5  # 停牌那只不计入
     assert read.total == 6
     assert read.advance_ratio == pytest.approx(1.0)
     assert read.median_pct == pytest.approx(6.0)
@@ -328,8 +319,8 @@ def test_a_first_day_listing_is_not_counted_as_a_limit_up() -> None:
     """上市首日无涨跌幅限制，实测 `N展芯 +396.9%`。用「≥ 涨停价」判定会把它
     算成涨停，而涨停家数是情绪判断里最不该掺假的那个计数。"""
     rows = [
-        row("300001", "封板", 20.0),      # 创业板 20cm，真涨停
-        row("300002", "新股", 396.9),     # 首日无限制，不是涨停
+        row("300001", "封板", 20.0),  # 创业板 20cm，真涨停
+        row("300002", "新股", 396.9),  # 首日无限制，不是涨停
         row("600001", "主板封板", 10.0),  # 主板 10cm，真涨停
         row("600002", "普通", 3.0),
         row("600003", "普通", 1.0),
@@ -339,14 +330,14 @@ def test_a_first_day_listing_is_not_counted_as_a_limit_up() -> None:
         [
             SectorDefinition(
                 "测试",
-                "SW1",
+                "THS_INDUSTRY",
                 ("300001.SZ", "300002.SZ", "600001.SH", "600002.SH", "600003.SH"),
             )
         ]
     )
 
     read = intraday.take_snapshot(
-        {"SW1": taxonomy}, adapter=FakeScan(rows), now=datetime(2026, 8, 9, 10)
+        {"THS_INDUSTRY": taxonomy}, adapter=FakeScan(rows), now=datetime(2026, 8, 9, 10)
     ).reads[0]
 
     assert read.limit_up == 2
@@ -357,11 +348,11 @@ def test_watched_symbols_are_recorded_on_the_sector() -> None:
     rows = [row(f"60000{i}", f"票{i}", 5.0) for i in range(1, 6)]
     rows += [row(f"60010{i}", f"其他{i}", 0.0) for i in range(10)]
     taxonomy = FakeTaxonomy(
-        [SectorDefinition("有色金属", "SW1", tuple(f"60000{i}.SH" for i in range(1, 6)))]
+        [SectorDefinition("有色金属", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(1, 6)))]
     )
 
     read = intraday.take_snapshot(
-        {"SW1": taxonomy},
+        {"THS_INDUSTRY": taxonomy},
         adapter=FakeScan(rows),
         now=datetime(2026, 8, 9, 10),
         watched_symbols={"600003"},
@@ -375,11 +366,11 @@ def test_one_broken_taxonomy_does_not_take_down_the_other() -> None:
     rows = [row(f"60000{i}", f"票{i}", 5.0) for i in range(1, 6)]
     rows += [row(f"60010{i}", f"其他{i}", 0.0) for i in range(10)]
     taxonomy = FakeTaxonomy(
-        [SectorDefinition("有色金属", "SW1", tuple(f"60000{i}.SH" for i in range(1, 6)))]
+        [SectorDefinition("有色金属", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(1, 6)))]
     )
 
     snapshot = intraday.take_snapshot(
-        {"SW1": taxonomy, "CONCEPT": BrokenTaxonomy()},
+        {"THS_INDUSTRY": taxonomy, "CONCEPT": BrokenTaxonomy()},
         adapter=FakeScan(rows),
         now=datetime(2026, 8, 9, 10),
     )
@@ -394,20 +385,20 @@ def test_thin_volume_marks_the_pass_untradable_but_still_records_it() -> None:
     rows = [row(f"60000{i}", f"票{i}", 5.0, amount_yi=0.1) for i in range(1, 6)]
     rows += [row(f"60010{i}", f"其他{i}", 0.0, amount_yi=0.1) for i in range(10)]
     taxonomy = FakeTaxonomy(
-        [SectorDefinition("测试", "SW1", tuple(f"60000{i}.SH" for i in range(1, 6)))]
+        [SectorDefinition("测试", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(1, 6)))]
     )
 
     snapshot = intraday.take_snapshot(
-        {"SW1": taxonomy}, adapter=FakeScan(rows), now=datetime(2026, 8, 9, 9, 31)
+        {"THS_INDUSTRY": taxonomy}, adapter=FakeScan(rows), now=datetime(2026, 8, 9, 9, 31)
     )
 
     assert snapshot.tradable is False
-    assert snapshot.reads                       # 读数照样算出来了
+    assert snapshot.reads  # 读数照样算出来了
     assert any("低于" in note and "闸门" in note for note in snapshot.notes)
 
 
 def test_industry_is_listed_before_concept() -> None:
-    """字母序会把 CONCEPT 排在 SW1 前面，于是每份简报都从 346 个概念开始读。"""
+    """字母序会把 CONCEPT 排在 THS_INDUSTRY 前面，于是每份简报都从 346 个概念开始读。"""
     snapshot = snapshot_of(
         [
             make_read("机器人概念", 3.0, level=intraday.LEVEL_CONCEPT),
@@ -423,7 +414,7 @@ def test_a_sector_with_too_few_quotes_gets_no_reading() -> None:
     scan_rows = {item.code: item for item in [row("600001", "甲", 3.0), row("600002", "乙", 2.0)]}
     reads, thin = intraday.measure(
         scan_rows,
-        [SectorDefinition("稀薄", "SW1", tuple(f"60000{i}.SH" for i in range(1, 7)))],
+        [SectorDefinition("稀薄", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(1, 7)))],
         market_median=0.0,
         total_amount_yi=100.0,
     )
@@ -432,13 +423,15 @@ def test_a_sector_with_too_few_quotes_gets_no_reading() -> None:
     assert thin == 1
 
 
-# ---- 序列落盘 --------------------------------------------------------------
+# 序列落盘
 
 
 def test_the_daily_series_round_trips(tmp_path) -> None:
     path = intraday.store_path("2026-08-09", root=tmp_path)
-    first = snapshot_of([make_read("有色金属", 2.0, watch_hits=(("600111", "北方稀土"),))],
-                        datetime(2026, 8, 9, 9, 40))
+    first = snapshot_of(
+        [make_read("有色金属", 2.0, watch_hits=(("600111", "北方稀土"),))],
+        datetime(2026, 8, 9, 9, 40),
+    )
     intraday.append(first, path)
     intraday.append(snapshot_of([make_read("有色金属", 4.0)], datetime(2026, 8, 9, 10, 20)), path)
 
@@ -463,27 +456,6 @@ def test_a_half_written_line_does_not_destroy_the_rest_of_the_series(tmp_path) -
 def test_the_baseline_is_the_first_line_not_the_whole_file(tmp_path) -> None:
     """告警层只要「当日第一条」。整份解析一遍只为取第一条，成本随当天已跑轮数
     线性涨——到收盘时是开盘时的三十倍。"""
-
-
-def test_old_series_files_are_pruned_by_the_date_in_their_name(tmp_path) -> None:
-    """一天约 3MB，是状态目录里最大的一类文件，一年不清就是 750MB。
-
-    **按文件名里的日期删，不按 mtime**：mtime 会被备份、rsync、镜像重建改掉，
-    于是「保留 30 天」在换一次部署方式之后可能变成删光或者一个不删。
-    """
-    today = date.today()
-    fresh = intraday.store_path(str(today), root=tmp_path)
-    recent = intraday.store_path(str(today - timedelta(days=5)), root=tmp_path)
-    stale = intraday.store_path(str(today - timedelta(days=90)), root=tmp_path)
-    junk = tmp_path / "intraday_sector_notadate.jsonl"
-    for path in (fresh, recent, stale, junk):
-        path.write_text("{}\n", encoding="utf-8")
-
-    removed = intraday.prune_history(keep_days=30, root=tmp_path)
-
-    assert removed == [stale.name]
-    assert fresh.exists() and recent.exists()
-    assert junk.exists()          # 名字对不上格式的不碰，宁可留着也不误删
     path = intraday.store_path("2026-08-09", root=tmp_path)
     for hour, excess in ((9, 1.0), (10, 3.0), (11, 5.0)):
         intraday.append(
@@ -497,35 +469,61 @@ def test_old_series_files_are_pruned_by_the_date_in_their_name(tmp_path) -> None
     assert baseline.reads[0].excess_pct == pytest.approx(1.0)
 
 
+def test_old_series_files_are_pruned_by_the_date_in_their_name(tmp_path) -> None:
+    """一天约 3MB，是状态目录里最大的一类文件，一年不清就是 750MB。
+
+    **按文件名里的日期删，不按 mtime**：mtime 会被备份、rsync、镜像重建改掉，
+    于是「保留 30 天」在换一次部署方式之后可能变成删光或者一个不删。
+    """
+    today = beijing_today()
+    fresh = intraday.store_path(str(today), root=tmp_path)
+    recent = intraday.store_path(str(today - timedelta(days=5)), root=tmp_path)
+    stale = intraday.store_path(str(today - timedelta(days=90)), root=tmp_path)
+    junk = tmp_path / "intraday_sector_notadate.jsonl"
+    for path in (fresh, recent, stale, junk):
+        path.write_text("{}\n", encoding="utf-8")
+
+    removed = intraday.prune_history(keep_days=30, root=tmp_path)
+
+    assert removed == [stale.name]
+    assert fresh.exists() and recent.exists()
+    assert junk.exists()  # 名字对不上格式的不碰，宁可留着也不误删
+
+
 def test_a_restarted_session_still_compares_against_the_open(tmp_path) -> None:
     """盘中重启是常事（改配置、断网重连）。基线记在内存里的话，13:00 重启的进程
     会拿 13:00 当「开盘」，于是「较开盘」悄悄变成「较重启」——而那正是排名跃升
     这条规则的全部判据。"""
     rows = [row(f"60000{i}", f"票{i}", 0.0, amount_yi=20.0) for i in range(1, 6)]
     rows += [row(f"60010{i}", f"其他{i}", 0.0, amount_yi=20.0) for i in range(10)]
-    definitions = [SectorDefinition("有色金属", "SW1", tuple(f"60000{i}.SH" for i in range(1, 6)))]
+    definitions = [
+        SectorDefinition("有色金属", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(1, 6)))
+    ]
 
     def build() -> SectorSession:
         return SectorSession(
             session_date=date(2026, 8, 10),
-            taxonomies={"SW1": FakeTaxonomy(definitions)},
+            taxonomies={"THS_INDUSTRY": FakeTaxonomy(definitions)},
             adapter=FakeScan(rows),
             store_root=tmp_path,
         )
 
-    build().poll(datetime(2026, 8, 10, 9, 40))          # 开盘那一轮落了基线
-    restarted = build()                                  # 换一个进程/实例
+    build().poll(datetime(2026, 8, 10, 9, 40))  # 开盘那一轮落了基线
+    restarted = build()  # 换一个进程/实例
     baseline = intraday.load_first(restarted.path)
 
     assert baseline is not None
-    assert baseline.as_of.hour == 9                      # 不是重启时刻
+    assert baseline.as_of.hour == 9  # 不是重启时刻
 
 
-@pytest.mark.parametrize("moment", [
-    datetime(2026, 8, 10, 9, 20),
-    datetime(2026, 8, 10, 12, 0),
-    datetime(2026, 8, 10, 15, 10),
-])
+@pytest.mark.parametrize(
+    "moment",
+    [
+        datetime(2026, 8, 10, 9, 20),
+        datetime(2026, 8, 10, 12, 0),
+        datetime(2026, 8, 10, 15, 10),
+    ],
+)
 def test_sector_session_skips_scans_outside_continuous_trading(tmp_path, moment) -> None:
     class MustNotFetch:
         def fetch(self):
@@ -543,7 +541,7 @@ def test_sector_session_skips_scans_outside_continuous_trading(tmp_path, moment)
     assert not session.path.exists()
 
 
-# ---- 跃迁告警 --------------------------------------------------------------
+# 跃迁告警
 
 
 def engine_state(tmp_path):
@@ -569,10 +567,12 @@ def test_a_rank_surge_fires_once_and_then_stays_quiet(tmp_path) -> None:
     """一个板块一天升一次就够说明问题。反复报名次会退化成实况解说。"""
     engine, state = engine_state(tmp_path)
     others = [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)]
-    first = snapshot_of([*others, make_read("有色金属", -1.0, advance=0.4)],
-                        datetime(2026, 8, 9, 9, 40))
-    later = snapshot_of([*others, make_read("有色金属", 5.0, advance=0.9)],
-                        datetime(2026, 8, 9, 10, 20))
+    first = snapshot_of(
+        [*others, make_read("有色金属", -1.0, advance=0.4)], datetime(2026, 8, 9, 9, 40)
+    )
+    later = snapshot_of(
+        [*others, make_read("有色金属", 5.0, advance=0.9)], datetime(2026, 8, 9, 10, 20)
+    )
 
     engine.evaluate(first, None, state, datetime(2026, 8, 9, 9, 40))
     alerts, _ = engine.evaluate(later, first, state, datetime(2026, 8, 9, 10, 20))
@@ -584,13 +584,108 @@ def test_a_rank_surge_fires_once_and_then_stays_quiet(tmp_path) -> None:
     assert again == []
 
 
+def test_sector_alerts_carry_their_preopen_plan_relationship(tmp_path) -> None:
+    """盘中异动要能回答：这是盘前主线被确认，还是盘中新冒出来的方向。"""
+    state = load_sector_state(date(2026, 8, 9), tmp_path / "sector.json")
+    engine = SectorTriggerEngine(
+        plan=SectorPlanContext(primary=frozenset({"有色金属"}), watch=frozenset({"机器人概念"}))
+    )
+    others = [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)]
+    first = snapshot_of(
+        [*others, make_read("有色金属", -1.0, advance=0.4)], datetime(2026, 8, 9, 9, 40)
+    )
+    later = snapshot_of(
+        [*others, make_read("有色金属", 5.0, advance=0.9)], datetime(2026, 8, 9, 10, 20)
+    )
+
+    engine.evaluate(first, None, state, datetime(2026, 8, 9, 9, 40))
+    alerts, _ = engine.evaluate(later, first, state, datetime(2026, 8, 9, 10, 20))
+
+    assert alerts[0].plan_tag == "盘前主线"
+    rendered = render_sector_alerts(alerts)
+    assert "【盘前主线】" in rendered
+    assert "按盘前候选池逐只核对触发条件" in rendered
+
+
+def test_intraday_monitor_loads_the_morning_sector_plan(tmp_path) -> None:
+    payload = {
+        "sectors": [{"name": "有色金属"}, {"name": "半导体"}],
+        "theme_radar": [{"name": "机器人概念", "sectors": ["机械设备"]}],
+        "rotation_price": {"rising": [{"name": "电力"}], "persistent": ["有色金属"]},
+        "turnover_migration": {"rising": [{"sector": "消费电子"}]},
+    }
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    plan, notes = _load_morning_sector_plan(tmp_path, date(2026, 8, 28))
+
+    assert plan.tag_for("有色金属") == "盘前主线"
+    assert plan.tag_for("电力") == "盘前观察"
+    assert plan.tag_for("消费电子") == "盘前观察"
+    assert plan.tag_for("银行") == "盘中新线索"
+    assert any("已载入盘前板块计划" in note for note in notes)
+
+
+def test_intraday_monitor_skips_a_stale_morning_sector_plan(tmp_path) -> None:
+    payload = {
+        "trade_date": "2026-08-27",
+        "sectors": [{"name": "昨日主线"}],
+    }
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    plan, notes = _load_morning_sector_plan(tmp_path, date(2026, 8, 28))
+
+    assert plan.tag_for("昨日主线") == "盘中新线索"
+    assert any("与本次监控交易日" in note for note in notes)
+
+
+def test_intraday_monitor_skips_non_executable_morning_plan(tmp_path) -> None:
+    payload = {
+        "trade_date": "2026-08-28",
+        "execution_ready": False,
+        "sectors": [{"name": "过期日线主线"}],
+    }
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    plan, notes = _load_morning_sector_plan(tmp_path, date(2026, 8, 28))
+
+    assert plan.tag_for("过期日线主线") == "盘中新线索"
+    assert any("不可执行" in note for note in notes)
+
+
+def test_new_intraday_sector_clues_are_observation_not_chase(tmp_path) -> None:
+    state = load_sector_state(date(2026, 8, 9), tmp_path / "sector.json")
+    engine = SectorTriggerEngine(plan=SectorPlanContext(primary=frozenset({"半导体"})))
+    others = [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)]
+    first = snapshot_of(
+        [*others, make_read("银行", -1.0, advance=0.4)], datetime(2026, 8, 9, 9, 40)
+    )
+    later = snapshot_of(
+        [*others, make_read("银行", 5.0, advance=0.9)], datetime(2026, 8, 9, 10, 20)
+    )
+
+    engine.evaluate(first, None, state, datetime(2026, 8, 9, 9, 40))
+    alerts, _ = engine.evaluate(later, first, state, datetime(2026, 8, 9, 10, 20))
+
+    rendered = render_sector_alerts(alerts)
+    assert alerts[0].plan_tag == "盘中新线索"
+    assert "只登记为新线索" in rendered
+    assert "不临时追高" in rendered
+
+
 def test_one_sector_gets_one_push_even_when_four_rules_fire(tmp_path) -> None:
     """排名跃升 + 转强 + 涨停潮 + 成交额虹吸说的是同一件事的四个侧面，而每条都
     贴着一模一样的证据块。分四条推出去正是通道被静音的原因。"""
     engine, state = engine_state(tmp_path)
     others = [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)]
-    first = snapshot_of([*others, make_read("有色金属", -1.0, advance=0.4)],
-                        datetime(2026, 8, 9, 9, 40))
+    first = snapshot_of(
+        [*others, make_read("有色金属", -1.0, advance=0.4)], datetime(2026, 8, 9, 9, 40)
+    )
     later = snapshot_of(
         [*others, make_read("有色金属", 5.0, advance=0.95, limit_up=6, share=0.05)],
         datetime(2026, 8, 9, 10, 20),
@@ -606,7 +701,7 @@ def test_one_sector_gets_one_push_even_when_four_rules_fire(tmp_path) -> None:
         assert folded in body
     # 折进正文的触发器也要记账，否则下一轮会把它们再单独报一遍。
     for trigger in ("tone_strong", "limit_up_wave", "amount_surge"):
-        assert state.fire_count("sector:SW1:有色金属", trigger) == 1
+        assert state.fire_count("sector:THS_INDUSTRY:有色金属", trigger) == 1
 
 
 def test_a_leading_sector_that_fades_asks_for_a_decision(tmp_path) -> None:
@@ -614,10 +709,12 @@ def test_a_leading_sector_that_fades_asks_for_a_decision(tmp_path) -> None:
     能提前于个股止损的信号。"""
     engine, state = engine_state(tmp_path)
     padding = [make_read(f"板块{i}", -1.0 - i * 0.1, advance=0.3) for i in range(15)]
-    strong = snapshot_of([make_read("有色金属", 4.0, advance=0.9), *padding],
-                         datetime(2026, 8, 9, 9, 40))
-    faded = snapshot_of([make_read("有色金属", 0.2, advance=0.5), *padding],
-                        datetime(2026, 8, 9, 11, 0))
+    strong = snapshot_of(
+        [make_read("有色金属", 4.0, advance=0.9), *padding], datetime(2026, 8, 9, 9, 40)
+    )
+    faded = snapshot_of(
+        [make_read("有色金属", 0.2, advance=0.5), *padding], datetime(2026, 8, 9, 11, 0)
+    )
 
     engine.evaluate(strong, None, state, datetime(2026, 8, 9, 9, 40))
     alerts, _ = engine.evaluate(faded, strong, state, datetime(2026, 8, 9, 11, 0))
@@ -629,10 +726,12 @@ def test_a_leading_sector_that_fades_asks_for_a_decision(tmp_path) -> None:
 def test_an_untradable_pass_produces_no_alerts(tmp_path) -> None:
     """排名已经被判为噪声，在噪声上做差分只会把噪声变成告警。"""
     engine, state = engine_state(tmp_path)
-    first = snapshot_of([make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)],
-                        datetime(2026, 8, 9, 9, 31))
-    noisy = snapshot_of([make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)],
-                        datetime(2026, 8, 9, 9, 33))
+    first = snapshot_of(
+        [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)], datetime(2026, 8, 9, 9, 31)
+    )
+    noisy = snapshot_of(
+        [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)], datetime(2026, 8, 9, 9, 33)
+    )
     noisy.tradable = False
 
     engine.evaluate(first, None, state, datetime(2026, 8, 9, 9, 31))
@@ -655,7 +754,7 @@ def test_truncation_is_never_silent(tmp_path) -> None:
     engine.evaluate(first, None, state, datetime(2026, 8, 9, 9, 40))
     alerts, notes = engine.evaluate(surge, first, state, datetime(2026, 8, 9, 10, 20))
 
-    assert len(alerts) == MAX_PER_HOUR      # 15 个板块同时转强，按额度截断
+    assert len(alerts) == MAX_PER_HOUR  # 15 个板块同时转强，按额度截断
     assert any("未推" in note for note in notes)
 
 
@@ -668,15 +767,18 @@ def test_morning_noise_cannot_silence_the_afternoon(tmp_path) -> None:
     下午的份。
     """
     engine, state = engine_state(tmp_path)
+
     # 机器人概念全天都在名单里，早盘垫底——真实盘面里 377 个板块每轮都有读数，
     # 一个「13:00 才第一次出现」的板块只会立基线（首见不是跃迁）。
     def board(robot_excess: float, robot_limit: int, hot: bool):
         return [
-            make_read("机器人概念", robot_excess, advance=0.95 if hot else 0.1,
-                      limit_up=robot_limit),
+            make_read(
+                "机器人概念", robot_excess, advance=0.95 if hot else 0.1, limit_up=robot_limit
+            ),
             *[
-                make_read(f"板块{i}", (4.0 - i * 0.05) if hot else 0.0,
-                          advance=0.95 if hot else 0.5)
+                make_read(
+                    f"板块{i}", (4.0 - i * 0.05) if hot else 0.0, advance=0.95 if hot else 0.5
+                )
                 for i in range(20)
             ],
         ]
@@ -707,8 +809,9 @@ def test_the_budget_counts_pushes_not_folded_triggers(tmp_path) -> None:
     """
     engine, state = engine_state(tmp_path)
     others = [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)]
-    first = snapshot_of([*others, make_read("有色金属", -1.0, advance=0.4)],
-                        datetime(2026, 8, 9, 9, 40))
+    first = snapshot_of(
+        [*others, make_read("有色金属", -1.0, advance=0.4)], datetime(2026, 8, 9, 9, 40)
+    )
     later = snapshot_of(
         [*others, make_read("有色金属", 5.0, advance=0.95, limit_up=6, share=0.05)],
         datetime(2026, 8, 9, 10, 20),
@@ -721,6 +824,38 @@ def test_the_budget_counts_pushes_not_folded_triggers(tmp_path) -> None:
     # 记了 4 个触发器，但只扣 1 条额度（另一条额度是首轮的开盘总览）
     assert sum(int(r.get("count") or 0) for r in state.fired.values()) >= 4
     assert _PushLedger(state).spent_today() == 2
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (123, 0),
+        (["bad", "2026-08-08T10:10:00", "2026-08-09T02:10:00Z"], 1),
+    ],
+)
+def test_push_budget_ignores_bad_records_and_uses_the_session_timezone(tmp_path, raw, expected):
+    _, state = engine_state(tmp_path)
+    state.set_state("__pushes__", {"at": raw})
+
+    ledger = _PushLedger(state)
+
+    assert ledger.spent_today() == expected
+    assert ledger.spent_this_hour(datetime(2026, 8, 9, 10, 20)) == expected
+
+
+def test_bad_previous_sector_numbers_do_not_create_transitions_or_stop_monitoring(tmp_path):
+    engine, state = engine_state(tmp_path)
+    first = snapshot_of([make_read("有色金属", 0.2, advance=0.5)], datetime(2026, 8, 9, 9, 40))
+    engine.evaluate(first, None, state, first.as_of)
+    state.set_state("sector:THS_INDUSTRY:有色金属", {"tone": "强", "rank": "bad", "limit_up": []})
+    later = snapshot_of(
+        [make_read("有色金属", 0.2, advance=0.5, limit_up=6)], datetime(2026, 8, 9, 10, 20)
+    )
+
+    alerts, _ = engine.evaluate(later, first, state, later.as_of)
+
+    assert alerts == []
+    assert state.state_of("sector:THS_INDUSTRY:有色金属")["limit_up"] == 6
 
 
 def test_alerts_touching_watched_symbols_are_ranked_first(tmp_path) -> None:
@@ -749,7 +884,7 @@ def test_alerts_touching_watched_symbols_are_ranked_first(tmp_path) -> None:
     alerts, _ = engine.evaluate(later, first, state, datetime(2026, 8, 9, 10, 20))
 
     assert [item.trigger for item in alerts] == ["tone_strong", "tone_strong"]
-    assert alerts[0].sector == "我的板块"        # 超额更低，但命中持仓
+    assert alerts[0].sector == "我的板块"  # 超额更低，但命中持仓
     assert alerts[0].touches_watched is True
 
 
@@ -759,9 +894,7 @@ def test_a_strong_sector_outside_the_attention_band_stays_quiet(tmp_path) -> Non
     engine, state = engine_state(tmp_path)
     hot = [make_read(f"热门{i}", 5.0 - i * 0.01, advance=0.9) for i in range(40)]
     first = snapshot_of([*hot, make_read("冷门", 0.0, advance=0.5)], datetime(2026, 8, 9, 9, 40))
-    later = snapshot_of(
-        [*hot, make_read("冷门", 1.5, advance=0.9)], datetime(2026, 8, 9, 10, 20)
-    )
+    later = snapshot_of([*hot, make_read("冷门", 1.5, advance=0.9)], datetime(2026, 8, 9, 10, 20))
 
     engine.evaluate(first, None, state, datetime(2026, 8, 9, 9, 40))
     alerts, _ = engine.evaluate(later, first, state, datetime(2026, 8, 9, 10, 20))
@@ -782,17 +915,19 @@ def test_todays_sector_alerts_are_readable_by_chat_ask_and_state(tmp_path) -> No
     `AlertState.load(today).fired_summary()` 时只看得到个股那一份，问「今天板块
     有什么异动」会答「没有任何告警」——而实际上推过。所以要有这条读回路径。
 
-    顺带把 key 拆回可读形式：`fired_summary()` 里是 `SECTOR:SW1:有色金属`。
+    顺带把 key 拆回可读形式：`fired_summary()` 里是 `SECTOR:THS_INDUSTRY:有色金属`。
     """
     session = date(2026, 8, 9)
     path = tmp_path / "sector.json"
     engine = SectorTriggerEngine()
     state = load_sector_state(session, path)
     others = [make_read(f"板块{i}", 3.0 - i * 0.2) for i in range(15)]
-    first = snapshot_of([*others, make_read("有色金属", -1.0, advance=0.4)],
-                        datetime(2026, 8, 9, 9, 40))
-    later = snapshot_of([*others, make_read("有色金属", 5.0, advance=0.95)],
-                        datetime(2026, 8, 9, 10, 20))
+    first = snapshot_of(
+        [*others, make_read("有色金属", -1.0, advance=0.4)], datetime(2026, 8, 9, 9, 40)
+    )
+    later = snapshot_of(
+        [*others, make_read("有色金属", 5.0, advance=0.95)], datetime(2026, 8, 9, 10, 20)
+    )
     engine.evaluate(first, None, state, datetime(2026, 8, 9, 9, 40))
     engine.evaluate(later, first, state, datetime(2026, 8, 9, 10, 20))
     state.save()
@@ -801,7 +936,7 @@ def test_todays_sector_alerts_are_readable_by_chat_ask_and_state(tmp_path) -> No
 
     hit = next(row for row in rows if row["sector"] == "有色金属")
     assert hit["sector_label"] == "行业"
-    assert hit["level"] == "SW1"
+    assert hit["level"] == "THS_INDUSTRY"
     assert hit["label"] == "排名跃升"
     assert hit["alert_level"] == "ACTION"
 
@@ -816,7 +951,7 @@ def test_todays_sector_alerts_are_readable_by_chat_ask_and_state(tmp_path) -> No
     assert all(not str(row["sector"]).startswith("__") for row in rows)
 
 
-# ---- 会话编排 --------------------------------------------------------------
+# 会话编排
 
 
 def test_the_session_degrades_to_a_note_when_the_scan_fails(tmp_path) -> None:
@@ -828,7 +963,7 @@ def test_the_session_degrades_to_a_note_when_the_scan_fails(tmp_path) -> None:
 
     session = SectorSession(
         session_date=date(2026, 8, 9),
-        taxonomies={"SW1": FakeTaxonomy([])},
+        taxonomies={"THS_INDUSTRY": FakeTaxonomy([])},
         adapter=ExplodingAdapter(),
         store_root=tmp_path,
     )
@@ -845,8 +980,12 @@ def test_the_session_writes_one_line_per_pass(tmp_path) -> None:
     session = SectorSession(
         session_date=date(2026, 8, 9),
         taxonomies={
-            "SW1": FakeTaxonomy(
-                [SectorDefinition("有色金属", "SW1", tuple(f"60000{i}.SH" for i in range(1, 6)))]
+            "THS_INDUSTRY": FakeTaxonomy(
+                [
+                    SectorDefinition(
+                        "有色金属", "THS_INDUSTRY", tuple(f"60000{i}.SH" for i in range(1, 6))
+                    )
+                ]
             )
         },
         adapter=FakeScan(rows),
@@ -862,7 +1001,7 @@ def test_the_session_writes_one_line_per_pass(tmp_path) -> None:
     assert history[0].reads[0].watch_hits == (("600003", "票3"),)
 
 
-# ---- 与个股循环的接线 ------------------------------------------------------
+# 与个股循环的接线
 
 
 class CountingSectorSession:
@@ -888,7 +1027,7 @@ class CountingSectorSession:
                     headline="行业·有色金属 排名跃升 14→1",
                     detail=["证据"],
                     sector="有色金属",
-                    sector_level="SW1",
+                    sector_level="THS_INDUSTRY",
                     as_of=now,
                 )
             ]
@@ -920,7 +1059,7 @@ def test_the_sector_pass_runs_on_its_own_cadence() -> None:
         sector_every=5,
     )
 
-    assert len(sector.polls) == 3          # 第 1、6、11 轮
+    assert len(sector.polls) == 3  # 第 1、6、11 轮
 
 
 def test_the_sector_pass_is_skipped_outside_the_session() -> None:
@@ -930,7 +1069,7 @@ def test_the_sector_pass_is_skipped_outside_the_session() -> None:
         session=QuietSession(),
         watch_symbols=list,
         notifiers=[],
-        now_fn=lambda: datetime(2026, 8, 10, 12, 0),   # 午休
+        now_fn=lambda: datetime(2026, 8, 10, 12, 0),  # 午休
         sleep=lambda seconds: None,
         max_passes=6,
         sector_session=sector,
@@ -979,7 +1118,7 @@ def test_sector_alerts_are_published_with_their_own_title() -> None:
     assert "先看哪里" in body
 
 
-# ---- 空名单 ----------------------------------------------------------------
+# 空名单
 
 
 def test_an_empty_position_list_still_runs_the_sector_monitor(monkeypatch) -> None:
@@ -1018,3 +1157,23 @@ def test_disabling_sectors_on_an_empty_position_list_says_so(monkeypatch) -> Non
 
     assert summary["passes"] == 0
     assert any("没有任何可做的事" in note for note in summary["notes"])
+
+
+def test_disabling_sectors_does_not_load_the_morning_sector_plan(tmp_path) -> None:
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps({"trade_date": "2026-08-10", "sectors": [{"name": "有色金属"}]}),
+        encoding="utf-8",
+    )
+
+    summary = run_monitor(
+        adapter=None,
+        once=True,
+        notifiers=[],
+        news_source=None,
+        trade_date=date(2026, 8, 10),
+        now=datetime(2026, 8, 10, 10, 0),
+        output_dir=tmp_path,
+        sectors=False,
+    )
+
+    assert not any("盘前板块计划" in note for note in summary["notes"])

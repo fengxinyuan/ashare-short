@@ -1,54 +1,8 @@
-"""板块跃迁告警：只在**板块状态发生变化**时说话。
+"""板块状态跃迁告警，复用 AlertState 的冷却与去重。
 
-和 `monitor/triggers.py` 同一条纪律，理由也一样：板块截面每几轮取一次，一整天
-下来有二三十轮。一条写成「有色金属现在很强」的规则会响二三十次，而**同一条消息
-说第二遍就已经没有信息了**——第三遍开始它在训练你忽略这个通道。所以这里每一条
-都是跃迁：它**之前不在**前十、**现在进了**；它**之前是强**、**现在不是**。
-
-## 为什么不塞进 `triggers.py`
-
-那个 `TriggerEngine` 的每个入口都吃 `StockAdvice + IntradaySnapshot + HoldingView`。
-板块没有止损、没有成本价、没有五档、没有持仓。硬塞进去要给一半参数传 None，
-然后在每条规则里判一次「这是板块还是个股」。共用的那部分——跃迁判定、冷却、
-每日一次——本来就不在 `TriggerEngine` 里，而在 `state/alerts.py`，这里直接复用它。
-
-## 状态存在哪
-
-**另开一个文件**，不与个股共用。`AlertState` 是「读进来 → 改 → 整份写回」，
-两个引擎各持一个实例指向同一个路径的话，后写的那个会把前一个的记录整片抹掉——
-而那正是「这条今天已经发过了」的唯一凭证。分开之后 `/alerts` 里也不会混进
-一堆看起来像代码的板块名。
-
-## 噪声预算
-
-行业 31 个 + 概念 346 个 = 377 个板块。**普涨的早盘里，几十个板块会同时「转强」。**
-四道闸，数的都是**推送条数**（同一板块的多条触发器先合并成一条）：
-
-1. **只看各自层级的前 `ATTENTION_RANK` 名。** 排在第 120 的概念转强不是新闻。
-2. **同一板块一轮只发一条**（`_merge_by_sector`）。一次跃迁经常同时命中四条规则，
-   而它们贴的是同一个证据块。
-3. **每轮最多 `MAX_PER_PASS` 条**，并把被截掉的条数写进 notes——**静默截断会让
-   「只推了 3 条」读起来像「只发生了 3 件事」**。
-4. **每小时最多 `MAX_PER_HOUR` 条 + 全天最多 `MAX_PER_SESSION` 条。**
-
-第 4 条里「每小时」那一层是实测补上的。30 轮模拟里，只有全天上限时早盘半小时的
-排名 churn 会把当天额度一次吃光，于是 13:00 一个九家涨停的真涨停潮**一条都推不
-出来**——而被它挤掉额度的那些，恰恰是成交额基数最小、名次最不稳的时段推出来的。
-一个把噪声挡在门外的机制反过来变成了漏报机制，比没有它更糟。按小时分配之后，
-早盘再吵也吵不掉下午的份。
-
-**预算数的是推送不是触发器**（`_PushLedger`）。按触发器数的话，一条「排名跃升
-（同时触发：转强、涨停潮）」记 3 笔，「全天 20 条」实际上七八条就闭嘴。
-
-> 上面这些阈值是**按噪声预算推的，没有回测**。同 `sectors/rotation.py`、五档
-> 那几层的处置：先落台账观察，等 `review` 能回答「排名跃升的板块选出来的票
-> 兑现率高多少」，再谈要不要动它们。目前 `rank_surge` 是最吵的一条。
-
-## 不做的事
-
-- **不预测。** 「排名跃升说明资金正在进场」这类话不写。每条告警都是对已经发生的
-  截面变化的陈述句，与 `sectors/rotation.py` 的处置一致。
-- **不打分、不进选股。** 板块告警是「先看哪里」，不是「买什么」。
+只关注各层前列板块，同板块同轮触发合并为一条推送。
+按每轮、每小时、每交易日限制推送条数，截断数量写入 notes。
+板块告警单独持久化；阈值用于控制噪声，结果不参与评分或选股。
 """
 
 from __future__ import annotations
@@ -58,6 +12,8 @@ from datetime import date, datetime
 from typing import Any
 
 from ashare_decision_support.monitor.triggers import LEVEL_ACTION, LEVEL_INFO, LEVEL_WARN
+from ashare_decision_support.numeric import finite, positive
+from ashare_decision_support.schedule.timezone import to_beijing_naive
 from ashare_decision_support.sectors.intraday import (
     LEVEL_LABEL,
     SectorRead,
@@ -88,7 +44,7 @@ AMOUNT_SURGE_MIN_SHARE = 0.02
 
 # 噪声预算，三层。数的都是**推送条数**，不是触发器条数——同一板块多条触发器
 # 合并成一条推送后只算一条（见 `_PushLedger`）。
-#
+
 # 每轮上限：一条推送要能读完。一轮真出现三十条变化时，截断比全发有用。
 MAX_PER_PASS = 5
 
@@ -138,6 +94,25 @@ POLICIES: dict[str, SectorTriggerPolicy] = {
 
 
 @dataclass(frozen=True)
+class SectorPlanContext:
+    """盘前计划给盘中告警的上下文。
+
+    这里只做标注，不改变触发阈值。盘前看好的方向如果盘中不动，就不会凭空推送；
+    盘中突发的新方向如果真的触发，也会被标成新线索。
+    """
+
+    primary: frozenset[str] = frozenset()
+    watch: frozenset[str] = frozenset()
+
+    def tag_for(self, sector: str) -> str:
+        if sector in self.primary:
+            return "盘前主线"
+        if sector in self.watch:
+            return "盘前观察"
+        return "盘中新线索" if sector else ""
+
+
+@dataclass(frozen=True)
 class SectorAlert:
     """一条板块告警。`sector` 为空表示这是一条跨板块的总览（`session_open`）。"""
 
@@ -154,6 +129,8 @@ class SectorAlert:
     excess_pct: float | None = None
     rank: int | None = None
     as_of: datetime | None = None
+    # 和盘前简报的关系：盘前主线 / 盘前观察 / 盘中新线索。
+    plan_tag: str = ""
     # 这个板块里命中的持仓（或本轮显式盯的）标的，用于排序时优先。
     watch_hits: tuple[tuple[str, str], ...] = ()
 
@@ -171,6 +148,7 @@ def load_sector_state(session: date, path: Any | None = None) -> AlertState:
     """板块告警自己的状态文件。**不能与个股共用**——见模块开头「状态存在哪」。"""
     resolved = path if path is not None else state_path("alerts", f"sector-{session}.json")
     return AlertState.load(session, resolved)
+
 
 # `AlertState.observed` 里放推送流水的保留键。借用 observed 而不是新开一个状态
 # 文件，是因为它本来就是「随告警状态一起原子写回」的那份数据——预算账和
@@ -197,11 +175,13 @@ class _PushLedger:
         self._state = state
         raw = state.state_of(PUSH_LEDGER_KEY).get("at") or []
         self.stamps: list[datetime] = []
-        for item in raw:
+        for item in raw if isinstance(raw, list) else []:
             try:
-                self.stamps.append(datetime.fromisoformat(str(item)))
-            except ValueError:
+                stamp = to_beijing_naive(datetime.fromisoformat(str(item)))
+            except (ValueError, OverflowError):
                 continue
+            if stamp.date() == state.session:
+                self.stamps.append(stamp)
 
     def spent_today(self) -> int:
         return len(self.stamps)
@@ -225,7 +205,7 @@ def fired_sectors_today(session: date, path: Any | None = None) -> list[dict]:
     「今天板块有什么异动」会得到「今天没有任何告警」，而实际上推过五条。
 
     顺带把 key 拆回可读形式：`fired_summary()` 的 symbol 是
-    `SECTOR:SW1:有色金属`（`normalize_symbol` 会整体大写），直接印出来像个代码。
+    `SECTOR:THS_INDUSTRY:工业金属`（`normalize_symbol` 会整体大写），直接印出来像个代码。
     """
     rows: list[dict] = []
     for row in load_sector_state(session, path).fired_summary():
@@ -262,12 +242,14 @@ class SectorTriggerEngine:
         max_per_pass: int = MAX_PER_PASS,
         max_per_hour: int = MAX_PER_HOUR,
         max_per_session: int = MAX_PER_SESSION,
+        plan: SectorPlanContext | None = None,
     ) -> None:
         self.levels = tuple(levels)
         self.attention_rank = attention_rank
         self.max_per_pass = max_per_pass
         self.max_per_hour = max_per_hour
         self.max_per_session = max_per_session
+        self.plan = plan or SectorPlanContext()
 
     def evaluate(
         self,
@@ -276,12 +258,9 @@ class SectorTriggerEngine:
         state: AlertState,
         now: datetime,
     ) -> tuple[list[SectorAlert], list[str]]:
-        """返回 (要推的告警, notes)。notes 里一定写清楚被预算截掉了多少条。
+        """返回待推送告警与 notes，并报告预算截断数量。
 
-        `baseline` 是**当日第一条**截面，只用来算「较开盘」。「较上一轮」不从这里
-        来——它在 `state.observed` 里，一个板块一条状态，不需要整段序列。
-        这也是这个参数收成一条快照而不是一个 `history` 列表的原因：早先传整段，
-        但用到的永远只有 `history[0]`，签名承诺的比实际用到的多一个量级。
+        baseline 为当日首条截面；前次状态从 state.observed 读取，分别用于开盘变化和逐轮跃迁。
         """
         notes: list[str] = []
         if not snapshot.tradable:
@@ -330,7 +309,7 @@ class SectorTriggerEngine:
         notes.extend(dropped)
         return emitted, notes
 
-    # ---- 单个板块的跃迁 ---------------------------------------------------
+    # 单个板块的跃迁
 
     def _sector_alerts(
         self,
@@ -344,6 +323,8 @@ class SectorTriggerEngine:
     ) -> list[SectorAlert]:
         alerts: list[SectorAlert] = []
         attention = rank <= self.attention_rank
+        previous_limit_up = finite(previous.get("limit_up"))
+        previous_rank = positive(previous.get("rank"))
         label = f"{LEVEL_LABEL.get(read.level, read.level)}·{read.name}"
 
         def make(trigger: str, headline: str, extra: list[str]) -> SectorAlert:
@@ -359,15 +340,12 @@ class SectorTriggerEngine:
                 excess_pct=read.excess_pct,
                 rank=rank,
                 as_of=now,
+                plan_tag=self.plan.tag_for(read.name),
                 watch_hits=read.watch_hits,
             )
 
         # 1) 排名跃升——「资金正在往这里挪」
-        if (
-            attention
-            and first_rank is not None
-            and first_rank - rank >= RANK_SURGE_STEPS
-        ):
+        if attention and first_rank is not None and first_rank - rank >= RANK_SURGE_STEPS:
             alerts.append(
                 make(
                     "rank_surge",
@@ -394,7 +372,9 @@ class SectorTriggerEngine:
 
         # 3) 涨停潮
         if (
-            int(previous.get("limit_up") or 0) <= LIMIT_WAVE_BEFORE
+            previous_limit_up is not None
+            and 0 <= previous_limit_up <= LIMIT_WAVE_BEFORE
+            and previous_limit_up.is_integer()
             and read.limit_up >= LIMIT_WAVE_AFTER
         ):
             alerts.append(
@@ -435,7 +415,8 @@ class SectorTriggerEngine:
         if (
             previous.get("tone") == "强"
             and current.get("tone") != "强"
-            and int(previous.get("rank") or 999) <= FADE_RANK_LIMIT
+            and previous_rank is not None
+            and previous_rank <= FADE_RANK_LIMIT
         ):
             alerts.append(
                 make(
@@ -455,7 +436,8 @@ class SectorTriggerEngine:
         if (
             first_rank is not None
             and rank - first_rank >= RANK_SURGE_STEPS
-            and int(previous.get("rank") or 999) <= FADE_RANK_LIMIT
+            and previous_rank is not None
+            and previous_rank <= FADE_RANK_LIMIT
         ):
             alerts.append(
                 make(
@@ -467,7 +449,7 @@ class SectorTriggerEngine:
 
         return alerts
 
-    # ---- 开盘总览 ---------------------------------------------------------
+    # 开盘总览
 
     def _session_open(self, snapshot: SectorSnapshot, now: datetime) -> SectorAlert | None:
         detail: list[str] = []
@@ -502,7 +484,7 @@ class SectorTriggerEngine:
             as_of=now,
         )
 
-    # ---- 预算 -------------------------------------------------------------
+    # 预算
 
     def _apply_budget(
         self, candidates: list[SectorAlert], state: AlertState, now: datetime
@@ -577,7 +559,7 @@ class SectorTriggerEngine:
         return max(0, room), None
 
 
-# ---- 内部 -----------------------------------------------------------------
+# 内部
 
 
 def _merge_by_sector(
@@ -600,7 +582,7 @@ def _merge_by_sector(
     merged: list[SectorAlert] = []
     folded: dict[int, tuple[str, ...]] = {}
     for members in groups.values():
-        primary = members[0]           # 调用方已按 `_priority` 排过序
+        primary = members[0]  # 调用方已按 `_priority` 排过序
         others = members[1:]
         if others:
             detail = [
@@ -619,6 +601,7 @@ def _merge_by_sector(
                 excess_pct=primary.excess_pct,
                 rank=primary.rank,
                 as_of=primary.as_of,
+                plan_tag=primary.plan_tag,
                 watch_hits=primary.watch_hits,
             )
         merged.append(primary)
@@ -661,7 +644,6 @@ def _priority(alert: SectorAlert) -> tuple:
         0 if alert.touches_watched else 1,
         -abs(alert.excess_pct or 0.0),
     )
-
 
 
 def _read_detail(read: SectorRead, rank: int, first_rank: int | None) -> list[str]:

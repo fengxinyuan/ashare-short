@@ -1,12 +1,6 @@
-"""盘中时钟：交易时段内「现在是第几分钟」。
+"""沪深交易时钟：累计交易分钟数排除 11:30–13:00 午休。
 
-沪深两市一天开两段（09:30–11:30、13:00–15:00），中间休市 90 分钟。任何按「开盘
-以来第几分钟」推导的读数——分时均价的分母、量能的时间进度、集合竞价之后的
-成交节奏——都必须把午休那段挖掉，否则 13:05 会被算成开盘后 215 分钟，而它实际
-上只走了 125 分钟的交易时间。量比会因此系统性偏低约四成。
-
-三个适配器此前各写了一份逐字相同的实现。放在这里是因为这是**市场规则**，
-不是某个数据源的解析细节。
+供日内成交量进度与分时分析共用，13:05 对应开盘后 125 个交易分钟。
 """
 
 from __future__ import annotations
@@ -18,10 +12,23 @@ MORNING_CLOSE = time(11, 30)
 AFTERNOON_OPEN = time(13, 0)
 AFTERNOON_CLOSE = time(15, 0)
 
+# 集合竞价开始报价的时刻。从这一刻起，行情源里的成交额、涨跌幅、涨停池都是
+# **今天还没走完**的数：`ask/context.py` 据此起算「盘前 → 盘中」，
+# `schedule/calendar.py:session_forming` 据此判断此刻拿到的全市场读数是不是半截。
+AUCTION_OPEN = time(9, 15)
+
 # 上午段的分钟数。午休之后的计时从这里接着往上走。
 MORNING_MINUTES = 120
 # 全天交易分钟数。
 SESSION_MINUTES = 240
+
+# 一天按时刻分成的四个阶段。`ask/context.py` 据此决定装配哪些上下文，
+# `factcheck.py` 据此判定文字里的即时动作是否越界——后者不能 import `ask/`
+# （`ask/` 依赖包根，反过来成环），所以取值放在这里而不是各写一份字面量。
+PHASE_PRE_OPEN = "pre_open"
+PHASE_INTRADAY = "intraday"
+PHASE_POST_CLOSE = "post_close"
+PHASE_OFF_HOURS = "off_hours"
 
 
 def minutes_since_open(moment: datetime) -> int:
@@ -46,7 +53,14 @@ def minutes_since_open(moment: datetime) -> int:
 def is_continuous_session(moment: datetime) -> bool:
     """Whether live A-share quotes should be moving at this moment."""
     current = moment.time().replace(tzinfo=None)
-    return (
-        MORNING_OPEN <= current <= MORNING_CLOSE
-        or AFTERNOON_OPEN <= current <= AFTERNOON_CLOSE
-    )
+    return MORNING_OPEN <= current <= MORNING_CLOSE or AFTERNOON_OPEN <= current <= AFTERNOON_CLOSE
+
+
+def within_session_hours(moment: datetime) -> bool:
+    """集合竞价已开始、尚未收盘。午休也算在内：午休时的成交额同样只是上半场。
+
+    只看钟，不看日历——周末与节假日由 `schedule/calendar.py:session_forming` 判，
+    这里没有日历。
+    """
+    current = moment.time().replace(tzinfo=None)
+    return AUCTION_OPEN <= current < AFTERNOON_CLOSE

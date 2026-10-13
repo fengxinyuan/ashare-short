@@ -229,12 +229,10 @@ def build_factor_contexts(
 
     outlooks = list(sector_outlooks or [])
     sector_map = {
-        str(item.name): _sector_context(item, _max_sector_flow(outlooks))
-        for item in outlooks
+        str(item.name): _sector_context(item, _max_sector_flow(outlooks)) for item in outlooks
     }
     symbol_sectors = {
-        normalize_symbol(symbol): sector
-        for symbol, sector in (sector_of or {}).items()
+        normalize_symbol(symbol): sector for symbol, sector in (sector_of or {}).items()
     }
     inflows = _normalise_numeric_map(net_inflow_by_symbol)
     trade_flows = {
@@ -243,8 +241,7 @@ def build_factor_contexts(
         if isinstance(value, Mapping)
     }
     earnings = {
-        normalize_symbol(symbol): value
-        for symbol, value in (earnings_by_symbol or {}).items()
+        normalize_symbol(symbol): value for symbol, value in (earnings_by_symbol or {}).items()
     }
 
     merged_flows: dict[str, float] = dict(inflows)
@@ -259,12 +256,7 @@ def build_factor_contexts(
     max_flow = max((abs(value) for value in merged_flows.values()), default=0.0)
 
     result: dict[str, StockFactorContext] = {}
-    known_symbols = (
-        set(symbol_sectors)
-        | set(merged_flows)
-        | set(large_flows)
-        | set(earnings)
-    )
+    known_symbols = set(symbol_sectors) | set(merged_flows) | set(large_flows) | set(earnings)
     for symbol in known_symbols:
         sector_name = symbol_sectors.get(symbol, "")
         row = market_scan.get(symbol) if market_scan is not None else None
@@ -313,7 +305,11 @@ def _sector_context(outlook: Any, max_flow: float) -> SectorFactorContext:
 
 def _max_sector_flow(outlooks: list[Any]) -> float:
     return max(
-        (abs(value) for value in (finite(getattr(item, "net_inflow", None)) for item in outlooks) if value is not None),
+        (
+            abs(value)
+            for value in (finite(getattr(item, "net_inflow", None)) for item in outlooks)
+            if value is not None
+        ),
         default=0.0,
     )
 

@@ -26,7 +26,7 @@ from ashare_decision_support.numeric import as_int, clamp, finite, first_finite,
         (-3.25, -3.25),
         (0.0, 0.0),
         ("12.5", 12.5),
-        ("  12.5  ", 12.5),          # 两头的空白要剥掉
+        ("  12.5  ", 12.5),  # 两头的空白要剥掉
         ("1e3", 1000.0),
     ],
 )
@@ -38,10 +38,23 @@ def test_finite_accepts_anything_that_is_a_real_number(value, expected) -> None:
     "value",
     [
         None,
-        "", "-", "--", "null", "None", "N/A", "n/a", "nan",   # 缺失占位
-        "abc", "12.5.6",
-        float("nan"), float("inf"), float("-inf"),            # 非读数
-        [], {}, (), object(),
+        "",
+        "-",
+        "--",
+        "null",
+        "None",
+        "N/A",
+        "n/a",
+        "nan",  # 缺失占位
+        "abc",
+        "12.5.6",
+        float("nan"),
+        float("inf"),
+        float("-inf"),  # 非读数
+        [],
+        {},
+        (),
+        object(),
     ],
 )
 def test_finite_refuses_everything_else(value) -> None:
@@ -64,8 +77,7 @@ def test_numpy_scalars_are_converted_not_passed_through() -> None:
     """**这条钉的是 `type(...) is float` 而不是 `isinstance(...)`。**
 
     `numpy.float64` 是 `float` 的子类。用 `isinstance` 做快路判断会让一个 numpy
-    标量原样返回给下游——而 `adapters/qmt_xtdata._to_plain` 整个存在的理由就是
-    不让 numpy 标量漏进来。
+    标量原样返回给下游，违反 `finite()` 统一返回原生 float 的契约。
     """
     np = pytest.importorskip("numpy")
 
@@ -124,5 +136,5 @@ def test_as_int_goes_through_finite_first() -> None:
     assert as_int("3.0") == 3
     assert as_int(3.9) == 3
     assert as_int(float("nan")) == 0
-    assert as_int(True) == 0          # bool 被 finite 挡掉，不是 1
+    assert as_int(True) == 0  # bool 被 finite 挡掉，不是 1
     assert as_int(None, default=-1) == -1

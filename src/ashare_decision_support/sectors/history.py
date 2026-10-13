@@ -1,34 +1,27 @@
-"""Persist and summarise recent sector leadership.
+"""按日期与分类保存板块排名，描述已发生的主线延续与轮动。
 
-This fills one of the project-wide gaps called out in `docs/ROADMAP.md`: the
-system could rank sectors for *today*, but it had no structured memory of what
-led over the last few sessions. The goal here is deliberately modest:
-
-- store the recent top-ranked sectors under the state directory;
-- derive a lightweight "主线延续 / 温和轮动 / 轮动加快" summary from that history;
-- keep the summary deterministic and local to the sector layer.
-
-It does **not** invent a second scoring system. The memory reads the ranking the
-project already produced and describes how stable that ranking has been.
+写入复用状态锁；坏记录按条隔离。回看窗口为最近一次记录向前的自然日范围，
+available_days 表示其中实际记录的日期数，不补猜缺失的交易日或排名。
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from datetime import date, timedelta
+from collections import Counter
+from dataclasses import dataclass, replace
+from datetime import date
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
-from ashare_decision_support.sectors.base import SectorOutlook
+from ashare_decision_support.jsoncache import read_stamped
+from ashare_decision_support.sectors.base import LEVEL_INDUSTRY, SectorOutlook
 from ashare_decision_support.state.paths import state_path
-from ashare_decision_support.state.store import read_json, write_json
+from ashare_decision_support.state.store import file_lock, write_json
 
 HISTORY_SCHEMA = "sector-rotation-v1"
-# 记忆按 level 分桶存。写入方是 `jobs/morning.py`（`MorningConfig.sector_level`），
-# 读取方是 `research/monthly.py`——两边各写一个字面量的话，`morning --level SW2`
-# 跑一天之后月度包会静默读到一个空桶，而空桶的表现和「今天没有轮动」一模一样。
-DEFAULT_LEVEL = "SW1"
+# 写入方 morning 与读取方 monthly 共用分类名称。
+DEFAULT_LEVEL = LEVEL_INDUSTRY
 DEFAULT_LEADER_COUNT = 5
 DEFAULT_LOOKBACK_DAYS = 5
 DEFAULT_HISTORY_DEPTH = 20
@@ -94,30 +87,28 @@ class SectorRotationStore:
         return self.summarize(trade_date, level, lookback_days, leader_count)
 
     def record(self, trade_date: date, level: str, outlooks: list[SectorOutlook]) -> None:
-        payload = self._load_payload()
         record = {
             "trade_date": str(trade_date),
             "level": level,
             "leaders": [
                 self._serialize(index, item)
                 for index, item in enumerate(
-                    [row for row in outlooks if getattr(row, "trusted", True)][: self.history_depth],
+                    islice((row for row in outlooks if row.trusted), self.history_depth),
                     start=1,
                 )
             ],
         }
-        records = [
-            item
-            for item in payload["records"]
-            if not (
-                item.get("trade_date") == record["trade_date"]
-                and item.get("level") == record["level"]
-            )
-        ]
-        records.append(record)
-        records.sort(key=lambda item: (str(item.get("level") or ""), str(item.get("trade_date") or "")))
-        payload["records"] = records
-        write_json(self.path, payload)
+        with file_lock(self.path):
+            payload = self._load_payload()
+            records = [
+                item
+                for item in payload["records"]
+                if (item["trade_date"], item["level"]) != (record["trade_date"], record["level"])
+            ]
+            records.append(record)
+            records.sort(key=lambda item: (item["level"], item["trade_date"]))
+            payload["records"] = records
+            write_json(self.path, payload)
 
     def summarize(
         self,
@@ -126,45 +117,38 @@ class SectorRotationStore:
         lookback_days: int = DEFAULT_LOOKBACK_DAYS,
         leader_count: int = DEFAULT_LEADER_COUNT,
     ) -> RotationSummary:
+        lookback_days = max(1, lookback_days)
         leader_count = max(1, leader_count)
         records = self._records(level, trade_date)
+        current_date = date.fromisoformat(records[-1]["trade_date"]) if records else trade_date
+        window_start = str(date.fromordinal(max(1, current_date.toordinal() - lookback_days + 1)))
+        window = [item for item in records if item["trade_date"] >= window_start]
+        summary = RotationSummary(
+            level=level,
+            trade_date=str(current_date),
+            lookback_days=lookback_days,
+            leader_count=leader_count,
+            regime="样本不足",
+            available_days=len(window),
+        )
         if not records:
-            return RotationSummary(
-                level=level,
-                trade_date=str(trade_date),
-                lookback_days=max(1, lookback_days),
-                leader_count=leader_count,
-                regime="样本不足",
-                available_days=0,
+            return replace(
+                summary,
                 observations=("板块记忆暂无历史样本，本次只能按当天截面判断。",),
             )
 
-        current = records[-1]
-        current_date = date.fromisoformat(current["trade_date"])
-        window_start = current_date - timedelta(days=max(1, lookback_days) - 1)
-        window = [item for item in records if date.fromisoformat(item["trade_date"]) >= window_start]
         ranked = [self._top_names(item, leader_count) for item in window]
         today_names = ranked[-1]
-        if not today_names:
-            return RotationSummary(
-                level=level,
-                trade_date=current["trade_date"],
-                lookback_days=max(1, lookback_days),
-                leader_count=leader_count,
-                regime="样本不足",
-                available_days=len(window),
+        if not all(ranked):
+            return replace(
+                summary,
                 observations=("板块覆盖率不足，暂无可用的轮动记忆。",),
             )
 
         prior = ranked[:-1]
         if not prior:
-            return RotationSummary(
-                level=level,
-                trade_date=current["trade_date"],
-                lookback_days=max(1, lookback_days),
-                leader_count=leader_count,
-                regime="样本不足",
-                available_days=1,
+            return replace(
+                summary,
                 observations=("板块记忆样本不足，目前只有当天截面。",),
             )
 
@@ -173,11 +157,10 @@ class SectorRotationStore:
         yesterday_set = set(yesterday_names)
         overlap = len(today_set & yesterday_set) / max(len(today_names), len(yesterday_names), 1)
 
-        hit_counts = self._counts(ranked)
-        prior_counts = self._counts(prior)
+        prior_counts = Counter(name for names in prior for name in names)
         hit_threshold = max(2, math.ceil(len(window) / 2))
 
-        persistent = tuple(name for name in today_names if hit_counts.get(name, 0) >= hit_threshold)
+        persistent = tuple(name for name in today_names if prior_counts[name] + 1 >= hit_threshold)
         new_entries = tuple(name for name in today_names if name not in prior_counts)
         faded = tuple(name for name in yesterday_names if name not in today_set)
 
@@ -203,13 +186,9 @@ class SectorRotationStore:
         if faded:
             observations.append(f"昨天靠前、今天退到队外：{'、'.join(faded)}")
 
-        return RotationSummary(
-            level=level,
-            trade_date=current["trade_date"],
-            lookback_days=max(1, lookback_days),
-            leader_count=leader_count,
+        return replace(
+            summary,
             regime=regime,
-            available_days=len(window),
             overlap_with_yesterday=round(overlap, 4),
             persistent=persistent,
             new_entries=new_entries,
@@ -218,29 +197,35 @@ class SectorRotationStore:
         )
 
     def _load_payload(self) -> dict[str, Any]:
-        payload = read_json(self.path, default={}) or {}
-        if payload.get("schema") != HISTORY_SCHEMA or not isinstance(payload.get("records"), list):
-            return {"schema": HISTORY_SCHEMA, "records": []}
-        return payload
-
-    def _records(self, level: str, trade_date: date) -> list[dict[str, Any]]:
-        rows = []
-        for item in self._load_payload()["records"]:
-            if item.get("level") != level:
+        payload = read_stamped(self.path, HISTORY_SCHEMA) or {}
+        raw = payload.get("records")
+        records: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
                 continue
-            day = item.get("trade_date")
-            if not isinstance(day, str):
+            day, level = item.get("trade_date"), item.get("level")
+            if not isinstance(day, str) or not isinstance(level, str) or not level.strip():
                 continue
             try:
-                parsed = date.fromisoformat(day)
+                stamp = date.fromisoformat(day).isoformat()
             except ValueError:
                 continue
-            if parsed <= trade_date:
-                rows.append(item)
-        rows.sort(key=lambda item: str(item.get("trade_date") or ""))
-        return rows
+            level = level.strip()
+            records[(level, stamp)] = {**item, "trade_date": stamp, "level": level}
+        return {**payload, "schema": HISTORY_SCHEMA, "records": list(records.values())}
 
-    def _serialize(self, rank: int, item: SectorOutlook) -> dict[str, Any]:
+    def _records(self, level: str, trade_date: date) -> list[dict[str, Any]]:
+        return sorted(
+            (
+                item
+                for item in self._load_payload()["records"]
+                if item["level"] == level and item["trade_date"] <= str(trade_date)
+            ),
+            key=lambda item: item["trade_date"],
+        )
+
+    @staticmethod
+    def _serialize(rank: int, item: SectorOutlook) -> dict[str, Any]:
         metrics = item.metrics
         return {
             "rank": rank,
@@ -254,17 +239,9 @@ class SectorRotationStore:
 
     @staticmethod
     def _top_names(record: dict[str, Any], leader_count: int) -> list[str]:
-        names: list[str] = []
-        for item in record.get("leaders", [])[:leader_count]:
-            name = item.get("name")
-            if isinstance(name, str) and name:
-                names.append(name)
-        return names
-
-    @staticmethod
-    def _counts(days: list[list[str]]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for names in days:
-            for name in names:
-                counts[name] = counts.get(name, 0) + 1
-        return counts
+        leaders = record.get("leaders")
+        if not isinstance(leaders, list):
+            return []
+        names = (item.get("name") for item in leaders if isinstance(item, dict))
+        valid = (name.strip() for name in names if isinstance(name, str) and name.strip())
+        return list(dict.fromkeys(valid))[:leader_count]

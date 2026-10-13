@@ -43,7 +43,7 @@ def bars(
     ]
 
 
-# ---- 低吸特征 -------------------------------------------------------------
+# 低吸特征
 
 
 def test_pullback_is_measured_from_the_20_day_high() -> None:
@@ -67,8 +67,8 @@ def test_pullback_bands_are_measured_in_the_stock_s_own_volatility() -> None:
     """
     closes = [100.0] * 19 + [94.0]  # 名义上一律跌 6%
 
-    calm = measure_dip(bars(closes, amplitude=0.01))     # 日振幅 1%
-    wild = measure_dip(bars(closes, amplitude=0.15))     # 日振幅 15%
+    calm = measure_dip(bars(closes, amplitude=0.01))  # 日振幅 1%
+    wild = measure_dip(bars(closes, amplitude=0.15))  # 日振幅 15%
 
     # 名义跌幅接近（夹具的 high 随振幅略有差异），但归一化深度差近 6 倍。
     assert calm.pullback_atr > wild.pullback_atr * 4
@@ -91,15 +91,29 @@ def test_bands_cover_the_full_range_as_normalised_depth_grows() -> None:
 def test_true_range_counts_gaps_not_just_the_intraday_span() -> None:
     """一字板和跳空开盘时日内区间几乎为零，只看 high-low 会把大跳空读成没波动。"""
     rows = [
-        {"date": "2026-06-01", "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
-         "volume": 1000.0},
+        {
+            "date": "2026-06-01",
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        },
     ]
     # 每根都平走，但每天跳空 5%。
     price = 100.0
     for day in range(2, 22):
         price *= 1.05
-        rows.append({"date": f"2026-06-{day:02d}", "open": price, "high": price,
-                     "low": price, "close": price, "volume": 1000.0})
+        rows.append(
+            {
+                "date": f"2026-06-{day:02d}",
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 1000.0,
+            }
+        )
 
     features = measure_dip(rows)
     assert features.atr_pct is not None
@@ -131,8 +145,7 @@ def test_turnover_cost_handles_shares_and_tickflow_lots() -> None:
     """成本代理不能因上游把成交量写成手而放大 100 倍。"""
     shares_rows = bars([100.0] * 30, [1000.0] * 30)
     lots_rows = [
-        {**row, "volume": row["volume"] / 100.0, "amount": row["amount"]}
-        for row in shares_rows
+        {**row, "volume": row["volume"] / 100.0, "amount": row["amount"]} for row in shares_rows
     ]
 
     shares = measure_dip(shares_rows)
@@ -196,8 +209,14 @@ def test_missing_data_yields_none_not_zero() -> None:
 def test_a_flat_line_has_no_band_rather_than_a_fake_one() -> None:
     """振幅为零时分母是零，不该拿绝对值凑一个档位出来。"""
     rows = [
-        {"date": f"2026-06-{i + 1:02d}", "open": 100.0, "high": 100.0, "low": 100.0,
-         "close": 100.0, "volume": 1000.0}
+        {
+            "date": f"2026-06-{i + 1:02d}",
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
         for i in range(25)
     ]
     features = measure_dip(rows)
@@ -220,7 +239,7 @@ def test_support_distance_only_counts_supports_below_the_price() -> None:
     assert abs(features.dist_to_support_pct - (100.0 / 95.0 - 1.0)) < 1e-6
 
 
-# ---- 对照组 ---------------------------------------------------------------
+# 对照组
 
 
 def make_record(symbol: str, kind: str, tmp_path) -> Recommendation:
@@ -321,7 +340,7 @@ def test_verification_accepts_normalized_timestamp_bars(tmp_path) -> None:
     assert result["outcomes"][0]["next_close_pct"] == 0.02
 
 
-# ---- 持仓表 ---------------------------------------------------------------
+# 持仓表
 
 
 def test_opening_a_position_makes_it_the_thing_being_watched(tmp_path) -> None:
@@ -371,7 +390,7 @@ def test_a_hand_edited_file_without_cost_still_loads(tmp_path) -> None:
     assert entry.note == "手工加的"
 
 
-# ---- 统计分层 -------------------------------------------------------------
+# 统计分层
 
 
 def outcome_row(rec_kind: str, close_pct: float, blowup: float | None = None, band: str = "ideal"):
@@ -379,6 +398,7 @@ def outcome_row(rec_kind: str, close_pct: float, blowup: float | None = None, ba
         "kind": "outcome",
         "trade_date": "2026-08-01",
         "rec_kind": rec_kind,
+        "sessions": 5,
         "mfe_pct": close_pct + 0.02,
         "mae_pct": -0.01,
         "close_pct": close_pct,
@@ -466,7 +486,7 @@ def test_pullback_bands_become_a_statistical_layer() -> None:
     assert buckets["ideal"]["median_close_pct"] > buckets["deep"]["median_close_pct"]
 
 
-# ---- 打分口径转向低吸 -------------------------------------------------------
+# 打分口径转向低吸
 
 
 def snap(**kw):
@@ -476,11 +496,20 @@ def snap(**kw):
     from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 
     d = {
-        "symbol": "600519.SH", "last_open": 99.0, "last_high": 101.0, "last_low": 98.0,
-        "last_close": 100.0, "trend_state": TrendState.UPTREND, "bar_count": 250,
-        "atr14": 2.0, "volume_ratio_20d": 1.0, "range_position_60d": 0.5,
-        "stop_reference": 95.0, "target_reference": 115.0,
-        "explanation": "fixture", "source_ts": datetime(2026, 8, 3, 15, 0),
+        "symbol": "600519.SH",
+        "last_open": 99.0,
+        "last_high": 101.0,
+        "last_low": 98.0,
+        "last_close": 100.0,
+        "trend_state": TrendState.UPTREND,
+        "bar_count": 250,
+        "atr14": 2.0,
+        "volume_ratio_20d": 1.0,
+        "range_position_60d": 0.5,
+        "stop_reference": 95.0,
+        "target_reference": 115.0,
+        "explanation": "fixture",
+        "source_ts": datetime(2026, 8, 3, 15, 0),
     }
     d.update(kw)
     return DailyTechnicalSnapshot(**d)
@@ -488,14 +517,22 @@ def snap(**kw):
 
 def dip(**kw):
     from ashare_decision_support.signals.dipbuy import DipFeatures
-    d = {"pullback_pct": -0.06, "atr_pct": 0.02, "pullback_atr": 3.0,
-             "pullback_band": "ideal", "shrinking": True, "volume_contraction": 0.5}
+
+    d = {
+        "pullback_pct": -0.06,
+        "atr_pct": 0.02,
+        "pullback_atr": 3.0,
+        "pullback_band": "ideal",
+        "shrinking": True,
+        "volume_contraction": 0.5,
+    }
     d.update(kw)
     return DipFeatures(**d)
 
 
 def score(**kw):
     from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput
+
     kw.setdefault("snapshot", snap())
     return RuleBasedScoreProvider().score(ScoreInput(symbol="A", bars=[], **kw))
 
@@ -507,8 +544,15 @@ def test_a_stock_that_has_pulled_back_now_outranks_one_that_has_not() -> None:
     打分一直在选主升段。
     """
     pulled_back = score(dip=dip())
-    at_the_high = score(dip=dip(pullback_pct=-0.002, pullback_atr=0.1, pullback_band="none",
-                                shrinking=False, volume_contraction=1.1))
+    at_the_high = score(
+        dip=dip(
+            pullback_pct=-0.002,
+            pullback_atr=0.1,
+            pullback_band="none",
+            shrinking=False,
+            volume_contraction=1.1,
+        )
+    )
     assert pulled_back.score > at_the_high.score
 
 
@@ -544,6 +588,7 @@ def test_wyckoff_pullback_events_now_outweigh_the_breakout_event() -> None:
         SOS_POINTS,
         SPRING_POINTS,
     )
+
     assert SPRING_POINTS > SOS_POINTS
     assert LPS_POINTS > SOS_POINTS
 
@@ -561,6 +606,13 @@ def test_a_hair_thin_stop_can_no_longer_earn_a_full_risk_reward_score() -> None:
     assert any("止损距离" in w for w in absurd.warnings)
 
 
+def test_preopen_score_flags_reward_risk_below_execution_floor() -> None:
+    result = score(snapshot=snap(stop_reference=95.0, target_reference=105.0))
+    assert any(
+        "盈亏比仅 1.00，未达到盘中执行门槛，仅供观察" in warning for warning in result.warnings
+    )
+
+
 def test_the_stop_itself_keeps_a_minimum_distance_from_the_price() -> None:
     """源头也要修——简报里报出一个 0.04% 的止损位本身就是误导。"""
     from datetime import timedelta
@@ -569,13 +621,19 @@ def test_the_stop_itself_keeps_a_minimum_distance_from_the_price() -> None:
 
     start = date(2026, 3, 2)
     rows = [
-        {"date": str(start + timedelta(days=i)), "open": 100.0, "high": 101.0,
-         "low": 99.0, "close": 100.0, "volume": 1000.0}
+        {
+            "date": str(start + timedelta(days=i)),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1000.0,
+        }
         for i in range(70)
     ]
     s = DailyTechnicalAnalyzer().analyze("600000.SH", rows)
     distance = 1.0 - s.stop_reference / s.last_close
-    assert distance >= 0.005          # 至少不是零距离
+    assert distance >= 0.005  # 至少不是零距离
     assert s.stop_reference < s.last_close
 
 
@@ -635,8 +693,17 @@ def test_sector_ranking_no_longer_rewards_having_already_run() -> None:
     predictor = SectorPredictor(None)
 
     def momentum(**kw):
-        d = {"name": "X", "constituents": 50, "covered": 50, "ret_1d": 0.005, "ret_5d": 0.03,
-                 "ret_20d": 0.08, "breadth": 0.6, "above_ma20": 0.7, "volume_ratio": 1.0}
+        d = {
+            "name": "X",
+            "constituents": 50,
+            "covered": 50,
+            "ret_1d": 0.005,
+            "ret_5d": 0.03,
+            "ret_20d": 0.08,
+            "breadth": 0.6,
+            "above_ma20": 0.7,
+            "volume_ratio": 1.0,
+        }
         d.update(kw)
         return predictor._momentum_component(SectorMetrics(**d), [], [])
 
@@ -652,7 +719,7 @@ def test_sector_ranking_no_longer_rewards_having_already_run() -> None:
     assert momentum(ret_20d=-0.15, pullback_atr=2.0) < pulled_back
 
 
-# ---- 只出读数那几层的验收位 -----------------------------------------------
+# 只出读数那几层的验收位
 
 
 def state_row(close_pct: float, **market_state):
@@ -669,13 +736,21 @@ def test_unscored_layers_get_their_own_buckets() -> None:
     有没有区分度」，于是也永远谈不上该给权重还是该撤掉。
     """
     rows = [
-        state_row(0.05, rotation_adjacent="高低切换", turnover_total_change=-0.14,
-                  index_divergence="等权强加权弱")
+        state_row(
+            0.05,
+            rotation_adjacent="高低切换",
+            turnover_total_change=-0.14,
+            index_divergence="等权强加权弱",
+        )
         for _ in range(3)
     ]
     rows += [
-        state_row(0.01, rotation_adjacent="强者恒强", turnover_total_change=0.08,
-                  index_divergence="等权与加权一致")
+        state_row(
+            0.01,
+            rotation_adjacent="强者恒强",
+            turnover_total_change=0.08,
+            index_divergence="等权与加权一致",
+        )
         for _ in range(3)
     ]
 
@@ -831,8 +906,12 @@ def test_review_renders_every_group_it_computes() -> None:
     from ashare_decision_support.jobs.review import render_review
 
     rows = [
-        state_row(0.05, rotation_adjacent="高低切换", turnover_total_change=-0.14,
-                  index_divergence="等权强加权弱")
+        state_row(
+            0.05,
+            rotation_adjacent="高低切换",
+            turnover_total_change=-0.14,
+            index_divergence="等权强加权弱",
+        )
         for _ in range(3)
     ]
     for row in rows:
@@ -892,7 +971,10 @@ def test_trade_flow_reaches_the_stats_layer() -> None:
         for _ in range(3)
     ]
     rows += [
-        {**outcome_row("recommendation", -0.01), "trade_flow": {"ok": True, "large_net_amount": -4e7}}
+        {
+            **outcome_row("recommendation", -0.01),
+            "trade_flow": {"ok": True, "large_net_amount": -4e7},
+        }
         for _ in range(3)
     ]
 
@@ -910,7 +992,10 @@ def test_trade_flow_that_failed_to_fetch_is_not_a_direction() -> None:
     半成品读数进了统计比没有更糟：它看起来是一个可分组的维度，实际是噪声。
     """
     rows = [
-        {**outcome_row("recommendation", 0.02), "trade_flow": {"ok": False, "large_net_amount": 5e7}},
+        {
+            **outcome_row("recommendation", 0.02),
+            "trade_flow": {"ok": False, "large_net_amount": 5e7},
+        },
         {**outcome_row("recommendation", 0.02), "trade_flow": {}},
         outcome_row("recommendation", 0.02),
     ]
@@ -952,7 +1037,7 @@ def test_outcome_carries_trade_flow_from_the_recommendation(tmp_path) -> None:
     assert outcome["trade_flow"]["ok"] is True
 
 
-# ---- 状态文件里的 NaN：两个方向都要挡 -------------------------------------
+# 状态文件里的 NaN：两个方向都要挡
 
 
 def test_state_file_never_persists_an_invalid_json_constant(tmp_path) -> None:

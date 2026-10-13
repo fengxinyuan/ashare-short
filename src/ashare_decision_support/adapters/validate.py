@@ -1,35 +1,8 @@
-"""数据校验：跨源比对、量纲、浮点卫生。
+"""跨源读数校验与成交量单位常量。
 
-这一层管的是**错了不会报错、只会算错**的那类问题。它们的共同特征是：出错时链路
-照跑、简报照出、数字看着完全正常，只有拿另一路数据比一比才看得出来。
-
-## 为什么需要跨源比对
-
-`CompositeMarketScanAdapter` 现在的做法是**合并**：主源整行为准，兜底只填空。
-合并是对的（逐字段挑选会造出一份哪一路都不等于的混合读数），但它有个盲区——
-**两路都有的字段从来没被比过**。主源的某个字段悄悄换了量纲、喂了昨天的数、
-或者标的映射错位，合并会照单全收，而兜底那一路明明就摆在旁边。
-
-`docs/DATA_SOURCES.md` 写着「两路逐字段吻合到新浪的取整精度，可以互为校验」——
-那是一次手工实测的结论，不是代码里在做的事。这个模块把它变成代码在做的事。
-
-## 量纲差异不是「两路不一致」
-
-比对时必须把这两件事分开报：
-
-- **比值 ≈ 100 或 10000** → 有一边的量纲错了（手/股、元/万元）。这是 bug，
-  有确定的修法，且**修完两边就完全一致**。
-- **比值 ≈ 1 但差了几个百分点** → 两个源对同一件事的测量确实不同（不同厂商
-  把逐笔归并到分钟的边界处理不同，实测相对差最大 0.31%）。这是数据本身的
-  性质，没有「正确答案」。
-
-混在一起报会把唯一可修的那类埋进噪声里。实测记录在案的三处量纲陷阱
-（`docs/DATA_SOURCES.md` §五）全都是 100 倍或 10000 倍。
-
-## 契约
-
-**所有函数都不抛异常，且从不修改传入对象。** 校验失败一律置空并标注，
-绝不用低分辨率数据顶替——和全仓其余地方同一条约定。
+CompositeMarketScanAdapter 合并行情时调用 cross_check，将已知量纲倍数、
+大额分歧和普通厂商差异分别报告。只检查两路共有的有限数，不修改输入或修补价格。
+各适配器负责按来源换算单位，分钟线价格精度由 tickflow_intraday.to_bars 处理。
 """
 
 from __future__ import annotations
@@ -40,18 +13,18 @@ from typing import Any
 
 from ashare_decision_support.numeric import finite
 
-# A 股最小报价单位是 0.01，4 位小数远够用。取到这个精度之后，复权算出来的
-# 1e-13 量级倒挂会归零。
-PRICE_DECIMALS = 4
-
 # 相对差超过这个值才算「两路不一致」。实测两家分钟线重叠部分相对差中位 ~1e-4、
 # 最大 0.31%，所以 0.5% 以内属于正常的厂商口径差异，不该报。
 DEFAULT_TOLERANCE = 0.005
 
+# A 股一手 = 100 股。TickFlow 的成交量与盘口量、腾讯的成交量与五档挂单量都记
+# 「手」，新浪记「股」；各适配器在解析层换算成股，下游只认一种单位。
+LOTS_TO_SHARES = 100.0
+
 # 已知的量纲倍数。比值落在这些数附近说明有一边搞错了单位，而不是数据有分歧。
 #   100   手 vs 股（volume）、比值 vs 百分数（change_pct）
 #   10000 元 vs 万元（流通市值）
-KNOWN_SCALES: tuple[float, ...] = (100.0, 10000.0)
+KNOWN_SCALES: tuple[float, ...] = (LOTS_TO_SHARES, 10000.0)
 
 # 判定比值「贴着」某个量纲倍数的相对宽容度。开得比 DEFAULT_TOLERANCE 松，
 # 因为两边除了量纲之外本来就还有正常的测量差。
@@ -60,7 +33,7 @@ SCALE_TOLERANCE = 0.02
 
 # 读数分歧超过这个相对差就不能再叫「厂商口径差异」。实测两家分钟线重叠部分相对差
 # 中位 ~1e-4、最大 0.31%，DEFAULT_TOLERANCE 的 0.5% 正是照这个量级定的。
-#
+
 # 2026-08-02 全市场实测：179 处分歧里有 21 处超过 10%，最大 77.7%，全部落在
 # `float_cap` 上（多半是一边的股本数在增发/解禁后没更新）。把这些和 0.6% 的舍入
 # 差一起写成「属厂商口径差异，非错误」，等于让简报**主动叫读者忽略一个真的错**——
@@ -156,8 +129,7 @@ class CrossCheck:
                 f"⚠️ 跨源校验发现 {len(material)}/{self.compared} 处**大额分歧**"
                 f"（相对差 ≥ {MATERIAL_GAP:.0%}，最大 {material[0].relative_gap:.0%}，"
                 f"集中在 {fields}）——这个量级不能用厂商口径解释，两路必有一路是错的，"
-                "涉及的标的读数不可信："
-                + "；".join(d.describe() for d in material[:max_examples])
+                "涉及的标的读数不可信：" + "；".join(d.describe() for d in material[:max_examples])
             )
         if gaps:
             out.append(
@@ -203,7 +175,9 @@ def cross_check(
                 result.agreed += 1
                 continue
             result.disputes.append(
-                Dispute(key=key, field=name, primary=a, fallback=b, ratio=ratio, scale=_scale_of(ratio))
+                Dispute(
+                    key=key, field=name, primary=a, fallback=b, ratio=ratio, scale=_scale_of(ratio)
+                )
             )
     return result
 
@@ -215,91 +189,3 @@ def _scale_of(ratio: float) -> float | None:
             if candidate and abs(ratio / candidate - 1.0) <= SCALE_TOLERANCE:
                 return scale if candidate >= 1 else -scale
     return None
-
-
-# ---- 浮点卫生 -------------------------------------------------------------
-
-
-@dataclass
-class Sanitised:
-    bars: list[dict]
-    inverted: int = 0
-    notes: list[str] = field(default_factory=list)
-
-
-def sanitise_ohlc(bars: list[dict]) -> Sanitised:
-    """把 OHLC 取到报价精度，消掉复权带来的 `high < low` 倒挂。
-
-    实测 60 只 / 15000 根 1 分钟线里 **1399 根（9.33%）满足 `high < low`**，
-    倒挂量级 1e-13（例如 high=1350.599999999988、low=1350.6）。复权对四个字段
-    各自算，尾巴不一样，倒挂就出来了。
-
-    下游拿 `high - low` 当振幅会得到负数，拿 `low == min(lows)` 找枢轴点会漏掉
-    真正的低点——**两者都不会报错**。这就是必须在入口统一处理的理由。
-
-    倒挂在取整之后仍然存在的（真正的数据错误，不是浮点尾巴），交换 high/low
-    并计数：一根 high/low 写反的 bar 比一根缺失的 bar 危险得多。
-    """
-    out: list[dict] = []
-    inverted = 0
-    for bar in bars or []:
-        row = dict(bar)
-        for name in ("open", "high", "low", "close"):
-            value = finite(row.get(name))
-            if value is not None:
-                row[name] = round(value, PRICE_DECIMALS)
-        high, low = finite(row.get("high")), finite(row.get("low"))
-        if high is not None and low is not None and high < low:
-            row["high"], row["low"] = low, high
-            inverted += 1
-        out.append(row)
-
-    notes: list[str] = []
-    if inverted:
-        notes.append(
-            f"{inverted}/{len(out)} 根 K 线取到 {PRICE_DECIMALS} 位小数后仍 high<low，"
-            "已交换高低价——这不是浮点尾巴，是上游数据错误"
-        )
-    return Sanitised(bars=out, inverted=inverted, notes=notes)
-
-
-# ---- 量纲 -----------------------------------------------------------------
-
-
-def infer_volume_unit(
-    volume: float | None, amount: float | None, price: float | None
-) -> tuple[float | None, str]:
-    """从 `amount / volume` 反推成交量的单位，返回 (换算成股的乘数, 说明)。
-
-    **能推出来就不要去配置里读。** 单位是可以自证的：`amount / volume` 必须落在
-    当根 bar 的价格量级上。落在 100 倍开外，说明 volume 记的是手。
-
-    这比信一个配置项可靠——量纲搞错不会报错，只会让茅台的 VWAP 算成 135083
-    而不是 1351，然后每只票都显示为永远在均价下方。
-
-    推不出来时返回 `(None, 原因)`，调用方**不要猜**：宁可不给 VWAP，也不要给一个
-    可能差 100 倍的。
-    """
-    if not volume or not amount or volume <= 0 or amount <= 0:
-        return None, "缺成交额或成交量，无法反推单位"
-    if not price or price <= 0:
-        return None, "缺参考价，无法反推单位"
-
-    implied = amount / volume
-    for multiplier, label in ((1.0, "股"), (100.0, "手"), (10.0, "十股")):
-        # volume 若以 `label` 为单位，换算成股之后隐含均价应当贴近参考价。
-        if _close_enough(implied / multiplier, price):
-            return multiplier, f"成交量单位判定为{label}（隐含均价 {implied / multiplier:.2f}）"
-    return None, f"隐含均价 {implied:.2f} 与参考价 {price:.2f} 对不上任何已知单位，拒绝推导 VWAP"
-
-
-def _close_enough(implied: float, price: float, tolerance: float = 0.35) -> bool:
-    """均价与参考价的宽容度开得大，是因为它们本来就不该相等。
-
-    参考价通常是收盘价或现价，隐含均价是全时段的加权平均——一根振幅 10% 的
-    bar 里两者差几个百分点很正常。这里要分辨的是 1 倍与 100 倍，不是 1.0 与 1.05，
-    所以宁可开松：开紧了会把正常的波动误判成量纲错误，那比漏判更糟。
-    """
-    if price <= 0:
-        return False
-    return abs(implied / price - 1.0) <= tolerance

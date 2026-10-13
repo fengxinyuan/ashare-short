@@ -7,7 +7,6 @@ restarts mid-day. Those are the paths an automated system actually takes.
 
 from __future__ import annotations
 
-import io
 import json
 from datetime import date, datetime, timedelta
 from datetime import time as clock_time
@@ -30,13 +29,15 @@ from ashare_decision_support.monitor.loop import INTERVAL_LADDER, run_monitor_lo
 from ashare_decision_support.monitor.triggers import LEVEL_ACTION, LEVEL_INFO, LEVEL_WARN
 from ashare_decision_support.notify.feishu import MESSAGE_URL, TOKEN_URL, FeishuNotifier, _sign
 from ashare_decision_support.schedule import TradingCalendar, build_timetable, run_daemon
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.state import AlertState, DaemonState, Positions
 from ashare_decision_support.symbols import bare_code, normalize_symbol
+from tests.fakes import FakeResponse
 
 SESSION = date(2026, 8, 3)
 
 
-# ---- fixtures ------------------------------------------------------------
+# fixtures
 
 
 def minute_bars(closes: list[float], day: date = SESSION, start_hour: int = 9, start_min: int = 30):
@@ -98,8 +99,11 @@ RISE = [100 + 0.05 * i for i in range(40)]
 def run_session(paths, levels=(LEVEL_ACTION, LEVEL_WARN)):
     script = [minute_bars(path) for path in paths]
     session = MonitorSession(
-        StubDaily(), ScriptedIntraday(script), SESSION,
-        levels=levels, alert_state=AlertState.load(SESSION),
+        StubDaily(),
+        ScriptedIntraday(script),
+        SESSION,
+        levels=levels,
+        alert_state=AlertState.load(SESSION),
     )
     session.prime(["600519.SH"])
     out = []
@@ -109,7 +113,7 @@ def run_session(paths, levels=(LEVEL_ACTION, LEVEL_WARN)):
     return session, out
 
 
-# ---- symbols -------------------------------------------------------------
+# symbols
 
 
 @pytest.mark.parametrize(
@@ -135,7 +139,7 @@ def test_unrecognisable_symbol_is_not_guessed_an_exchange() -> None:
     assert normalize_symbol("NOTACODE") == "NOTACODE"
 
 
-# ---- positions -----------------------------------------------------------
+# positions
 
 
 def test_positions_persist_and_deduplicate_across_symbol_forms() -> None:
@@ -183,7 +187,7 @@ def test_corrupt_state_file_degrades_instead_of_crashing(tmp_path) -> None:
     assert Positions(path=path).symbols() == []
 
 
-# ---- freshness gate ------------------------------------------------------
+# freshness gate
 
 
 def test_fresh_feed_is_usable() -> None:
@@ -231,13 +235,19 @@ def test_outside_session_the_gate_says_closed_rather_than_stale() -> None:
     assert health.usable is False
 
 
+def test_feed_future_minute_end_stamp_has_zero_not_negative_lag() -> None:
+    now = datetime(2026, 9, 14, 13, 0, 30)
+    health = assess_feed({"a": [{"timestamp": now + timedelta(seconds=30), "close": 10.0}]}, 1, now)
+
+    assert health.lag_minutes == 0.0
+    assert health.verdict == VERDICT_FRESH
+
+
 def test_median_lag_is_used_so_one_prompt_symbol_cannot_vouch_for_the_feed() -> None:
     now = datetime(2026, 8, 3, 11, 0)
     prompt = minute_bars(RISE, start_hour=10, start_min=19)
     stale = [minute_bars(RISE, start_hour=9, start_min=30) for _ in range(3)]
-    health = assess_feed(
-        {"fresh": prompt, "a": stale[0], "b": stale[1], "c": stale[2]}, 4, now
-    )
+    health = assess_feed({"fresh": prompt, "a": stale[0], "b": stale[1], "c": stale[2]}, 4, now)
 
     assert health.verdict == VERDICT_STALE
 
@@ -254,7 +264,7 @@ def test_a_stale_feed_produces_no_alerts_at_all() -> None:
     assert result.alerts == []
 
 
-# ---- triggers ------------------------------------------------------------
+# triggers
 
 
 def test_first_sighting_establishes_a_baseline_without_alerting() -> None:
@@ -275,10 +285,10 @@ def test_stop_is_pinned_so_a_falling_price_can_actually_break_it() -> None:
     construction — price can never break it and the alert never fires."""
     session, results = run_session(
         [
-            RISE[:10],                                       # too early to arm
-            RISE,                                            # arm here
-            [*RISE, 101.2, 100.9, 100.6],                    # lose vwap
-            [*RISE, 101.2, 100.9, 100.6, 99.0, 98.0],        # break the pinned stop
+            RISE[:10],  # too early to arm
+            RISE,  # arm here
+            [*RISE, 101.2, 100.9, 100.6],  # lose vwap
+            [*RISE, 101.2, 100.9, 100.6, 99.0, 98.0],  # break the pinned stop
             [*RISE, 101.2, 100.9, 100.6, 99.0, 98.0, 97.0],  # deeper, must not re-fire
         ]
     )
@@ -319,7 +329,7 @@ def test_info_triggers_appear_when_the_level_is_enabled() -> None:
     assert "vwap_regain" in triggers
 
 
-# ---- loop ----------------------------------------------------------------
+# loop
 
 
 class FlakyIntraday:
@@ -409,7 +419,7 @@ def test_a_pass_that_raises_does_not_kill_the_loop() -> None:
     assert stats.bad_passes == 3
 
 
-# ---- journal -------------------------------------------------------------
+# journal
 
 
 def adjusted_series(multipliers: list[float], base: float = 40.0, start: date = date(2026, 7, 10)):
@@ -440,11 +450,20 @@ class StubVerifier:
 
 def make_recommendation() -> Recommendation:
     advice = StockAdvice(
-        symbol="600519.SH", name="测试股", score=76.0, last_price=100.0,
-        entry_low=98.0, entry_high=100.0, stop=96.0, targets=[105.0], rrr=1.75,
+        symbol="600519.SH",
+        name="测试股",
+        score=76.0,
+        last_price=100.0,
+        entry_low=98.0,
+        entry_high=100.0,
+        stop=96.0,
+        targets=[105.0],
+        rrr=1.75,
         trend_state="上升趋势",
     )
-    return Recommendation.from_advice(advice, date(2026, 7, 20), source="morning", sector="食品饮料")
+    return Recommendation.from_advice(
+        advice, date(2026, 7, 20), source="morning", sector="食品饮料"
+    )
 
 
 def test_recommendation_stores_relative_levels_for_adjustment_safe_verification() -> None:
@@ -458,9 +477,12 @@ def test_recommendation_stores_relative_levels_for_adjustment_safe_verification(
 def test_recommendation_without_a_reference_price_is_refused() -> None:
     # No reference price means no relative levels, and a record that cannot be
     # verified only pollutes the statistics.
-    assert Recommendation.from_advice(
-        StockAdvice(symbol="600519.SH", last_price=None), date(2026, 7, 20), source="morning"
-    ) is None
+    assert (
+        Recommendation.from_advice(
+            StockAdvice(symbol="600519.SH", last_price=None), date(2026, 7, 20), source="morning"
+        )
+        is None
+    )
 
 
 def test_verification_works_across_the_raw_to_adjusted_price_gap() -> None:
@@ -501,8 +523,16 @@ def test_a_stop_hit_before_the_target_is_recorded_as_such() -> None:
 
 def test_statistics_flag_small_buckets_rather_than_hiding_them() -> None:
     outcomes = [
-        {"kind": "outcome", "score": 75, "entered": True, "first_hit": "target",
-         "mfe_pct": 0.06, "mae_pct": -0.02, "close_pct": 0.03, "sector": "食品饮料"}
+        {
+            "kind": "outcome",
+            "score": 75,
+            "entered": True,
+            "first_hit": "target",
+            "mfe_pct": 0.06,
+            "mae_pct": -0.02,
+            "close_pct": 0.03,
+            "sector": "食品饮料",
+        }
     ]
     stats = summarize(outcomes)
 
@@ -514,7 +544,7 @@ def test_statistics_flag_small_buckets_rather_than_hiding_them() -> None:
     assert stats["overall"]["median_mfe_pct"] == 0.06
 
 
-# ---- agents --------------------------------------------------------------
+# agents
 
 
 def test_one_failing_agent_does_not_take_down_the_others() -> None:
@@ -575,11 +605,15 @@ DEBATE_FACTS = {"symbol": "600519.SH", "last_price": 1337.53, "volume_ratio": 3.
 
 
 def test_debate_roles_pass_when_every_number_traces_to_the_facts() -> None:
-    panel = DebatePanel(client=FakeLlm([
-        "- 现价 1337.53，量比 3.2 倍",
-        "- 量比 3.2 倍也可能是情绪透支",
-        "- 分歧在于 1337.53 能否守住",
-    ]))
+    panel = DebatePanel(
+        client=FakeLlm(
+            [
+                "- 现价 1337.53，量比 3.2 倍",
+                "- 量比 3.2 倍也可能是情绪透支",
+                "- 分歧在于 1337.53 能否守住",
+            ]
+        )
+    )
     result = panel.run(DEBATE_FACTS)
 
     assert [item.role for item in result.arguments] == ["bull", "bear", "judge"]
@@ -587,11 +621,15 @@ def test_debate_roles_pass_when_every_number_traces_to_the_facts() -> None:
 
 
 def test_a_role_that_invents_numbers_is_discarded_whole() -> None:
-    panel = DebatePanel(client=FakeLlm([
-        "- 上涨概率约 68%，目标看 1500.00",
-        "- 量比 3.2 倍偏高",
-        "- 分歧在量比 3.2",
-    ]))
+    panel = DebatePanel(
+        client=FakeLlm(
+            [
+                "- 上涨概率约 68%，目标看 1500.00",
+                "- 量比 3.2 倍偏高",
+                "- 分歧在量比 3.2",
+            ]
+        )
+    )
     result = panel.run(DEBATE_FACTS)
     bull = result.arguments[0]
 
@@ -611,21 +649,15 @@ def test_debate_is_skipped_without_credentials() -> None:
     assert any("跳过多空辩论" in note for note in result.notes)
 
 
-# ---- feishu --------------------------------------------------------------
-
-
-class Response(io.BytesIO):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
+# feishu
 
 
 def test_feishu_treats_a_non_zero_code_as_failure_despite_http_200() -> None:
     notifier = FeishuNotifier(
         webhook_url="https://open.feishu.cn/x",
-        opener=lambda request, timeout=None: Response(b'{"code":19021,"msg":"sign match fail"}'),
+        opener=lambda request, timeout=None: FakeResponse(
+            b'{"code":19021,"msg":"sign match fail"}'
+        ),
     )
 
     assert notifier.send("t", "c") is False
@@ -644,7 +676,7 @@ def test_feishu_chunks_by_bytes_not_characters() -> None:
 
     def capture(request, timeout=None):
         sent.append(json.loads(request.data.decode("utf-8")))
-        return Response(b'{"code":0}')
+        return FakeResponse(b'{"code":0}')
 
     notifier = FeishuNotifier(webhook_url="https://x", opener=capture)
     long_chinese = "\n".join("中文行内容测试" * 40 for _ in range(60))
@@ -652,7 +684,8 @@ def test_feishu_chunks_by_bytes_not_characters() -> None:
     assert notifier.send("盘后简报", long_chinese) is True
     assert len(sent) > 1
     assert all(
-        len(card["card"]["elements"][0]["content"].encode("utf-8")) <= notifier.capabilities.max_bytes
+        len(card["card"]["elements"][0]["content"].encode("utf-8"))
+        <= notifier.capabilities.max_bytes
         for card in sent
     )
 
@@ -662,7 +695,7 @@ def test_feishu_signs_the_timestamp_not_the_payload() -> None:
 
     def capture(request, timeout=None):
         sent.append(json.loads(request.data.decode("utf-8")))
-        return Response(b'{"code":0}')
+        return FakeResponse(b'{"code":0}')
 
     FeishuNotifier(webhook_url="https://x", secret="s3cr3t", opener=capture).send("t", "c")
 
@@ -680,10 +713,16 @@ def test_feishu_can_send_via_app_credentials() -> None:
     sent = []
 
     def capture(request, timeout=None):
-        sent.append((request.full_url, json.loads(request.data.decode("utf-8")), dict(request.header_items())))
+        sent.append(
+            (
+                request.full_url,
+                json.loads(request.data.decode("utf-8")),
+                dict(request.header_items()),
+            )
+        )
         if request.full_url == TOKEN_URL:
-            return Response(b'{"code":0,"tenant_access_token":"tenant-token","expire":7200}')
-        return Response(b'{"code":0,"data":{"message_id":"om_x"}}')
+            return FakeResponse(b'{"code":0,"tenant_access_token":"tenant-token","expire":7200}')
+        return FakeResponse(b'{"code":0,"data":{"message_id":"om_x"}}')
 
     notifier = FeishuNotifier(
         app_id="cli_x",
@@ -713,7 +752,7 @@ def test_feishu_app_mode_reports_incomplete_configuration() -> None:
 
 def test_feishu_app_mode_treats_token_errors_as_failure() -> None:
     def capture(request, timeout=None):
-        return Response(b'{"code":99991663,"msg":"invalid app_secret"}')
+        return FakeResponse(b'{"code":99991663,"msg":"invalid app_secret"}')
 
     notifier = FeishuNotifier(
         app_id="cli_x",
@@ -727,7 +766,7 @@ def test_feishu_app_mode_treats_token_errors_as_failure() -> None:
     assert "token 获取失败" in notifier.last_error
 
 
-# ---- scheduling ----------------------------------------------------------
+# scheduling
 
 
 def timetable(runners):
@@ -736,15 +775,21 @@ def timetable(runners):
 
 def test_daemon_runs_each_task_once_and_isolates_failures() -> None:
     calls = []
-    tasks = timetable({
-        "news": lambda: calls.append("news") or {"ok": True},
-        "morning": lambda: calls.append("morning") or {"ok": True},
-        "preopen": _raise,
-        "postclose": lambda: calls.append("postclose") or {"ok": True},
-    })
+    tasks = timetable(
+        {
+            "news": lambda: calls.append("news") or {"ok": True},
+            "morning": lambda: calls.append("morning") or {"ok": True},
+            "preopen": _raise,
+            "postclose": lambda: calls.append("postclose") or {"ok": True},
+        }
+    )
     report = run_daemon(
-        tasks, calendar=_calendar(), day=SESSION,
-        now_fn=lambda: datetime(2026, 8, 3, 16, 0), sleep=lambda s: None, max_ticks=30,
+        tasks,
+        calendar=_calendar(),
+        day=SESSION,
+        now_fn=lambda: datetime(2026, 8, 3, 16, 0),
+        sleep=lambda s: None,
+        max_ticks=30,
     )
 
     assert report.ran == ["news", "morning", "postclose"]
@@ -756,8 +801,12 @@ def test_a_failing_task_is_retried_but_not_forever() -> None:
     attempts = []
     tasks = timetable({"morning": lambda: attempts.append(1) or _raise()})
     run_daemon(
-        tasks, calendar=_calendar(), day=SESSION,
-        now_fn=lambda: datetime(2026, 8, 3, 16, 0), sleep=lambda s: None, max_ticks=30,
+        tasks,
+        calendar=_calendar(),
+        day=SESSION,
+        now_fn=lambda: datetime(2026, 8, 3, 16, 0),
+        sleep=lambda s: None,
+        max_ticks=30,
     )
 
     from ashare_decision_support.schedule import MAX_ATTEMPTS
@@ -768,11 +817,16 @@ def test_a_failing_task_is_retried_but_not_forever() -> None:
 def test_a_restarted_daemon_does_not_re_run_completed_tasks() -> None:
     calls = []
     tasks = timetable({"morning": lambda: calls.append("morning") or {"ok": True}})
+
     def clock():
         return datetime(2026, 8, 3, 16, 0)
 
-    run_daemon(tasks, calendar=_calendar(), day=SESSION, now_fn=clock, sleep=lambda s: None, max_ticks=5)
-    run_daemon(tasks, calendar=_calendar(), day=SESSION, now_fn=clock, sleep=lambda s: None, max_ticks=5)
+    run_daemon(
+        tasks, calendar=_calendar(), day=SESSION, now_fn=clock, sleep=lambda s: None, max_ticks=5
+    )
+    run_daemon(
+        tasks, calendar=_calendar(), day=SESSION, now_fn=clock, sleep=lambda s: None, max_ticks=5
+    )
 
     assert calls == ["morning"]
 
@@ -780,8 +834,12 @@ def test_a_restarted_daemon_does_not_re_run_completed_tasks() -> None:
 def test_task_summaries_are_trimmed_to_scalars() -> None:
     tasks = timetable({"morning": lambda: {"ok": True, "content": "x" * 50_000}})
     run_daemon(
-        tasks, calendar=_calendar(), day=SESSION,
-        now_fn=lambda: datetime(2026, 8, 3, 16, 0), sleep=lambda s: None, max_ticks=5,
+        tasks,
+        calendar=_calendar(),
+        day=SESSION,
+        now_fn=lambda: datetime(2026, 8, 3, 16, 0),
+        sleep=lambda s: None,
+        max_ticks=5,
     )
 
     assert DaemonState.load(SESSION).tasks["morning"]["summary"] == {"ok": True}
@@ -790,11 +848,26 @@ def test_task_summaries_are_trimmed_to_scalars() -> None:
 def test_non_trading_days_produce_nothing() -> None:
     calls = []
     tasks = timetable({"morning": lambda: calls.append("morning")})
+
     def clock():
         return datetime(2026, 8, 3, 16, 0)
 
-    weekend = run_daemon(tasks, calendar=_calendar(), day=date(2026, 8, 2), now_fn=clock, sleep=lambda s: None, max_ticks=5)
-    holiday = run_daemon(tasks, calendar=_calendar(), day=date(2026, 10, 1), now_fn=clock, sleep=lambda s: None, max_ticks=5)
+    weekend = run_daemon(
+        tasks,
+        calendar=_calendar(),
+        day=date(2026, 8, 2),
+        now_fn=clock,
+        sleep=lambda s: None,
+        max_ticks=5,
+    )
+    holiday = run_daemon(
+        tasks,
+        calendar=_calendar(),
+        day=date(2026, 10, 1),
+        now_fn=clock,
+        sleep=lambda s: None,
+        max_ticks=5,
+    )
 
     assert calls == []
     assert "周末" in weekend.notes[0]
@@ -833,7 +906,7 @@ def _calendar() -> TradingCalendar:
     return calendar
 
 
-# ---- scoring scale -------------------------------------------------------
+# scoring scale
 
 
 def _snapshot(**overrides):
@@ -841,11 +914,19 @@ def _snapshot(**overrides):
     from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 
     defaults = {
-        "symbol": "600519.SH", "last_open": 99.0, "last_high": 101.0, "last_low": 98.0,
-        "last_close": 100.0, "trend_state": TrendState.UPTREND,
-        "bar_count": 250, "volume_ratio_20d": 1.5, "range_position_60d": 0.5,
-        "stop_reference": 95.0, "target_reference": 115.0,
-        "explanation": "fixture", "source_ts": datetime(2026, 8, 3, 15, 0),
+        "symbol": "600519.SH",
+        "last_open": 99.0,
+        "last_high": 101.0,
+        "last_low": 98.0,
+        "last_close": 100.0,
+        "trend_state": TrendState.UPTREND,
+        "bar_count": 250,
+        "volume_ratio_20d": 1.5,
+        "range_position_60d": 0.5,
+        "stop_reference": 95.0,
+        "target_reference": 115.0,
+        "explanation": "fixture",
+        "source_ts": datetime(2026, 8, 3, 15, 0),
     }
     defaults.update(overrides)
     return DailyTechnicalSnapshot(**defaults)
@@ -856,11 +937,20 @@ def _wyckoff(**overrides):
     from ashare_decision_support.models.schemas import WyckoffSignal
 
     defaults = {
-        "symbol": "600519.SH", "bias": WyckoffBias.MARKUP, "score": 100.0,
-        "close_position": 0.8, "short_return_pct": 0.05, "medium_return_pct": 0.12,
-        "volume_ratio": 1.5, "compression_ratio": 0.4,
-        "spring": True, "sign_of_strength": True, "last_point_of_support": True, "upthrust": False,
-        "explanation": "fixture", "source_ts": datetime(2026, 8, 3, 15, 0),
+        "symbol": "600519.SH",
+        "bias": WyckoffBias.MARKUP,
+        "score": 100.0,
+        "close_position": 0.8,
+        "short_return_pct": 0.05,
+        "medium_return_pct": 0.12,
+        "volume_ratio": 1.5,
+        "compression_ratio": 0.4,
+        "spring": True,
+        "sign_of_strength": True,
+        "last_point_of_support": True,
+        "upthrust": False,
+        "explanation": "fixture",
+        "source_ts": datetime(2026, 8, 3, 15, 0),
     }
     defaults.update(overrides)
     return WyckoffSignal(**defaults)
@@ -870,8 +960,13 @@ def _news(**overrides):
     from ashare_decision_support.news.base import SymbolSentiment
 
     defaults = {
-        "symbol": "600519.SH", "polarity": 1.0, "intensity": 1.0, "doc_count": 4,
-        "headlines": ("业绩预增",), "bullish_hits": ("业绩预增", "中标"), "bearish_hits": (),
+        "symbol": "600519.SH",
+        "polarity": 1.0,
+        "intensity": 1.0,
+        "doc_count": 4,
+        "headlines": ("业绩预增",),
+        "bullish_hits": ("业绩预增", "中标"),
+        "bearish_hits": (),
     }
     defaults.update(overrides)
     return SymbolSentiment(**defaults)
@@ -881,10 +976,18 @@ def _dip(**overrides):
     from ashare_decision_support.signals.dipbuy import DipFeatures
 
     defaults = {
-        "ret_20d": 0.08, "ret_60d": 0.2, "above_ma20": True, "dist_to_ma20_pct": 0.03,
-        "pullback_pct": -0.06, "atr_pct": 0.02, "pullback_atr": 3.0, "pullback_band": "ideal",
-        "down_days": 4, "dist_to_support_pct": 0.01,
-        "volume_contraction": 0.5, "shrinking": True,
+        "ret_20d": 0.08,
+        "ret_60d": 0.2,
+        "above_ma20": True,
+        "dist_to_ma20_pct": 0.03,
+        "pullback_pct": -0.06,
+        "atr_pct": 0.02,
+        "pullback_atr": 3.0,
+        "pullback_band": "ideal",
+        "down_days": 4,
+        "dist_to_support_pct": 0.01,
+        "volume_contraction": 0.5,
+        "shrinking": True,
     }
     defaults.update(overrides)
     return DipFeatures(**defaults)
@@ -900,7 +1003,9 @@ def test_scores_do_not_all_saturate_at_the_top_of_the_scale() -> None:
     best = provider.score(ScoreInput(symbol="A", bars=[], snapshot=_snapshot(), wyckoff=_wyckoff()))
     good = provider.score(
         ScoreInput(
-            symbol="B", bars=[], snapshot=_snapshot(),
+            symbol="B",
+            bars=[],
+            snapshot=_snapshot(),
             wyckoff=_wyckoff(bias=WyckoffBias.ACCUMULATION, score=60.0, spring=False),
         )
     )
@@ -924,8 +1029,12 @@ def test_the_perfect_case_reaches_but_does_not_exceed_the_ceiling() -> None:
     provider = RuleBasedScoreProvider()
     result = provider.score(
         ScoreInput(
-            symbol="A", bars=[], snapshot=_snapshot(volume_ratio_20d=0.5),
-            wyckoff=_wyckoff(bias=WyckoffBias.ACCUMULATION), news=_news(), dip=_dip(),
+            symbol="A",
+            bars=[],
+            snapshot=_snapshot(volume_ratio_20d=0.5),
+            wyckoff=_wyckoff(bias=WyckoffBias.ACCUMULATION),
+            news=_news(),
+            dip=_dip(),
         )
     )
 
@@ -944,7 +1053,10 @@ def test_missing_news_is_not_read_as_bad_news() -> None:
     )
     neutral = provider.score(
         ScoreInput(
-            symbol="A", bars=[], snapshot=_snapshot(), wyckoff=_wyckoff(),
+            symbol="A",
+            bars=[],
+            snapshot=_snapshot(),
+            wyckoff=_wyckoff(),
             news=_news(polarity=0.0, intensity=0.0, bullish_hits=(), doc_count=3),
         )
     )
@@ -965,7 +1077,10 @@ def test_bearish_stock_news_lowers_the_score_and_raises_a_warning() -> None:
     )
     flagged = provider.score(
         ScoreInput(
-            symbol="A", bars=[], snapshot=_snapshot(), wyckoff=_wyckoff(),
+            symbol="A",
+            bars=[],
+            snapshot=_snapshot(),
+            wyckoff=_wyckoff(),
             news=_news(polarity=-1.0, bullish_hits=(), bearish_hits=("减持", "立案调查")),
         )
     )
@@ -984,10 +1099,16 @@ def test_news_cannot_outrank_price_action() -> None:
     provider = RuleBasedScoreProvider()
     hyped_but_broken = provider.score(
         ScoreInput(
-            symbol="BAD", bars=[],
+            symbol="BAD",
+            bars=[],
             snapshot=_snapshot(trend_state=TrendState.DOWNTREND, volume_ratio_20d=0.4),
-            wyckoff=_wyckoff(bias=WyckoffBias.MARKDOWN, score=-80.0, spring=False,
-                             sign_of_strength=False, last_point_of_support=False),
+            wyckoff=_wyckoff(
+                bias=WyckoffBias.MARKDOWN,
+                score=-80.0,
+                spring=False,
+                sign_of_strength=False,
+                last_point_of_support=False,
+            ),
             news=_news(),
         )
     )
@@ -1004,14 +1125,22 @@ def test_a_broken_name_scores_below_neutral() -> None:
 
     result = RuleBasedScoreProvider().score(
         ScoreInput(
-            symbol="A", bars=[],
+            symbol="A",
+            bars=[],
             snapshot=_snapshot(
-                trend_state=TrendState.DOWNTREND, volume_ratio_20d=0.4,
-                range_position_60d=0.05, stop_reference=99.0, target_reference=101.0,
+                trend_state=TrendState.DOWNTREND,
+                volume_ratio_20d=0.4,
+                range_position_60d=0.05,
+                stop_reference=99.0,
+                target_reference=101.0,
             ),
             wyckoff=_wyckoff(
-                bias=WyckoffBias.MARKDOWN, score=-80.0, spring=False,
-                sign_of_strength=False, last_point_of_support=False, upthrust=True,
+                bias=WyckoffBias.MARKDOWN,
+                score=-80.0,
+                spring=False,
+                sign_of_strength=False,
+                last_point_of_support=False,
+                upthrust=True,
             ),
         )
     )
@@ -1019,7 +1148,7 @@ def test_a_broken_name_scores_below_neutral() -> None:
     assert result.score < 50.0
 
 
-# ---- position sizing -----------------------------------------------------
+# position sizing
 
 
 def test_overheat_haircut_is_continuous_not_a_cliff() -> None:
@@ -1058,8 +1187,15 @@ def test_market_outlook_refuses_a_direction_on_thin_coverage() -> None:
 
     thin = {
         f"s{i}": SectorMetrics(
-            name=f"s{i}", constituents=300, covered=2, breadth=0.9,
-            ret_1d=0.02, ret_5d=0.05, above_ma20=0.9, volume_ratio=1.1, strong_count=0,
+            name=f"s{i}",
+            constituents=300,
+            covered=2,
+            breadth=0.9,
+            ret_1d=0.02,
+            ret_5d=0.05,
+            above_ma20=0.9,
+            volume_ratio=1.1,
+            strong_count=0,
         )
         for i in range(6)
     }
@@ -1079,8 +1215,15 @@ def test_market_outlook_reads_direction_from_measured_breadth() -> None:
     def metrics(breadth, ret_1d, ret_5d, ma20):
         return {
             f"s{i}": SectorMetrics(
-                name=f"s{i}", constituents=120, covered=100, breadth=breadth,
-                ret_1d=ret_1d, ret_5d=ret_5d, above_ma20=ma20, volume_ratio=1.1, strong_count=0,
+                name=f"s{i}",
+                constituents=120,
+                covered=100,
+                breadth=breadth,
+                ret_1d=ret_1d,
+                ret_5d=ret_5d,
+                above_ma20=ma20,
+                volume_ratio=1.1,
+                strong_count=0,
             )
             for i in range(6)
         }
@@ -1094,23 +1237,21 @@ def test_market_outlook_reads_direction_from_measured_breadth() -> None:
     assert strong.score > weak.score
 
 
-# ---- batch snapshots with depth -----------------------------------------
+# batch snapshots with depth
 
 SINA_LINE = (
     'var hq_str_sh600519="贵州茅台,1330.030,1361.760,1350.600,1355.000,1329.000,'
-    '1350.600,1350.670,'
-    '84,113322,'
-    '84,1350.600,100,1350.550,500,1350.500,100,1350.400,100,1350.350,'
-    '3100,1350.670,100,1350.700,1100,1350.880,300,1350.980,600,1351.000,'
+    "1350.600,1350.670,"
+    "84,113322,"
+    "84,1350.600,100,1350.550,500,1350.500,100,1350.400,100,1350.350,"
+    "3100,1350.670,100,1350.700,1100,1350.880,300,1350.980,600,1351.000,"
     '2026-07-31,15:34:59,00";'
 )
 
 # Captured verbatim from qt.gtimg.cn — hand-built fixtures put the 88
 # tilde-separated fields out of alignment, which is the exact class of bug
 # the parser has to get right.
-TENCENT_LINE = (
-    'v_sz300750="51~宁德时代~300750~395.30~401.88~395.55~394149~188920~205229~395.30~6~395.29~3~395.28~5~395.26~14~395.25~1~395.60~22~395.66~2~395.74~2~395.80~2~395.81~1~~20260731161442~-6.58~-1.64~400.20~389.00~395.30/394149/15602984033~394149~1560298~0.93~21.52~~400.20~389.00~2.79~16840.10~18289.17~4.82~482.26~321.50~1.01~0~395.86~21.13~25.33~~~1.17~1560298.4033~252.9920~64~ A A~GP-A-CYB~9.70~3.21~1.97~22.41~8.03~468.75~249.81~9.81~4.03~-12.47~4260081019~4626654919~0.00~6.25~4260081019~~~53.99~-0.41~~CNY~0~~396.00~-115~";'
-)
+TENCENT_LINE = 'v_sz300750="51~宁德时代~300750~395.30~401.88~395.55~394149~188920~205229~395.30~6~395.29~3~395.28~5~395.26~14~395.25~1~395.60~22~395.66~2~395.74~2~395.80~2~395.81~1~~20260731161442~-6.58~-1.64~400.20~389.00~395.30/394149/15602984033~394149~1560298~0.93~21.52~~400.20~389.00~2.79~16840.10~18289.17~4.82~482.26~321.50~1.01~0~395.86~21.13~25.33~~~1.17~1560298.4033~252.9920~64~ A A~GP-A-CYB~9.70~3.21~1.97~22.41~8.03~468.75~249.81~9.81~4.03~-12.47~4260081019~4626654919~0.00~6.25~4260081019~~~53.99~-0.41~~CNY~0~~396.00~-115~";'
 
 
 class StubHttp:
@@ -1120,7 +1261,7 @@ class StubHttp:
 
     def __call__(self, request, timeout=None):
         self.requests.append(request)
-        return Response(self.body.encode("gbk", errors="replace"))
+        return FakeResponse(self.body, encoding="gbk")
 
 
 def test_sina_snapshot_carries_a_full_five_level_book() -> None:
@@ -1171,8 +1312,11 @@ def test_limit_state_is_unknown_rather_than_guessed_without_a_limit_price() -> N
 def test_a_halted_symbol_is_reported_missing_not_priced_at_zero() -> None:
     from ashare_decision_support.adapters.snapshot import SnapshotAdapter
 
-    halted = 'var hq_str_sh600519="ST测试,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0,0,' + \
-        ",".join(["0"] * 20) + ',2026-07-31,15:00:00,00";'
+    halted = (
+        'var hq_str_sh600519="ST测试,0.000,0.000,0.000,0.000,0.000,0.000,0.000,0,0,'
+        + ",".join(["0"] * 20)
+        + ',2026-07-31,15:00:00,00";'
+    )
     adapter = SnapshotAdapter(opener=StubHttp(halted))
     snapshots, notes = adapter.get_snapshots(["600519"])
 
@@ -1202,7 +1346,7 @@ def test_snapshot_symbols_are_translated_to_the_vendor_form() -> None:
     assert http.requests[0].headers["Referer"].startswith("https://finance.sina.com.cn")
 
 
-# ---- 舆情：去重、时效、个股归因 -------------------------------------------
+# 舆情：去重、时效、个股归因
 
 
 def _doc(title: str, published_at: str = "", summary: str = "", source: str = ""):
@@ -1301,15 +1445,21 @@ def test_symbol_news_agent_merges_announcements_with_headlines() -> None:
     source = StubNewsSource(
         by_symbol={"600519.SH": [_doc("公司获得大额订单", "2026-08-03 07:00:00")]},
         announcements=[
-            {"symbol": "600519", "title": "关于控股股东减持股份的公告",
-             "category": "股东减持", "published_at": "2026-08-03"},
-            {"symbol": "000001", "title": "别人家的公告", "category": "其他",
-             "published_at": "2026-08-03"},
+            {
+                "symbol": "600519",
+                "title": "关于控股股东减持股份的公告",
+                "category": "股东减持",
+                "published_at": "2026-08-03",
+            },
+            {
+                "symbol": "000001",
+                "title": "别人家的公告",
+                "category": "其他",
+                "published_at": "2026-08-03",
+            },
         ],
     )
-    agent = SymbolNewsAgent(
-        symbols=["600519.SH"], announcements=source.announcements, now=NEWS_NOW
-    )
+    agent = SymbolNewsAgent(symbols=["600519.SH"], announcements=source.announcements, now=NEWS_NOW)
     data, notes = agent.run(
         AgentContext(trade_date=SESSION, news_source=source, symbols=["600519.SH"])
     )
@@ -1348,7 +1498,7 @@ def test_symbol_news_agent_without_a_source_says_so() -> None:
     assert any("不含个股舆情项" in note for note in notes)
 
 
-# ---- 突发风险公告告警 -----------------------------------------------------
+# 突发风险公告告警
 
 
 BLOCKING_NOTICE = {
@@ -1362,9 +1512,16 @@ BLOCKING_NOTICE = {
 def test_refresh_risk_survives_contact_with_a_real_announcement() -> None:
     """这条路径在此之前没有任何调用点，两个缺陷因此一直没被发现：
     没人给它数据，而且它读的是 `AnnouncementRisk` 上不存在的属性。"""
-    session = MonitorSession(StubDaily(), ScriptedIntraday([minute_bars(RISE)]), SESSION, alert_state=AlertState.load(SESSION))
+    session = MonitorSession(
+        StubDaily(),
+        ScriptedIntraday([minute_bars(RISE)]),
+        SESSION,
+        alert_state=AlertState.load(SESSION),
+    )
 
-    blocked = session.refresh_risk([BLOCKING_NOTICE, {"symbol": "000001", "title": "年度报告", "category": "年报"}])
+    blocked = session.refresh_risk(
+        [BLOCKING_NOTICE, {"symbol": "000001", "title": "年度报告", "category": "年报"}]
+    )
 
     assert blocked == 1
     assert session.risk_notes["600519"]  # 非空说明理由真的取出来了
@@ -1373,7 +1530,9 @@ def test_refresh_risk_survives_contact_with_a_real_announcement() -> None:
 def test_risk_notice_fires_once_the_announcements_are_actually_loaded() -> None:
     engine = TriggerEngine(levels=(LEVEL_ACTION, LEVEL_WARN))
     state = AlertState.load(SESSION)
-    advice = StockAdvice(symbol="600519.SH", last_price=100.6, entry_low=99.0, entry_high=101.0, stop=95.0)
+    advice = StockAdvice(
+        symbol="600519.SH", last_price=100.6, entry_low=99.0, entry_high=101.0, stop=95.0
+    )
 
     from ashare_decision_support.signals.intraday import IntradayAnalyzer
 
@@ -1381,8 +1540,11 @@ def test_risk_notice_fires_once_the_announcements_are_actually_loaded() -> None:
     advice.last_price = snapshot.last_price
     # 第一轮建基线，但风险公告本身就是一次跃迁，不必等第二轮。
     alerts = engine.evaluate(
-        advice=advice, intraday=snapshot, state=state,
-        now=datetime(2026, 8, 3, 10, 0), risk_note="风险警示：关于公司股票被实施退市风险警示的公告",
+        advice=advice,
+        intraday=snapshot,
+        state=state,
+        now=datetime(2026, 8, 3, 10, 0),
+        risk_note="风险警示：关于公司股票被实施退市风险警示的公告",
     )
 
     assert [alert.trigger for alert in alerts] == ["risk_notice"]
@@ -1390,8 +1552,11 @@ def test_risk_notice_fires_once_the_announcements_are_actually_loaded() -> None:
 
     # 一天一次：同一条公告不会每轮重推。
     again = engine.evaluate(
-        advice=advice, intraday=snapshot, state=state,
-        now=datetime(2026, 8, 3, 11, 0), risk_note="风险警示：关于公司股票被实施退市风险警示的公告",
+        advice=advice,
+        intraday=snapshot,
+        state=state,
+        now=datetime(2026, 8, 3, 11, 0),
+        risk_note="风险警示：关于公司股票被实施退市风险警示的公告",
     )
     assert again == []
 
@@ -1399,7 +1564,12 @@ def test_risk_notice_fires_once_the_announcements_are_actually_loaded() -> None:
 def test_monitor_loop_refreshes_announcements_on_a_slow_cycle() -> None:
     """公告是整日全量拉取，每轮都拉是浪费；但只在开盘读一次会漏掉盘中临时公告。"""
     calls: list[int] = []
-    session = MonitorSession(StubDaily(), ScriptedIntraday([minute_bars(RISE)]), SESSION, alert_state=AlertState.load(SESSION))
+    session = MonitorSession(
+        StubDaily(),
+        ScriptedIntraday([minute_bars(RISE)]),
+        SESSION,
+        alert_state=AlertState.load(SESSION),
+    )
     session.prime(["600519.SH"])
 
     stats = run_monitor_loop(
@@ -1421,7 +1591,12 @@ def test_a_failing_announcement_refresh_does_not_stop_monitoring() -> None:
     def boom():
         raise RuntimeError("notice feed down")
 
-    session = MonitorSession(StubDaily(), ScriptedIntraday([minute_bars(RISE)]), SESSION, alert_state=AlertState.load(SESSION))
+    session = MonitorSession(
+        StubDaily(),
+        ScriptedIntraday([minute_bars(RISE)]),
+        SESSION,
+        alert_state=AlertState.load(SESSION),
+    )
     session.prime(["600519.SH"])
 
     stats = run_monitor_loop(
@@ -1439,7 +1614,7 @@ def test_a_failing_announcement_refresh_does_not_stop_monitoring() -> None:
     assert any("公告刷新失败" in note for note in stats.notes)
 
 
-# ---- 任务层接线：并行采集 · 舆情入分 · 辩论 -------------------------------
+# 任务层接线：并行采集 · 舆情入分 · 辩论
 
 
 def test_advise_runs_its_independent_fetches_concurrently() -> None:
@@ -1522,7 +1697,7 @@ def test_advise_presents_company_event_and_risk_evidence() -> None:
         def get_minute_bars(self, symbols, period="5", **kwargs):
             return {symbol: minute_bars(RISE) for symbol in symbols}, []
 
-    fresh = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    fresh = (beijing_naive_now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     source = StubNewsSource(
         {"600519.SH": [_doc("测试股中标大额订单", fresh)]},
         announcements=[
@@ -1562,8 +1737,12 @@ def test_advise_feeds_stock_news_into_the_score() -> None:
 
     def score_of(docs):
         summary = run_advise(
-            adapter=StubDaily(), symbols=["600519.SH"], intraday_adapter=Intraday(),
-            news_source=News(docs), notifiers=[], trade_date=SESSION,
+            adapter=StubDaily(),
+            symbols=["600519.SH"],
+            intraday_adapter=Intraday(),
+            news_source=News(docs),
+            notifiers=[],
+            trade_date=SESSION,
         )
         return summary["facts"]["symbols"][0]
 
@@ -1573,7 +1752,7 @@ def test_advise_feeds_stock_news_into_the_score() -> None:
     # 这条断言只在真实时间落在那之后 24 小时内才成立：实测 24.2 小时时 intensity
     # 衰减到 0.2449，而告警门槛要求 ≥0.25，差 2%。**测试会在某天早上自己变红，
     # 而那天没有任何人改过代码。**
-    fresh = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    fresh = (beijing_naive_now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     bearish = score_of([_doc("控股股东拟大幅减持，公司收到问询函", fresh)])
 
     assert bearish["score"] < quiet["score"]
@@ -1612,12 +1791,23 @@ def test_advise_appends_the_debate_without_letting_it_touch_the_numbers() -> Non
         def get_minute_bars(self, symbols, period="5", **kwargs):
             return {symbol: minute_bars(RISE) for symbol in symbols}, []
 
-    panel = DebatePanel(client=FakeLlm([
-        "- 结构完整", "- 但已接近压力位", "- 分歧在于能否守住",
-    ]))
+    panel = DebatePanel(
+        client=FakeLlm(
+            [
+                "- 结构完整",
+                "- 但已接近压力位",
+                "- 分歧在于能否守住",
+            ]
+        )
+    )
     summary = run_advise(
-        adapter=StubDaily(), symbols=["600519.SH"], intraday_adapter=Intraday(),
-        use_news=False, debate=panel, notifiers=[], trade_date=SESSION,
+        adapter=StubDaily(),
+        symbols=["600519.SH"],
+        intraday_adapter=Intraday(),
+        use_news=False,
+        debate=panel,
+        notifiers=[],
+        trade_date=SESSION,
     )
 
     assert "多空视角" in summary["content"]
@@ -1628,6 +1818,7 @@ def test_advise_appends_the_debate_without_letting_it_touch_the_numbers() -> Non
 
 def test_monitor_loads_announcements_so_the_risk_trigger_has_input() -> None:
     from ashare_decision_support.jobs import run_monitor
+
     Positions().open("600519.SH", cost_price=1300.0)
 
     class Intraday:
@@ -1650,6 +1841,7 @@ def test_monitor_loads_announcements_so_the_risk_trigger_has_input() -> None:
 
 def test_monitor_says_so_when_the_announcement_source_is_missing() -> None:
     from ashare_decision_support.jobs import run_monitor
+
     Positions().open("600519.SH", cost_price=1300.0)
 
     class Intraday:
@@ -1657,13 +1849,60 @@ def test_monitor_says_so_when_the_announcement_source_is_missing() -> None:
             return {symbol: minute_bars(RISE) for symbol in symbols}, []
 
     summary = run_monitor(
-        adapter=StubDaily(), once=True, intraday_adapter=Intraday(),
-        news_source=object(), notifiers=[], trade_date=SESSION,
+        adapter=StubDaily(),
+        once=True,
+        intraday_adapter=Intraday(),
+        news_source=object(),
+        notifiers=[],
+        trade_date=SESSION,
         now=datetime(2026, 8, 3, 10, 0),
     )
 
     assert summary["risk_blocked"] == 0
     assert any("不含突发风险公告告警" in note for note in summary["notes"])
+
+
+@pytest.mark.parametrize("once", [True, False])
+def test_monitor_no_news_really_skips_announcements(once, monkeypatch, tmp_path) -> None:
+    """`--no-news` 此前只是让 CLI 传 `news_source=None`，而 job 一见 None 就自己造
+    默认源——开关等于没接上。关掉之后不得碰任何公告源。"""
+    from ashare_decision_support.jobs import monitor as monitor_job
+    from ashare_decision_support.jobs import run_monitor
+
+    Positions().open("600519.SH", cost_price=1300.0)
+
+    class Intraday:
+        def get_minute_bars(self, symbols, period="1", **kwargs):
+            return {symbol: minute_bars(RISE) for symbol in symbols}, []
+
+    def explode(cache_dir):
+        raise AssertionError("--no-news 时不应构造默认公告源")
+
+    monkeypatch.setattr(monitor_job, "_default_news_source", explode)
+    moment = datetime(2026, 8, 3, 10, 0)
+    real_loop = monitor_job.run_monitor_loop
+    monkeypatch.setattr(
+        monitor_job,
+        "run_monitor_loop",
+        lambda **kwargs: real_loop(now_fn=lambda: moment, sleep=lambda _: None, **kwargs),
+    )
+    summary = run_monitor(
+        adapter=StubDaily(),
+        once=once,
+        max_passes=2,
+        intraday_adapter=Intraday(),
+        use_news=False,
+        notifiers=[],
+        trade_date=SESSION,
+        now=moment,
+        sectors=False,
+        use_order_book=False,
+        output_dir=tmp_path,
+    )
+
+    assert summary["passes"] == (1 if once else 2)
+    assert summary["risk_blocked"] == 0
+    assert any("--no-news" in note for note in summary["notes"])
 
 
 def test_post_close_accepts_the_trade_date_the_daemon_passes_it() -> None:
@@ -1681,8 +1920,12 @@ def test_post_close_runs_the_debate_on_its_own_facts(tmp_path) -> None:
 
     panel = DebatePanel(client=FakeLlm(["- 结构完整", "- 位置偏高", "- 分歧在成交量"]))
     summary = run_post_close(
-        adapter=StubDaily(), symbols=["600519.SH"], output_dir=str(tmp_path),
-        notifiers=[], debate=panel, trade_date=SESSION,
+        adapter=StubDaily(),
+        symbols=["600519.SH"],
+        output_dir=str(tmp_path),
+        notifiers=[],
+        debate=panel,
+        trade_date=SESSION,
     )
 
     assert "多空视角" in summary["content"]
@@ -1696,11 +1939,20 @@ def test_two_headlines_cannot_max_out_the_sector_sentiment_cap() -> None:
     from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics
     from ashare_decision_support.sectors.predict import SENTIMENT_CAP, SectorPredictor
 
-    definition = SectorDefinition(name="基础化工", level="SW1", symbols=["600230.SH", "002440.SZ"])
+    definition = SectorDefinition(
+        name="基础化工", level="THS_INDUSTRY", symbols=["600230.SH", "002440.SZ"]
+    )
     metrics = {
         "基础化工": SectorMetrics(
-            name="基础化工", constituents=2, covered=2, ret_1d=0.01, ret_5d=0.02,
-            breadth=0.6, above_ma20=0.6, strong_count=0, volume_ratio=1.1,
+            name="基础化工",
+            constituents=2,
+            covered=2,
+            ret_1d=0.01,
+            ret_5d=0.02,
+            breadth=0.6,
+            above_ma20=0.6,
+            strong_count=0,
+            volume_ratio=1.1,
         )
     }
     strong = [_doc("化工行业利好，产品大幅涨价", "2026-08-03 08:00:00")] * 2
@@ -1722,25 +1974,61 @@ def test_more_evidence_is_worth_more_not_less() -> None:
     assert sentiment_confidence(50) == 1.0
 
 
-# ---- 涨停池情绪 ----------------------------------------------------------
+# 涨停池情绪
 
 
 def _pool_payload(pool: str, qdate: int = 20260731):
     rows = {
         "ZT": [
-            {"c": "000593", "m": 0, "n": "德龙汇能", "p": 16920, "zdp": 10.01,
-             "amount": 1.1e8, "hs": 1.8, "lbc": 1, "fbt": 92500, "fund": 8.2e7,
-             "zbc": 0, "hybk": "燃气Ⅱ", "zttj": {"days": 1, "ct": 1}},
+            {
+                "c": "000593",
+                "m": 0,
+                "n": "德龙汇能",
+                "p": 16920,
+                "zdp": 10.01,
+                "amount": 1.1e8,
+                "hs": 1.8,
+                "lbc": 1,
+                "fbt": 92500,
+                "fund": 8.2e7,
+                "zbc": 0,
+                "hybk": "燃气Ⅱ",
+                "zttj": {"days": 1, "ct": 1},
+            },
             # 真实形态：`zttj` 是「20 天 10 板」的统计窗口，`lbc` 才是连板高度。
             # 两者拉开差距，这条断言才验得出读的是哪个字段。
-            {"c": "603221", "m": 1, "n": "爱丽家居", "p": 10000, "zdp": 10.0,
-             "amount": 9.2e7, "hs": 5.0, "lbc": 6, "fbt": 92500, "fund": 9.2e7,
-             "zbc": 0, "hybk": "家居用品", "zttj": {"days": 20, "ct": 10}},
+            {
+                "c": "603221",
+                "m": 1,
+                "n": "爱丽家居",
+                "p": 10000,
+                "zdp": 10.0,
+                "amount": 9.2e7,
+                "hs": 5.0,
+                "lbc": 6,
+                "fbt": 92500,
+                "fund": 9.2e7,
+                "zbc": 0,
+                "hybk": "家居用品",
+                "zttj": {"days": 20, "ct": 10},
+            },
         ],
         "ZB": [
-            {"c": "000636", "m": 0, "n": "风华高科", "p": 49350, "ztp": 55550,
-             "zdp": -2.28, "amount": 1.3e10, "hs": 22.1, "lbc": 0, "fbt": 92500,
-             "zbc": 3, "hybk": "元件", "zttj": {"days": 0, "ct": 0}},
+            {
+                "c": "000636",
+                "m": 0,
+                "n": "风华高科",
+                "p": 49350,
+                "ztp": 55550,
+                "zdp": -2.28,
+                "amount": 1.3e10,
+                "hs": 22.1,
+                "lbc": 0,
+                "fbt": 92500,
+                "zbc": 3,
+                "hybk": "元件",
+                "zttj": {"days": 0, "ct": 0},
+            },
         ],
         "DT": [],
     }[pool]
@@ -1758,21 +2046,7 @@ class StubPoolHttp:
         pool = next(p for p in ("ZT", "ZB", "DT") if f"getTopic{p}Pool" in request.full_url)
         if pool in self.fail:
             raise OSError("boom")
-        return _Resp(_pool_payload(pool, self.qdate).encode("utf-8"))
-
-
-class _Resp:
-    def __init__(self, body: bytes):
-        self.body = body
-
-    def read(self):
-        return self.body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+        return FakeResponse(_pool_payload(pool, self.qdate).encode("utf-8"))
 
 
 def test_limit_pool_reads_seal_quality_not_just_counts() -> None:
@@ -1784,11 +2058,11 @@ def test_limit_pool_reads_seal_quality_not_just_counts() -> None:
     # 炸板率 = 冲过板的票里没守住的比例，不是"炸板数/涨停数"。
     assert snap.blowup_rate == pytest.approx(1 / 3, abs=1e-4)
     assert snap.max_streak == 6
-    assert snap.limit_up[1].window_days == 20      # 「20 天 10 板」是另一件事
+    assert snap.limit_up[1].window_days == 20  # 「20 天 10 板」是另一件事
     assert snap.limit_up[1].window_limit_ups == 10
-    assert snap.limit_up[1].symbol == "603221.SH"   # m=1 -> 沪
-    assert snap.limit_up[0].symbol == "000593.SZ"   # m=0 -> 深
-    assert snap.limit_up[0].price == pytest.approx(16.92)   # 分 -> 元
+    assert snap.limit_up[1].symbol == "603221.SH"  # m=1 -> 沪
+    assert snap.limit_up[0].symbol == "000593.SZ"  # m=0 -> 深
+    assert snap.limit_up[0].price == pytest.approx(16.92)  # 分 -> 元
     assert snap.limit_up[0].first_seal == "09:25"
     assert snap.blowups[0].limit_price == pytest.approx(55.55)
 
@@ -1806,18 +2080,26 @@ def test_limit_pool_does_not_mistake_the_stat_window_for_a_streak() -> None:
     class StatWindowHttp(StubPoolHttp):
         def __call__(self, request, timeout=None):
             if "getTopicZTPool" not in request.full_url:
-                return _Resp(json.dumps({"rc": 0, "data": {"tc": 0, "pool": []}}).encode())
+                return FakeResponse(json.dumps({"rc": 0, "data": {"tc": 0, "pool": []}}).encode())
             rows = [
-                {"c": "000815", "m": 0, "n": "美利云", "p": 10000, "zdp": 10.0,
-                 "lbc": 1, "zbc": 0, "zttj": {"days": 10, "ct": 5}},
+                {
+                    "c": "000815",
+                    "m": 0,
+                    "n": "美利云",
+                    "p": 10000,
+                    "zdp": 10.0,
+                    "lbc": 1,
+                    "zbc": 0,
+                    "zttj": {"days": 10, "ct": 5},
+                },
             ]
-            return _Resp(
+            return FakeResponse(
                 json.dumps({"rc": 0, "data": {"tc": 1, "qdate": 20260731, "pool": rows}}).encode()
             )
 
     snap = LimitPoolAdapter(opener=StatWindowHttp()).fetch(date(2026, 7, 31))
 
-    assert snap.max_streak == 1          # 首板，不是 10 板
+    assert snap.max_streak == 1  # 首板，不是 10 板
     assert snap.limit_up[0].window_days == 10
     assert snap.limit_up[0].window_limit_ups == 5
 
@@ -1832,6 +2114,52 @@ def test_limit_pool_labels_data_with_the_date_the_server_actually_returned() -> 
     assert snap.trade_date == date(2026, 7, 31)
     assert snap.requested_date == date(2026, 8, 1)
     assert any("实际为 2026-07-31" in note for note in snap.notes)
+
+
+def test_limit_pool_keeps_the_asked_date_when_the_server_serves_an_older_pool() -> None:
+    """`qdate` 是服务端所知的最新交易日，不是这批行的日期。
+
+    2026-09-14 盘中实测：问 0911 拿到的是周五那 40 只，`qdate` 却是 0914。此前一律
+    取 `qdate`，回溯到周五的池子会被标成周一的，情绪周期就挂错了天。
+    """
+    from ashare_decision_support.adapters.limit_pool import LimitPoolAdapter
+
+    snap = LimitPoolAdapter(opener=StubPoolHttp(qdate=20260914)).fetch(date(2026, 9, 11))
+
+    assert snap.trade_date == date(2026, 9, 11)
+    assert snap.requested_date == date(2026, 9, 11)
+    assert not any("实际为" in note for note in snap.notes)
+
+
+def test_fetch_recent_skips_todays_pool_while_the_session_is_still_forming() -> None:
+    """开盘后跑批，今天的池子存在但没定格：09:33 读到 15 家会被判成「冰点」。
+
+    情绪周期问的是「昨天封住的板今天还封得住吗」，输入必须是上一个走完的交易日。
+    盘中跳过今天、回溯到周五，并把这件事写进 notes；收盘后同一份池子照常采用。
+    """
+    from ashare_decision_support.adapters.limit_pool import LimitPoolAdapter
+
+    class ServesEveryDay(StubPoolHttp):
+        def __call__(self, request, timeout=None):
+            self.requests.append(request.full_url)
+            pool = next(p for p in ("ZT", "ZB", "DT") if f"getTopic{p}Pool" in request.full_url)
+            asked = request.full_url.split("date=")[1][:8]
+            rows = _pool_payload(pool, 20260914) if asked in {"20260914", "20260911"} else None
+            body = rows or json.dumps({"rc": 0, "data": {"tc": 0, "qdate": 20260914, "pool": []}})
+            return FakeResponse(body.encode("utf-8"))
+
+    monday = date(2026, 9, 14)
+    live = LimitPoolAdapter(opener=ServesEveryDay()).fetch_recent(
+        monday, now=datetime(2026, 9, 14, 9, 33)
+    )
+    assert live.ok and live.trade_date == date(2026, 9, 11)
+    assert any("盘中尚未定格（09:33）" in note for note in live.notes)
+
+    closed = LimitPoolAdapter(opener=ServesEveryDay()).fetch_recent(
+        monday, now=datetime(2026, 9, 14, 15, 10)
+    )
+    assert closed.ok and closed.trade_date == monday
+    assert not any("尚未定格" in note for note in closed.notes)
 
 
 def test_no_limit_up_at_all_is_not_reported_as_zero_blowup_rate() -> None:
@@ -1867,7 +2195,7 @@ def test_blowup_rate_moves_the_market_score_against_a_rising_index() -> None:
     assert limit_pool_points(None, None) == (0.0, [])
 
 
-# ---- 大模型舆情归因 ------------------------------------------------------
+# 大模型舆情归因
 
 
 class StubLlm:
@@ -1895,12 +2223,27 @@ def test_labels_align_by_echoed_title_not_by_model_reported_index() -> None:
         _doc("中微公司5年内产能将超700亿元", "2026-08-01 08:01:00"),
     ]
     # 序号全部错开一位，但 t 抄对了。
-    reply = json.dumps([
-        {"i": 1, "t": "法国森林火灾", "sectors": [], "direction": "neutral",
-         "event": "其他", "why": ""},
-        {"i": 2, "t": "中微公司5年", "sectors": ["电子"], "direction": "bullish",
-         "event": "产能", "why": "设备产能扩张"},
-    ], ensure_ascii=False)
+    reply = json.dumps(
+        [
+            {
+                "i": 1,
+                "t": "法国森林火灾",
+                "sectors": [],
+                "direction": "neutral",
+                "event": "其他",
+                "why": "",
+            },
+            {
+                "i": 2,
+                "t": "中微公司5年",
+                "sectors": ["电子"],
+                "direction": "bullish",
+                "event": "产能",
+                "why": "设备产能扩张",
+            },
+        ],
+        ensure_ascii=False,
+    )
 
     result = LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS)
     from ashare_decision_support.news.dedup import dedup_key
@@ -1914,10 +2257,19 @@ def test_a_batch_that_cannot_be_aligned_is_discarded_whole() -> None:
     from ashare_decision_support.news.llm_classifier import LlmNewsClassifier
 
     docs = [_doc("央行开展5000亿元逆回购", "2026-08-01 08:00:00")]
-    reply = json.dumps([
-        {"i": 0, "t": "完全不相干的标题", "sectors": ["电子"], "direction": "bullish",
-         "event": "政策", "why": "硬凑"},
-    ], ensure_ascii=False)
+    reply = json.dumps(
+        [
+            {
+                "i": 0,
+                "t": "完全不相干的标题",
+                "sectors": ["电子"],
+                "direction": "bullish",
+                "event": "政策",
+                "why": "硬凑",
+            },
+        ],
+        ensure_ascii=False,
+    )
 
     result = LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS)
 
@@ -1952,10 +2304,19 @@ def test_an_invented_sector_name_is_dropped_not_fuzzy_matched() -> None:
     from ashare_decision_support.news.llm_classifier import LlmNewsClassifier
 
     docs = [_doc("某公司发布新款芯片", "2026-08-01 08:00:00")]
-    reply = json.dumps([
-        {"i": 0, "t": "某公司发布新", "sectors": ["半导体设备", "电子"],
-         "direction": "bullish", "event": "技术突破", "why": "新品发布"},
-    ], ensure_ascii=False)
+    reply = json.dumps(
+        [
+            {
+                "i": 0,
+                "t": "某公司发布新",
+                "sectors": ["半导体设备", "电子"],
+                "direction": "bullish",
+                "event": "技术突破",
+                "why": "新品发布",
+            },
+        ],
+        ensure_ascii=False,
+    )
 
     result = LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS)
     from ashare_decision_support.news.dedup import dedup_key
@@ -1969,10 +2330,19 @@ def test_an_attribution_without_a_stated_mechanism_is_not_trusted() -> None:
     from ashare_decision_support.news.llm_classifier import LlmNewsClassifier
 
     docs = [_doc("西班牙发生山火", "2026-08-01 08:00:00")]
-    reply = json.dumps([
-        {"i": 0, "t": "西班牙发生山", "sectors": ["传媒"], "direction": "bullish",
-         "event": "其他", "why": ""},
-    ], ensure_ascii=False)
+    reply = json.dumps(
+        [
+            {
+                "i": 0,
+                "t": "西班牙发生山",
+                "sectors": ["传媒"],
+                "direction": "bullish",
+                "event": "其他",
+                "why": "",
+            },
+        ],
+        ensure_ascii=False,
+    )
 
     result = LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS)
 
@@ -1988,16 +2358,16 @@ def test_the_model_saying_no_sector_is_a_verdict_not_a_gap() -> None:
     from ashare_decision_support.sectors.predict import SectorPredictor
 
     doc = _doc("光伏行业迎来政策利好，产品涨价", "2026-08-01 08:00:00")
-    definition = SectorDefinition(name="电力设备", level="SW1", symbols=["600000.SH"])
+    definition = SectorDefinition(name="光伏设备", level="THS_INDUSTRY", symbols=["600000.SH"])
     predictor = SectorPredictor(LexiconSentiment())
 
-    # 没有归因 -> 关键词把"光伏"挂到电力设备
+    # 没有归因 -> 关键词把"光伏"挂到光伏设备
     by_keyword = predictor.attribute_docs([definition], [doc], None)
-    assert by_keyword["电力设备"] == [doc]
+    assert by_keyword["光伏设备"] == [doc]
 
     # 模型明确判定无归属 -> 就是无归属，不再回退关键词
     by_model = predictor.attribute_docs([definition], [doc], {dedup_key(doc): ()})
-    assert by_model["电力设备"] == []
+    assert by_model["光伏设备"] == []
 
 
 def test_classification_falls_back_to_the_lexicon_without_a_key() -> None:
@@ -2048,14 +2418,23 @@ def test_an_invented_event_type_is_dropped_like_an_invented_sector() -> None:
     from ashare_decision_support.news.llm_classifier import LlmNewsClassifier
 
     docs = [_doc("比亚迪7月新能源汽车销量419211辆", "2026-08-01 08:00:00")]
-    reply = json.dumps([
-        {"i": 0, "t": "比亚迪7月新能", "sectors": ["电子"], "direction": "bullish",
-         "event": "销量", "why": "新能源车销量大增"},
-    ], ensure_ascii=False)
+    reply = json.dumps(
+        [
+            {
+                "i": 0,
+                "t": "比亚迪7月新能",
+                "sectors": ["电子"],
+                "direction": "bullish",
+                "event": "销量",
+                "why": "新能源车销量大增",
+            },
+        ],
+        ensure_ascii=False,
+    )
 
-    label = LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS).labels[
-        dedup_key(docs[0])
-    ]
+    label = (
+        LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS).labels[dedup_key(docs[0])]
+    )
 
     assert label.event is None, "「销量」不在清单里"
     assert label.sectors == ("电子",)
@@ -2067,14 +2446,23 @@ def test_a_listed_event_type_survives() -> None:
     from ashare_decision_support.news.llm_classifier import LlmNewsClassifier
 
     docs = [_doc("某公司中标10亿元订单", "2026-08-01 08:00:00")]
-    reply = json.dumps([
-        {"i": 0, "t": "某公司中标10", "sectors": ["计算机"], "direction": "bullish",
-         "event": "订单", "why": "大额订单落地"},
-    ], ensure_ascii=False)
+    reply = json.dumps(
+        [
+            {
+                "i": 0,
+                "t": "某公司中标10",
+                "sectors": ["计算机"],
+                "direction": "bullish",
+                "event": "订单",
+                "why": "大额订单落地",
+            },
+        ],
+        ensure_ascii=False,
+    )
 
-    label = LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS).labels[
-        dedup_key(docs[0])
-    ]
+    label = (
+        LlmNewsClassifier(StubLlm(reply)).classify(docs, NEWS_SECTORS).labels[dedup_key(docs[0])]
+    )
 
     assert label.event == "订单"
 
@@ -2148,3 +2536,105 @@ def test_explicit_symbols_are_not_overridden_by_the_position_table() -> None:
     )
 
     assert polled == [["600519.SH"]]
+
+
+# 时钟：默认值那条路
+
+# 上面每一个 `run_monitor` / `run_monitor_loop` / `run_daemon` 测试都显式传了
+# `now=` 或 `now_fn=`——这正是三处时钟缺陷能一直躲着 1339 个测试的原因：
+# **默认值那条路一次都没跑过**，而线上跑的只有默认值那条路。
+
+
+def test_monitor_default_clock_works_against_non_empty_positions() -> None:
+    """不传 `now` 时 `monitor` 必须能跑完一轮。
+
+    回归的是一次真崩：`moment` 原来取 `beijing_now()`（带 tzinfo），而分钟线的
+    时间戳是 naive 的北京时间，`feed.assess_feed` 拿两者相减算滞后，直接
+    `TypeError: can't subtract offset-naive and offset-aware datetimes`。
+
+    **名单为空时不崩**——那条路进 `_sector_only`，根本不碰 `assess_feed`。
+    所以持仓表空着的时候它看着一切正常，一旦真的登记了持仓、或者传了
+    `--symbols`，盘中监控就整个起不来。名单非空是这个测试的全部要点。
+    """
+    from ashare_decision_support.jobs import run_monitor
+
+    class Intraday:
+        def get_minute_bars(self, symbols, period="1", **kwargs):
+            return {symbol: minute_bars(RISE) for symbol in symbols}, []
+
+    summary = run_monitor(
+        adapter=StubDaily(),
+        symbols=["600519.SH"],
+        intraday_adapter=Intraday(),
+        once=True,
+        notifiers=[],
+        news_source=None,
+        trade_date=SESSION,
+    )
+
+    assert summary["watch"] == 1
+    assert summary["passes"] == 1
+
+
+def test_monitor_once_updates_status_after_feed_recovers(tmp_path) -> None:
+    from ashare_decision_support.jobs import run_monitor
+    from ashare_decision_support.notify import FileNotifier
+
+    notifier = FileNotifier(tmp_path, slug="alerts", stamp="20260803")
+    common = {
+        "adapter": StubDaily(),
+        "symbols": ["600519.SH"],
+        "once": True,
+        "notifiers": [notifier],
+        "use_news": False,
+        "use_order_book": False,
+        "sectors": False,
+        "trade_date": SESSION,
+        "now": datetime(2026, 8, 3, 10, 10),
+    }
+    stale = run_monitor(intraday_adapter=ScriptedIntraday([[]]), **common)
+    status_path = tmp_path / "monitor_status_latest.json"
+    assert stale["feed_verdict"] == "stale"
+    assert json.loads(status_path.read_text(encoding="utf-8"))["feed_verdict"] == "stale"
+
+    fresh = run_monitor(intraday_adapter=ScriptedIntraday([minute_bars(RISE)]), **common)
+    assert fresh["feed_verdict"] == "fresh"
+    assert json.loads(status_path.read_text(encoding="utf-8"))["feed_verdict"] == "fresh"
+    assert "停更" in (tmp_path / "alerts-20260803.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "func",
+    [run_monitor_loop, run_daemon],
+    ids=["run_monitor_loop", "run_daemon"],
+)
+def test_injected_clocks_default_to_beijing_not_the_host_timezone(func, monkeypatch) -> None:
+    """注入时钟的默认值必须是北京墙上时间，不能是宿主机本地时间。
+
+    两处默认值原来都是裸的 `datetime.now`。**`DTZ005` 认的是调用，不认引用**，
+    所以 `= datetime.now`（不跟括号）从 DTZ 整族通电起就没被报过一次；
+    见 `schedule/timezone.py` 的模块注释。
+
+    这里把进程时区拨到 UTC 再取值：`datetime.now` 会给出比北京晚 8 小时的
+    读数，于是 19:14（收盘后）在监控循环里读成 11:14，`in_session()` 返回
+    `True`，告警会照着一份收盘数据发出去。不是崩，是**静默算错**。
+    """
+    import inspect
+    import time as time_module
+
+    default = inspect.signature(func).parameters["now_fn"].default
+
+    monkeypatch.setenv("TZ", "UTC")
+    if hasattr(time_module, "tzset"):
+        time_module.tzset()
+    try:
+        moment = default()
+        expected = beijing_naive_now()
+    finally:
+        monkeypatch.undo()
+        if hasattr(time_module, "tzset"):
+            time_module.tzset()
+
+    assert moment.tzinfo is None, "必须是 naive——要和数据源的裸时间戳直接相减"
+    # 宿主机时区一旦被读进来，UTC 下就会差整整 8 小时。
+    assert abs((moment - expected).total_seconds()) < 5

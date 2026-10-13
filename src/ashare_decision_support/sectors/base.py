@@ -1,20 +1,20 @@
-"""Contracts for the sector (板块) layer.
+"""板块层契约：分类定义、成分股统计与排序结论。
 
-The layer answers three questions in order:
-  1. What are the sectors and who is in them?      -> SectorTaxonomy
-  2. How did each sector actually trade?           -> SectorMetrics
-  3. Which ones deserve attention tomorrow?        -> SectorOutlook
-
-Keeping them separate matters because they degrade independently: the taxonomy
-is a cached static file, the metrics need daily bars, and the outlook needs
-news. Losing the third should still leave you with a usable momentum ranking.
-"""
+分类、行情和舆情分别降级；缺少舆情时仍可保留已取得的板块动量。"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+
+# 同花顺行业与概念。行业使用新标识，避免与历史申万大类排名混在一起。
+LEVEL_INDUSTRY = "THS_INDUSTRY"
+LEVEL_CONCEPT = "CONCEPT"
+
+
+class SectorTaxonomyError(RuntimeError):
+    """分类不可用；不能将取数失败解释成市场没有板块。"""
 
 
 @dataclass(frozen=True)
@@ -50,12 +50,21 @@ class SectorMetrics:
     # 中期趋势与回调深度。低吸要的板块画像是「中期强 + 短期弱」，只有 1 日和 5 日
     # 读数答不了这个问题——5 日涨幅高说明的恰恰是**已经涨过了**。
     ret_20d: float | None = None
-    pullback: float | None = None       # 板块中位的「距 20 日高回撤」，≤0
-    pullback_atr: float | None = None   # 同上，除以各自日波幅后的中位数
+    pullback: float | None = None  # 板块中位的「距 20 日高回撤」，≤0
+    pullback_atr: float | None = None  # 同上，除以各自日波幅后的中位数
 
     @property
     def coverage_ratio(self) -> float:
         return self.covered / self.constituents if self.constituents else 0.0
+
+
+def daily_returns(metrics: dict[str, SectorMetrics]) -> dict[str, float]:
+    """取有覆盖的板块日收益，统一预测台账与主题台账的基准口径。"""
+    return {
+        name: item.ret_1d
+        for name, item in metrics.items()
+        if item.ret_1d is not None and item.coverage_ratio > 0
+    }
 
 
 @dataclass
@@ -65,11 +74,7 @@ class SectorOutlook:
     name: str
     score: float
     metrics: SectorMetrics
-    # 这条读数出自哪一层分类（`SectorDefinition.level`：SW1/SW2/SW3 或 CONCEPT）。
-    #
-    # 行业与概念**并排跑、各自排名**，所以选择那一步必须能把两层分开。理由与
-    # `sectors/intraday.py` 开头写的同一条：把一个 1215 只的概念和一个 88 只的
-    # 行业放进同一张榜，名次本身就没有含义了。空串是老记录/单层调用方的默认值。
+    # 同花顺行业与概念分别排名；旧记录保留原分类标识。
     level: str = ""
     sentiment_polarity: float = 0.0
     sentiment_intensity: float = 0.0
@@ -98,22 +103,9 @@ class SectorOutlook:
 
 
 def reverse_index(definitions: Iterable[SectorDefinition]) -> dict[str, str]:
-    """symbol → 板块名。**一只票落在多个板块时留下第一个。**
+    """按定义顺序生成 symbol 到板块名的映射，重叠标的归入第一个板块。
 
-    这条并列规则不是实现细节，它决定了这只票在打分时继承谁的板块热度：
-    `scoring/context.py:build_factor_contexts` 拿这张表给每只票挂上所属板块的
-    热度、资金与排名。而调用方传进来的 `definitions` 是**按板块强弱排好序**的，
-    所以「留第一个」= 归给它所属板块里最强的那个，「留最后一个」= 归给最弱的那个。
-    同一只票，两种规则会得出不同的分数。
-
-    收成一个函数是因为它曾经有两份、而且两份不一样：`SectorTaxonomy.sector_of`
-    写了 `setdefault`（留第一个）并把理由写进了 docstring，`jobs/morning.py` 那份
-    是字典生成式（**留最后一个**），两份都对着自己那半边。生成式那份是活的，
-    带 docstring 的那份一个调用方都没有——所以真正在跑的是没写下理由的那一半，
-    而它跑的正好是反的。
-
-    概念板块接进排序之后这条会更要紧：一只票同时属于三四个概念是常态，不是边角。
-    """
+    调用方按板块强弱传入定义，因此重叠标的继承最强板块的上下文。"""
     index: dict[str, str] = {}
     for definition in definitions:
         for symbol in definition.symbols:

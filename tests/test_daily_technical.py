@@ -46,7 +46,7 @@ def test_daily_technical_snapshot_has_levels() -> None:
     assert snapshot.resistances[0].price > snapshot.last_close
 
 
-# ---- 时间戳解析 -------------------------------------------------------------
+# 时间戳解析
 
 
 def test_bar_datetime_reads_every_shape_the_feeds_hand_back() -> None:
@@ -62,7 +62,7 @@ def test_bar_datetime_reads_every_shape_the_feeds_hand_back() -> None:
     assert bar_datetime("2025-08-01") == expected
     assert bar_datetime("20250801") == expected
     assert bar_datetime("2025/08/01") == expected
-    assert bar_datetime("2025-8-1") == expected          # 月/日不补零，只有 strptime 认
+    assert bar_datetime("2025-8-1") == expected  # 月/日不补零，只有 strptime 认
     assert bar_datetime("2025/8/1") == expected
 
     stamped = datetime(2025, 8, 1, 9, 30, 0)
@@ -117,9 +117,9 @@ def test_normalize_bars_fills_the_gaps_without_inventing_a_close() -> None:
 
     rows = normalize_bars(
         [
-            {"date": "2025-08-01", "close": 10.0},                    # 只有收盘
+            {"date": "2025-08-01", "close": 10.0},  # 只有收盘
             {"date": "2025-08-02", "open": 9.0, "high": 11.0, "low": 8.5, "close": 10.5},
-            {"date": "2025-08-03", "open": 9.0},                      # 没有收盘 -> 丢
+            {"date": "2025-08-03", "open": 9.0},  # 没有收盘 -> 丢
             "not-a-dict",
         ]
     )

@@ -5,6 +5,8 @@ from dataclasses import fields
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from ashare_decision_support.cli import _writer as build_cli_writer
 from ashare_decision_support.factcheck import unverified_numbers
 from ashare_decision_support.jobs.morning import (
@@ -14,9 +16,16 @@ from ashare_decision_support.jobs.morning import (
     run_morning,
 )
 from ashare_decision_support.news import NewsDoc
-from ashare_decision_support.sectors import CONCEPT_LEVEL
+from ashare_decision_support.notify.render import (
+    DISCIPLINE_HEADING,
+    MARKET_READ_HEADING,
+    SECTOR_CANDIDATES_HEADING,
+    SECTOR_RANKING_HEADING,
+)
+from ashare_decision_support.sectors import LEVEL_CONCEPT, LEVEL_INDUSTRY, SectorTaxonomyError
 from ashare_decision_support.sectors.base import SectorDefinition
 from ashare_decision_support.writer import LlmBriefWriter, TemplateWriter, WriteRequest
+from ashare_decision_support.writer.base import BriefWriter, WriteResult
 
 
 def _run_morning(**kwargs):
@@ -31,6 +40,7 @@ def _run_morning(**kwargs):
     passthrough = {"trade_date", "progress"}
 
     kwargs = dict(kwargs)
+    kwargs.setdefault("industry_taxonomy", FakeIndustryTaxonomy())
     output_dir = kwargs.pop("output_dir")
     unknown = set(kwargs) - config_fields - source_fields - passthrough
     if unknown:
@@ -43,7 +53,8 @@ def _run_morning(**kwargs):
         **{k: v for k, v in kwargs.items() if k in passthrough},
     )
 
-# ---- numeric fidelity gate ----------------------------------------------
+
+# numeric fidelity gate
 
 
 FACTS = {"symbol": "600519.SH", "score": 72.5, "last_close": 1361.8, "count": 3}
@@ -69,9 +80,17 @@ def test_gate_rejects_a_large_bare_integer_not_in_the_facts() -> None:
     assert unverified_numbers("涨停家数 87 只", FACTS_TEXT) == ["87"]
 
 
-def test_gate_accepts_a_substring_of_a_longer_fact_number() -> None:
-    """Rounding 1361.8 to 1361 in prose is rephrasing, not fabrication."""
-    assert unverified_numbers("现价约 1361 元", FACTS_TEXT) == []
+def test_gate_accepts_actual_rounding_but_not_a_numeric_substring() -> None:
+    assert unverified_numbers("现价约 1362 元", FACTS_TEXT) == []
+    assert unverified_numbers("现价约 1361 元", FACTS_TEXT) == ["1361"]
+
+
+def test_gate_rejects_wrong_price_and_share_unit() -> None:
+    assert unverified_numbers("目标价 23.4 元", '{"last_price": 123.45}') == ["23.4"]
+    facts = '{"bid_shares": 3688000}'
+    assert unverified_numbers("买盘 368.8 万股", facts) == []
+    assert unverified_numbers("买盘 368.8 万手", facts) == ["368.8"]
+    assert unverified_numbers("等待 3 分钟", facts) == ["3"]
 
 
 def test_gate_accepts_a_trailing_zero_reformat() -> None:
@@ -143,7 +162,7 @@ def test_the_three_number_gates_share_one_definition_of_a_free_ordinal() -> None
     assert sorted(definitions) == ["factcheck.py"] * 3
 
 
-# ---- writers -------------------------------------------------------------
+# writers
 
 
 def make_request() -> WriteRequest:
@@ -208,6 +227,22 @@ def test_llm_writer_does_not_duplicate_compliance_text() -> None:
     assert writer.write(request).markdown.count("## 纪律提醒") == 1
 
 
+def test_llm_prompt_names_the_sections_the_caller_will_re_attach() -> None:
+    """价位表由发布层原样补回，提示词要告诉模型不必复述——否则它会改写价位。"""
+    writer = LlmBriefWriter(provider="qwen", api_key="test-key")
+    request = WriteRequest(
+        title="测试简报",
+        facts=FACTS,
+        fallback_markdown="# 模板正文",
+        verbatim_sections=("## 板块怎么排", "## 板块里先看谁"),
+    )
+
+    prompt = writer._user_prompt(request, FACTS_TEXT)
+
+    assert "「板块怎么排、板块里先看谁」这几节的表格会由系统在稿后按原样附上" in prompt
+    assert "按原样附上" not in writer._user_prompt(make_request(), FACTS_TEXT)
+
+
 def test_llm_writer_discards_output_that_invents_a_number() -> None:
     writer = LlmBriefWriter(provider="qwen", api_key="test-key")
     writer._complete = lambda prompt: "600519.SH 评分 72.5，预计上涨 15.6%，目标 1888.0。"
@@ -239,7 +274,7 @@ def test_llm_writer_falls_back_on_empty_output() -> None:
     assert writer.write(make_request()).used_fallback
 
 
-# ---- constituent sampling ------------------------------------------------
+# constituent sampling
 
 
 def test_llm_writer_drops_a_duplicate_title_line() -> None:
@@ -279,14 +314,20 @@ def test_cli_template_writer_does_not_construct_an_llm(monkeypatch) -> None:
         raise AssertionError("template mode must not construct an LLM writer")
 
     monkeypatch.setattr("ashare_decision_support.cli.LlmBriefWriter", unexpected_llm)
-    writer = build_cli_writer(SimpleNamespace(writer="template", llm_provider="qwen", llm_model=None))
+    writer = build_cli_writer(
+        SimpleNamespace(writer="template", llm_provider="qwen", llm_model=None)
+    )
 
     assert isinstance(writer, TemplateWriter)
 
 
 def test_sampling_gives_every_sector_the_same_coverage_rate() -> None:
-    big = SectorDefinition(name="大", level="SW1", symbols=tuple(f"B{i}" for i in range(400)))
-    small = SectorDefinition(name="小", level="SW1", symbols=tuple(f"S{i}" for i in range(40)))
+    big = SectorDefinition(
+        name="大", level="THS_INDUSTRY", symbols=tuple(f"B{i}" for i in range(400))
+    )
+    small = SectorDefinition(
+        name="小", level="THS_INDUSTRY", symbols=tuple(f"S{i}" for i in range(40))
+    )
 
     picked = set(_sample_across_sectors([big, small], 220))
     big_rate = len([s for s in picked if s.startswith("B")]) / 400
@@ -296,19 +337,21 @@ def test_sampling_gives_every_sector_the_same_coverage_rate() -> None:
 
 
 def test_sampling_returns_everything_when_the_budget_is_ample() -> None:
-    sector = SectorDefinition(name="小", level="SW1", symbols=("A", "B", "C"))
+    sector = SectorDefinition(name="小", level="THS_INDUSTRY", symbols=("A", "B", "C"))
     assert set(_sample_across_sectors([sector], 100)) == {"A", "B", "C"}
 
 
 def test_sampling_keeps_at_least_two_names_from_a_tiny_sector() -> None:
-    big = SectorDefinition(name="大", level="SW1", symbols=tuple(f"B{i}" for i in range(1000)))
-    tiny = SectorDefinition(name="微", level="SW1", symbols=("T0", "T1", "T2"))
+    big = SectorDefinition(
+        name="大", level="THS_INDUSTRY", symbols=tuple(f"B{i}" for i in range(1000))
+    )
+    tiny = SectorDefinition(name="微", level="THS_INDUSTRY", symbols=("T0", "T1", "T2"))
 
     picked = set(_sample_across_sectors([big, tiny], 50))
     assert len([s for s in picked if s.startswith("T")]) >= 2
 
 
-# ---- end-to-end job ------------------------------------------------------
+# end-to-end job
 
 
 def trending_bars(
@@ -363,21 +406,16 @@ STRONG = tuple(f"60000{i}.SH" for i in range(8))
 WEAK = tuple(f"00000{i}.SZ" for i in range(8))
 
 
-class FakeUniverses:
-    def list(self):
+class FakeIndustryTaxonomy:
+    def list_sectors(self):
         return [
-            {"id": "CN_Equity_SW1_1", "name": "SW1电子", "symbol_count": len(STRONG)},
-            {"id": "CN_Equity_SW1_2", "name": "SW1钢铁", "symbol_count": len(WEAK)},
+            SectorDefinition(name="半导体", level=LEVEL_INDUSTRY, symbols=STRONG),
+            SectorDefinition(name="钢铁", level=LEVEL_INDUSTRY, symbols=WEAK),
         ]
-
-    def get(self, universe_id):
-        symbols = STRONG if universe_id.endswith("_1") else WEAK
-        return {"id": universe_id, "symbols": list(symbols)}
 
 
 class FakeSectorAdapter:
     def __init__(self, names: dict[str, str] | None = None) -> None:
-        self.client = type("C", (), {"universes": FakeUniverses()})()
         self.batch_calls = 0
         self.names = names or {}
 
@@ -405,13 +443,13 @@ class FakeStaticTaxonomy:
         for index, symbol in enumerate(STRONG):
             profiles[symbol] = SimpleNamespace(
                 name=f"芯片{index}",
-                industries=("电子", "半导体", "存储"),
+                industry="半导体",
                 concepts=("AI芯片", "算力", "先进封装"),
             )
         for index, symbol in enumerate(WEAK):
             profiles[symbol] = SimpleNamespace(
                 name=f"钢铁{index}",
-                industries=("钢铁", "普钢", "长材"),
+                industry="普钢",
                 concepts=("周期",),
             )
         self.snapshot = SimpleNamespace(profiles=profiles)
@@ -420,14 +458,14 @@ class FakeStaticTaxonomy:
         if self.broken:
             raise RuntimeError("boom")
         return [
-            SectorDefinition(name="静态电子", level="SW1", symbols=STRONG),
-            SectorDefinition(name="静态钢铁", level="SW1", symbols=WEAK),
+            SectorDefinition(name="静态电子", level="THS_INDUSTRY", symbols=STRONG),
+            SectorDefinition(name="静态钢铁", level="THS_INDUSTRY", symbols=WEAK),
         ]
 
 
 class FakeConceptTaxonomy:
     def list_sectors(self):
-        return [SectorDefinition(name="AI芯片", level=CONCEPT_LEVEL, symbols=STRONG)]
+        return [SectorDefinition(name="AI芯片", level=LEVEL_CONCEPT, symbols=STRONG)]
 
 
 class FakeNewsSource:
@@ -544,7 +582,9 @@ def test_sampled_morning_is_marked_as_diagnostic_mode(tmp_path) -> None:
     assert summary["diagnostic"]["mode"] == "sampled"
     assert summary["diagnostic"]["max_constituents"] == 6
     assert payload["diagnostic"]["sampled_symbols"] == summary["funnel"]["universe"]
-    assert any("诊断模式" in note and "不可视为正式全量结论" in note for note in summary["data_notes"])
+    assert any(
+        "诊断模式" in note and "不可视为正式全量结论" in note for note in summary["data_notes"]
+    )
 
 
 def test_morning_ranks_sectors_then_picks_stocks_inside_them(tmp_path) -> None:
@@ -564,11 +604,49 @@ def test_morning_ranks_sectors_then_picks_stocks_inside_them(tmp_path) -> None:
         use_market_scan=False,
     )
 
-    assert summary["sectors_selected"] == ["电子"]
+    assert summary["sectors_selected"] == ["半导体"]
     assert summary["candidates"] == 2
     payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
     # Every candidate must belong to a sector that was actually selected.
-    assert {item["sector"] for item in payload["candidates"]} == {"电子"}
+    assert {item["sector"] for item in payload["candidates"]} == {"半导体"}
+
+
+class TableDroppingWriter(BriefWriter):
+    """像 2026-09-14 实测那样的 LLM 稿：四段论述加纪律提醒，一只候选都不点名。"""
+
+    name = "fake-llm"
+
+    def write(self, request: WriteRequest) -> WriteResult:
+        return WriteResult(markdown=f"一句判断。\n\n{request.mandatory_suffix}", writer=self.name)
+
+
+def test_morning_re_attaches_the_tables_a_writer_dropped(tmp_path) -> None:
+    summary = _run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=FakeNewsSource(),
+        top_sectors=1,
+        candidates_per_sector=2,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+        writer=TableDroppingWriter(),
+    )
+
+    content = summary["content"]
+    ranking = content.index(SECTOR_RANKING_HEADING)
+    candidates = content.index(SECTOR_CANDIDATES_HEADING)
+    # 两张表都在，排在纪律提醒之前而不是落到它后面；候选逐只带价位。
+    assert ranking < candidates < content.index(DISCIPLINE_HEADING)
+    for symbol in summary["candidate_symbols"]:
+        assert symbol in content[candidates:]
+    assert (
+        "| 标的 | 所属板块 | 评分 | 结构参考收盘价 | 盘中快照 | 趋势 | 止损参考 | 目标参考 | 盈亏比 |"
+        in content
+    )
+    assert any("已按模板原样补回" in note for note in summary["data_notes"])
 
 
 def test_morning_ranks_concepts_separately_without_double_counting_market(tmp_path) -> None:
@@ -589,11 +667,11 @@ def test_morning_ranks_concepts_separately_without_double_counting_market(tmp_pa
     )
 
     payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
-    assert summary["industry_sectors_selected"] == ["电子"]
+    assert summary["industry_sectors_selected"] == ["半导体"]
     assert summary["concept_sectors_selected"] == ["AI芯片"]
     assert payload["market"]["sectors_total"] == 2  # 两个行业；概念不重复计算大盘
     assert summary["funnel"]["selected_sector_constituents"] == len(STRONG)
-    assert {item["level"] for item in payload["sectors"]} == {"SW1", CONCEPT_LEVEL}
+    assert {item["level"] for item in payload["sectors"]} == {"THS_INDUSTRY", LEVEL_CONCEPT}
 
 
 def test_morning_keeps_st_names_for_the_normal_candidate_flow(tmp_path) -> None:
@@ -772,16 +850,23 @@ def test_morning_reads_rotation_from_disk_and_stamps_how_stale_it_is(tmp_path, m
         bars = [
             {
                 "date": f"202607{day + 1:02d}",
-                "open": 100.0, "high": 100.0, "low": 100.0,
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
                 "close": 100.0 * (1.0 + 0.001 * index) ** day,
-                "volume": 1.0, "amount": 100.0,
+                "volume": 1.0,
+                "amount": 100.0,
             }
             for day in range(30)
         ]
         (home / f"88{1100 + index}.json").write_text(
             json.dumps(
-                {"schema": HISTORY_SCHEMA, "code": f"88{1100 + index}",
-                 "name": f"板块{index}", "bars": bars},
+                {
+                    "schema": HISTORY_SCHEMA,
+                    "code": f"88{1100 + index}",
+                    "name": f"板块{index}",
+                    "bars": bars,
+                },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
@@ -797,7 +882,7 @@ def test_morning_reads_rotation_from_disk_and_stamps_how_stale_it_is(tmp_path, m
         notifiers=[],
         trade_date=date(2026, 8, 3),
         use_limit_pool=False,
-        use_sector_index=False,   # 网络取数关掉，轮动仍然要出
+        use_sector_index=False,  # 网络取数关掉，轮动仍然要出
         use_market_scan=False,
     )
 
@@ -839,10 +924,7 @@ def test_earnings_vetoes_are_recorded_so_the_gate_can_be_audited(tmp_path) -> No
         journal=journal,
     )
 
-    rows = [
-        row for row in journal.rows()
-        if row.get("kind") == KIND_VETOED
-    ]
+    rows = [row for row in journal.rows() if row.get("kind") == KIND_VETOED]
     assert rows, "被业绩否决的标的必须落台账，否则闸门不可验证"
     vetoed = rows[0]
     assert vetoed["symbol"] == STRONG[0]
@@ -897,8 +979,49 @@ def test_morning_runs_without_any_news_input(tmp_path) -> None:
         use_market_scan=False,
     )
 
-    assert summary["sectors_selected"] == ["电子"]
+    assert summary["sectors_selected"] == ["半导体"]
     assert any("禁用舆情" in note for note in summary["data_notes"])
+
+
+class RepeatingNoteNewsSource(FakeNewsSource):
+    """每次 `fetch_market` 都把数据源健康报一遍——真实的舆情源就是这么写的。
+
+    盘前会取两次：首轮 + 板块定向补抓。两次都报，于是同一句话在 `data_notes` 里
+    出现两遍，读者看到的是「两个源挂了」。
+    """
+
+    HEALTH_NOTE = "海外官方信息源 美国劳工统计局（HTTPError） 不可用，本次跳过"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def fetch_market(self, trade_date, limit=200):
+        self.calls += 1
+        docs, _ = super().fetch_market(trade_date, limit=limit)
+        return docs, [self.HEALTH_NOTE]
+
+
+def test_a_source_that_reports_itself_twice_is_listed_once(tmp_path) -> None:
+    """同一句话说两遍不是两条证据。压缩视图只留前 8 条，重复行会挤掉真信息。"""
+    source = RepeatingNoteNewsSource()
+    summary = _run_morning(
+        adapter=FakeSectorAdapter(),
+        output_dir=tmp_path,
+        news_source=source,
+        top_sectors=1,
+        notifiers=[],
+        trade_date=date(2026, 8, 1),
+        use_limit_pool=False,
+        use_sector_index=False,
+        use_market_scan=False,
+        use_llm_news=False,
+    )
+
+    notes = summary["data_notes"]
+    assert source.calls >= 2, "定向补抓没跑起来，这个用例就测不到重复"
+    assert notes.count(RepeatingNoteNewsSource.HEALTH_NOTE) == 1
+    assert len(notes) == len(set(notes))
 
 
 def test_morning_facts_and_brief_include_macro_links(tmp_path) -> None:
@@ -920,7 +1043,11 @@ def test_morning_facts_and_brief_include_macro_links(tmp_path) -> None:
     assert macro["item_count"] >= 2
     assert any(item["topic"] == "oil" for item in macro["links"])
     assert any(item["topic"] == "china_macro" for item in macro["links"])
-    assert "## 宏观联动" in summary["content"]
+    content = summary["content"]
+    assert "## 宏观联动" in content
+    # 宏观联动讲的是背景，要排在「大盘怎么读」前面。此前锚点写的是一个模板里
+    # 不存在的标题，这一节一直静默落在纪律提醒之后——只查「在不在」抓不到。
+    assert content.index("## 宏观联动") < content.index(MARKET_READ_HEADING)
 
 
 def test_morning_records_macro_context_into_the_journal(tmp_path) -> None:
@@ -970,12 +1097,12 @@ def test_morning_adds_sector_rotation_memory_after_the_second_run(tmp_path) -> N
     rotation = payload["rotation"]
 
     assert rotation["regime"] == "主线延续"
-    assert rotation["persistent"] == ["电子"]
+    assert rotation["persistent"] == ["半导体"]
     assert "## 轮动记忆" in summary["content"]
-    assert "电子" in summary["content"]
+    assert "半导体" in summary["content"]
 
 
-# ---- 舆情语料库接线 --------------------------------------------------------
+# 舆情语料库接线
 
 
 def test_morning_archives_the_news_it_collected(tmp_path) -> None:
@@ -1010,9 +1137,16 @@ def test_morning_keeps_first_seen_across_two_runs(tmp_path) -> None:
 
     corpus = NewsStore(tmp_path / "corpus.sqlite3")
     kwargs = {
-        "adapter": FakeSectorAdapter(), "output_dir": tmp_path, "news_source": FakeNewsSource(),
-        "top_sectors": 1, "candidates_per_sector": 1, "notifiers": [], "trade_date": date(2026, 8, 1),
-        "use_limit_pool": False, "use_sector_index": False, "use_market_scan": False,
+        "adapter": FakeSectorAdapter(),
+        "output_dir": tmp_path,
+        "news_source": FakeNewsSource(),
+        "top_sectors": 1,
+        "candidates_per_sector": 1,
+        "notifiers": [],
+        "trade_date": date(2026, 8, 1),
+        "use_limit_pool": False,
+        "use_sector_index": False,
+        "use_market_scan": False,
         "news_store": corpus,
     }
     _run_morning(**kwargs)
@@ -1064,30 +1198,24 @@ def test_morning_prefers_injected_static_taxonomy_and_persists_symbol_metadata(t
 
     assert row["sector"] == "静态电子"
     assert row["name"] == "芯片0"
-    assert row["industry_path"] == "电子·半导体·存储"
+    assert row["industry"] == "半导体"
+    assert not {"industries", "industry_path", "industry_leaf"} & row.keys()
     assert row["concepts"] == ["AI芯片", "算力", "先进封装"]
-    assert any("同花顺静态 taxonomy" in note for note in payload["data_notes"])
+    assert any("同花顺（第三方静态快照）" in note for note in payload["data_notes"])
 
 
-def test_morning_falls_back_to_tickflow_when_static_taxonomy_breaks(tmp_path) -> None:
-    summary = _run_morning(
-        adapter=FakeSectorAdapter(),
-        output_dir=tmp_path,
-        news_source=FakeNewsSource(),
-        top_sectors=1,
-        candidates_per_sector=1,
-        notifiers=[],
-        trade_date=date(2026, 8, 1),
-        use_limit_pool=False,
-        use_sector_index=False,
-        use_market_scan=False,
-        industry_taxonomy=FakeStaticTaxonomy(broken=True),
-    )
+def test_morning_fails_clearly_when_the_only_industry_taxonomy_breaks(tmp_path) -> None:
+    adapter = FakeSectorAdapter()
+    with pytest.raises(SectorTaxonomyError, match=r"同花顺行业分类不可用.*boom"):
+        _run_morning(
+            adapter=adapter,
+            output_dir=tmp_path,
+            industry_taxonomy=FakeStaticTaxonomy(broken=True),
+            notifiers=[],
+        )
 
-    assert summary["candidates"] == 1
-    payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
-    assert payload["candidates"][0]["sector"] == "电子"
-    assert any("回退 TickFlow" in note for note in payload["data_notes"])
+    assert adapter.batch_calls == 0
+    assert not (tmp_path / "morning_latest.json").exists()
 
 
 def test_morning_emits_progress_updates(tmp_path) -> None:
@@ -1121,7 +1249,8 @@ def test_advise_emits_progress_updates(tmp_path) -> None:
             price = max(price * (1 + drift), 1.0)
             rows.append(
                 {
-                    "timestamp": datetime.combine(day, datetime.min.time()) + timedelta(minutes=5 * index),
+                    "timestamp": datetime.combine(day, datetime.min.time())
+                    + timedelta(minutes=5 * index),
                     "open": round(price * 0.99, 3),
                     "high": round(price * 1.02, 3),
                     "low": round(price * 0.97, 3),
@@ -1160,7 +1289,7 @@ def test_advise_emits_progress_updates(tmp_path) -> None:
     assert any("个股分析已完成" in message for message in messages)
 
 
-# ---- 逐笔资金旁证 ---------------------------------------------------------
+# 逐笔资金旁证
 
 
 class FakeTradeFlow:
@@ -1186,8 +1315,18 @@ def test_morning_attaches_trade_flow_only_to_the_final_candidates(tmp_path) -> N
     """
     flow = FakeTradeFlow(
         {
-            STRONG[0]: {"ok": True, "buy_ratio": 0.61, "net_amount": 1.2e8, "large_net_amount": 9e7},
-            STRONG[1]: {"ok": True, "buy_ratio": 0.48, "net_amount": -3e7, "large_net_amount": -2e7},
+            STRONG[0]: {
+                "ok": True,
+                "buy_ratio": 0.61,
+                "net_amount": 1.2e8,
+                "large_net_amount": 9e7,
+            },
+            STRONG[1]: {
+                "ok": True,
+                "buy_ratio": 0.48,
+                "net_amount": -3e7,
+                "large_net_amount": -2e7,
+            },
         }
     )
     summary = _run_morning(
@@ -1237,7 +1376,7 @@ def test_morning_without_trade_flow_says_so_instead_of_going_quiet(tmp_path) -> 
     assert not any(item.get("trade_flow") for item in payload["candidates"])
 
 
-# ---- 台账里的大盘快照 -----------------------------------------------------
+# 台账里的大盘快照
 
 
 def test_market_state_carries_the_unscored_layers(tmp_path) -> None:
@@ -1284,7 +1423,9 @@ def test_market_state_records_absence_instead_of_a_neutral_number(tmp_path) -> N
     """
     from ashare_decision_support.jobs.morning_facts import market_state
 
-    state = market_state(SimpleNamespace(direction="偏多", score=80.0, breadth=0.6), 0.5, None, None)
+    state = market_state(
+        SimpleNamespace(direction="偏多", score=80.0, breadth=0.6), 0.5, None, None
+    )
 
     for key in (
         "rotation_switch",
@@ -1306,7 +1447,9 @@ def test_market_state_ignores_layers_that_reported_not_ok(tmp_path) -> None:
         0.5,
         None,
         None,
-        rotation_price=SimpleNamespace(ok=False, switch_label="样本不足", adjacent_label="样本不足"),
+        rotation_price=SimpleNamespace(
+            ok=False, switch_label="样本不足", adjacent_label="样本不足"
+        ),
         turnover=SimpleNamespace(ok=False, total_change=-0.9),
         broad_index=SimpleNamespace(ok=False, median_ret=-0.5, trade_date="2026-08-03"),
     )
@@ -1316,7 +1459,7 @@ def test_market_state_ignores_layers_that_reported_not_ok(tmp_path) -> None:
     assert state["index_median_ret"] is None
 
 
-# ---- 简报里的成交额标题行 --------------------------------------------------
+# 简报里的成交额标题行
 
 
 def _turnover_headline(turnover: dict) -> str:
@@ -1370,7 +1513,73 @@ def test_turnover_headline_stays_short_when_the_two_reads_agree() -> None:
     assert "窗口内" not in headline
 
 
-# ---- 台账里的仓位决策过程 --------------------------------------------------
+def test_morning_brief_renders_a_conditional_trade_plan() -> None:
+    """盘前报告应是条件式计划：先给边界，再给候选触发与失效。"""
+    from ashare_decision_support.notify.render import render_sector_brief
+    from ashare_decision_support.sectors.base import SectorMetrics, SectorOutlook
+
+    market = SimpleNamespace(
+        direction="中性偏多",
+        score=62.0,
+        trusted=True,
+        sectors_trusted=2,
+        sectors_total=2,
+        constituents_covered=80,
+        reasons=["上涨占比改善"],
+        warnings=[],
+        sentiment=SimpleNamespace(reasons=["情绪回暖"]),
+    )
+    outlook = SectorOutlook(
+        name="机器人",
+        score=72.0,
+        metrics=SectorMetrics(
+            name="机器人",
+            constituents=50,
+            covered=45,
+            ret_1d=0.012,
+            ret_5d=0.035,
+            breadth=0.68,
+            volume_ratio=1.3,
+        ),
+        reasons=["放量回升"],
+    )
+    candidate = {
+        "symbol": "300001.SZ",
+        "name": "样本股",
+        "sector": "机器人",
+        "score": 81.2,
+        "last_close": 20.5,
+        "trend_state": "UPTREND",
+        "stop_reference": 19.3,
+        "target_reference": 22.8,
+        "playbook": "回踩",
+        "reasons": ["缩量回踩"],
+        "warnings": ["上方压力接近"],
+    }
+
+    markdown = render_sector_brief(
+        date(2026, 8, 7),
+        [outlook],
+        [candidate],
+        market,
+        0.55,
+        market_outlook=market,
+    )
+
+    assert "## 条件预案" in markdown
+    assert "今日环境：**试错**" in markdown
+    assert "突发利好/利空先进入事件队列" in markdown
+    assert (
+        "  - 触发条件：打法 回踩 的判据继续成立；机器人 仍在主线或盘中转强队列；向目标参考 22.80 延续"
+        in markdown
+    )
+    assert (
+        "  - 失效条件：跌破止损参考 19.30；风险项未解除：上方压力接近；机器人 盘中被证伪或明显跑输"
+        in markdown
+    )
+
+
+# 台账里的仓位决策过程
 
 
 def _sizing_state(**kw):
@@ -1417,7 +1626,7 @@ def test_journal_records_a_manual_override_as_such() -> None:
         cycle_label="启动", cycle_cap=0.5, suggested_factor=0.4, manual_factor=0.8
     )
 
-    assert state["position_factor"] == 0.8      # 手工值优先
+    assert state["position_factor"] == 0.8  # 手工值优先
     assert state["manual_factor"] == 0.8
     assert state["capped_suggested_factor"] == 0.4  # 系统本来想给的
     assert state["suggested_factor"] == 0.4
@@ -1453,16 +1662,16 @@ def test_journal_keeps_both_turnover_readings() -> None:
     assert state["turnover_total_trend"] == 0.3343
 
 
-# ---- 概念层的两处边界 ------------------------------------------------------
+# 概念层的两处边界
 
 
 class ClashingConceptTaxonomy:
-    """概念名与行业名撞车。实测 31 个 SW1 与 346 个概念只撞「家用电器」一个。"""
+    """概念名与行业名撞车。实测 31 个 THS_INDUSTRY 与 346 个概念只撞「家用电器」一个。"""
 
     def list_sectors(self):
         return [
-            SectorDefinition(name="电子", level=CONCEPT_LEVEL, symbols=WEAK),
-            SectorDefinition(name="AI芯片", level=CONCEPT_LEVEL, symbols=STRONG),
+            SectorDefinition(name="半导体", level=LEVEL_CONCEPT, symbols=WEAK),
+            SectorDefinition(name="AI芯片", level=LEVEL_CONCEPT, symbols=STRONG),
         ]
 
 
@@ -1492,9 +1701,9 @@ def test_a_concept_named_like_an_industry_is_dropped_not_merged(tmp_path) -> Non
         use_market_scan=False,
     )
 
-    # 「电子」只作为行业出现一次，不会同时出现在概念名额里。
+    # 「半导体」只作为行业出现一次，不会同时出现在概念名额里。
     assert summary["concept_sectors_selected"] == ["AI芯片"]
-    assert summary["industry_sectors_selected"] == ["电子"]
+    assert summary["industry_sectors_selected"] == ["半导体"]
     assert any("重名已跳过" in note for note in summary["data_notes"])
 
 
@@ -1518,7 +1727,7 @@ def test_a_broken_concept_source_leaves_the_industry_ranking_alone(tmp_path) -> 
         use_market_scan=False,
     )
 
-    assert summary["industry_sectors_selected"] == ["电子"]
+    assert summary["industry_sectors_selected"] == ["半导体"]
     assert summary["concept_sectors_selected"] == []
     assert any("概念板块不可用" in note for note in summary["data_notes"])
 
@@ -1527,8 +1736,7 @@ def test_the_daemon_ranks_concepts_too(tmp_path) -> None:
     """**daemon 才是这套系统真正在跑的那条路。**
 
     手工 `morning` 有概念维度、无人值守跑没有，是同一套分类下两条链路看到的板块
-    集合不一样——`docs/INVENTORY.md` §1.1 记的正是这种分叉。结构守卫而非行为
-    用例：真跑一次 daemon 要连全部外部源。
+    集合不一样。这里检查两个分类都接入调度；任务行为另由离线集成测试覆盖。
     """
     import ast
     import inspect
@@ -1585,9 +1793,39 @@ def test_the_sector_news_memory_reaches_the_facts_of_a_real_morning_run(tmp_path
     # 断言落盘的那一份：`ask` / `facts` / MCP 读到的正是它。
     payload = json.loads((tmp_path / "morning_latest.json").read_text(encoding="utf-8"))
     memory = payload["sector_news_memory"]
-    assert [item["sector"] for item in memory] == ["电子"]
+    assert [item["sector"] for item in memory] == ["半导体"]
     block = memory[0]
     assert block["fresh_docs_total"] == 1
     assert block["still_developing"][0]["title"] == "半导体行业订单超预期，芯片涨价"
     # 两个时间戳原样给出，读的人自己减——落盘之后隔天再读，「3 小时前」就是假的。
     assert block["still_developing"][0]["first_seen"] <= block["still_developing"][0]["last_seen"]
+
+
+def test_candidate_table_prints_reward_risk_and_flags_below_execution_floor() -> None:
+    from ashare_decision_support.notify.render import render_candidate_levels_table
+
+    table = render_candidate_levels_table(
+        [
+            {
+                "symbol": "003816.SZ",
+                "sector": "电力",
+                "score": 69.6,
+                "last_close": 4.33,
+                "stop_reference": 4.23,
+                "target_reference": 4.44,
+            },
+            {
+                "symbol": "601138.SH",
+                "sector": "算力",
+                "score": 70.1,
+                "last_close": 64.07,
+                "stop_reference": 61.85,
+                "target_reference": 68.59,
+            },
+            {"symbol": "000001.SZ", "sector": "银行", "score": 60.0},
+        ]
+    )
+    rows = [line for line in table.splitlines() if line.startswith("| ")][1:]
+    assert rows[0].endswith("| 1.10 ⚠️ |")
+    assert rows[1].endswith("| 2.04 |")
+    assert rows[2].endswith("| — |")

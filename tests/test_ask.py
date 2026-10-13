@@ -21,6 +21,8 @@ from ashare_decision_support.ask import (
     current_phase,
     run_ask,
 )
+from ashare_decision_support.ask.context import load_known_names
+from ashare_decision_support.ask.question import parse_question
 from ashare_decision_support.cli import _dump_json, build_parser
 from ashare_decision_support.facts import build_facts_bundle
 
@@ -43,7 +45,7 @@ class BoomClient:
         raise RuntimeError("provider down")
 
 
-# ---- 时段 ----------------------------------------------------------------
+# 时段
 
 
 @pytest.mark.parametrize(
@@ -71,7 +73,7 @@ def test_a_non_trading_day_is_off_hours_whatever_the_clock_says() -> None:
     assert any("旧数据" in note for note in ctx.notes)
 
 
-# ---- 装配 ----------------------------------------------------------------
+# 装配
 
 
 def test_intraday_computes_live_levels_while_pre_open_does_not() -> None:
@@ -84,7 +86,7 @@ def test_intraday_computes_live_levels_while_pre_open_does_not() -> None:
 
     def compute(symbols: list[str]) -> dict:
         calls.append(list(symbols))
-        return {"symbols": [{"symbol": symbols[0], "last_price": 20.0}]}
+        return {"trade_date": "2026-07-31", "symbols": [{"symbol": symbols[0], "last_price": 20.0}]}
 
     from ashare_decision_support.state import Positions
 
@@ -120,6 +122,89 @@ def test_live_computation_failure_costs_only_that_block() -> None:
     assert any("实时买卖点计算失败" in note for note in ctx.notes)
 
 
+def test_intraday_rejects_previous_session_levels() -> None:
+    def stale(symbols: list[str]) -> dict:
+        return {
+            "trade_date": "2026-07-30",
+            "symbols": [{"symbol": symbols[0], "last_price": 10.0}],
+        }
+
+    ctx = assemble(
+        datetime(2026, 7, 31, 10, 30),
+        symbols=["600519.SH"],
+        compute_symbols=stale,
+    )
+
+    assert "实时买卖点" not in ctx.blocks
+    assert any("已跳过旧价位" in note for note in ctx.notes)
+    assert any(
+        item["名称"] == "实时买卖点" and item["判定"] == "缺失"
+        for item in ctx.blocks["数据健康"]["块"]
+    )
+
+
+def test_question_resolves_unheld_names_from_local_cache(monkeypatch) -> None:
+    from ashare_decision_support.adapters.security_master import SecurityInfo, SecurityMasterAdapter
+
+    monkeypatch.setattr(
+        SecurityMasterAdapter,
+        "cached",
+        lambda self: SimpleNamespace(
+            entries={
+                "001309.SZ": SecurityInfo("001309.SZ", name="德明利"),
+                "000657.SZ": SecurityInfo("000657.SZ", name="中钨高新"),
+            }
+        ),
+    )
+
+    names = load_known_names()
+    assert names["德明利"] == "001309.SZ"
+    assert names["中钨高新"] == "000657.SZ"
+    assert set(parse_question("德明利和中钨高新今天能抄底吗", known_names=names).symbols) == {
+        "001309.SZ",
+        "000657.SZ",
+    }
+
+
+def test_empty_live_result_is_reported_as_missing() -> None:
+    ctx = assemble(
+        datetime(2026, 7, 31, 10, 30),
+        symbols=["600519.SH"],
+        compute_symbols=lambda symbols: {"trade_date": "2026-07-31", "symbols": []},
+    )
+
+    assert "实时买卖点" not in ctx.blocks
+    assert any("没有返回任何标的" in note for note in ctx.notes)
+
+
+def test_undated_live_result_cannot_be_called_realtime() -> None:
+    ctx = assemble(
+        datetime(2026, 7, 31, 10, 30),
+        symbols=["600519.SH"],
+        compute_symbols=lambda symbols: {"symbols": [{"symbol": symbols[0], "last_price": 10}]},
+    )
+
+    assert "实时买卖点" not in ctx.blocks
+    assert any("缺少交易日期" in note for note in ctx.notes)
+
+
+def test_local_name_collision_does_not_guess_a_symbol(monkeypatch) -> None:
+    from ashare_decision_support.adapters.security_master import SecurityInfo, SecurityMasterAdapter
+
+    monkeypatch.setattr(
+        SecurityMasterAdapter,
+        "cached",
+        lambda self: SimpleNamespace(
+            entries={
+                "001309.SZ": SecurityInfo("001309.SZ", name="同名证券"),
+                "000657.SZ": SecurityInfo("000657.SZ", name="同名证券"),
+            }
+        ),
+    )
+
+    assert "同名证券" not in load_known_names()
+
+
 def test_a_missing_payload_file_is_a_note_not_a_crash(tmp_path) -> None:
     ctx = assemble(datetime(2026, 7, 31, 8, 30), output_dir=tmp_path)
 
@@ -139,12 +224,16 @@ def test_dump_json_creates_missing_parent_directory(tmp_path) -> None:
     assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
 
 
-def test_dump_json_does_not_duplicate_file_payload_on_stdout(tmp_path, capsys) -> None:
+@pytest.mark.parametrize("echo_when_written", [False, True])
+def test_dump_json_only_echoes_file_payload_when_requested(
+    tmp_path, capsys, echo_when_written
+) -> None:
     target = tmp_path / "result.json"
-    _dump_json({"large": [1, 2, 3]}, str(target))
+    _dump_json({"large": [1, 2, 3]}, str(target), echo_when_written=echo_when_written)
 
     assert target.is_file()
-    assert capsys.readouterr().out == ""
+    expected = target.read_text(encoding="utf-8") if echo_when_written else ""
+    assert capsys.readouterr().out == expected
 
 
 def test_morning_cli_receipt_omits_bulky_diagnostics() -> None:
@@ -168,6 +257,17 @@ def test_morning_cli_receipt_omits_bulky_diagnostics() -> None:
     assert receipt["data_notes_omitted"] == 4
 
 
+def test_morning_receipt_keeps_late_execution_caveat() -> None:
+    from ashare_decision_support.cli import _morning_cli_summary
+
+    notes = [f"普通来源说明 {index}" for index in range(30)]
+    notes.append("全市场扫描仅部分成功，截面不完整")
+
+    receipt = _morning_cli_summary({"data_notes": notes})
+
+    assert "截面不完整" in receipt["data_notes"][0]
+
+
 def test_intraday_facts_include_cached_sector_confirmation(tmp_path, monkeypatch) -> None:
     from ashare_decision_support.ask import context
 
@@ -178,13 +278,30 @@ def test_intraday_facts_include_cached_sector_confirmation(tmp_path, monkeypatch
     expected = {"schema": "ashare-sector-confirmation-v2", "results": []}
     monkeypatch.setattr(context, "_build_sector_confirmation", lambda output_dir: expected)
 
-    ctx = context.assemble(
-        datetime(2026, 8, 28, 10, 0), output_dir=tmp_path, is_trading_day=True
-    )
+    ctx = context.assemble(datetime(2026, 8, 28, 10, 0), output_dir=tmp_path, is_trading_day=True)
 
     assert ctx.blocks["板块预测盘中验证"] == expected
     assert "[板块预测盘中验证]" in ctx.render_compact()
     assert "截至：—" in ctx.render_compact()
+
+
+def test_intraday_facts_skip_stale_sector_confirmation(tmp_path, monkeypatch) -> None:
+    from ashare_decision_support.ask import context
+
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps({"trade_date": "2026-08-27", "market": {}, "sectors": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        context,
+        "_build_sector_confirmation",
+        lambda output_dir: {"target_session": "2026-08-27", "results": []},
+    )
+
+    ctx = context.assemble(datetime(2026, 8, 28, 10, 0), output_dir=tmp_path, is_trading_day=True)
+
+    assert "板块预测盘中验证" not in ctx.blocks
+    assert any("与当前交易日" in note for note in ctx.notes)
 
 
 def test_facts_cli_accepts_the_same_phase_contract_as_mcp() -> None:
@@ -206,28 +323,27 @@ def test_facts_bundle_exposes_compact_text_without_changing_json_shape(tmp_path)
 
 
 def test_strategy_screen_parser_accepts_all_profiles() -> None:
-    args = build_parser().parse_args(["strategy-screen", "--profile", "all", "--all-a", "--allow-st"])
+    args = build_parser().parse_args(["strategy-screen", "--profile", "all", "--all-a"])
     assert args.profile == "all"
     assert args.all_a is True
-    assert args.allow_st is True
     assert args.exclude_st is False
 
     excluded = build_parser().parse_args(["strategy-screen", "--exclude-st"])
     assert excluded.exclude_st is True
 
 
-def test_strategy_screen_cli_writes_batch_payload_with_stubbed_data(tmp_path, monkeypatch, capsys) -> None:
+def test_strategy_screen_cli_writes_batch_payload_with_stubbed_data(
+    tmp_path, monkeypatch, capsys
+) -> None:
     from ashare_decision_support import cli
 
     class Profile:
         def __init__(self, name: str) -> None:
             self.name = name
-
-        def industry(self, level: str) -> str:
-            return "测试行业"
+            self.industry = "测试行业"
 
     class Taxonomy:
-        def __init__(self, level: str) -> None:
+        def __init__(self) -> None:
             self.snapshot = SimpleNamespace(
                 profiles={
                     "600000.SH": Profile("测试银行"),
@@ -238,10 +354,26 @@ def test_strategy_screen_cli_writes_batch_payload_with_stubbed_data(tmp_path, mo
 
     monkeypatch.setattr(cli, "ThsIndustryTaxonomy", Taxonomy)
     monkeypatch.setattr(cli, "_tickflow", lambda args: object())
+    # 只给一只两根日线：不够进任何策略，但足以让落盘带上信号日——事实包按它判时效。
+    bars = [
+        {
+            "symbol": "600000.SH",
+            "timestamp": stamp,
+            "open": 10.0,
+            "high": 10.2,
+            "low": 9.8,
+            "close": 10.1,
+            "volume": 1_000_000,
+            "amount": 10_100_000.0,
+        }
+        for stamp in ("2026-09-10", "2026-09-11")
+    ]
     monkeypatch.setattr(
         cli,
         "fetch_daily_bars",
-        lambda adapter, symbols, start, end, **kwargs: {symbol: [] for symbol in symbols},
+        lambda adapter, symbols, start, end, **kwargs: {
+            symbol: (bars if symbol == "600000.SH" else []) for symbol in symbols
+        },
     )
     target = tmp_path / "nested" / "screen.json"
     args = build_parser().parse_args(
@@ -251,7 +383,9 @@ def test_strategy_screen_cli_writes_batch_payload_with_stubbed_data(tmp_path, mo
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["schema"] == "ashare-strategy-screen-batch-v2"
     assert payload["profiles"]["balanced-pullback"]["summary"]["excluded_st"] == 1
+    assert payload["trade_date"] == "2026-09-11"
     assert "fixture taxonomy" in payload["data_notes"]
+    assert any("信号日为最近一根已取得日线（2026-09-11）" in note for note in payload["data_notes"])
     assert capsys.readouterr().out == ""
 
 
@@ -274,7 +408,7 @@ def test_post_close_carries_todays_alerts_and_the_journal() -> None:
     assert "台账统计" in ctx.blocks
 
 
-# ---- 问答 ----------------------------------------------------------------
+# 问答
 
 
 def test_no_question_prints_the_context_without_calling_the_model() -> None:
@@ -321,7 +455,7 @@ def test_without_a_client_the_default_path_is_facts_only() -> None:
 
 def test_facts_bundle_is_ready_for_external_ai_consumers() -> None:
     def compute(symbols: list[str]) -> dict:
-        return {"symbols": [{"symbol": symbols[0], "last_price": 20.0}]}
+        return {"trade_date": "2026-07-31", "symbols": [{"symbol": symbols[0], "last_price": 20.0}]}
 
     from ashare_decision_support.state import Positions
 
@@ -358,6 +492,7 @@ def test_render_prefers_shortline_summary_over_raw_field_listing() -> None:
 
     def compute(symbols: list[str]) -> dict:
         return {
+            "trade_date": "2026-07-31",
             "symbols": [
                 {
                     "symbol": symbols[0],
@@ -378,7 +513,7 @@ def test_render_prefers_shortline_summary_over_raw_field_listing() -> None:
                         "session_amount": 12686185800.0,
                     },
                 }
-            ]
+            ],
         }
 
     rendered = assemble(

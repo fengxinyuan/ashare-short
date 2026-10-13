@@ -1,21 +1,7 @@
-"""选股段：日线 → 结构 → 打法门槛 → 打分。**三条链路共用这一段。**
+"""共享选股流程：日线分析、打法门槛与评分。
 
-改造前 `jobs/morning.py` 与 `jobs/post_close.py` 各写了一遍这个流程，而两遍已经
-漂移到用不同的规则：morning 过打法门槛与情绪周期闸门，post_close 不过——它把加权
-分数直接喂进一条独立的矩阵管线（`research.py`，随本次改造一并删除）。于是**盘后
-给出的次日候选，用的正是盘前链路明确否定过的那套逻辑**，而两边没有任何地方对账。
-
-这个模块把那一段收成一份代码。调用方的差别只剩两处，都由参数表达：
-
-```text
-标的从哪来   morning=板块成分股（自上而下）· post_close=自选与持仓 · advise=手工指定
-周期约束     morning / post_close 施加 · advise 不施加（`allowed=None`）
-```
-
-**为什么拆成 `analyze_universe` + `select_from` 两步。** morning 要打两遍分：先用
-量价粗排收窄范围，再只对入围的那批拉个股舆情精排（舆情是每标的一次 HTTP，对几百只
-全拉不值得）。两遍打分共用同一份结构读数，而日线分析、威科夫、低吸画像这三样是这
-条链上最贵的纯计算。合成一个函数就意味着精排时把它们全部重算一遍。
+analyze_universe 计算可复用读数，select_from 按上下文评分，供盘前粗排和精排共用。
+调用方提供标的和周期约束；主动单票分析可用 allowed=None 省略周期约束。
 """
 
 from __future__ import annotations
@@ -43,7 +29,7 @@ from ashare_decision_support.strategy.playbook import PlaybookMatch, evaluate_pl
 from ashare_decision_support.strategy.regime import RegimeVerdict
 
 # 打法门槛过滤后至少要剩这么多标的，否则说明今天没有像样的位置。
-#
+
 # **不足时不放宽门槛。** 改造前 morning 的行为是「少于最低样本就放宽低吸门槛并按
 # 分数排序」，那等于在最该收手的日子里输出最多的追高票。现在少就是少。
 MIN_SETUP_CANDIDATES = 20
@@ -76,12 +62,7 @@ class SelectedSymbol:
         return primary.value if primary else None
 
     def to_row(self) -> dict[str, Any]:
-        """台账、候选、渲染三处共用的那一行。
-
-        字段名与改造前 `jobs/morning.py:_rank_candidates` 产出的行**逐字相同**。
-        `journal/records.py` 与 `notify/render.py` 都按这些名字读，改名会让台账里
-        新旧记录的同一个字段对不上，而那种错不会报错，只会让统计静默分叉。
-        """
+        """生成台账、候选和渲染共用的记录，保持字段契约一致。"""
         return {
             "symbol": self.symbol,
             "name": self.name,
@@ -94,6 +75,9 @@ class SelectedSymbol:
                 self.factor_context.to_dict() if self.factor_context is not None else None
             ),
             "last_close": self.snapshot.last_close,
+            # `last_close` 是哪一根日线的收盘。台账拿它锚定百分比价位——盘前跑的
+            # 晨报，这一天是上一交易日，不是计划要执行的那天（`journal/verify.py`）。
+            "bar_date": self.snapshot.source_ts.date().isoformat(),
             "trend_state": self.snapshot.trend_state.value,
             "stop_reference": self.snapshot.stop_reference,
             "target_reference": self.snapshot.target_reference,
@@ -198,9 +182,7 @@ def analyze_universe(
 
     snapshots = DailyTechnicalAnalyzer().analyze_many(usable)
     wyckoff = {signal.symbol: signal for signal in WyckoffAnalyzer().analyze_many(usable)}
-    dips = {
-        symbol: measure_dip(rows, snapshots.get(symbol)) for symbol, rows in usable.items()
-    }
+    dips = {symbol: measure_dip(rows, snapshots.get(symbol)) for symbol, rows in usable.items()}
     shares = float_shares or {}
     volume_price = {
         symbol: measure_volume_price(rows, snapshots.get(symbol), shares.get(symbol))
@@ -279,6 +261,11 @@ def select_from(
             if symbol in analysis.bars
         ]
     )
+    # `ScoreProvider.score_many()` promises best-first for the built-in provider, but
+    # external/model providers may batch and return in service order. Candidate
+    # selection is where ranking becomes a trading decision, so the order is
+    # normalised here as the final gate.
+    scored = sorted(scored, key=lambda item: (-item.score, item.symbol))
 
     for item in scored:
         match = result.matches[item.symbol]
@@ -343,8 +330,7 @@ def _funnel_notes(
         )
         detail = f"；其中 {'、'.join(blocked)} 被周期挡掉" if blocked else ""
         return [
-            (f"⚠️ {cycle}：入围 {len(scope)} 只无一满足允许打法的入场判据{detail}，"
-            "今日不产出候选")
+            (f"⚠️ {cycle}：入围 {len(scope)} 只无一满足允许打法的入场判据{detail}，今日不产出候选")
         ]
 
     tally: dict[str, int] = {}
@@ -355,8 +341,10 @@ def _funnel_notes(
     breakdown = "、".join(f"{name} {count} 只" for name, count in sorted(tally.items()))
     breakdown_text = f"（{breakdown}）" if breakdown else ""
     notes = [
-        (f"{cycle}：{len(scope)} 只入围中 {len(qualified)} 只满足入场判据{breakdown_text}，"
-        f"其余 {len(scope) - len(qualified)} 只无可用打法")
+        (
+            f"{cycle}：{len(scope)} 只入围中 {len(qualified)} 只满足入场判据{breakdown_text}，"
+            f"其余 {len(scope) - len(qualified)} 只无可用打法"
+        )
     ]
     if len(qualified) < MIN_SETUP_CANDIDATES:
         notes.append(

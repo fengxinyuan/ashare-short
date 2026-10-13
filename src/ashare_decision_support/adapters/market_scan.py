@@ -1,28 +1,7 @@
-"""全市场扫描：一次枚举所有 A 股，带估值、换手与流通市值。
+"""全市场实时行情扫描，提供估值、换手、流通市值与成交额。
 
-**和 `snapshot.py` 的分工。** 那个是「给定 N 个标的，取现价与五档盘口」，前提是
-你已经知道要看哪些票。这个反过来：**不需要预先知道标的池**，一次把全市场 5500+ 只
-连同 `snapshot.py` 拿不到的三类字段一起扫回来——
-
-| 字段 | 谁能给 | 项目里此前有没有 |
-|---|---|---|
-| 现价 / 五档盘口 | `snapshot.py`（hq.sinajs.cn） | 有 |
-| **市盈率 / 市净率** | 本模块 | **没有** |
-| **流通市值 / 总市值** | 本模块 | **没有** |
-| **换手率 / 成交额** | 本模块 | **没有** |
-
-这三类是超短线选股的**硬门槛**，不是锦上添花：流通市值太小的票拉一个板只要几千万，
-成交额太小的票你买得进卖不出。此前候选只过滤 ST 与致命公告，一只 15 亿流通、日成交
-3000 万的票和茅台在筛选层面是等价的。
-
-**顺带得到一个更硬的宽度读数。** `sectors/momentum.py` 的 breadth 是 4430 只申万成分股
-里有日线的那部分（实测 4236 只）算出来的；这里是全市场 5500+ 只的真实涨跌家数。
-2026-07-31 实测：全市场 4690 涨 / 728 跌（85%），申万样本口径 83%。两者接近，但**接近
-是结论不是假设**——差得远的时候说明成分股样本有偏，那本身就是要报出来的事。
-
-**数据源。** 新浪 `Market_Center.getHQNodeData`。分页硬上限 100 条/页（实测 num=500
-和 num=1000 都只回 100），所以 5500 只要 56 页并发。走 stdlib 直连、字段自己解析，
-理由和 `snapshot.py`、`limit_pool.py` 一致：上游改列名时是解析失败而不是静默错值。
+结果用于市场宽度、盘中板块截面和可交易性筛选；缺失字段保留未知。
+免费与付费路径、量纲及跨源合并规则见 docs/DATA_SOURCES.md。
 """
 
 from __future__ import annotations
@@ -30,12 +9,18 @@ from __future__ import annotations
 import json
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from contextlib import suppress
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any
 
 from ashare_decision_support.adapters.http import fetch_text
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import finite
+from ashare_decision_support.schedule.clock import is_continuous_session
+from ashare_decision_support.schedule.timezone import beijing_naive_now
+from ashare_decision_support.state.paths import state_path
+from ashare_decision_support.state.store import read_json_object, write_json
 
 BASE_URL = (
     "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
@@ -45,10 +30,12 @@ BASE_URL = (
 REFERER = "https://vip.stock.finance.sina.com.cn/"
 
 NODE_ALL_A = "hs_a"
-PAGE_SIZE = 100          # 服务端硬上限，加大无效
-MAX_PAGES = 80           # 5500 / 100 = 55 页，留足余量兼防翻页失控
+PAGE_SIZE = 100  # 服务端硬上限，加大无效
+MAX_PAGES = 80  # 5500 / 100 = 55 页，留足余量兼防翻页失控
 TIMEOUT_SECONDS = 20
 MAX_WORKERS = 8
+SCAN_CACHE_SECONDS = 300
+SCAN_CACHE_FILE = "cache/market_scan_latest.json"
 
 # 超短线可交易性门槛。两个都是**下限**不是选股条件：
 #   - 流通市值 20 亿以下，拉一个板只要几千万，价格由不了基本面；
@@ -66,13 +53,13 @@ class MarketRow:
     price: float
     prev_close: float | None = None
     change_pct: float | None = None
-    amount: float | None = None          # 元
-    volume: float | None = None          # 股
+    amount: float | None = None  # 元
+    volume: float | None = None  # 股
     turnover_ratio: float | None = None  # %
     pe: float | None = None
     pb: float | None = None
-    float_cap: float | None = None       # 流通市值，元
-    total_cap: float | None = None       # 总市值，元
+    float_cap: float | None = None  # 流通市值，元
+    total_cap: float | None = None  # 总市值，元
 
     @property
     def float_cap_yi(self) -> float | None:
@@ -107,6 +94,13 @@ class MarketScan:
     rows: dict[str, MarketRow] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     ok: bool = True
+    complete: bool = True
+    # 取数时刻，以及取到的是不是半截交易日。全市场扫描是实时快照：盘前拿到的是上一
+    # 交易日的整段，盘后是今天的整段，09:15–15:00 之间拿到的成交额与涨跌幅都还在
+    # 形成中。由取数那一层（`jobs/sources.py:fetch_market_scan`）盖戳，读的一层
+    # （`screens/liquidity.py`）据此决定成交额门槛还能不能用。
+    as_of: datetime | None = None
+    session_in_progress: bool = False
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -115,7 +109,7 @@ class MarketScan:
         """按 `600519.SH` 或 `600519` 都能取。"""
         return self.rows.get(symbol.split(".", maxsplit=1)[0])
 
-    # ---- breadth ---------------------------------------------------------
+    # breadth
 
     @property
     def advancers(self) -> int:
@@ -137,10 +131,22 @@ class MarketScan:
     def describe(self) -> list[str]:
         if not self.rows:
             return []
+        breadth = self.breadth
+        # 涨跌幅全部缺失或为 0（隔夜行情源把涨跌幅清零之后就是这样）时上涨面算不
+        # 出来。写成一句「无读数」，而不是让一个 None 在格式化时把整轮盘前跑崩——
+        # 2026-09-14 01:10 实测就崩在这里。
+        face = f"上涨面 {breadth:.0%}" if breadth is not None else "涨跌幅全部缺失，上涨面无读数"
         lines = [
-            (f"全市场 {len(self.rows)} 只：涨 {self.advancers} / 跌 {self.decliners}"
-            f"（上涨面 {self.breadth:.0%}），成交额 {self.total_amount / 1e12:.2f} 万亿")
+            (
+                f"全市场 {len(self.rows)} 只：涨 {self.advancers} / 跌 {self.decliners}"
+                f"（{face}），成交额 {self.total_amount / 1e12:.2f} 万亿"
+            )
         ]
+        if self.session_in_progress:
+            stamp = f"截至 {self.as_of:%H:%M}" if self.as_of is not None else "盘中"
+            lines.append(
+                f"⚠️ 全市场扫描取自盘中（{stamp}），成交额与涨跌为半截交易日的读数，不能和收盘口径比"
+            )
         st = sum(1 for r in self.rows.values() if r.is_st)
         if st:
             lines.append(f"其中 ST/退市风险 {st} 只")
@@ -165,6 +171,9 @@ class MarketScanAdapter:
         self.node = node
 
     def fetch(self, max_pages: int = MAX_PAGES) -> MarketScan:
+        cache_enabled = self._opener is urllib.request.urlopen and max_pages == MAX_PAGES
+        if cache_enabled and (cached := self._read_recent_cache()) is not None:
+            return cached
         notes: list[str] = []
         rows: dict[str, MarketRow] = {}
 
@@ -172,43 +181,88 @@ class MarketScanAdapter:
         done, errors = gather(pages, self._page, max_workers=self.max_workers)
         failures = len(errors)
 
-        empty_streak = 0
-        for _page, payload in done:
+        populated_pages: set[int] = set()
+        for page, payload in done:
             if not payload:
-                empty_streak += 1
                 continue
-            empty_streak = 0
+            populated_pages.add(page)
             for raw in payload:
                 row = _parse_row(raw)
                 if row is not None:
                     rows.setdefault(row.code, row)
+
+        last_page = max(populated_pages, default=0)
+        missing_inside = sorted(set(range(1, last_page + 1)) - populated_pages)
+        complete = not failures and not missing_inside
 
         if failures:
             kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors}))
             notes.append(
                 f"全市场扫描 {failures}/{len(pages)} 页取数失败（{kinds}），宽度读数按已取到的算"
             )
+        if missing_inside and not failures:
+            notes.append(f"全市场扫描前 {last_page} 页有 {len(missing_inside)} 页为空，截面不完整")
         if not rows:
-            return MarketScan(notes=[*notes, "全市场扫描没有取到任何数据"], ok=False)
+            return MarketScan(
+                notes=[*notes, "全市场扫描没有取到任何数据"], ok=False, complete=False
+            )
 
-        notes.append(
-            f"全市场扫描 {len(rows)} 只（{len(pages) - failures - empty_streak} 页有数据）"
+        notes.append(f"全市场扫描 {len(rows)} 只（{len(populated_pages)} 页有数据）")
+        scan = MarketScan(rows=rows, notes=notes, ok=True, complete=complete)
+        if cache_enabled and complete and len(rows) >= 5000:
+            self._save_recent_cache(scan)
+        return scan
+
+    @staticmethod
+    def _read_recent_cache() -> MarketScan | None:
+        try:
+            payload = read_json_object(state_path(SCAN_CACHE_FILE))
+        except OSError:
+            return None
+        if payload.get("schema") != "market-scan-cache-v1":
+            return None
+        try:
+            stamp = datetime.fromisoformat(payload["as_of"])
+            now = beijing_naive_now()
+            rows = {code: MarketRow(**value) for code, value in payload["rows"].items()}
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        age = (now - stamp).total_seconds()
+        if (
+            stamp.date() != now.date()
+            or not 0 <= age <= SCAN_CACHE_SECONDS
+            or is_continuous_session(stamp) != is_continuous_session(now)
+            or len(rows) < 5000
+        ):
+            return None
+        return MarketScan(
+            rows=rows, notes=[f"全市场扫描复用 {stamp:%H:%M} 的完整截面"], ok=True, as_of=stamp
         )
-        return MarketScan(rows=rows, notes=notes, ok=True)
 
-    # ---- internals -------------------------------------------------------
-
+    @staticmethod
+    def _save_recent_cache(scan: MarketScan) -> None:
+        with suppress(OSError, TypeError, ValueError):
+            write_json(
+                state_path(SCAN_CACHE_FILE),
+                {
+                    "schema": "market-scan-cache-v1",
+                    "as_of": beijing_naive_now().isoformat(timespec="seconds"),
+                    "rows": {code: asdict(row) for code, row in scan.rows.items()},
+                },
+            )
 
     def _page(self, page: int) -> list[dict]:
         url = BASE_URL.format(page=page, size=PAGE_SIZE, node=self.node)
-        text = fetch_text(
-            self._opener, url, timeout=self.timeout, referer=REFERER, encoding="gbk"
-        )
+        text = fetch_text(self._opener, url, timeout=self.timeout, referer=REFERER, encoding="gbk")
         text = text.strip()
         if not text or text in ("null", "[]"):
             return []
         payload = json.loads(text)
-        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+        return (
+            [item for item in payload if isinstance(item, dict)]
+            if isinstance(payload, list)
+            else []
+        )
 
 
 def _parse_row(raw: dict) -> MarketRow | None:

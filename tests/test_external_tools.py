@@ -41,7 +41,7 @@ def test_sector_leaders_are_relative_facts_not_return_predictions() -> None:
             symbols[1]: _bars(0.004, 4e8),
             symbols[2]: _bars(-0.003, 1e8),
         },
-        [SectorDefinition(name="测试行业", level="SW1", symbols=symbols)],
+        [SectorDefinition(name="测试行业", level="THS_INDUSTRY", symbols=symbols)],
         names={symbols[0]: "强势股", symbols[1]: "中间股", symbols[2]: "弱势股"},
         as_of="2026-08-10",
         top_per_sector=2,
@@ -58,7 +58,7 @@ def test_equal_component_values_receive_equal_percentiles() -> None:
     rows = _bars(0.004, 4e8)
     payload = build_sector_leaders(
         dict.fromkeys(symbols, rows),
-        [SectorDefinition(name="并列行业", level="SW1", symbols=symbols)],
+        [SectorDefinition(name="并列行业", level="THS_INDUSTRY", symbols=symbols)],
     )
     components = [item["rank_components"] for item in payload["sectors"][0]["leaders"]]
     assert components[0] == components[1]
@@ -71,9 +71,7 @@ def test_monthly_context_delegates_external_event_research(tmp_path, monkeypatch
         "as_of": "2026-09-15",
         "sectors": [],
     }
-    (tmp_path / "sector_leaders_latest.json").write_text(
-        json.dumps(leaders), encoding="utf-8"
-    )
+    (tmp_path / "sector_leaders_latest.json").write_text(json.dumps(leaders), encoding="utf-8")
 
     payload = build_monthly_context(
         output_dir=tmp_path,
@@ -87,7 +85,10 @@ def test_monthly_context_delegates_external_event_research(tmp_path, monkeypatch
     assert payload["sector_leaders"]["view"] == "summary"
     assert "recent_validation" in payload["historical_validation"]
     assert "industry_level" in payload["sector_rotation_memory"]
-    assert any(task["topic"] == "business leadership verification" for task in payload["external_research_tasks"])
+    assert any(
+        task["topic"] == "business leadership verification"
+        for task in payload["external_research_tasks"]
+    )
 
 
 def test_mcp_lists_read_only_and_refresh_tools() -> None:
@@ -131,7 +132,10 @@ def test_preopen_tool_can_be_used_without_global_snapshot(tmp_path, monkeypatch)
 
     monkeypatch.setattr(
         "ashare_decision_support.tool_api.build_preopen_research",
-        lambda **kwargs: {"output_dir": kwargs["output_dir"], "market_adapter": kwargs["market_adapter"]},
+        lambda **kwargs: {
+            "output_dir": kwargs["output_dir"],
+            "market_adapter": kwargs["market_adapter"],
+        },
     )
 
     payload = preopen_research_context(output_dir=str(tmp_path), include_global=False)
@@ -165,9 +169,7 @@ def test_cli_exposes_external_research_commands() -> None:
 
 def test_sector_leaders_cli_reads_the_cached_pack(tmp_path, capsys) -> None:
     cached = {"schema": "ashare-sector-leaders-v1", "sectors": []}
-    (tmp_path / "sector_leaders_latest.json").write_text(
-        json.dumps(cached), encoding="utf-8"
-    )
+    (tmp_path / "sector_leaders_latest.json").write_text(json.dumps(cached), encoding="utf-8")
     args = build_parser().parse_args(["sector-leaders", "--output-dir", str(tmp_path)])
     cli.COMMANDS[args.command](args)
     assert json.loads(capsys.readouterr().out)["schema"] == cached["schema"]
@@ -224,9 +226,7 @@ def test_the_server_reports_the_package_version() -> None:
     """两处各写一个字面量的话，`initialize` 报的版本和 `pip show` 的会各说各话。"""
     from ashare_decision_support import __version__
 
-    initialized = handle(
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-    )
+    initialized = handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
     assert initialized["result"]["serverInfo"]["version"] == __version__
 
 
@@ -281,7 +281,7 @@ def test_an_unknown_argument_comes_back_as_a_tool_error_not_a_dead_server() -> N
     assert "TypeError" in response["result"]["content"][0]["text"]
 
 
-# ---- MCP 传输层 -------------------------------------------------------------
+# MCP 传输层
 
 
 def test_a_datetime_in_the_payload_does_not_kill_the_response(monkeypatch) -> None:
@@ -346,8 +346,8 @@ def test_the_stdio_loop_answers_line_by_line_and_survives_garbage() -> None:
 
     lines = [
         '{"jsonrpc":"2.0","id":1,"method":"ping"}',
-        "",                                    # 空行跳过，不产生回复
-        "{ not json",                          # 坏行只回一条 parse error
+        "",  # 空行跳过，不产生回复
+        "{ not json",  # 坏行只回一条 parse error
         '{"jsonrpc":"2.0","method":"notifications/initialized"}',
         '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
     ]
@@ -362,7 +362,7 @@ def test_the_stdio_loop_answers_line_by_line_and_survives_garbage() -> None:
     assert len(replies[2]["result"]["tools"]) == len(mcp_server._TOOLS)
 
 
-# ---- 体积：这是给模型调的工具，每一份多余的拷贝都是它的上下文 ----------------
+# 体积：这是给模型调的工具，每一份多余的拷贝都是它的上下文
 
 
 def test_the_text_content_is_the_readable_view_not_a_second_json_dump(monkeypatch) -> None:
@@ -420,7 +420,9 @@ def test_a_payload_without_a_readable_view_still_gets_json_content(monkeypatch) 
     assert json.loads(response["result"]["content"][0]["text"]) == {"schema": "x-v1"}
 
 
-def test_sections_returns_only_what_was_asked_and_says_what_it_dropped(tmp_path, monkeypatch) -> None:
+def test_sections_returns_only_what_was_asked_and_says_what_it_dropped(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setenv("ASHARE_DS_HOME", str(tmp_path / "state"))
     from ashare_decision_support.tool_api import get_facts
 
@@ -433,7 +435,9 @@ def test_sections_returns_only_what_was_asked_and_says_what_it_dropped(tmp_path,
     assert any("省略的块" in note for note in picked["notes"])
 
 
-def test_an_unknown_section_is_refused_instead_of_returning_an_empty_pack(tmp_path, monkeypatch) -> None:
+def test_an_unknown_section_is_refused_instead_of_returning_an_empty_pack(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setenv("ASHARE_DS_HOME", str(tmp_path / "state"))
     from ashare_decision_support.tool_api import get_facts
 
@@ -471,7 +475,7 @@ def test_the_screen_block_is_trimmed_with_the_drop_written_down(tmp_path) -> Non
     assert any("共省略" in note for note in ctx.notes)
 
 
-# ---- 声明与实现对不对得上 ----------------------------------------------------
+# 声明与实现对不对得上
 
 
 def test_every_declared_tool_has_a_handler_and_every_handler_is_declared() -> None:

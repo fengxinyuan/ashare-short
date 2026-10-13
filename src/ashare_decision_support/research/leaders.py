@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Callable
 from datetime import timedelta
@@ -23,6 +22,7 @@ from ashare_decision_support.sectors import ThsConceptTaxonomy, ThsIndustryTaxon
 from ashare_decision_support.sectors.base import SectorDefinition
 from ashare_decision_support.signals.daily_technical import DailyTechnicalAnalyzer
 from ashare_decision_support.signals.series import change, series
+from ashare_decision_support.state.store import write_json
 from ashare_decision_support.symbols import normalize_symbol
 
 LEADERS_SCHEMA = "ashare-sector-leaders-v1"
@@ -90,9 +90,7 @@ def build_sector_leaders(
                     "symbol": symbol,
                     "name": labels.get(symbol),
                     "leadership_rank": round(score, 2),
-                    "rank_components": {
-                        key: round(value, 4) for key, value in components.items()
-                    },
+                    "rank_components": {key: round(value, 4) for key, value in components.items()},
                     **metric,
                 }
             )
@@ -138,7 +136,6 @@ def refresh_sector_leaders(
     *,
     output_dir: str | Path = "briefs",
     levels: tuple[str, ...] = ("industry", "concept"),
-    industry_level: str = "SW1",
     top_per_sector: int = DEFAULT_TOP_PER_SECTOR,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     min_bars: int = DEFAULT_MIN_BARS,
@@ -156,7 +153,7 @@ def refresh_sector_leaders(
     report = progress or (lambda message: None)
     definitions: list[SectorDefinition] = []
     if "industry" in wanted:
-        definitions.extend(ThsIndustryTaxonomy(source, level=industry_level).list_sectors())
+        definitions.extend(ThsIndustryTaxonomy(source).list_sectors())
     if "concept" in wanted:
         definitions.extend(ThsConceptTaxonomy(source).list_sectors())
     report(f"分类加载完成：{len(definitions)} 个板块")
@@ -193,8 +190,7 @@ def refresh_sector_leaders(
     report(f"板块内排名完成：{payload['sector_count']} 个板块")
     payload["data_notes"] = [*snapshot.notes, *fetch_notes]
     target = Path(output_dir) / LEADERS_LATEST_NAME
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_json(target, payload)
     payload["payload_path"] = str(target)
     return payload
 
@@ -210,7 +206,9 @@ def _symbol_metrics(
         closes = series(bars, "close")
         if snapshot is None or len(closes) < min_bars or snapshot.last_close <= 0:
             continue
-        amount_values = [value for row in bars[-20:] if (value := finite(row.get("amount"))) is not None]
+        amount_values = [
+            value for row in bars[-20:] if (value := finite(row.get("amount"))) is not None
+        ]
         average_amount = sum(amount_values) / len(amount_values) if amount_values else None
         trend_quality = _trend_quality(snapshot)
         out[symbol] = {

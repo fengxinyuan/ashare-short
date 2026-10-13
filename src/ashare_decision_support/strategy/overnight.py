@@ -16,7 +16,8 @@ from typing import Any
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.signals.candles import close_position
 from ashare_decision_support.signals.daily_technical import DailyTechnicalAnalyzer
-from ashare_decision_support.signals.dipbuy import measure_dip
+from ashare_decision_support.signals.dipbuy import DipFeatures, measure_dip
+from ashare_decision_support.signals.series import bar_day
 from ashare_decision_support.symbols import normalize_symbol
 
 
@@ -133,7 +134,9 @@ class StrategyScreenConfig:
             raise ValueError("min_history_bars must be at least 20")
         base = PROFILES.get(self.profile)
         if base is None:
-            raise ValueError(f"unknown strategy profile {self.profile!r}; choose one of {sorted(PROFILES)}")
+            raise ValueError(
+                f"unknown strategy profile {self.profile!r}; choose one of {sorted(PROFILES)}"
+            )
         values = {
             key: value
             for key, value in {
@@ -155,13 +158,21 @@ class StrategyScreenConfig:
         resolved = replace(base, **values)
         if resolved.min_atr_pct < 0 or resolved.max_atr_pct < resolved.min_atr_pct:
             raise ValueError("ATR bounds must satisfy 0 <= min_atr_pct <= max_atr_pct")
-        if resolved.min_range_position < 0 or resolved.max_range_position > 1 or resolved.max_range_position < resolved.min_range_position:
+        if (
+            resolved.min_range_position < 0
+            or resolved.max_range_position > 1
+            or resolved.max_range_position < resolved.min_range_position
+        ):
             raise ValueError("range position bounds must be within [0, 1]")
         if resolved.min_volume_ratio < 0 or resolved.max_volume_ratio < resolved.min_volume_ratio:
             raise ValueError("volume ratio bounds are invalid")
         if resolved.min_pullback_pct > resolved.max_pullback_pct:
             raise ValueError("pullback bounds are invalid")
-        if resolved.min_close_position < 0 or resolved.max_close_position > 1 or resolved.max_close_position < resolved.min_close_position:
+        if (
+            resolved.min_close_position < 0
+            or resolved.max_close_position > 1
+            or resolved.max_close_position < resolved.min_close_position
+        ):
             raise ValueError("close position bounds must be within [0, 1]")
         return resolved
 
@@ -231,6 +242,18 @@ class StrategyScreenResult:
         }
 
 
+@dataclass
+class _ScreenInputs:
+    names: dict[str, str | None]
+    sectors: dict[str, str | None]
+    bars: dict[str, list[dict]]
+    snapshots: dict[str, Any]
+    dips: dict[str, DipFeatures]
+    scanned: int
+    excluded_scope: int
+    excluded_st: int
+
+
 def is_main_board(symbol: str) -> bool:
     """Return whether a normalized A-share symbol belongs to SH/SZ main board."""
     code, _, market = normalize_symbol(symbol).partition(".")
@@ -246,7 +269,7 @@ def is_st_name(name: str | None) -> bool:
     return "ST" in label or "退" in label
 
 
-def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
+def screen_overnight(
     bars_by_symbol: dict[str, list[dict]],
     *,
     names: dict[str, str | None] | None = None,
@@ -260,39 +283,74 @@ def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
     """
     cfg = config or StrategyScreenConfig()
     profile = cfg.resolved_profile()
+    prepared = _prepare_screen(bars_by_symbol, names or {}, sectors or {}, cfg)
+    return _screen_prepared(prepared, cfg, profile)
+
+
+def _prepare_screen(
+    bars_by_symbol: dict[str, list[dict]],
+    names: dict[str, str | None],
+    sectors: dict[str, str | None],
+    cfg: StrategyScreenConfig,
+) -> _ScreenInputs:
+    """同一批日线只归一化和计算一次；作用域限定本轮，下一轮重新计算。"""
     normalized_names = {
-        normalized: value
-        for key, value in (names or {}).items()
-        if (normalized := normalize_symbol(key))
+        normalized: value for key, value in names.items() if (normalized := normalize_symbol(key))
     }
     normalized_sectors = {
-        normalized: value
-        for key, value in (sectors or {}).items()
-        if (normalized := normalize_symbol(key))
+        normalized: value for key, value in sectors.items() if (normalized := normalize_symbol(key))
     }
     normalized_bars: dict[str, list[dict]] = {}
     for raw_symbol, rows in bars_by_symbol.items():
         symbol = normalize_symbol(raw_symbol)
         if symbol and symbol not in normalized_bars:
-            normalized_bars[symbol] = _ordered_bars(rows)
-    result = StrategyScreenResult(config=cfg, profile=profile, scanned=len(normalized_bars))
+            normalized_bars[symbol] = rows
+    excluded_scope = 0
+    excluded_st = 0
     eligible_bars: dict[str, list[dict]] = {}
     for symbol, rows in normalized_bars.items():
         name = normalized_names.get(symbol)
         if cfg.main_board_only and not is_main_board(symbol):
-            result.excluded_scope += 1
+            excluded_scope += 1
             continue
         if not cfg.allow_st and is_st_name(name):
-            result.excluded_st += 1
+            excluded_st += 1
             continue
-        eligible_bars[symbol] = rows
+        eligible_bars[symbol] = _ordered_bars(rows)
 
     # Scope and name gates are deliberately before technical analysis: a full
     # universe scan should not spend CPU deriving indicators for excluded boards.
     snapshots = DailyTechnicalAnalyzer().analyze_many(eligible_bars)
-    for symbol, rows in eligible_bars.items():
-        name = normalized_names.get(symbol)
-        if not rows or symbol not in snapshots:
+    dips = {
+        symbol: measure_dip(rows, snapshots[symbol])
+        for symbol, rows in eligible_bars.items()
+        if rows and symbol in snapshots
+    }
+    return _ScreenInputs(
+        names=normalized_names,
+        sectors=normalized_sectors,
+        bars=eligible_bars,
+        snapshots=snapshots,
+        dips=dips,
+        scanned=len(normalized_bars),
+        excluded_scope=excluded_scope,
+        excluded_st=excluded_st,
+    )
+
+
+def _screen_prepared(
+    prepared: _ScreenInputs, cfg: StrategyScreenConfig, profile: StrategyProfile
+) -> StrategyScreenResult:
+    result = StrategyScreenResult(
+        config=cfg,
+        profile=profile,
+        scanned=prepared.scanned,
+        excluded_scope=prepared.excluded_scope,
+        excluded_st=prepared.excluded_st,
+    )
+    for symbol, rows in prepared.bars.items():
+        name = prepared.names.get(symbol)
+        if not rows or symbol not in prepared.snapshots:
             result.rejected_data += 1
             result.rejection_reasons["data_bars"] = result.rejection_reasons.get("data_bars", 0) + 1
             continue
@@ -300,9 +358,10 @@ def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
         candidate, rejection = _candidate_from(
             symbol,
             rows,
-            snapshots[symbol],
+            prepared.snapshots[symbol],
+            prepared.dips[symbol],
             name=name,
-            sector=normalized_sectors.get(symbol),
+            sector=prepared.sectors.get(symbol),
             config=cfg,
             profile=profile,
         )
@@ -316,7 +375,9 @@ def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
         else:
             result.candidates.append(candidate)
 
-    result.candidates.sort(key=lambda item: (-item.setup_rank, item.range_position_60d, -(item.amount_yi or 0.0)))
+    result.candidates.sort(
+        key=lambda item: (-item.setup_rank, item.range_position_60d, -(item.amount_yi or 0.0))
+    )
     if cfg.limit:
         result.candidates = result.candidates[: cfg.limit]
     if not result.candidates:
@@ -328,16 +389,11 @@ def screen_overnight(  # noqa: PLR0912 - each branch is an auditable funnel gate
 
 
 def _ordered_bars(rows: list[dict] | None) -> list[dict]:
-    """Return valid daily rows in chronological order for a stable signal day."""
+    """按 bar_day 对有效日线排序，无法识别日期的行排在前面。"""
     if not isinstance(rows, list):
         return []
     valid = [row for row in rows if isinstance(row, dict)]
-    return sorted(
-        valid,
-        key=lambda row: str(
-            row.get("timestamp") or row.get("date") or row.get("日期") or row.get("时间") or ""
-        ),
-    )
+    return sorted(valid, key=lambda row: bar_day(row) or "")
 
 
 def diversified_shortlist(
@@ -386,6 +442,7 @@ def _candidate_from(
     symbol: str,
     rows: list[dict],
     snapshot: Any,
+    dip: DipFeatures,
     *,
     name: str | None,
     sector: str | None,
@@ -406,7 +463,6 @@ def _candidate_from(
     if daily_position is None or range_position is None:
         return None, "data_technical"
 
-    dip = measure_dip(rows, snapshot)
     contraction = dip.volume_contraction
     pullback = dip.pullback_pct
     if contraction is None or pullback is None:
@@ -420,11 +476,21 @@ def _candidate_from(
         ("amount", amount_yi is not None and amount_yi >= config.min_amount_yi),
         ("atr", profile.min_atr_pct <= atr_pct <= profile.max_atr_pct),
         ("pullback", profile.min_pullback_pct <= pullback <= profile.max_pullback_pct),
-        ("range_position", profile.min_range_position <= range_position <= profile.max_range_position),
+        (
+            "range_position",
+            profile.min_range_position <= range_position <= profile.max_range_position,
+        ),
         ("ma20", close_vs_ma20 >= profile.min_close_vs_ma20_pct),
         ("volume_contraction", contraction <= profile.max_volume_contraction),
-        ("volume_ratio", volume_ratio is not None and profile.min_volume_ratio <= volume_ratio <= profile.max_volume_ratio),
-        ("close_position", profile.min_close_position <= daily_position <= profile.max_close_position),
+        (
+            "volume_ratio",
+            volume_ratio is not None
+            and profile.min_volume_ratio <= volume_ratio <= profile.max_volume_ratio,
+        ),
+        (
+            "close_position",
+            profile.min_close_position <= daily_position <= profile.max_close_position,
+        ),
     )
     failed = next((name for name, accepted in constraints if not accepted), None)
     if failed:
@@ -453,8 +519,7 @@ def _candidate_from(
         warnings.append("收盘接近日内高位，下一交易日不宜按昨收直接追价")
     previous_low = finite(rows[-2].get("low")) if len(rows) >= 2 else None
     signal_low = finite(last.get("low"))
-    stamp = last.get("timestamp") or last.get("date") or last.get("日期")
-    signal_date = str(stamp)[:10] if stamp is not None else None
+    signal_date = bar_day(last)
     return StrategyCandidate(
         symbol=symbol,
         name=name,
@@ -503,25 +568,39 @@ def _setup_rank(
         location = 1.0 - range_position
         pullback_quality = min(1.0, abs(pullback) / max(abs(min_pullback), 0.01))
         close_target = 0.55
-    close_quality = 1.0 - min(1.0, abs(close_position_value - close_target) / max(close_target, 0.01))
+    close_quality = 1.0 - min(
+        1.0, abs(close_position_value - close_target) / max(close_target, 0.01)
+    )
     components = {
         "liquidity": round(liquidity, 6),
         "location": round(location, 6),
         "pullback_quality": round(pullback_quality, 6),
         "close_quality": round(close_quality, 6),
     }
-    rank = 100.0 * (0.30 * liquidity + 0.30 * location + 0.25 * pullback_quality + 0.15 * close_quality)
+    rank = 100.0 * (
+        0.30 * liquidity + 0.30 * location + 0.25 * pullback_quality + 0.15 * close_quality
+    )
     return round(rank, 2), components
 
 
 BATCH_SCHEMA = "ashare-strategy-screen-batch-v2"
 
+
+def latest_signal_date(bars: dict[str, list[dict]]) -> str | None:
+    """返回全部日线的最新交易日 YYYY-MM-DD，供事实包检查时效；无日期时返回 None。"""
+    days = (bar_day(rows[-1]) for rows in bars.values() if rows)
+    return max((day for day in days if day), default=None)
+
+
 # 这两句跟着每一份筛选结果走。写成常量而不是在调用处各拼一遍：`_cmd_strategy_screen`
 # 原来把它拼了**两遍**（单策略分支一遍，末尾一个重复的 `if profile == "all"` 又
 # 一遍），两份字面量逐字相同——直到有人只改了其中一份。
-def screen_notes(days: int, taxonomy_notes: list[str] | None = None) -> list[str]:
+def screen_notes(
+    days: int, taxonomy_notes: list[str] | None = None, signal_date: str | None = None
+) -> list[str]:
+    stamp = f"（{signal_date}）" if signal_date else ""
     return [
-        f"日线回溯区间约 {days} 个自然日，信号日为最近一根已取得日线",
+        f"日线回溯区间约 {days} 个自然日，信号日为最近一根已取得日线{stamp}",
         "这是候选观察事实，不是订单、收益保证或模型预测",
         *(taxonomy_notes or []),
     ]
@@ -546,15 +625,13 @@ def screen_all_profiles(
     命中集合上；反过来先截断再求交，重叠就变成了排序切点的产物——同一批数据，
     把 `--limit` 从 30 改成 50 会「发现」新的重复命中，而那不是发现。
     """
-    results = {
-        profile: screen_overnight(
-            bars,
-            names=names,
-            sectors=sectors,
-            config=StrategyScreenConfig(profile=profile, **{**common, "limit": 0}),
-        )
+    configs = {
+        profile: StrategyScreenConfig(profile=profile, **{**common, "limit": 0})
         for profile in sorted(PROFILES)
     }
+    profiles = {key: cfg.resolved_profile() for key, cfg in configs.items()}
+    prepared = _prepare_screen(bars, names, sectors, next(iter(configs.values())))
+    results = {key: _screen_prepared(prepared, cfg, profiles[key]) for key, cfg in configs.items()}
 
     memberships: dict[str, list[str]] = {}
     for profile, result in results.items():

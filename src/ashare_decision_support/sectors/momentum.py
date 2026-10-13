@@ -18,10 +18,11 @@ from ashare_decision_support.numeric import median_of
 from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics
 from ashare_decision_support.sectors.panel import rounded
 from ashare_decision_support.signals.dipbuy import measure_dip
+from ashare_decision_support.signals.series import volume_ratio
 
 # A 9.5% daily gain is at the main-board limit. 创业板/科创板 stocks cap at 20%,
 # so this counts "moved hard", not "sealed the limit".
-#
+
 # 付费档现在能取到真实涨跌停价了——`instruments.batch` 对全 A 5534 只 100% 覆盖，
 # 一次 0.97 秒，见 `adapters/tickflow_market.py`。这里**刻意还没改用它**：
 # `strong_count` 直接喂进 `sectors/predict.py` 的板块打分，换判据会让所有历史
@@ -112,7 +113,9 @@ class SectorMomentum:
             ret_20d=rounded(median_of(rets_20d), 6),
             pullback=rounded(median_of(pullbacks), 6),
             pullback_atr=rounded(median_of(pullbacks_atr), 4),
-            breadth=round(sum(1 for value in rets_1d if value > 0) / len(rets_1d), 4) if rets_1d else None,
+            breadth=round(sum(1 for value in rets_1d if value > 0) / len(rets_1d), 4)
+            if rets_1d
+            else None,
             strong_count=sum(1 for value in rets_1d if value >= self.strong_threshold),
             volume_ratio=rounded(median_of(volume_ratios), 4),
             above_ma20=round(above_ma / ma_samples, 4) if ma_samples else None,
@@ -135,15 +138,14 @@ def _pct_change(previous: float, current: float) -> float | None:
 
 
 def _volume_ratio(bars: list[dict]) -> float | None:
-    """Latest volume against the mean of the preceding baseline window."""
+    """Latest volume against the mean of the preceding baseline window.
+
+    先把零成交量的根剔掉再取窗口（停牌日不占「近 20 根」的名额），算式本身走
+    `signals.series.volume_ratio`——和个股层的 `volume_ratio_20d` 是同一个函数。
+    """
     volumes = [
         float(bar["volume"])
         for bar in bars
         if isinstance(bar.get("volume"), (int, float)) and bar["volume"] > 0
     ]
-    if len(volumes) < VOLUME_BASELINE_BARS + 1:
-        return None
-    baseline = fmean(volumes[-(VOLUME_BASELINE_BARS + 1) : -1])
-    if baseline <= 0:
-        return None
-    return volumes[-1] / baseline
+    return volume_ratio(volumes, VOLUME_BASELINE_BARS)

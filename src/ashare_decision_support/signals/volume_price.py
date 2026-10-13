@@ -1,39 +1,8 @@
-"""量价关系：把「放量上涨 / 缩量下跌」这套话变成可记录、可统计的读数。
+"""日线量价特征：量能趋势、换手率、涨跌量比与量价背离。
 
-改造前整套系统对量能只有**两个**数：`volume_ratio_20d`（当日量 / 前 20 日均量）
-和 `dip.volume_contraction`（回调段的缩量程度）。它们都是**单日快照**，答不了超短
-最常问的那几个问题：
-
-```text
-连续三天放量，还是今天突然放一根？          → vol_trend_5d
-这只票的量能对它自己来说算大吗？            → turnover_rate（量比跨票不可比，换手率可比）
-最近这段是买盘推的还是卖盘砸的？            → up_down_vol_ratio
-价还在创新高，量跟上了吗？                  → divergence
-```
-
-**这一层只出读数，不出结论。** 和 `signals/orderflow.py` 同一条口径：「量比 3.2」
-是事实，「放量突破」是判断——后者取决于这只票现在处在回调段还是启动段，同一个量比
-在两种位置下含义相反（`scoring/rule_based.py:_score_volume` 已经踩过这个坑）。
-含义由 `strategy/playbook.py` 的判据链决定，不在这里。
-
-## `up_down_vol_ratio` 不是主动买卖单
-
-它是**近 20 日上涨日成交量之和 ÷ 下跌日成交量之和**，日线粒度的方向性成交量代理。
-本机拿不到逐笔（`push2.eastmoney.com` 被出口代理拒绝，QMT 未开通），这是能拿到的
-最接近的东西——但它和 L2 的「主动买入额」是两个东西：
-
-- 它按**整根日线的涨跌**给当天的量定方向，一天之内的买卖结构完全看不见；
-- 真正的主动买卖单按**每一笔成交撮合在买一还是卖一**分，粒度差了四五个数量级。
-
-所以命名、注释、简报文案三处都不许把它写成「主力资金」「主动买入」「明盘暗盘」。
-有分钟线时可以升级到「收在分时均价上方的分钟成交量占比」，那更接近，但仍然不是逐笔。
-
-## 阈值都是先验设定
-
-下面每个常量都是超短交易里通用的经验刻度，**不是从这套系统的台账里标定出来的**，
-也没有回测支持。它们的作用是让「放量上涨」这句话第一次有一个确定的判据，而不是
-精确。等台账攒够样本（`journal/stats.py:MODEL_READY_SAMPLES`）再谈调参——在那之前
-按统计调这些数，调的是噪声。
+up_down_vol_ratio 为上涨日成交量 / 下跌日成交量，只是日线方向代理，
+不能解释为逐笔主动买卖或主力资金。阈值是规则先验，具体动作由策略层判定。
+方法与形态边界见 docs/KNOWLEDGE_VOLUME_PRICE.md。
 """
 
 from __future__ import annotations
@@ -44,7 +13,7 @@ from typing import Any
 from ashare_decision_support.numeric import finite, mean
 from ashare_decision_support.signals.candles import close_position
 from ashare_decision_support.signals.dipbuy import normalised_volume
-from ashare_decision_support.signals.series import change, series
+from ashare_decision_support.signals.series import change, series, volume_ratio
 
 # 放/缩量的切点。1.2 与 0.8 之间是「平量」——留一条中性带，否则量比在 1.0 附近
 # 来回穿越时，四象限标签会每天翻面。
@@ -54,7 +23,7 @@ CONTRACTION_RATIO = 0.8
 # 倍量 / 三倍量。**这是日环比**（当日量 ÷ 前一日量），和下面 `vol_ratio_20d` 那套
 # 「对 20 日均量」的口径不是一回事，两者常年不同号：连续温和放量的第 5 天可以是
 # `vol_ratio_20d = 2.5` 而环比只有 1.1——后者根本不是倍量。
-#
+
 # 分成两个字段而不是共用一个数，因为它们回答的是两个问题：均量比问「这只票今天
 # 相对自己平时活跃多少」，环比问「今天相对昨天突然放大了多少」。倍量阴、三倍量
 # 这类形态问的全是后者。
@@ -98,7 +67,7 @@ DIVERGENCE_BOTTOM = "底背离"
 # 来：量价读数（本模块 `describe`）、派发判定（`signals/distribution.py`）、卖点
 # 判据（`strategy/exits.py`）。三处此前都 `== DIVERGENCE_TOP` 地共用名字，却把
 # 后半句各写各的。
-#
+
 # 于是改名字三处一起变，改句子只有一处变——**同一份简报里同一个信号出现两种
 # 说法**，而两种都不报错。名字和它的定义必须在同一处。
 CLIMAX_STALL_TEXT = "天量滞涨：放巨量而收在日内下半段"
@@ -208,7 +177,7 @@ def measure_volume_price(
     # snapshot 时要扫 60 根 K 线的高低点。
     position = _range_position(bars, snapshot)
 
-    features = VolumePriceFeatures(
+    return VolumePriceFeatures(
         ret_1d=ret_1d,
         vol_ratio_20d=ratio,
         vol_ratio_1d=_volume_ratio_1d(volumes),
@@ -225,10 +194,9 @@ def measure_volume_price(
         breakdown_on_volume=_breakdown(closes, ret_1d, ratio, snapshot),
         notes=notes,
     )
-    return features
 
 
-# ---- 各读数 ---------------------------------------------------------------
+# 各读数
 
 
 def _quadrant(ret_1d: float | None, ratio: float | None) -> str | None:
@@ -417,9 +385,6 @@ def _breakdown(
     return ratio >= EXPANSION_RATIO and closes[-1] < ma20
 
 
-# ---- helpers -------------------------------------------------------------
-
-
 def _normalised_volumes(bars: list[dict]) -> list[float] | None:
     """整条序列归一成股。**任何一根推不出单位就整条弃权**——半条归一化的序列
     比没有归一化更危险，因为量比会在换单位的那一天凭空跳 100 倍。"""
@@ -449,15 +414,14 @@ def _volume_ratio_1d(volumes: list[float]) -> float | None:
 
 
 def _volume_ratio(volumes: list[float], snapshot: Any) -> float | None:
+    """快照里有就直接用快照的；没有就算一份**和 `daily_technical` 一模一样**的数。
+
+    后半句靠共用 `series.volume_ratio` 保证，不靠两份实现碰巧相同。
+    """
     existing = getattr(snapshot, "volume_ratio_20d", None)
     if existing is not None:
         return float(existing)
-    if len(volumes) < VOLUME_BASELINE_WINDOW + 1:
-        return None
-    baseline = mean(volumes[-(VOLUME_BASELINE_WINDOW + 1) : -1])
-    if not baseline:
-        return None
-    return round(volumes[-1] / baseline, 4)
+    return volume_ratio(volumes, VOLUME_BASELINE_WINDOW, digits=4)
 
 
 def _turnover(

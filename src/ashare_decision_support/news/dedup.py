@@ -23,6 +23,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from ashare_decision_support.news.base import NewsDoc
+from ashare_decision_support.schedule.timezone import to_beijing_naive
 
 # 权重减半所需的小时数。盘前 08:20 跑批看的是隔夜舆情，12 小时意味着昨天此刻的
 # 消息还剩一半、前天此刻剩四分之一——和「隔夜」这个窗口对得上。
@@ -31,20 +32,19 @@ DEFAULT_HALF_LIFE_HOURS = 12.0
 # 超过这个年龄整条丢弃，不再参与任何聚合。
 MAX_AGE_HOURS = 72.0
 
-# 时间戳解析格式，按出现频率排。各源实测形态：
+# 时间戳格式。各源实测形态：
 #   财联社   发布日期 + 发布时间 → "2026-08-01 09:31:20"
 #   东财快讯 发布时间           → "2026-08-01 09:31:20"
 #   新闻联播 date               → "20260801"
 #   个股新闻 发布时间           → "2026-08-01 09:31:20"
-_FORMATS: tuple[str, ...] = (
+_FALLBACK_FORMATS: tuple[str, ...] = (
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d %H:%M",
     "%Y-%m-%d",
     "%Y/%m/%d %H:%M:%S",
     "%Y/%m/%d %H:%M",
     "%Y/%m/%d",
-    "%Y%m%d%H%M%S",
-    "%Y%m%d",
+    "%Y-%m-%dT%H:%M:%S",
 )
 
 # 去重前先剥掉的装饰：全半角标点与空白。剥掉之后
@@ -57,23 +57,70 @@ _LEADING_TAG = re.compile(r"^\s*[【\[（(]([^】\]）)]{1,12})[】\]）)]\s*")
 
 
 def parse_published(value: str) -> datetime | None:
-    """把各源五花八门的时间串解析成 datetime，解析不了就是 None。"""
-    text = (value or "").strip()
+    """把各源五花八门的时间串解析成 datetime，解析不了就是 None。
+
+    这是新闻批处理的逐条热路径。形状已经是固定的数字串，直接构造
+    ``datetime`` 只做一次校验；逐个试 ``strptime`` 会为每条常见格式反复扫描。
+    """
+    text = value.strip() if isinstance(value, str) else ""
     if not text:
         return None
-    for fmt in _FORMATS:
+
+    # 有时区的发布时间必须先换算到北京时间；直接截掉偏移会错算消息年龄。
+    if len(text) > 19 or text.endswith("Z"):
+        return _parse_iso_published(text)
+
+    candidate = text
+    try:
+        if len(candidate) in (10, 16, 19):
+            date_separator = candidate[4]
+            time_separator = candidate[10:11]
+            if date_separator in "-/" and candidate[7] == date_separator:
+                if len(candidate) == 10:
+                    return datetime(int(candidate[:4]), int(candidate[5:7]), int(candidate[8:10]))
+                time_shape_ok = candidate[13] == ":" and (
+                    len(candidate) == 16 or candidate[16] == ":"
+                )
+                if time_shape_ok and (
+                    time_separator == " " or (time_separator == "T" and len(candidate) == 19)
+                ):
+                    second = int(candidate[17:19]) if len(candidate) == 19 else 0
+                    return datetime(
+                        int(candidate[:4]),
+                        int(candidate[5:7]),
+                        int(candidate[8:10]),
+                        int(candidate[11:13]),
+                        int(candidate[14:16]),
+                        second,
+                    )
+        if len(candidate) in (8, 14) and candidate.isascii() and candidate.isdigit():
+            return datetime(
+                int(candidate[:4]),
+                int(candidate[4:6]),
+                int(candidate[6:8]),
+                int(candidate[8:10]) if len(candidate) == 14 else 0,
+                int(candidate[10:12]) if len(candidate) == 14 else 0,
+                int(candidate[12:14]) if len(candidate) == 14 else 0,
+            )
+    except (ValueError, IndexError):
+        pass
+
+    # 保留 strptime 容许单位月/日等非标准但历史上可接受的输入；常见形状
+    # 已在上面返回，所以批处理不再为它们支付多次格式探测的成本。
+    for fmt in _FALLBACK_FORMATS:
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
             continue
-    # 少数源会带毫秒或时区尾巴，截断到秒再试一次。
-    trimmed = text[:19]
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(trimmed, fmt)
-        except ValueError:
-            continue
     return None
+
+
+def _parse_iso_published(text: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(text)
+        return to_beijing_naive(parsed).replace(microsecond=0)
+    except (ValueError, OverflowError):
+        return None
 
 
 def recency_weight(
@@ -88,7 +135,7 @@ def recency_weight(
     """
     if published is None:
         return 1.0
-    age_hours = (now - published).total_seconds() / 3600.0
+    age_hours = (to_beijing_naive(now) - to_beijing_naive(published)).total_seconds() / 3600.0
     if age_hours <= 0:
         return 1.0
     if age_hours >= MAX_AGE_HOURS:
@@ -173,4 +220,5 @@ def freshest(docs: list[NewsDoc]) -> datetime | None:
 def age_hours(published: datetime | None, now: datetime) -> float | None:
     if published is None:
         return None
-    return round(max(0.0, (now - published).total_seconds() / 3600.0), 1)
+    elapsed = (to_beijing_naive(now) - to_beijing_naive(published)).total_seconds()
+    return round(max(0.0, elapsed / 3600.0), 1)

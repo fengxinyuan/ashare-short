@@ -71,7 +71,7 @@ def trending_market(n: int = 40) -> dict[str, list[float]]:
     return profiles
 
 
-# ---- 高低切换 -------------------------------------------------------------
+# 高低切换
 
 
 def test_switching_and_momentum_produce_opposite_labels() -> None:
@@ -208,7 +208,7 @@ def test_a_thin_cross_section_gives_no_verdict_at_all() -> None:
     assert any("不足以支撑轮动判断" in line for line in read.observations)
 
 
-# ---- 相对强弱排名 ---------------------------------------------------------
+# 相对强弱排名
 
 
 def test_rank_change_surfaces_where_money_is_moving() -> None:
@@ -238,7 +238,7 @@ def test_excess_return_is_measured_against_the_cross_section() -> None:
     assert laggard.excess_5d is not None and laggard.excess_5d < 0
 
 
-# ---- 对齐与降级 -----------------------------------------------------------
+# 对齐与降级
 
 
 def test_a_stale_sector_is_excluded_rather_than_compared() -> None:
@@ -273,7 +273,7 @@ def test_no_series_at_all_is_a_stated_absence() -> None:
     assert any("没有可用的板块指数序列" in line for line in read.observations)
 
 
-# ---- 主线持续度 -----------------------------------------------------------
+# 主线持续度
 
 
 def test_persistence_separates_a_clear_leadership_from_churn() -> None:

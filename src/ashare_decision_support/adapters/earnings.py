@@ -1,33 +1,8 @@
-"""业绩预告与业绩快报：中报/年报窗口里唯一的「公司自己说的基本面事实」。
+"""业绩预告与快报，按净利润口径归一化。
 
-**为什么单列一层。** 系统此前完全没有业绩维度。舆情层回答「有没有人在说」，
-量价层回答「走成什么样」，而「这家公司上半年是赚是亏」——最硬、最先于股价、
-且由公司自己签字披露的那个事实——一条都进不来。实测 2026 中报窗口 1874 家披露
-预告，归母口径里预增 580 家、首亏 284 家。超短线最怕的「业绩杀」和最想要的
-「中报超预期」全在这批数据里，而这一层建起来之前它们对系统是不存在的。
-
-**一个标的有多行，每个「预测指标」一行，而预告类型随指标而变。**
-这是这个源最容易出错的地方，实测同一家公司：
-
-```text
-归属于上市公司股东的净利润   续亏   +6.98%
-扣除非经常性损益后的净利润   续亏  +15.74%
-扣除后营业收入               略增  +22.55%
-营业收入                     略增  +25.62%
-```
-
-取错指标会把一家**持续亏损**的公司读成「略增」。所以这里只认归母净利润，取不到
-才按 `METRIC_PRIORITY` 往下退，并且**把退到哪一档写进读数**（`metric` 字段）——
-一个基于营业收入的「略增」和一个基于归母净利润的「略增」不是同一个结论，
-下游必须能分辨。实测 1874 家里 1867 家有归母口径，退档是罕见路径而不是常态。
-
-**快报优先于预告。** `stock_yjkb_em` 是已经算出来的实际数，`stock_yjyg_em` 是
-区间估计。同一标的两边都有时以快报为准，并在 `source` 上标明——这和别处
-「不用低分辨率数据顶替」是同一条原则的正面用法：高分辨率的那个到了就该换。
-
-**口径提醒：`change_pct` 是百分数不是比值**（+296.645 表示 +296.645%）。
-实测极值到 +265430 与 -31094，所以任何下游都不该拿它直接乘进分数——
-本层只报数，`screens/earnings.py` 只用**类型**做否决、用幅度做措辞。
+同一标的可能按多个指标列行，按 METRIC_PRIORITY 选取并保留实际 metric；
+同标的快报优先于预告。change_pct 为百分数，不能直接作为评分比例。
+数据源与指标解释见 docs/DATA_SOURCES.md。
 """
 
 from __future__ import annotations
@@ -55,10 +30,10 @@ POSITIVE_TYPES: frozenset[str] = frozenset({"预增", "略增", "扭亏", "减�
 NEGATIVE_TYPES: frozenset[str] = frozenset({"预减", "略减", "首亏", "增亏", "续亏"})
 
 # 归母净利润仍为负的四种。**「方向」和「水平」是两个问题，这里回答第二个。**
-#
+
 # 「减亏」在上面的词表里方向为正（同比在改善），但它的净利润仍然是负的。只看
 # 方向会把一家还在亏钱的公司标成「业绩催化」——而这一层存在的理由之一正是别让
-# 亏损公司混进候选。两个字段各答一问，谁也不覆盖谁，和 `DATA_SOURCES.md` §五
+# 亏损公司混进候选。两个字段各答一问，谁也不覆盖谁，和 `DATA_SOURCES.md` 的“业绩”节
 # 里「量纲差异和读数分歧分开报」是同一条处理原则。
 LOSS_TYPES: frozenset[str] = frozenset({"首亏", "增亏", "续亏", "减亏"})
 DETERIORATING_LOSS_TYPES: frozenset[str] = frozenset({"首亏", "增亏"})
@@ -260,7 +235,9 @@ class EarningsAdapter:
         notes: list[str] = []
 
         for attempt, candidate in enumerate((wanted, previous_period(wanted))):
-            rows, note = self._rows("yjyg", candidate, "业绩预告", lambda p=candidate: self.ak.stock_yjyg_em(date=p))
+            rows, note = self._rows(
+                "yjyg", candidate, "业绩预告", lambda p=candidate: self.ak.stock_yjyg_em(date=p)
+            )
             if note:
                 notes.append(note)
             forecasts = _collapse(rows, candidate, trade_date)
@@ -289,8 +266,6 @@ class EarningsAdapter:
         )
         return EarningsSnapshot(period=wanted, notes=notes, ok=False)
 
-    # ---- internals -------------------------------------------------------
-
     def _rows(self, key: str, period: str, label: str, loader) -> tuple[list[dict], str | None]:
         if self.cache is not None:
             cached = self.cache.read(period, f"{key}_{period}")
@@ -304,9 +279,6 @@ class EarningsAdapter:
         if self.cache is not None and rows:
             self.cache.write(period, f"{key}_{period}", rows)
         return rows, None
-
-
-# ---- parsing -------------------------------------------------------------
 
 
 def _collapse(rows: list[dict], period: str, trade_date: date) -> dict[str, EarningsForecast]:
@@ -442,8 +414,9 @@ def default_earnings_adapter() -> EarningsAdapter | None:
     而业绩数据**会改变候选名单**（否决掉真实亏损股），于是同一份 fixture 的结果
     开始取决于外网是否可达——这类泄漏不会报错，只会让测试时而通过时而失败。
 
-    消费方各自 `from ... import default_earnings_adapter`，所以 `conftest.py`
-    要**逐个消费模块**打补丁，和 `default_snapshot_adapter` 完全同一套做法。
+    唯一的消费方是 `jobs/sources.py:fetch_earnings`（`morning` 与 `advise` 都走它），
+    所以 `conftest.py` 只需在那一个绑定点打补丁，和 `default_snapshot_adapter`
+    同一套做法。
     """
     try:
         return EarningsAdapter()

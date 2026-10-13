@@ -14,6 +14,7 @@ reproducible: two runs at 07:40 and 08:20 read the same documents.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict
@@ -22,8 +23,26 @@ from pathlib import Path
 from typing import Any
 
 from ashare_decision_support.news.base import NewsDoc
+from ashare_decision_support.state.store import read_json_object, write_json
 
 CACHE_DIRNAME = "news_cache"
+
+
+def analysis_cache_key(namespace: str, inputs: Any, client: Any) -> str:
+    """按实际分析输入与模型配置隔离缓存；凭据不参与缓存内容或键。"""
+    settings = {
+        name: getattr(client, name, None)
+        for name in ("model", "base_url", "temperature", "max_tokens")
+    }
+    settings["provider"] = getattr(getattr(client, "provider", None), "key", None)
+    encoded = json.dumps(
+        {"inputs": inputs, "settings": settings},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"{namespace}_{hashlib.sha256(encoded).hexdigest()}"
 
 
 class NewsCache:
@@ -37,11 +56,7 @@ class NewsCache:
 
     def read(self, trade_date: date, key: str) -> Any | None:
         path = self.path_for(trade_date, key)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-
+        payload = read_json_object(path)
         stamp = payload.get("cached_at")
         if not isinstance(stamp, str):
             return None
@@ -49,8 +64,10 @@ class NewsCache:
             cached_at = datetime.fromisoformat(stamp)
         except ValueError:
             return None
+        if cached_at.tzinfo is None:
+            return None
         age = (datetime.now(UTC) - cached_at).total_seconds()
-        if age > self.ttl_seconds:
+        if not 0 <= age <= self.ttl_seconds:
             return None
         return payload.get("data")
 
@@ -63,21 +80,18 @@ class NewsCache:
             "data": data,
         }
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
             # `default=str` because feeds hand back native date/Timestamp values
             # (news_cctv does) that json cannot encode. Stringifying is correct
             # here: the cache round-trips into text-scoring code either way.
-            path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
-            )
+            write_json(path, payload)
         except (OSError, TypeError, ValueError):
             # A cache that cannot be written is a performance problem, never a
             # correctness one — the caller already has the live data.
             return False
         return True
 
-    # ---- NewsDoc 直存 ------------------------------------------------------
-    #
+    # NewsDoc 直存
+
     # akshare 那一路缓存的是**上游原始行**，因为它的取数和映射是分开的两步。
     # 另外三路的解析（HTML 列表页、RSS/Atom、见闻分页 JSON）和映射是同一步，
     # 缓存原始页面等于把解析也留到下次重做，还得连页面编码一起存。存已经归一
@@ -111,17 +125,7 @@ def cached_docs(
     key: str,
     fetch: Callable[[], list[NewsDoc]],
 ) -> list[NewsDoc]:
-    """取缓存，没有才打网络，取回来再写一份。`cache` 为 None 就是直接打网络。
-
-    **按栏目/feed 一个键，不按整源一个键。** 分路取数的源里每一路分属不同机构、
-    各自会挂；整源一个键的话，一路超时就会让另外两路已经取回的内容一起失效，
-    下次重跑再全打一遍。
-
-    收口的理由不是这八行，是**「miss 才写」这个顺序**：`official_source` 与
-    `rss_source` 此前各写一遍，两边一旦有一边把 `write_docs` 写进了 miss 分支
-    外面，症状是那一路每次都重写缓存文件——不报错，也不改变返回值，只有翻缓存
-    目录的 mtime 才看得出来。
-    """
+    """按键读取缓存，未命中时取数并写入；cache 为 None 时直接取数。"""
     if cache is not None:
         hit = cache.read_docs(trade_date, key)
         if hit is not None:

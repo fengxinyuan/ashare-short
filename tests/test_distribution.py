@@ -25,8 +25,13 @@ from ashare_decision_support.signals.volume_price import (
 
 def feats(**kw) -> SimpleNamespace:
     base = {
-        "quadrant": None, "up_down_vol_ratio": None, "climax": None, "climax_stall": None,
-        "dry_up": None, "breakdown_on_volume": None, "divergence": None,
+        "quadrant": None,
+        "up_down_vol_ratio": None,
+        "climax": None,
+        "climax_stall": None,
+        "dry_up": None,
+        "breakdown_on_volume": None,
+        "divergence": None,
     }
     base.update(kw)
     return SimpleNamespace(**base)
@@ -44,12 +49,14 @@ def rel(day=None, week=None, month=None) -> SimpleNamespace:
     return SimpleNamespace(excess=excess)
 
 
-# ---- 判别成立 ---------------------------------------------------------------
+# 判别成立
 
 
 def test_volume_down_plus_weak_flow_plus_high_position_reads_as_distribution() -> None:
     read = judge_distribution(
-        features=feats(quadrant=QUADRANT_DOWN_EXPAND, up_down_vol_ratio=0.7, breakdown_on_volume=True),
+        features=feats(
+            quadrant=QUADRANT_DOWN_EXPAND, up_down_vol_ratio=0.7, breakdown_on_volume=True
+        ),
         relative=rel(day=-0.03, month=-0.08),
         range_position_60d=0.85,
         price_vs_vwap_pct=-0.012,
@@ -72,9 +79,11 @@ def test_contracting_volume_at_the_range_low_reads_as_shakeout() -> None:
 
 
 def test_two_consecutive_expanding_down_bars_escalate_to_accelerating() -> None:
-    """ROADMAP 296：放量下跌 → 放量下跌 = 加速出货。"""
+    """放量下跌 → 放量下跌 = 加速出货。"""
     read = judge_distribution(
-        features=feats(quadrant=QUADRANT_DOWN_EXPAND, up_down_vol_ratio=0.6, divergence=DIVERGENCE_TOP),
+        features=feats(
+            quadrant=QUADRANT_DOWN_EXPAND, up_down_vol_ratio=0.6, divergence=DIVERGENCE_TOP
+        ),
         relative=rel(day=-0.03, month=-0.09),
         range_position_60d=0.80,
         prior_quadrants=[QUADRANT_DOWN_EXPAND],
@@ -92,7 +101,7 @@ def test_a_single_expanding_down_bar_is_not_accelerating() -> None:
     assert read.verdict == VERDICT_DISTRIBUTION
 
 
-# ---- 必须能说「不判别」------------------------------------------------------
+# 必须能说「不判别」
 
 
 def test_thin_evidence_abstains_rather_than_guessing() -> None:
@@ -121,7 +130,7 @@ def test_everything_missing_still_returns_a_usable_read() -> None:
     assert read.counter_evidence == []
 
 
-# ---- 那次误判 ---------------------------------------------------------------
+# 那次误判
 
 
 def test_the_muyuan_case_does_not_count_a_rotation_day_as_distribution() -> None:
@@ -154,7 +163,7 @@ def test_same_direction_single_and_multi_day_weakness_does_count() -> None:
     assert read.verdict == VERDICT_DISTRIBUTION
 
 
-# ---- 输出纪律 ---------------------------------------------------------------
+# 输出纪律
 
 
 def test_the_read_never_claims_to_predict() -> None:

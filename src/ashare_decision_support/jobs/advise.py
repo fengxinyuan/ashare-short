@@ -17,10 +17,16 @@ from pathlib import Path
 from typing import Any
 
 from ashare_decision_support.adapters.base import float_shares, metadata_names, security_metadata
-from ashare_decision_support.adapters.earnings import default_earnings_adapter
 from ashare_decision_support.adapters.tickflow_intraday import build_intraday_adapter
 from ashare_decision_support.advice.adjudicate import LevelAdjudicator
-from ashare_decision_support.advice.engine import AdviceEngine, StockAdvice
+from ashare_decision_support.advice.engine import (
+    MIN_RRR,
+    AdviceEngine,
+    StockAdvice,
+    meets_min_rrr,
+    refresh_level_risk,
+    risk_reward,
+)
 from ashare_decision_support.agents import (
     AgentContext,
     BenchmarkDailyAgent,
@@ -34,13 +40,20 @@ from ashare_decision_support.agents import (
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.artifacts import ADVICE_LATEST_NAME
 from ashare_decision_support.jobs.progress import progress_reporter
+from ashare_decision_support.jobs.sources import fetch_earnings
 from ashare_decision_support.journal import Journal
-from ashare_decision_support.journal.records import Recommendation
+from ashare_decision_support.journal.records import DEFAULT_STRATEGY_VERSION, Recommendation
+from ashare_decision_support.monitor.holdings import (
+    HoldingView,
+    breakeven_lines,
+    effective_stop,
+    effective_targets,
+)
 from ashare_decision_support.news import AkshareNewsSource
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.base import Notifier, publish, written_path
 from ashare_decision_support.notify.render import advice_mandatory_block, render_advice_brief
-from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_today
 from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput, ScoreProvider
 from ashare_decision_support.screens import EarningsScreen
 from ashare_decision_support.signals.dipbuy import measure_dip
@@ -51,6 +64,7 @@ from ashare_decision_support.signals.relative_strength import (
     measure_relative_strength,
 )
 from ashare_decision_support.signals.volume_price import measure_volume_price
+from ashare_decision_support.state.workflow import read_plans
 from ashare_decision_support.strategy.playbook import evaluate_playbooks
 from ashare_decision_support.symbols import normalize_symbol
 from ashare_decision_support.writer import TemplateWriter, WriteRequest
@@ -65,14 +79,7 @@ ADVISE_SOURCE = "advise"
 
 @dataclass(slots=True)
 class _Reads:
-    """一轮 `advise` 的全部读数。
-
-    从 `run_advise` 里搬出来的，判据和 `jobs/morning_facts.py` 那次搬家一样：
-    **这一段不做任何判断**。四路并行取数加五组纯计算（低吸画像、量价、相对强度、
-    打法判据、打分），每一样都是「算出来放着」，没有一处分支会改变结论。
-
-    搬出来之后 `run_advise` 的主线只剩三步：取读数 → 逐只出建议 → 发布。
-    """
+    """单轮 advise 的行情、舆情与计算结果，供建议生成和发布复用。"""
 
     snapshots: dict[str, Any]
     wyckoff: dict[str, Any]
@@ -105,14 +112,18 @@ def _collect(
     progress: Callable[[str], Any],
 ) -> _Reads:
     """① 并行取数 + 纯计算。取不到的那一路写进 notes，不抛。"""
-    # ---- 并行采集：日线 || 分时 || 个股舆情 --------------------------------
-    source = intraday_adapter or _default_intraday(adapter)
+    # 并行采集：日线 || 分时 || 个股舆情
+    # 付费档走 TickFlow 批量分钟线，免费档退回新浪。选路只有一处，见
+    # `adapters/tickflow_intraday.build_intraday_adapter`。
+    source = intraday_adapter or build_intraday_adapter(adapter)
     if source is None:
         notes.append("akshare 不可用，本次无分钟线，价位仅为前复权口径、不可直接挂单")
 
     news = (news_source if news_source is not None else _default_news()) if use_news else None
     if use_news and news is None:
         notes.append("个股舆情源不可用，本次打分不含个股舆情项")
+    elif not use_news:
+        notes.append("已关闭个股舆情（--no-news），本次打分不含个股舆情项")
 
     ctx = AgentContext(
         trade_date=today,
@@ -133,8 +144,9 @@ def _collect(
         SymbolDailyAgent(),
         BenchmarkDailyAgent(symbols),
         SymbolIntradayAgent(),
-        SymbolNewsAgent(symbols=list(symbols), names=names or None),
     ]
+    if use_news:
+        collectors.append(SymbolNewsAgent(symbols=list(symbols), names=names or None))
     if use_order_book:
         # 五档是**整批一次**请求，和逐标的的分钟线延迟量级差一个数量级；
         # 放进同一波并行里，它基本不增加这一轮的墙钟时间。
@@ -155,8 +167,9 @@ def _collect(
     usable_daily = daily.get("bars", {}) or {}
     benchmark_daily = findings["benchmark_daily"].get("bars", {}) or {}
     prev_closes = daily.get("prev_closes", {}) or {}
-    sentiment = findings["symbol_news"].get("sentiment", {}) or {}
-    news_events = findings["symbol_news"].get("events", {}) or {}
+    symbol_news = findings.get("symbol_news")
+    sentiment = (symbol_news.get("sentiment", {}) or {}) if symbol_news is not None else {}
+    news_events = (symbol_news.get("events", {}) or {}) if symbol_news is not None else {}
     books = findings["order_book"].get("readings", {}) if "order_book" in findings else {}
 
     # 分时的**取数**和日线并行，但 change_pct / 量比要用日线的昨收，所以拿回原始
@@ -189,9 +202,7 @@ def _collect(
     # 完整判断，不该被今天的大盘状态静默截断。周期的影响另有出口——盘前主链路
     # 会拦，这里只负责把「这只票自己能用哪些打法、判据过没过」说清楚。
     matches = {
-        symbol: evaluate_playbooks(
-            snapshots[symbol], dips.get(symbol), wyckoff.get(symbol), None
-        )
+        symbol: evaluate_playbooks(snapshots[symbol], dips.get(symbol), wyckoff.get(symbol), None)
         for symbol in snapshots
     }
 
@@ -236,6 +247,8 @@ def _build_advices(
     reads: _Reads,
     earnings_verdicts: dict[str, Any],
     adjudicator: LevelAdjudicator | None,
+    positions: Any | None = None,
+    today: date | None = None,
 ) -> list[StockAdvice]:
     """② 逐只出建议。**这一段做判断**，所以它单独成型、单独可读。"""
     engine = AdviceEngine(adjudicator=adjudicator)
@@ -275,8 +288,80 @@ def _build_advices(
         event = reads.news_events.get(symbol)
         if event is not None:
             advice.event_evidence = event.to_dict()
+        _apply_holding(
+            advice, positions.get(symbol) if positions is not None else None, snapshot, today
+        )
         advices.append(advice)
     return advices
+
+
+def _apply_holding(
+    advice: StockAdvice, position: Any, daily: Any, today: date | None = None
+) -> None:
+    """把登记的持仓叠到建议上。**你定的止损与目标优先于系统算的**，口径同监控层。
+
+    分三件事：成本与浮盈进 `holding`（简报单独一行）；`plan_stop` / `plan_target`
+    替换系统价位并重算盈亏比，替换过的在 warnings 里标明「你设定的」；被套时补回本
+    结构。系统自己算的那份价位仍在 `candidates` 里，替换不丢信息。
+    """
+    if position is None:
+        return
+    holding = HoldingView.from_position(position, today)
+    advice.holding = {
+        "cost_price": holding.cost_price,
+        "shares": holding.shares,
+        "opened_on": holding.opened_on,
+        "held_days": holding.held_days,
+        "plan_stop": holding.plan_stop,
+        "plan_target": holding.plan_target,
+        "unrealised_pct": holding.unrealised_pct(advice.last_price),
+        "lines": holding.describe(advice.last_price),
+    }
+    if not advice.has_actionable_levels:
+        return
+    manual: list[str] = []
+    stop = effective_stop(holding, advice.stop)
+    if stop != advice.stop:
+        advice.stop = stop
+        manual.append(f"止损 {stop:.2f}")
+    targets = effective_targets(holding, advice.targets)
+    if targets != advice.targets:
+        advice.targets = targets
+        manual.append(f"目标 {targets[0]:.2f}")
+    if manual:
+        refresh_level_risk(advice)
+        advice.warnings.insert(0, f"你设定的 {'、'.join(manual)} 已替换系统价位，盈亏比按它重算")
+    _flag_breached_levels(advice, holding)
+    advice.breakeven_lines = breakeven_lines(holding.cost_price, advice.last_price, daily)
+
+
+def _flag_breached_levels(advice: StockAdvice, holding: HoldingView) -> None:
+    """你定的止损已被跌破、或目标已到，直说，不再当成一个待执行的计划。
+
+    2026-09-15 实测：登记止损 61.85、现价 61.57，简报写「止损距离仅 -0.11%，处于
+    日内噪声范围内」——一个负数距离不是噪声，是已经破位。带 ⚠️ 前缀的警告会让
+    `_risk_qualified_plan` 判为不合格，与监控层「跌破止损」告警是同一件事。
+    """
+    price = advice.last_price
+    if not price:
+        return
+    breached = False
+    if holding.plan_stop and price <= holding.plan_stop:
+        breached = True
+        advice.warnings.insert(
+            0,
+            f"⚠️ 现价 {price:.2f} 已跌破你设定的止损 {holding.plan_stop:.2f}，"
+            "按纪律应先处置持仓；下面的买入区间对这笔仓位不适用",
+        )
+    if holding.plan_target and price >= holding.plan_target:
+        breached = True
+        advice.warnings.insert(
+            0,
+            f"⚠️ 现价 {price:.2f} 已到你设定的目标 {holding.plan_target:.2f}，"
+            "先按计划兑现或上移止损，再谈加仓",
+        )
+    if breached:
+        advice.warnings = [text for text in advice.warnings if not text.startswith("止损距离仅 ")]
 
 
 @dataclass(slots=True)
@@ -332,7 +417,8 @@ def _publish(
         file_notifier = FileNotifier(output_dir, slug="advice")
         channels = notifiers if notifiers is not None else [ConsoleNotifier(), file_notifier]
         delivered = publish(channels, title, markdown)
-        file_notifier.write_payload(facts, ADVICE_LATEST_NAME)
+        if file_notifier.write_payload(facts, ADVICE_LATEST_NAME) is None:
+            notes.append("个股事实包保存失败，后续读取将缺少本轮结果")
         brief_path = written_path(channels, file_notifier)
     else:
         # 没给输出目录仍然是「给我看看」——只有显式传空 notifier 列表（对话那条路）
@@ -369,6 +455,8 @@ def run_advise(
     use_earnings: bool = True,
     journal: Journal | None = None,
     progress: Callable[[str], Any] | None = None,
+    strategy_version: str = DEFAULT_STRATEGY_VERSION,
+    positions: Any | None = None,
 ) -> dict[str, Any]:
     today = trade_date or beijing_today()
     notes: list[str] = []
@@ -396,15 +484,40 @@ def run_advise(
     # `advise` 是你点名问一只票，答案必须是「它怎么样」而不是把它藏起来——「这只
     # 票我不给你看」正是最没用的回答。和 ST 的处理完全同一条理由，见
     # `Asked about explicitly, so it is answered — loudly.`
-    earnings_screen = EarningsScreen(_advise_earnings(earnings_adapter, today, use_earnings, notes))
+    earnings_screen = EarningsScreen(
+        fetch_earnings(
+            earnings_adapter,
+            today,
+            use_earnings,
+            notes,
+            off_note="已关闭业绩读数（--no-earnings），本次不提示业绩风险",
+            subject="本次不提示业绩风险",
+            describe=False,
+        )
+    )
     advices = _build_advices(
         symbols=symbols,
         reads=reads,
         earnings_verdicts=earnings_screen.evaluate(symbols),
         adjudicator=adjudicator,
+        positions=positions,
+        today=today,
     )
 
     facts = _facts(today, advices, notes, period, reads.sentiment, reads.master)
+    facts["strategy_version"] = strategy_version
+    facts["strategy_parameters"] = {
+        "period": period,
+        "use_news": use_news,
+        "use_order_book": use_order_book,
+        "use_earnings": use_earnings,
+        "rrr_basis": "entry_high_to_nearest_target",
+        "min_rrr": MIN_RRR,
+        "transaction_costs_included": False,
+    }
+    plans = read_plans(output_dir or "briefs", today, until=beijing_naive_now(), notes=notes)
+    if plans:
+        facts["plan_id"] = plans[-1]["plan_id"]
     recorded = _record_journal(journal, advices, today, facts) if journal is not None else 0
     _progress("② 结构、买卖点和情景已算完，正在整理简报与辩论")
 
@@ -420,10 +533,15 @@ def run_advise(
     )
     _progress("③ 个股分析已完成")
 
+    with_levels = sum(1 for item in advices if item.has_actionable_levels)
     return {
         "trade_date": str(today),
         "requested": len(symbols),
-        "advised": sum(1 for item in advices if item.has_actionable_levels),
+        "analyzed": len(advices),
+        "with_levels": with_levels,
+        "risk_qualified_plans": sum(1 for item in advices if _risk_qualified_plan(item)),
+        "advised": with_levels,  # 兼容旧调用方；仅表示已算出价位，不等于可以买
+        "count_note": "with_levels/advised 仅表示生成了价位；risk_qualified_plans 也不是即刻买点",
         "writer": published.writer,
         "used_fallback": published.used_fallback,
         "delivered": published.delivered,
@@ -433,6 +551,20 @@ def run_advise(
         "brief_path": published.brief_path,
         "content": published.markdown,
     }
+
+
+def _risk_qualified_plan(item: StockAdvice) -> bool:
+    """仅回答计划的风险收益是否达标，当前价是否触发由监控和问答再判。"""
+    return bool(
+        item.has_actionable_levels
+        and item.is_current_session
+        and item.playbook
+        and item.rrr is not None
+        and item.rrr >= MIN_RRR
+        and meets_min_rrr(risk_reward(item, rounded=False))
+        and not (item.book or {}).get("at_limit_up")
+        and not any(str(note).startswith("⚠️") for note in item.warnings)
+    )
 
 
 def _record_journal(
@@ -456,20 +588,13 @@ def _record_journal(
     那个函数的 docstring 说得很清楚，掺进没做过决定的样本，差值就被稀释向零。
     弃权的记录**要留**：它没有买入价，但 `abstained_samples` 单独统计它。
 
-    **同一只票同一天只记第一条。** `advise` 是随时可以再跑的命令，而
-    `record_many` 是无脑追加，不挡一道，一天跑五次就是五条同源记录，`stats` 会
-    当成五个独立样本。留第一条而不是最后一条，是因为核对流程看的是「记下之后
-    价格有没有进入买入区间」（`journal/verify.py`）——14:50 记的那条只剩十分钟
-    可走，它的「没进区间」说明不了买卖点的好坏。
+    相邻内容一致时由台账去重；变化后追加判断版本，各自核对后续交易日窗口。
+    总体统计只取当日首次判断，各策略版本也只取首次，重复运行不增加独立样本。
+    这些日线核对不能证明盘中实际成交；当日过程由每日复盘读取监控日志还原。
     """
-    already = {
-        row.get("symbol")
-        for row in journal.recommendations(since=today, until=today)
-        if row.get("source") == ADVISE_SOURCE
-    }
     records: list[Recommendation] = []
     for advice in advices:
-        if advice.symbol in already or advice.adjudication is None:
+        if advice.adjudication is None:
             continue
         # 参考价缺失时 `from_advice` 返回 None——没有参考价就算不出相对值。
         record = Recommendation.from_advice(advice, today, source=ADVISE_SOURCE, facts=facts)
@@ -478,36 +603,11 @@ def _record_journal(
     return journal.record_many(list(records))
 
 
-def _default_intraday(data_adapter: Any = None) -> Any | None:
-    # 付费档走 TickFlow 批量分钟线，免费档退回新浪。选路只有一处，见
-    # `adapters/tickflow_intraday.build_intraday_adapter`。
-    return build_intraday_adapter(data_adapter)
-
-
 def _default_news() -> Any | None:
     try:
         return AkshareNewsSource()
     except Exception:
         return None
-
-
-def _advise_earnings(
-    adapter: Any | None, today: date, enabled: bool, notes: list[str]
-) -> Any:
-    """业绩快照。取不到就返回 None——`EarningsScreen(None)` 全部放行且自报未过滤。"""
-    if not enabled:
-        notes.append("已关闭业绩读数（--no-earnings），本次不提示业绩风险")
-        return None
-    source = adapter if adapter is not None else default_earnings_adapter()
-    if source is None:
-        return None
-    try:
-        snapshot = source.fetch(today)
-    except Exception as exc:
-        notes.append(f"业绩预告不可用（{type(exc).__name__}），本次不提示业绩风险")
-        return None
-    notes.extend(snapshot.notes)
-    return snapshot
 
 
 def _apply_earnings(advice: Any, verdict: Any) -> None:
@@ -544,10 +644,7 @@ def _facts(
             {
                 "symbol": item.symbol,
                 "name": item.name,
-                "industries": list((instruments.get(item.symbol) or {}).get("industries") or []),
                 "industry": (instruments.get(item.symbol) or {}).get("industry"),
-                "industry_leaf": (instruments.get(item.symbol) or {}).get("industry_leaf"),
-                "industry_path": (instruments.get(item.symbol) or {}).get("industry_path"),
                 "concepts": list((instruments.get(item.symbol) or {}).get("concepts") or []),
                 "score": item.score,
                 "score_components": item.score_components,
@@ -565,6 +662,8 @@ def _facts(
                 "stop": item.stop,
                 "targets": item.targets,
                 "rrr": item.rrr,
+                "rrr_basis": "entry_high_to_nearest_target",
+                "transaction_costs_included": False,
                 "scenarios": [
                     {
                         "name": scenario.name,
@@ -576,9 +675,9 @@ def _facts(
                 ],
                 "reasons": item.reasons,
                 "warnings": item.warnings,
-                "volume_price": (
-                    item.volume_price
-                ),
+                "holding": item.holding,
+                "breakeven_lines": list(item.breakeven_lines),
+                "volume_price": (item.volume_price),
                 "distribution": item.distribution,
                 "relative_strength": item.relative_strength,
                 "event_evidence": item.event_evidence,
@@ -586,20 +685,14 @@ def _facts(
                 "trade_context": (
                     item.trade_context.to_dict() if item.trade_context is not None else None
                 ),
-                "shortline": (
-                    item.shortline.to_dict() if item.shortline is not None else None
-                ),
+                "shortline": (item.shortline.to_dict() if item.shortline is not None else None),
                 # 盘口、候选集、裁决三样都进 facts。不只是为了给简报多点素材——
                 # 数字闸门比对的就是这份 facts，候选价不在里面的话，模型引用一个
                 # 合法候选反而会被当成编造。
                 "order_book": item.book or None,
                 "candidates": item.candidates.to_dict() if item.candidates else None,
-                "adjudication": (
-                    item.adjudication.to_dict() if item.adjudication else None
-                ),
-                "news": (
-                    readings[item.symbol].to_dict() if item.symbol in readings else None
-                ),
+                "adjudication": (item.adjudication.to_dict() if item.adjudication else None),
+                "news": (readings[item.symbol].to_dict() if item.symbol in readings else None),
             }
             for item in advices
         ],

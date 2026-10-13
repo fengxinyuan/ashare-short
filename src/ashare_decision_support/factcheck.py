@@ -1,69 +1,20 @@
-"""输出闸门的共用件：文字里的数字要能追溯，措辞与立场不得越过确定性层。
+"""模型输出的共用闸门：数字可追溯，措辞与立场服从确定性事实。
 
-**放在包根**，理由同 `fanout.py` 与 `numeric.py`：它约束的不是写作，也不是裁决，
-是**一件横跨三层的事**——凡是让模型出文字的地方，文字里的每个数字都要能在喂进去
-的事实里找到出处。今天有三道这样的闸门：
+review_output 统一检查散文数字、未经验证的预测表述与越过周期/时段约束的动作。
+缺失约束保持未知；否定表达和风险提示分别处理。调用方丢弃越界文本并提供回退结果。
 
-| 位置 | 用在哪 | 严到什么程度 |
-|---|---|---|
-| `factcheck.py:unverified_numbers` | 简报改写、深挖分步、多空辩论、舆情通读、问答 | 允许「按你写的精度四舍五入后相等」，并认 万/亿/% 后缀 |
-| `advice/adjudicate.py:offending_numbers` | 价位裁决 | 只认**数值相等** |
-| `advice/external.py:_untraceable_numbers` | 外部裁决包 | 只认 token 原样出现 |
-
-**三种严格程度是有意的，不该统一。** 散文改写本来就会重排数字，把
-12198154.379999977 写成 12198154.38 是正常表述；同一件事发生在挂单价上，
-22.9512 写成 22.95 就是另一个价了。所以另外两处的判定留在各自那层，只有散文那一档
-在本模块——它的调用方有五个，放在 `writer/llm.py` 里等于让「写简报」这一层替另外
-四条链路保管闸门。
-
-收口之前 `ORDINAL_CEILING = 20` 有两份定义（`writer/llm.py` 和
-`advice/adjudicate.py`），而 `advice/external.py` 从**两个不同模块**分别拿这道闸门
-的两个常量。两份 20 漂成 20 和 15 不会有任何测试变红，只会让同一个「第 18 档」
-在简报里放行、在裁决里作废。
-
-## 数字之外的两条：`prose_violations`
-
-数字这一条是全仓唯一被真正执行的输出约束。而六份提示词里还写着另外两类要求，
-**一条都没有人查**：
-
-| 提示词里写的 | 写在哪 | 此前谁在查 |
-|---|---|---|
-| 不得给概率 / 胜率 / 预期收益率 | `writer/llm.py` 第 4 条、`ask/runner.py` 第 4 条、`chat/session.py` 第 4 条、`agents/debate.py` 第 3 条、`advice/adjudicate.py` 第 4 条 | **没有人** |
-| 不得改变结论 | `writer/llm.py` 第 1 条 | **没有人** |
-
-「不得产出概率/胜率/预期收益率」不是措辞偏好，是 `DECISIONS.md` §七 的一条固化
-决定（没有拟合模型能支撑它们），而且它同时印在给用户看的纪律段里。一条写在提示词
-里、没人执行的约束，和没有这条约束是一回事——这套仓库对文档里的口径已经反复用
-`scripts/` 下的审计脚本得出过同一个结论，提示词不该是例外。
-
-所以这里补两条，判定全部留在确定性层已经算出来的读数上，闸门自己**不看行情**：
-
-- **措辞**：出现 `CLAIM_MARKERS` 里的词，且不是被否定着说的（「系统不产出胜率」
-  是纪律段的原话，必须放行）。
-- **立场**：`OutputGuard` 带着情绪周期给出的仓位上限与当前时段。上限为 0 那一档
-  （冰点）说的是**今天不出手**，此时任何买入措辞都是在改结论；上限已经给出时，
-  「满仓 / 重仓 / 梭哈」同样是在改结论。时段不是盘中时，「立即买入」这类即时动作
-  指令没有可执行的对象。
-
-三条闸门的处置口径一致：**整段丢弃，回落到确定性层的输出**（同 `agents/debate.py`
-的注释——一段半可信的论证比没有更糟，读的人分不清该信哪一半）。
-
-## 为什么有 `review_output` 这个单一入口
-
-补上措辞与立场之后，每个调用点要做的事从「查一件」变成「查三件」，而**漏掉其中
-一件不会有任何测试变红**——这正是那两条能在五个调用点上同时缺席几个月的原因：
-每一处都写着 `unverified_numbers(...)`，看起来都在过闸。
-
-所以过闸走一个入口：`review_output(text, facts_text, guard)` 一次把三件都查完，
-返回两类越界。**话术仍然留给调用方**（`chat` 说「已丢弃，换个问法」，简报说「改用
-模板输出」），共用的是「要查哪几件、按什么顺序」，同 `jobs/sources.py` 开头那条纪律。
-"""
+三种数字契约各自保留：散文允许可追溯的精度/单位换算，价位裁决要求候选数值相等，
+外部裁决包要求 token 可追溯。共用数字解析与序号规则，不合并不同用途的严格程度。
+设计依据见 docs/ARCHITECTURE.md 的“输出闸门”。"""
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
+
+from ashare_decision_support.schedule.clock import PHASE_INTRADAY
 
 # 小到这个程度的整数是条目序号与档位数（「第 3 档」「5 档买盘」），模型正当地会
 # 写出来，而它们本来就不在事实里。
@@ -118,32 +69,77 @@ def unverified_numbers(generated: str, facts_text: str) -> list[str]:
     look fabricated.
     """
     fact_tokens, fact_values = fact_numbers(facts_text)
+    share_values, lot_values = _quantity_values(facts_text)
     offenders: list[str] = []
     for match in NUMBER_PATTERN.finditer(generated):
         raw_token = match.group()
         token = raw_token.replace(",", "")
-        if token in fact_tokens or token in facts_text:
-            continue
-        if "." not in token and int(token) <= ORDINAL_CEILING:
+        if "." not in token and int(token) <= ORDINAL_CEILING and _is_ordinal(generated, match):
             continue
 
         value = float(token)
         decimals = len(token.partition(".")[2])
         scales = [1.0]
-        suffix = generated[match.end() : match.end() + 1]
+        after_number = generated[match.end() :].lstrip()
+        suffix = after_number[:1]
         if suffix in UNIT_SCALES:
             scales.append(UNIT_SCALES[suffix])
 
-        if any(
-            round(fact / scale, decimals) == value
-            for fact in fact_values
-            for scale in scales
-        ):
+        unit_tail = after_number[1:] if suffix in ("万", "亿") else after_number
+        quantity_unit = unit_tail.lstrip()[:1]
+        comparable = fact_values
+        if quantity_unit == "股" and share_values:
+            comparable = share_values
+        elif quantity_unit == "手" and (share_values or lot_values):
+            comparable = lot_values
+
+        if comparable is fact_values and token in fact_tokens:
+            continue
+
+        if any(round(fact / scale, decimals) == value for fact in comparable for scale in scales):
             continue
         offenders.append(raw_token)
     return list(dict.fromkeys(offenders))
 
-# ---- 第二条口径：措辞 ------------------------------------------------------
+
+def _is_ordinal(text: str, match: re.Match[str]) -> bool:
+    before = text[: match.start()]
+    after = text[match.end() :]
+    return bool(
+        before.endswith("第")
+        or re.match(r"\s*档", after)
+        or ((not before.strip() or before.endswith("\n")) and re.match(r"[.、)]\s", after))
+    )
+
+
+def _quantity_values(facts_text: str) -> tuple[set[float], set[float]]:
+    """从结构化事实提取股/手；没有结构化输入时留给通用数字规则。"""
+    try:
+        payload = json.loads(facts_text)
+    except (TypeError, ValueError):
+        return set(), set()
+    shares: set[float] = set()
+    lots: set[float] = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                label = str(key).lower()
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    if "shares" in label or "股数" in label:
+                        shares.add(float(value))
+                    if "lots" in label or "手数" in label:
+                        lots.add(float(value))
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(payload)
+    return shares, lots
+
+
+# 第二条口径：措辞
 
 # 这些词本身就是一个「系统给不出的数」。前六个是量化承诺，后面几个是口语化的
 # 同一件事——「翻倍」和「预期收益率 100%」在读的人那里是一个意思。
@@ -167,12 +163,14 @@ CLAIM_MARKERS: tuple[str, ...] = (
 # 纪律段的原话，`notify/render.py` 每天把它印进简报、`ask/report.py` 每次把它写进
 # 报告——它就在喂给模型的事实里，模型照抄回来是正确行为。不认否定的话，这道闸门
 # 拦下的第一段文字会是系统自己那句免责声明。
-#
+
 # **逐个列出来，不拿「不」当通配。** 中文里的否定是一个封闭词类，而「不」在形容词
 # 前面根本不是否定：「行情不错，可以满仓」里的那个「不」否定的是行情，用单字匹配
 # 会把这句话整个放行——那正是这道闸门最该拦的一句。同类的还有不少 / 不低 / 不足 /
 # 不断 / 不确定。
 NEGATION_HINTS: tuple[str, ...] = (
+    "不代表",
+    "不等于",
     "不建议",
     "不宜",
     "不要",
@@ -214,7 +212,7 @@ NEGATION_HINTS: tuple[str, ...] = (
 NEGATION_LOOKBACK = 12
 
 
-# ---- 第三条口径：立场 ------------------------------------------------------
+# 第三条口径：立场
 
 # 重仓措辞。仓位上限一旦算出来（哪怕是最宽松的 0.80 那一档），这几个词说的都是
 # 另一件事，而**改变结论**正是提示词第 1 条禁止的。
@@ -275,9 +273,8 @@ RISK_HINTS: tuple[str, ...] = ("风险", "危险", "谨慎", "警惕", "回撤",
 # 放宽会把下一个分句的风险提示算进来，那时闸门就等于关掉了。
 RISK_LOOKAHEAD = 6
 
-# 唯一能执行即时动作的时段。取值同 `ask/context.py:PHASE_INTRADAY`，此处不 import
-# 那个模块：`ask/` 依赖包根，反过来会成环。
-TRADABLE_PHASE = "intraday"
+# 唯一能执行即时动作的时段。
+TRADABLE_PHASE = PHASE_INTRADAY
 
 
 @dataclass(frozen=True)
@@ -285,7 +282,7 @@ class OutputGuard:
     """确定性层已经给出的两个结论，闸门只拿它们当尺子，自己不看行情。
 
     三个字段都可能是 None，含义是**这一项今天没算出来**，那就不判——同
-    `DECISIONS.md` §七「没数据 ≠ 中性」：给一个默认上限会让闸门凭空拦下正常文字。
+    缺失约束保持未知，默认上限会让闸门凭空拦下正常文字。
     """
 
     phase: str | None = None
@@ -358,11 +355,15 @@ def prose_violations(text: str, guard: OutputGuard | None = None) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-# ---- 单一入口 --------------------------------------------------------------
+# 单一入口
 
 # 越界项列进话术时最多带几条。三条足够说明是哪一类问题，再多就没人读了，而完整
 # 清单在返回值里，调用方要写进日志随时能取。
 REPORTED_VIOLATIONS = 3
+
+PRICE_FIELDS = ("last_price", "live_price", "current_price", "last_close", "price")
+PRICE_CLAIM = re.compile(r"(?:现价|股价|最新价|收盘价)\s*(?:约|为|是)?\s*(\d+(?:\.\d+)?)")
+NEW_CONDITION = re.compile(r"(?:等待\s*\d+\s*分钟|连续\s*\d+\s*笔|\d+\s*分钟(?:未收回|不收回))")
 
 
 @dataclass(frozen=True)
@@ -408,8 +409,65 @@ def review_output(
     """
     return OutputReview(
         numbers=tuple(unverified_numbers(text, facts_text)) if facts_text is not None else (),
-        prose=tuple(prose_violations(text, guard)),
+        prose=tuple(
+            dict.fromkeys([*prose_violations(text, guard), *_semantic_violations(text, facts_text)])
+        ),
     )
+
+
+def _semantic_violations(text: str, facts_text: str | None) -> list[str]:
+    if facts_text is None:
+        return []
+    found: list[str] = []
+    normalized_facts = re.sub(r"\s+", "", facts_text)
+    for match in NEW_CONDITION.finditer(text):
+        condition = re.sub(r"\s+", "", match.group())
+        if condition not in normalized_facts:
+            found.append(f"新增交易条件「{condition}」")
+
+    try:
+        payload = json.loads(facts_text)
+    except (TypeError, ValueError):
+        return found
+    prices = _named_prices(payload)
+    if not prices:
+        return found
+    for sentence in re.split(r"[。；\n|]", text):
+        names = [name for name in prices if name in sentence]
+        if len(names) != 1:
+            continue
+        name = names[0]
+        tail = sentence[sentence.index(name) + len(name) :]
+        match = PRICE_CLAIM.search(tail[:24])
+        if match is None:
+            continue
+        claim = float(match.group(1))
+        decimals = len(match.group(1).partition(".")[2])
+        if not any(round(value, decimals) == claim for value in prices[name]):
+            found.append(f"{name}的现价与该标的事实不符（{match.group(1)}）")
+    return found
+
+
+def _named_prices(payload: Any) -> dict[str, set[float]]:
+    found: dict[str, set[float]] = {}
+
+    def visit(node: Any, label: str | None = None) -> None:
+        if isinstance(node, dict):
+            name = node.get("name") or node.get("名称") or label
+            if isinstance(name, str) and name:
+                values = found.setdefault(name, set())
+                for field in PRICE_FIELDS:
+                    value = node.get(field)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        values.add(float(value))
+            for key, value in node.items():
+                visit(value, str(key) if isinstance(value, dict) else None)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(payload)
+    return {name: values for name, values in found.items() if values}
 
 
 def _asserted(text: str, marker: str, exempt: tuple[str, ...] = ()) -> bool:

@@ -15,7 +15,8 @@ from math import isfinite
 from typing import Any
 
 from ashare_decision_support.factcheck import NUMBER_PATTERN, ORDINAL_CEILING
-from ashare_decision_support.schedule.timezone import beijing_naive_now, to_beijing_naive
+from ashare_decision_support.schedule.timezone import beijing_naive_now
+from ashare_decision_support.signals.series import parse_bar_datetime
 
 PACKET_SCHEMA = "ashare-codex-adjudication-v1"
 
@@ -103,7 +104,9 @@ def validate_external_decisions(
     if not isinstance(response, dict):
         return ExternalDecisionCheck(False, reasons=["response 必须是对象"])
     packet_symbols = packet.get("symbols")
-    if not isinstance(packet_symbols, list) or any(not isinstance(row, dict) for row in packet_symbols):
+    if not isinstance(packet_symbols, list) or any(
+        not isinstance(row, dict) for row in packet_symbols
+    ):
         return ExternalDecisionCheck(False, reasons=["裁决包 symbols 必须是对象数组"])
     decisions = response.get("decisions")
     if not isinstance(decisions, list) or not decisions:
@@ -130,7 +133,9 @@ def validate_external_decisions(
     missing = sorted(set(known) - seen)
     if missing:
         reasons.append(f"缺少标的裁决：{'、'.join(missing[:5])}")
-    return ExternalDecisionCheck(not reasons, selections=selected if not reasons else [], reasons=reasons)
+    return ExternalDecisionCheck(
+        not reasons, selections=selected if not reasons else [], reasons=reasons
+    )
 
 
 _SIDES = ("entries", "stops", "targets")
@@ -138,7 +143,10 @@ _RESPONSE_KEYS = {"entry": "entries", "stop": "stops", "target": "targets"}
 
 
 def _validate_one(
-    decision: dict[str, Any], row: dict[str, Any], selected: list[dict[str, Any]], reasons: list[str]
+    decision: dict[str, Any],
+    row: dict[str, Any],
+    selected: list[dict[str, Any]],
+    reasons: list[str],
 ) -> None:
     symbol = str(row["symbol"])
     action = str(decision.get("action") or "").lower()
@@ -157,10 +165,14 @@ def _validate_one(
         if any(decision.get(key) is not None for key in _RESPONSE_KEYS):
             reasons.append(f"{symbol} 弃权时 entry/stop/target 必须全部为 null")
             return
-        selected.append({"symbol": symbol, "action": "abstain", "reason": reason or "外部分析者弃权"})
+        selected.append(
+            {"symbol": symbol, "action": "abstain", "reason": reason or "外部分析者弃权"}
+        )
         return
 
-    resolved = {key: _candidate(row, side, decision.get(key)) for key, side in _RESPONSE_KEYS.items()}
+    resolved = {
+        key: _candidate(row, side, decision.get(key)) for key, side in _RESPONSE_KEYS.items()
+    }
     if resolved["entry"] is None or resolved["stop"] is None:
         reasons.append(f"{symbol} 必须选择有效的 entry 与 stop 候选键")
         return
@@ -218,8 +230,12 @@ def _untraceable_numbers(reason: str, row: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(bad))
 
 
-def _is_fresh(packet: dict[str, Any], moment: datetime, max_age_minutes: int, reasons: list[str]) -> bool:
-    as_of = _parse_datetime(packet.get("as_of"))
+def _is_fresh(
+    packet: dict[str, Any], moment: datetime, max_age_minutes: int, reasons: list[str]
+) -> bool:
+    # 时间戳解析走 `signals.series.parse_bar_datetime`：`Z` / `+00:00` 折算成北京
+    # 墙上时间的规则全仓只有那一份，这里此前自带的一份只是它的子集。
+    as_of = parse_bar_datetime(packet.get("as_of"))
     if as_of is None:
         reasons.append("裁决包缺少可解析的 as_of")
         return False
@@ -236,7 +252,10 @@ def _is_fresh(packet: dict[str, Any], moment: datetime, max_age_minutes: int, re
         return False
     for row in symbols:
         intraday = row.get("intraday") or {}
-        if row.get("is_current_session") is not True or intraday.get("is_current_session") is not True:
+        if (
+            row.get("is_current_session") is not True
+            or intraday.get("is_current_session") is not True
+        ):
             reasons.append(f"{row.get('symbol')} 不是当前交易日分时")
             return False
     return True
@@ -244,10 +263,7 @@ def _is_fresh(packet: dict[str, Any], moment: datetime, max_age_minutes: int, re
 
 def _rule_default(adjudication: Any, candidates: dict[str, Any]) -> dict[str, Any]:
     if isinstance(adjudication, dict):
-        return {
-            key: adjudication.get(f"rule_{key}")
-            for key in ("entry", "stop", "target")
-        }
+        return {key: adjudication.get(f"rule_{key}") for key in ("entry", "stop", "target")}
     return {
         "entry": _first(candidates.get("entries")),
         "stop": _first(candidates.get("stops")),
@@ -271,16 +287,3 @@ def _symbol_rows(facts: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(value, dict) and isinstance(value.get("symbols"), list):
             return [row for row in value["symbols"] if isinstance(row, dict)]
     return []
-
-
-def _parse_datetime(value: Any) -> datetime | None:
-    try:
-        text = str(value)
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(text)
-        if parsed.tzinfo is not None:
-            return to_beijing_naive(parsed)
-        return parsed
-    except (TypeError, ValueError):
-        return None

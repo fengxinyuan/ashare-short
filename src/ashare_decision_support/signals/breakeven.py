@@ -59,7 +59,9 @@ class BreakevenRead:
     def describe(self) -> list[str]:
         if self.cost is None or self.last_price is None:
             return list(self.notes)
-        lines = [f"成本 {self.cost:.2f}，现价 {self.last_price:.2f}，浮动 {self.unrealised_pct:+.2%}"]
+        lines = [
+            f"成本 {self.cost:.2f}，现价 {self.last_price:.2f}，浮动 {self.unrealised_pct:+.2%}"
+        ]
         if not self.underwater:
             lines.append("当前浮盈，回本价已在下方")
             lines.extend(self.notes)

@@ -10,11 +10,10 @@ from ashare_decision_support.sectors import (
     SectorMomentum,
     SectorPredictor,
     SectorRotationStore,
-    TickFlowSwTaxonomy,
 )
 from ashare_decision_support.sectors.base import SectorDefinition
 
-# ---- sentiment -----------------------------------------------------------
+# sentiment
 
 
 def test_lexicon_separates_bullish_from_bearish() -> None:
@@ -70,7 +69,11 @@ def test_score_docs_weights_by_intensity_not_by_count() -> None:
 def test_announcement_screen_separates_blocking_from_warning() -> None:
     verdicts = AnnouncementScreen().evaluate(
         [
-            {"symbol": "000001", "category": "其它风险提示公告", "title": "关于股票被实施其他风险警示的公告"},
+            {
+                "symbol": "000001",
+                "category": "其它风险提示公告",
+                "title": "关于股票被实施其他风险警示的公告",
+            },
             {"symbol": "000002", "category": "其他", "title": "关于收到证监会立案调查通知书的公告"},
             {"symbol": "000003", "category": "股票交易异常波动", "title": "股票交易异常波动公告"},
             {"symbol": "000004", "category": "董事会决议公告", "title": "第四届董事会决议公告"},
@@ -83,7 +86,7 @@ def test_announcement_screen_separates_blocking_from_warning() -> None:
     assert "000004" not in verdicts
 
 
-# ---- sector momentum -----------------------------------------------------
+# sector momentum
 
 
 def bars_with_returns(returns: list[float], base_volume: float = 1000.0) -> list[dict]:
@@ -108,7 +111,7 @@ def bars_with_returns(returns: list[float], base_volume: float = 1000.0) -> list
 def test_sector_momentum_uses_median_not_mean() -> None:
     """One runaway constituent must not define the sector's reading."""
     flat = [0.0] * 25
-    definition = SectorDefinition(name="测试", level="SW1", symbols=("A", "B", "C"))
+    definition = SectorDefinition(name="测试", level="THS_INDUSTRY", symbols=("A", "B", "C"))
     bars = {
         "A": bars_with_returns([*flat, 0.001]),
         "B": bars_with_returns([*flat, 0.002]),
@@ -124,7 +127,7 @@ def test_sector_momentum_uses_median_not_mean() -> None:
 
 
 def test_sector_momentum_reports_partial_coverage() -> None:
-    definition = SectorDefinition(name="测试", level="SW1", symbols=("A", "B", "C", "D"))
+    definition = SectorDefinition(name="测试", level="THS_INDUSTRY", symbols=("A", "B", "C", "D"))
     metrics = SectorMomentum().measure([definition], {"A": bars_with_returns([0.0] * 30)})["测试"]
 
     assert metrics.constituents == 4
@@ -132,7 +135,7 @@ def test_sector_momentum_reports_partial_coverage() -> None:
     assert metrics.coverage_ratio == 0.25
 
 
-# ---- sector ranking ------------------------------------------------------
+# sector ranking
 
 
 def build_metrics(definitions, bars):
@@ -140,8 +143,12 @@ def build_metrics(definitions, bars):
 
 
 def test_predictor_ranks_the_stronger_sector_first() -> None:
-    strong = SectorDefinition(name="电子", level="SW1", symbols=tuple(f"S{i}" for i in range(6)))
-    weak = SectorDefinition(name="钢铁", level="SW1", symbols=tuple(f"W{i}" for i in range(6)))
+    strong = SectorDefinition(
+        name="电子", level="THS_INDUSTRY", symbols=tuple(f"S{i}" for i in range(6))
+    )
+    weak = SectorDefinition(
+        name="钢铁", level="THS_INDUSTRY", symbols=tuple(f"W{i}" for i in range(6))
+    )
     bars: dict[str, list[dict]] = {}
     for symbol in strong.symbols:
         bars[symbol] = bars_with_returns([0.01] * 25)
@@ -158,8 +165,10 @@ def test_predictor_ranks_the_stronger_sector_first() -> None:
 
 
 def test_predictor_attributes_news_by_expanded_keywords() -> None:
-    """'光伏' must reach 电力设备 even though the sector name never appears."""
-    definition = SectorDefinition(name="电力设备", level="SW1", symbols=tuple(f"S{i}" for i in range(6)))
+    """'光伏' must reach 光伏设备 even though the sector name never appears."""
+    definition = SectorDefinition(
+        name="光伏设备", level="THS_INDUSTRY", symbols=tuple(f"S{i}" for i in range(6))
+    )
     bars = {symbol: bars_with_returns([0.0] * 25) for symbol in definition.symbols}
     docs = [NewsDoc(title="光伏组件价格上涨，龙头企业订单超预期")]
 
@@ -172,7 +181,9 @@ def test_predictor_attributes_news_by_expanded_keywords() -> None:
 
 
 def test_predictor_ignores_untrusted_coverage_in_momentum() -> None:
-    thin = SectorDefinition(name="综合", level="SW1", symbols=tuple(f"T{i}" for i in range(20)))
+    thin = SectorDefinition(
+        name="综合", level="THS_INDUSTRY", symbols=tuple(f"T{i}" for i in range(20))
+    )
     bars = {"T0": bars_with_returns([0.09] * 25)}
 
     outlook = SectorPredictor(LexiconSentiment()).predict([thin], build_metrics([thin], bars))[0]
@@ -183,8 +194,12 @@ def test_predictor_ignores_untrusted_coverage_in_momentum() -> None:
 
 def test_market_sentiment_weights_breadth_by_coverage() -> None:
     """A 1-of-20 sector must not outvote a fully covered one."""
-    wide = SectorDefinition(name="电子", level="SW1", symbols=tuple(f"S{i}" for i in range(10)))
-    thin = SectorDefinition(name="综合", level="SW1", symbols=tuple(f"T{i}" for i in range(20)))
+    wide = SectorDefinition(
+        name="电子", level="THS_INDUSTRY", symbols=tuple(f"S{i}" for i in range(10))
+    )
+    thin = SectorDefinition(
+        name="综合", level="THS_INDUSTRY", symbols=tuple(f"T{i}" for i in range(20))
+    )
     bars = {symbol: bars_with_returns([-0.01] * 25) for symbol in wide.symbols}
     bars["T0"] = bars_with_returns([0.05] * 25)
 
@@ -199,7 +214,9 @@ def test_market_sentiment_weights_breadth_by_coverage() -> None:
 
 
 def test_market_sentiment_falls_back_to_neutral_without_coverage() -> None:
-    thin = SectorDefinition(name="综合", level="SW1", symbols=tuple(f"T{i}" for i in range(20)))
+    thin = SectorDefinition(
+        name="综合", level="THS_INDUSTRY", symbols=tuple(f"T{i}" for i in range(20))
+    )
     market = SectorPredictor(LexiconSentiment()).market_sentiment(
         [], build_metrics([thin], {"T0": bars_with_returns([0.0] * 25)})
     )
@@ -209,19 +226,21 @@ def test_market_sentiment_falls_back_to_neutral_without_coverage() -> None:
 
 def test_market_sentiment_never_suggests_a_full_book() -> None:
     """Everything up, every day — still capped. No unbacktested reading gets 1.0."""
-    sector = SectorDefinition(name="电子", level="SW1", symbols=tuple(f"S{i}" for i in range(10)))
+    sector = SectorDefinition(
+        name="电子", level="THS_INDUSTRY", symbols=tuple(f"S{i}" for i in range(10))
+    )
     bars = {symbol: bars_with_returns([0.02] * 25) for symbol in sector.symbols}
 
-    market = SectorPredictor(LexiconSentiment()).market_sentiment(
-        [], build_metrics([sector], bars)
-    )
+    market = SectorPredictor(LexiconSentiment()).market_sentiment([], build_metrics([sector], bars))
 
     assert market.suggested_position_factor <= 0.8
 
 
 def test_market_sentiment_cuts_the_suggestion_when_the_move_is_extended() -> None:
     """A week of gains with everything green is a late entry, not a green light."""
-    sector = SectorDefinition(name="电子", level="SW1", symbols=tuple(f"S{i}" for i in range(10)))
+    sector = SectorDefinition(
+        name="电子", level="THS_INDUSTRY", symbols=tuple(f"S{i}" for i in range(10))
+    )
     extended = {symbol: bars_with_returns([0.025] * 25) for symbol in sector.symbols}
     fresh = {symbol: bars_with_returns([0.0] * 20 + [0.001] * 5) for symbol in sector.symbols}
 
@@ -241,83 +260,43 @@ def test_sector_rotation_memory_marks_persistent_and_fresh_leaders(tmp_path) -> 
         return SectorOutlook(name=name, score=score, metrics=metrics)
 
     store = SectorRotationStore(tmp_path / "rotation.json")
-    store.record(date(2026, 7, 30), "SW1", [
-        outlook("电子", 80.0),
-        outlook("电力设备", 78.0),
-        outlook("券商", 72.0),
-    ])
-    store.record(date(2026, 7, 31), "SW1", [
-        outlook("电力设备", 81.0),
-        outlook("创新药", 77.0),
-        outlook("电子", 74.0),
-    ])
-    summary = store.remember(date(2026, 8, 3), "SW1", [
-        outlook("电力设备", 82.0),
-        outlook("创新药", 79.0),
-        outlook("家用电器", 75.0),
-    ], lookback_days=5, leader_count=3)
+    store.record(
+        date(2026, 7, 30),
+        "THS_INDUSTRY",
+        [
+            outlook("电子", 80.0),
+            outlook("光伏设备", 78.0),
+            outlook("券商", 72.0),
+        ],
+    )
+    store.record(
+        date(2026, 7, 31),
+        "THS_INDUSTRY",
+        [
+            outlook("光伏设备", 81.0),
+            outlook("创新药", 77.0),
+            outlook("电子", 74.0),
+        ],
+    )
+    summary = store.remember(
+        date(2026, 8, 3),
+        "THS_INDUSTRY",
+        [
+            outlook("光伏设备", 82.0),
+            outlook("创新药", 79.0),
+            outlook("家用电器", 75.0),
+        ],
+        lookback_days=5,
+        leader_count=3,
+    )
 
     assert summary.regime == "主线延续"
-    assert summary.persistent == ("电力设备", "创新药")
+    assert summary.persistent == ("光伏设备", "创新药")
     assert summary.new_entries == ("家用电器",)
     assert any("昨天靠前" in text for text in summary.observations)
 
 
-# ---- taxonomy ------------------------------------------------------------
-
-
-class FakeUniverses:
-    """Mimics TickFlow's sharded universe listing."""
-
-    def __init__(self) -> None:
-        self.get_calls = 0
-        self._detail = {
-            "CN_Equity_SW1_1": ["600000.SH", "600001.SH", "600002.SH"],
-            "CN_Equity_SW1_2": ["600002.SH", "600003.SH", "600004.SH"],
-            "CN_Equity_SW2_9": ["600009.SH"],
-        }
-
-    def list(self):
-        return [
-            {"id": "CN_Equity_SW1_1", "name": "SW1电子", "symbol_count": 3},
-            {"id": "CN_Equity_SW1_2", "name": "SW1电子", "symbol_count": 3},
-            {"id": "CN_Equity_SW2_9", "name": "SW2半导体", "symbol_count": 1},
-        ]
-
-    def get(self, universe_id):
-        self.get_calls += 1
-        return {"id": universe_id, "symbols": self._detail.get(universe_id, [])}
-
-
-class FakeClient:
-    def __init__(self) -> None:
-        self.universes = FakeUniverses()
-
-
-def test_taxonomy_merges_shards_and_dedupes_constituents() -> None:
-    client = FakeClient()
-    sectors = TickFlowSwTaxonomy(client, level="SW1", min_constituents=1).list_sectors()
-
-    assert len(sectors) == 1
-    assert sectors[0].name == "电子"
-    # 600002.SH appears in both shards and must be counted once.
-    assert sectors[0].symbols == ("600000.SH", "600001.SH", "600002.SH", "600003.SH", "600004.SH")
-
-
-def test_taxonomy_caches_to_disk_and_skips_refetch(tmp_path) -> None:
-    client = FakeClient()
-    first = TickFlowSwTaxonomy(client, level="SW1", cache_dir=tmp_path, min_constituents=1)
-    first.list_sectors()
-    calls_after_first = client.universes.get_calls
-
-    second = TickFlowSwTaxonomy(client, level="SW1", cache_dir=tmp_path, min_constituents=1)
-    sectors = second.list_sectors()
-
-    assert client.universes.get_calls == calls_after_first
-    assert sectors[0].name == "电子"
-
-
-# ---- news collection -----------------------------------------------------
+# news collection
 
 
 class FakeAk:
@@ -334,16 +313,31 @@ class FakeAk:
 
     def stock_info_global_cls(self, symbol):
         self._guard("cls")
-        return [{"标题": "央行降准", "内容": "释放流动性", "发布日期": "2026-08-01", "发布时间": "09:00"}]
+        return [
+            {
+                "标题": "央行降准",
+                "内容": "释放流动性",
+                "发布日期": "2026-08-01",
+                "发布时间": "09:00",
+            }
+        ]
 
     def stock_info_global_em(self):
         self._guard("em")
-        return [{"标题": "光伏涨价", "摘要": "组件提价", "发布时间": "2026-08-01", "链接": "http://x"}]
+        return [
+            {"标题": "光伏涨价", "摘要": "组件提价", "发布时间": "2026-08-01", "链接": "http://x"}
+        ]
 
     def stock_info_global_ths(self):
         self._guard("ths")
-        return [{"标题": "储能中标", "内容": "正文", "发布时间": "2026-08-01 08:30:00",
-                 "链接": "http://t"}]
+        return [
+            {
+                "标题": "储能中标",
+                "内容": "正文",
+                "发布时间": "2026-08-01 08:30:00",
+                "链接": "http://t",
+            }
+        ]
 
     def stock_info_global_sina(self):
         self._guard("sina")
@@ -354,8 +348,12 @@ class FakeAk:
     def stock_info_cjzc_em(self):
         self._guard("cjzc")
         return [
-            {"标题": f"财经早餐 {day}", "摘要": "汇总", "发布时间": f"2026-07-{day:02d} 06:00:00",
-             "链接": "http://c"}
+            {
+                "标题": f"财经早餐 {day}",
+                "摘要": "汇总",
+                "发布时间": f"2026-07-{day:02d} 06:00:00",
+                "链接": "http://c",
+            }
             for day in range(1, 21)
         ]
 
@@ -365,18 +363,40 @@ class FakeAk:
 
     def stock_news_em(self, symbol):
         self._guard(f"stock:{symbol}")
-        return [{"新闻标题": f"{symbol} 中标", "新闻内容": "正文", "发布时间": "2026-08-01",
-                 "文章来源": "东财", "新闻链接": "http://y"}]
+        return [
+            {
+                "新闻标题": f"{symbol} 中标",
+                "新闻内容": "正文",
+                "发布时间": "2026-08-01",
+                "文章来源": "东财",
+                "新闻链接": "http://y",
+            }
+        ]
 
     def stock_notice_report(self, symbol, date):
         self._guard("notice")
-        return [{"代码": "000001", "名称": "平安银行", "公告标题": "年报", "公告类型": "其他",
-                 "公告日期": date, "网址": "http://z"}]
+        return [
+            {
+                "代码": "000001",
+                "名称": "平安银行",
+                "公告标题": "年报",
+                "公告类型": "其他",
+                "公告日期": date,
+                "网址": "http://z",
+            }
+        ]
 
     def stock_lhb_detail_em(self, start_date, end_date):
         self._guard("lhb")
-        return [{"代码": "000001", "名称": "平安银行", "龙虎榜净买额": 1.2e8, "涨跌幅": 5.0,
-                 "上榜日": end_date}]
+        return [
+            {
+                "代码": "000001",
+                "名称": "平安银行",
+                "龙虎榜净买额": 1.2e8,
+                "涨跌幅": 5.0,
+                "上榜日": end_date,
+            }
+        ]
 
 
 def test_news_source_collects_every_reachable_feed() -> None:
@@ -384,7 +404,12 @@ def test_news_source_collects_every_reachable_feed() -> None:
     docs, notes = source.fetch_market(date(2026, 8, 1))
 
     assert {doc.source for doc in docs} == {
-        "财联社", "东方财富", "同花顺", "新浪财经", "财经早餐", "新闻联播",
+        "财联社",
+        "东方财富",
+        "同花顺",
+        "新浪财经",
+        "财经早餐",
+        "新闻联播",
     }
     assert notes == []
 
@@ -446,8 +471,8 @@ def test_news_source_reports_failed_symbols_without_losing_the_rest() -> None:
     assert any("000002.SZ" in note for note in notes)
 
 
-# ---- announcements -------------------------------------------------------
-#
+# announcements
+
 # 公告是**风险否决**层。盘前 08:30 跑的时候当日公告还没披露，周末与节假日更是
 # 一条都没有，而 akshare 在空结果上抛 `KeyError: '代码'`（2026-08-02 实测）。
 # 把这个异常当成「今天没有风险公告」，等于让否决层在每个周一盘前静默消失。
@@ -465,8 +490,16 @@ class TradingDayAk(FakeAk):
         self.asked.append(date)
         if date not in self.available:
             raise KeyError("代码")
-        return [{"代码": "000001", "名称": "平安银行", "公告标题": "年报", "公告类型": "其他",
-                 "公告日期": date, "网址": "http://z"}]
+        return [
+            {
+                "代码": "000001",
+                "名称": "平安银行",
+                "公告标题": "年报",
+                "公告类型": "其他",
+                "公告日期": date,
+                "网址": "http://z",
+            }
+        ]
 
 
 def test_announcements_use_the_requested_day_when_it_has_data() -> None:
@@ -497,7 +530,7 @@ def test_announcements_say_so_loudly_when_the_screen_is_absent() -> None:
     assert any("没有公告风险否决" in note for note in notes)
 
 
-# ---- cache ---------------------------------------------------------------
+# cache
 
 
 def test_cache_round_trips_and_expires(tmp_path) -> None:

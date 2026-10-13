@@ -5,9 +5,17 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
+from contextlib import redirect_stdout
 from typing import Any
 
+import ashare_decision_support.research.monthly as monthly_research
+import ashare_decision_support.research.preopen as preopen_research
+import ashare_decision_support.research.sector_confirmation as confirmation_research
+import ashare_decision_support.research.sector_forecast as forecast_research
+import ashare_decision_support.sectors.backtest as sector_backtest
 from ashare_decision_support import __version__
+from ashare_decision_support.envfile import load_env_files
+from ashare_decision_support.numeric import finite
 from ashare_decision_support.tool_api import (
     TOOL_INSTRUCTIONS,
     daily_sector_analysis,
@@ -38,9 +46,7 @@ _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 # 每个参数都带 description，`additionalProperties: false` 明确拒收拼错的键。
-# 这两件事都是给**调用方是模型**准备的：没有字段说明它只能靠参数名猜语义，而多
-# 传一个键在这里会变成 handler 的 TypeError——报成 isError 比静默忽略好，但不如
-# 在 schema 里先说清楚。
+# 声明与执行共用同一份 schema；错误参数在取数或写入之前拒绝。
 _TOOLS = [
     {
         "name": "sector_confirmation",
@@ -49,7 +55,9 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "output_dir": {
-                    "type": "string", "default": "briefs", "description": "morning 产物目录"
+                    "type": "string",
+                    "default": "briefs",
+                    "description": "morning 产物目录",
                 }
             },
             "additionalProperties": False,
@@ -203,7 +211,7 @@ _TOOLS = [
                     "default": 31,
                     "minimum": 7,
                     "maximum": 93,
-                    "description": "展望窗口天数，超出范围会被夹到边界",
+                    "description": "展望窗口天数，须在 7-93 天范围内",
                 },
                 "symbols": {
                     "type": "array",
@@ -255,6 +263,9 @@ _TOOLS = [
     },
 ]
 
+_INPUT_SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in _TOOLS}
+_ARGUMENT_TYPES = {"string": str, "integer": int, "boolean": bool, "array": list}
+
 
 def _result(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -274,15 +285,18 @@ def _text_content(payload: dict[str, Any]) -> str:
     事实包自带 `rendered`，那正是同一份事实的可读版（41KB），MCP 也允许
     `content` 是 `structuredContent` 的等价可读形式。所以有 `rendered` 就用它，
     没有的（龙头包、月度包）才回落到 JSON。
+
+    按 `schema` 分派时认的是各研究模块自己的常量，不在这里再抄一遍字面量：
+    某个包升到 v2 而这里还写着 v1 的话不会报错，只会静默回落到整份 JSON——
+    对一个专门给模型调的工具，那正是上面说的那种浪费。
     """
     rendered = payload.get("rendered") if isinstance(payload, dict) else None
     if isinstance(rendered, str) and rendered.strip():
         return rendered
-    if payload.get("task") == "A股盘前先手研报":
-        from ashare_decision_support.research.preopen import render_preopen_research
-
-        return render_preopen_research(payload)
-    if payload.get("schema") == "ashare-monthly-research-context-v1":
+    schema = payload.get("schema")
+    if schema == preopen_research.SCHEMA:
+        return preopen_research.render_preopen_research(payload)
+    if schema == monthly_research.MONTHLY_SCHEMA:
         facts = payload.get("a_share_facts") or {}
         fact_text = facts.get("rendered") or "（事实摘要不可用）"
         horizon = payload.get("horizon") or {}
@@ -299,7 +313,7 @@ def _text_content(payload: dict[str, Any]) -> str:
             lines.extend(["", "## 数据边界", *(f"- {note}" for note in notes[:12])])
         lines.append("\n完整研究任务、事件窗口和结构化字段见 structuredContent。")
         return "\n".join(lines)
-    if payload.get("schema") == "ashare-sector-forecast-v1":
+    if schema == forecast_research.SCHEMA:
         market = payload.get("market") or {}
         confidence = payload.get("confidence") or {}
         lines = [
@@ -325,7 +339,7 @@ def _text_content(payload: dict[str, Any]) -> str:
             ]
         )
         return "\n".join(lines)
-    if payload.get("schema") == "ashare-sector-confirmation-v2":
+    if schema == confirmation_research.SCHEMA:
         lines = [
             f"# 板块盘中确认 {payload.get('target_session', '—')}",
             f"截至：{payload.get('as_of') or '—'}；{payload.get('data_status', '—')}",
@@ -337,7 +351,7 @@ def _text_content(payload: dict[str, Any]) -> str:
             for item in payload.get("results") or []
         )
         return "\n".join(lines)
-    if payload.get("schema") == "sector-price-baseline-backtest-v1":
+    if schema == sector_backtest.SCHEMA:
         date_range = payload.get("date_range") or {}
         lines = [
             "# 板块价格基线历史验证",
@@ -376,41 +390,43 @@ def _percent_point(value: Any) -> str:
     return f"{float(value):+.2f}%"
 
 
-def handle(message: dict[str, Any]) -> dict[str, Any] | None:
-    """Handle one JSON-RPC message; notifications intentionally produce no response."""
-    method = message.get("method")
-    request_id = message.get("id")
-    if method == "notifications/initialized":
-        return None
-    if method == "initialize":
-        return _result(
-            request_id,
-            {
-                "protocolVersion": message.get("params", {}).get("protocolVersion", PROTOCOL_VERSION),
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "instructions": TOOL_INSTRUCTIONS,
-            },
-        )
-    if method == "ping":
-        return _result(request_id, {})
-    if method == "tools/list":
-        return _result(request_id, {"tools": _TOOLS})
-    if method != "tools/call":
-        return _error(request_id, -32601, f"method not found: {method}")
+def _validate_argument(name: str, value: Any, spec: dict[str, Any]) -> None:
+    """校验工具声明实际使用的类型、枚举、数组元素与数值边界。"""
+    kind = spec["type"]
+    if not isinstance(value, _ARGUMENT_TYPES[kind]) or (
+        kind == "integer" and isinstance(value, bool)
+    ):
+        raise TypeError(f"{name} must be {kind}")
+    if "enum" in spec and value not in spec["enum"]:
+        raise ValueError(f"unsupported {name}: {value!r}; expected one of {spec['enum']}")
+    if "minimum" in spec and value < spec["minimum"]:
+        raise ValueError(f"{name} must be at least {spec['minimum']}")
+    if "maximum" in spec and value > spec["maximum"]:
+        raise ValueError(f"{name} must be at most {spec['maximum']}")
+    if kind == "array":
+        for index, item in enumerate(value):
+            _validate_argument(f"{name}[{index}]", item, spec["items"])
 
-    params = message.get("params") or {}
+
+def _call_tool(request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
     name = params.get("name")
-    handler = _HANDLERS.get(name)
-    if handler is None:
+    if not isinstance(name, str) or name not in _HANDLERS:
         return _error(request_id, -32602, f"unknown tool: {name}")
+    arguments = params.get("arguments", {})
+    if not isinstance(arguments, dict):
+        return _error(request_id, -32602, "tool arguments must be an object")
     try:
-        payload = handler(**(params.get("arguments") or {}))
-        # 序列化放在 try 里面，`default=str` 与 CLI 的 `_dump_json` 同口径。
-        # 两件事都是被同一个洞逼出来的：facts 里带 `datetime` 时（盘中现算的那批
-        # 就带），裸 `json.dumps` 抛的 TypeError 会**穿过 handle()**——于是这一次
-        # tools/call 收到的是一条 `id: null` 的 -32603，客户端等的那个 id 永远等不到
-        # 回复。CLI 打得出来的 payload，MCP 这一侧不能死在上面。
+        properties = _INPUT_SCHEMAS[name]["properties"]
+        for key, value in arguments.items():
+            if key not in properties:
+                raise TypeError(f"unexpected argument: {key}")
+            _validate_argument(key, value, properties[key])
+        # SDK 的启动横幅只能去 stderr；stdout 每行必须保持一条协议消息。
+        with redirect_stdout(sys.stderr):
+            payload = _HANDLERS[name](**arguments)
+        # 先验证整份结果可序列化，含有 rendered 的结果也不能夹带 NaN/Infinity。
+        # datetime 等保持与 CLI 一致的字符串口径；错误仍关联本次请求编号。
+        json.dumps(payload, ensure_ascii=False, default=str, allow_nan=False)
         text = _text_content(payload)
     except Exception as exc:  # tool failure is data for the client, not a dead server
         return _result(
@@ -430,27 +446,81 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
-def main(stdin: Any = None, stdout: Any = None) -> None:
-    """STDIO 传输循环。
+def handle(message: Any) -> dict[str, Any] | None:
+    """Handle one JSON-RPC message; notifications intentionally produce no response."""
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        return _error(None, -32600, "invalid JSON-RPC request")
+    method = message.get("method")
+    request_id = message.get("id")
+    if not isinstance(method, str) or ("id" in message and type(request_id) not in (str, int)):
+        return _error(None, -32600, "invalid request method or id")
+    if "id" not in message:
+        return None
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        return _error(request_id, -32602, "params must be an object")
+    if method == "initialize":
+        return _result(
+            request_id,
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": TOOL_INSTRUCTIONS,
+            },
+        )
+    if method == "ping":
+        return _result(request_id, {})
+    if method == "tools/list":
+        return _result(request_id, {"tools": _TOOLS})
+    if method == "tools/call":
+        return _call_tool(request_id, params)
+    return _error(request_id, -32601, f"method not found: {method}")
 
-    两个流是参数而不是直接用 `sys.*`，只为一件事：**这个循环能被测试**。它是
-    整条链路上唯一不经过 `handle()` 的部分，也是失败最不显眼的部分——它一坏，
-    客户端那一侧看到的是「服务器没反应」，而全部单测照常绿。
-    """
+
+def _json_number(value: str) -> float:
+    number = finite(value)
+    if number is None:
+        raise ValueError("JSON numbers must be finite")
+    return number
+
+
+def _response_line(line: str) -> str | None:
+    """解析并编码一条消息；错误保留请求编号，不中断后续消息。"""
+    try:
+        message = json.loads(line, parse_constant=_json_number, parse_float=_json_number)
+    except (ValueError, RecursionError) as exc:
+        response = _error(None, -32700, f"invalid JSON: {exc}")
+    else:
+        try:
+            response = handle(message)
+        except Exception as exc:
+            request_id = message.get("id") if isinstance(message, dict) else None
+            if type(request_id) not in (str, int):
+                request_id = None
+            response = _error(request_id, -32603, f"internal error: {type(exc).__name__}: {exc}")
+    if response is None:
+        return None
+    try:
+        return json.dumps(response, ensure_ascii=False, default=str, allow_nan=False)
+    except Exception as exc:
+        error = _error(
+            response.get("id"), -32603, f"serialization error: {type(exc).__name__}: {exc}"
+        )
+        return json.dumps(error, ensure_ascii=False)
+
+
+def main(stdin: Any = None, stdout: Any = None) -> None:
+    """逐行处理 STDIO 消息；可注入流以验证传输和异常恢复。"""
+    load_env_files()
     source = stdin if stdin is not None else sys.stdin
     sink = stdout if stdout is not None else sys.stdout
     for line in source:
         if not line.strip():
             continue
-        try:
-            message = json.loads(line)
-            response = handle(message)
-        except json.JSONDecodeError as exc:
-            response = _error(None, -32700, f"invalid JSON: {exc}")
-        except Exception as exc:
-            response = _error(None, -32603, f"internal error: {type(exc).__name__}: {exc}")
+        response = _response_line(line)
         if response is not None:
-            sink.write(json.dumps(response, ensure_ascii=False, default=str) + "\n")
+            sink.write(response + "\n")
             sink.flush()
 
 

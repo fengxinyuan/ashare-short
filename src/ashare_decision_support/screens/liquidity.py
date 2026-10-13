@@ -1,19 +1,6 @@
-"""可交易性硬筛：流通市值与成交额的下限。
+"""按流通市值与成交额下限进行可交易性筛选。
 
-这是唯一与名称、代码段无关的执行性筛选：技术形态再好也救不回一只买得进卖不出的
-票，而扣分迟早会被别的因子投票盖过去。
-
-**为什么这一层此前是空的。** 候选原来只过名称/代码段与致命公告，一只 15 亿流通、
-日成交 3000 万的票和茅台在筛选层面完全等价。对超短线这是个真窟窿：
-
-- **流通市值太小**——20 亿以下拉一个板只要几千万，价格由不了基本面，也由不了你；
-- **成交额太小**——8000 万以下的票，几百万的仓位就能打穿盘口。**超短线的核心风险
-  不是买错，是卖不掉**，而这一层是唯一看这件事的地方。
-
-门槛取得偏松（真做超短通常要求更高），因为这一层的职责是**排除不可交易**，不是
-替使用者选票。要收紧在调用处传参。
-
-数据来自 `adapters/market_scan.py`（新浪全市场扫描，一次 5.3 秒拿全 5529 只）。
+数据由全市场快照提供，阈值可配置。未达门槛时排除；缺失读数按未知处理并说明覆盖。
 """
 
 from __future__ import annotations
@@ -40,9 +27,17 @@ class LiquidityStats:
     checked: int = 0
     rejected: int = 0
     unmeasured: int = 0
+    missing_fields: int = 0
+    # 成交额门槛因为扫描取自盘中而没开。它和「没测到」不同：市值这一半仍然筛了。
+    amount_gate_off: bool = False
 
     def note(self) -> str | None:
-        if not self.rejected and not self.unmeasured:
+        if (
+            not self.rejected
+            and not self.unmeasured
+            and not self.missing_fields
+            and not self.amount_gate_off
+        ):
             return None
         parts = []
         if self.rejected:
@@ -50,6 +45,12 @@ class LiquidityStats:
         if self.unmeasured:
             # 静默放行没测到的票，读起来会像「全都测过且都合格」。必须说出来。
             parts.append(f"{self.unmeasured} 只没有全市场行情数据，本次未经该层过滤")
+        if self.missing_fields:
+            parts.append(
+                f"{self.missing_fields} 只行情缺少必要的流通市值或成交额，本次只按已知字段过滤"
+            )
+        if self.amount_gate_off:
+            parts.append("全市场扫描取自盘中，成交额还在形成中，本次可交易性只按流通市值筛")
         return "；".join(parts)
 
 
@@ -66,7 +67,11 @@ class LiquidityScreen:
     ) -> None:
         self.scan = scan
         self.min_float_cap_yi = min_float_cap_yi
-        self.min_amount_yi = min_amount_yi
+        # 盘中取到的成交额是半截交易日的：09:33 跑一次，全场大半都「低于 0.8 亿」。
+        # 2026-09-14 实测剔了 958 只——比正常盘前多出六百只，全是正常票。那时成交额
+        # 门槛不能用，只留流通市值（它不随时间走）。
+        self.amount_gate_off = bool(getattr(scan, "session_in_progress", False))
+        self.min_amount_yi = 0.0 if self.amount_gate_off else min_amount_yi
 
     @property
     def available(self) -> bool:
@@ -95,18 +100,28 @@ class LiquidityScreen:
         kept: list[str] = []
         rejected: list[ScreenVerdict] = []
         unmeasured = 0
+        missing_fields = 0
         for symbol in symbols:
-            if self.scan.get(symbol) is None:
+            row = self.scan.get(symbol)
+            if row is None:
                 unmeasured += 1
                 kept.append(symbol)
                 continue
+            if row.float_cap_yi is None or (not self.amount_gate_off and row.amount_yi is None):
+                missing_fields += 1
             verdict = self.check(symbol)
             if verdict.passed:
                 kept.append(symbol)
             else:
                 rejected.append(verdict)
-        return kept, rejected, LiquidityStats(
-            checked=len(symbols) - unmeasured,
-            rejected=len(rejected),
-            unmeasured=unmeasured,
+        return (
+            kept,
+            rejected,
+            LiquidityStats(
+                checked=len(symbols) - unmeasured,
+                rejected=len(rejected),
+                unmeasured=unmeasured,
+                missing_fields=missing_fields,
+                amount_gate_off=self.amount_gate_off,
+            ),
         )

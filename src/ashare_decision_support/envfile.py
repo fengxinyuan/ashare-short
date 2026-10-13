@@ -1,20 +1,7 @@
-"""密钥从哪来：进程启动时把 `.env` 文件读进 `os.environ`。
+"""CLI 与 MCP 启动时加载本地配置，仅补充尚未设置的环境变量。
 
-`export TICKFLOW_API_KEY=...` 只对**之后启动的**进程生效。长驻的 `daemon`、编辑器
-里起的会话、cron、systemd —— 这些进程往往在你改 `~/.bashrc` 之前就已经在跑了，于是
-`TickFlowAdapter` 拿不到 key，静默退回免费档：不报错，只是分钟线和五档从此为空。
-那种失败很难往「环境变量」上想，因为命令行里 `echo $TICKFLOW_API_KEY` 明明有值。
-
-`.gitignore` 里早就给 `.env` / `.env.tickflow` / `.env.feishu` 留了位置，`.env.tickflow.example` 也在
-版本库里，缺的只是读它的这一步。
-
-**已存在的环境变量永远优先。** 文件只补空缺，不覆盖：显式 `export`、systemd 的
-`Environment=`、`docker run -e` 都应当压过磁盘上的文件，否则「我明明改了变量却不生效」
-会变成下一个同样难查的问题。
-
-只在 `cli.main()` 里调用一次，不放进 `TickFlowAdapter.__init__`。适配器构造函数保持
-「只看环境变量」这一条来源，测试里 `conftest.py` 删掉 `TICKFLOW_API_KEY` 才能真的删掉
-——否则免费档降级路径会像那条 fixture 描述的一样，再次悄悄失去覆盖。
+显式环境变量（包括空字符串）优先于文件，同名配置以最先出现的文件为准。
+加载只在进程入口执行；适配器读取环境变量，不自行寻找配置文件。
 """
 
 from __future__ import annotations
@@ -108,7 +95,7 @@ def load_env_files(force: bool = False) -> list[str]:
             continue
         applied = False
         for name, value in parse(text).items():
-            if os.environ.get(name):
+            if name in os.environ:
                 continue
             os.environ[name] = value
             applied = True

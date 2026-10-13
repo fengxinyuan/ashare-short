@@ -21,6 +21,7 @@ from ashare_decision_support.ask.question import (
     INTENT_ENTRY,
     INTENT_EXIT,
     INTENT_GAP,
+    INTENT_SCREEN,
     parse_question,
 )
 from ashare_decision_support.ask.verdict import (
@@ -75,7 +76,9 @@ class StubClient:
 
     configured = True
 
-    def __init__(self, reply: str = "读数支持该结论。", replies: dict[str, str] | None = None) -> None:
+    def __init__(
+        self, reply: str = "读数支持该结论。", replies: dict[str, str] | None = None
+    ) -> None:
         self.reply = reply
         self.replies = replies or {}
         self.calls: list[list[dict]] = []
@@ -89,7 +92,7 @@ class StubClient:
         return self.reply
 
 
-# ---- 问题解析 -------------------------------------------------------------
+# 问题解析
 
 
 def test_codes_and_known_names_both_resolve() -> None:
@@ -124,7 +127,13 @@ def test_an_unrecognised_question_falls_back_to_the_phase_default() -> None:
     assert any("默认关注点" in note for note in spec.notes)
 
 
-# ---- 决策卡：判据 ---------------------------------------------------------
+def test_afternoon_stock_request_is_screen_and_entry() -> None:
+    spec = parse_question("下午有什么能够入手的股票")
+    assert INTENT_SCREEN in spec.intents
+    assert INTENT_ENTRY in spec.intents
+
+
+# 决策卡：判据
 
 
 def test_price_inside_the_band_with_enough_rrr_is_actionable() -> None:
@@ -133,6 +142,19 @@ def test_price_inside_the_band_with_enough_rrr_is_actionable() -> None:
     assert decision.label == LABEL_ACTIONABLE
     assert any("已在买入带" in item for item in decision.triggers)
     assert any("跌破止损" in item for item in decision.invalidations)
+
+
+def test_missing_price_cannot_become_actionable() -> None:
+    decision = assess(payload(last=None))
+    assert decision.label == LABEL_BLOCKED
+    assert any("现价" in item for item in decision.blockers)
+
+
+@pytest.mark.parametrize("entry, stop", [((22.8, 23.3), 22.8), ((23.3, 22.8), 22.0)])
+def test_invalid_entry_risk_geometry_is_blocked(entry: tuple[float, float], stop: float) -> None:
+    decision = assess(payload(entry=entry, stop=stop))
+    assert decision.label == LABEL_BLOCKED
+    assert any("结构无效" in item for item in decision.blockers)
 
 
 def test_price_above_the_band_needs_a_pullback_first() -> None:
@@ -155,6 +177,41 @@ def test_price_below_the_band_is_a_breakdown_not_a_discount() -> None:
     assert any("站回" in item for item in decision.triggers)
 
 
+def test_breakout_below_trigger_is_waiting_not_a_broken_pullback() -> None:
+    facts = payload(last=22.9, entry=(23.3, 23.3), stop=21.5, targets=[27.0], rrr=2.0)
+    facts["playbook"] = "突破"
+    facts["setup"] = {"matched": [{"playbook": "突破", "ok": True}]}
+
+    decision = assess(facts)
+
+    assert decision.label == LABEL_CONFIRM
+    assert any("放量站上突破触发价" in item for item in decision.triggers)
+    assert not any("失守" in item for item in decision.invalidations)
+
+
+def test_breakout_at_trigger_still_needs_intraday_volume() -> None:
+    facts = payload(last=23.3, entry=(23.3, 23.3), stop=21.5, targets=[27.0], rrr=2.0)
+    facts["playbook"] = "突破"
+    facts["setup"] = {"matched": [{"playbook": "突破", "ok": True}]}
+
+    waiting = assess(facts)
+    assert waiting.label == LABEL_CONFIRM
+    assert any("分钟量能" in item for item in waiting.triggers)
+
+    facts["intraday"]["volume_ratio"] = 1.2
+    assert assess(facts).label == LABEL_ACTIONABLE
+
+
+def test_no_approved_playbook_blocks_buy_even_if_levels_look_good() -> None:
+    facts = payload(last=23.0)
+    facts["setup"] = {"matched": [], "rejected": [{"playbook": "回踩"}]}
+
+    decision = assess(facts)
+
+    assert decision.label == LABEL_BLOCKED
+    assert any("没有通过任何入场打法" in item for item in decision.blockers)
+
+
 def test_a_risk_warning_blocks_the_whole_card() -> None:
     decision = assess(payload(warnings=["⚠️ 近 30 日内有风险公告：立案调查"]))
 
@@ -172,7 +229,7 @@ def test_stale_data_blocks_the_card_even_when_the_levels_look_fine() -> None:
 
 
 def test_a_thin_rrr_is_not_actionable() -> None:
-    assert assess(payload(rrr=1.1, last=23.00)).label == LABEL_CONFIRM
+    assert assess(payload(rrr=1.1, last=23.00, targets=[24.50])).label == LABEL_CONFIRM
 
 
 def test_sealed_at_the_upper_limit_downgrades_instead_of_blocking() -> None:
@@ -190,7 +247,7 @@ def test_a_missing_limit_price_is_not_treated_as_sealed() -> None:
     assert assess(payload(last=23.00, book={})).label == LABEL_ACTIONABLE
 
 
-# ---- 决策卡：持仓侧 -------------------------------------------------------
+# 决策卡：持仓侧
 
 
 def test_a_position_switches_the_card_to_the_sell_side() -> None:
@@ -232,14 +289,14 @@ def test_the_gap_against_yesterdays_close_reaches_the_card() -> None:
     assert any("低开" in item and "-3.12%" in item for item in decision.readings)
 
 
-# ---- 排序 -----------------------------------------------------------------
+# 排序
 
 
 def test_ranking_is_deterministic_and_puts_actionable_first() -> None:
     cards = [
         assess(payload(symbol="000001.SZ", warnings=["⚠️ ST"])),
         assess(payload(symbol="600000.SH", last=23.00, rrr=1.8)),
-        assess(payload(symbol="600519.SH", last=23.00, rrr=3.0)),
+        assess(payload(symbol="600519.SH", last=23.00, rrr=3.0, targets=[27.0])),
         assess(payload(symbol="300750.SZ", last=24.90)),
     ]
     ordered = [item.symbol for item in rank(cards)]
@@ -249,7 +306,7 @@ def test_ranking_is_deterministic_and_puts_actionable_first() -> None:
     assert [item.symbol for item in rank(list(reversed(cards)))] == ordered
 
 
-# ---- 计划 -----------------------------------------------------------------
+# 计划
 
 
 def test_a_question_the_system_has_no_data_for_becomes_a_declared_gap() -> None:
@@ -294,7 +351,7 @@ def test_each_symbol_step_only_carries_its_own_facts() -> None:
     assert "000001.SZ" not in text
 
 
-# ---- 分步执行 -------------------------------------------------------------
+# 分步执行
 
 
 def _facts(*items: dict) -> dict:
@@ -327,9 +384,7 @@ def test_one_discarded_step_costs_only_that_step() -> None:
     )
     client = StubClient(replies={"600519.SH": "目标看到 999.99 元。"})
 
-    report, result = _deep(
-        "这两只怎么样", facts, client, symbols=("600519.SH", "000001.SZ")
-    )
+    report, result = _deep("这两只怎么样", facts, client, symbols=("600519.SH", "000001.SZ"))
 
     assert "论证段缺失：含数据中不存在的数字" in report
     # 被丢弃的**句子**不能出现；那个数字本身会出现在「丢了什么」的说明里，
@@ -411,7 +466,56 @@ def test_the_report_stays_natural_when_there_are_no_decisions() -> None:
     assert "## 逐只决策卡" not in report
 
 
-# ---- 可视化 ---------------------------------------------------------------
+@pytest.mark.parametrize(
+    "stamp, expected",
+    [
+        ("2026-07-30", "不能作为今天下午的候选"),
+        ("2026-08-03", "形态观察名单"),
+    ],
+)
+def test_screening_report_explains_freshness_before_listing_stocks(
+    tmp_path, stamp: str, expected: str
+) -> None:
+    screen = {
+        "as_of": stamp,
+        "candidates": [{"symbol": "000725.SZ", "name": "京东方A"}],
+    }
+    (tmp_path / "strategy_screen_latest.json").write_text(json.dumps(screen), encoding="utf-8")
+    report, _ = _deep(
+        "下午有什么能够入手的股票",
+        _facts(),
+        StubClient(),
+        symbols=(),
+        output_dir=tmp_path,
+    )
+    assert "本轮没有经过当日价位验证的个股决策卡" in report
+    assert expected in report
+    if stamp != "2026-08-03":
+        assert "000725.SZ" not in report
+
+
+def test_old_morning_position_factor_is_not_presented_as_today(tmp_path) -> None:
+    morning = {
+        "trade_date": "2026-07-30",
+        "data_date": "2026-07-30",
+        "execution_ready": True,
+        "position_factor": 0.27,
+        "market": {"direction": "上升"},
+    }
+    (tmp_path / "morning_latest.json").write_text(json.dumps(morning), encoding="utf-8")
+    report, _ = _deep(
+        "今天大盘怎么样",
+        _facts(),
+        StubClient(),
+        symbols=(),
+        output_dir=tmp_path,
+    )
+    assert "今日仓位系数 0.27" not in report
+    assert "不是当日可执行结果" in report
+    assert "## 研究过程" not in report
+
+
+# 可视化
 
 
 def test_the_ladder_keeps_every_label_readable() -> None:
@@ -429,7 +533,7 @@ def test_a_symbol_without_levels_says_so_instead_of_drawing_a_flat_line() -> Non
     assert "画不出" in price_ladder(card)[0]
 
 
-# ---- 装配 -----------------------------------------------------------------
+# 装配
 
 
 def test_holdings_reach_the_sell_side_through_the_assembled_context() -> None:

@@ -62,7 +62,7 @@ def forecast_row(code: str, metric: str, kind: str, pct: float, day: str = "2026
     }
 
 
-# ---- 取数与收敛 -----------------------------------------------------------
+# 取数与收敛
 
 
 def test_report_period_follows_the_disclosure_window() -> None:
@@ -100,9 +100,7 @@ def test_net_profit_wins_over_revenue_when_they_disagree() -> None:
 
 def test_falls_back_to_a_lesser_metric_and_says_so() -> None:
     """退档是允许的，但必须能被下游看见——营收口径的结论不该拿去否决。"""
-    ak = FakeAk(
-        forecasts={"20260630": [forecast_row("000001", "营业收入", "略减", -8.0)]}
-    )
+    ak = FakeAk(forecasts={"20260630": [forecast_row("000001", "营业收入", "略减", -8.0)]})
     item = EarningsAdapter(ak_module=ak).fetch(date(2026, 8, 3)).get("000001.SZ")
 
     assert item is not None
@@ -115,9 +113,7 @@ def test_empty_period_walks_back_one_quarter() -> None:
     「这批公司都没有业绩问题」在只报数量的设计里长得一模一样。"""
     ak = FakeAk(
         forecasts={
-            "20260331": [
-                forecast_row("000001", "归属于上市公司股东的净利润", "预增", 120.0)
-            ]
+            "20260331": [forecast_row("000001", "归属于上市公司股东的净利润", "预增", 120.0)]
         }
     )
     snapshot = EarningsAdapter(ak_module=ak).fetch(date(2026, 7, 2))
@@ -139,9 +135,7 @@ def test_a_fast_report_overrides_the_forecast_range() -> None:
     """快报是算出来的实际数，预告是区间估计。两边都有时以快报为准。"""
     ak = FakeAk(
         forecasts={
-            "20260630": [
-                forecast_row("000001", "归属于上市公司股东的净利润", "预增", 120.0)
-            ]
+            "20260630": [forecast_row("000001", "归属于上市公司股东的净利润", "预增", 120.0)]
         },
         fast={
             "20260630": [
@@ -169,7 +163,9 @@ def test_a_fast_report_overrides_the_forecast_range() -> None:
 def test_a_loss_making_fast_report_is_not_read_as_growth() -> None:
     """净利润为负时同比「增长」说的是亏得比去年少，那是减亏不是预增。"""
     ak = FakeAk(
-        forecasts={"20260630": [forecast_row("000002", "归属于上市公司股东的净利润", "预减", -10.0)]},
+        forecasts={
+            "20260630": [forecast_row("000002", "归属于上市公司股东的净利润", "预减", -10.0)]
+        },
         fast={
             "20260630": [
                 {
@@ -217,7 +213,7 @@ def test_a_narrowing_loss_is_neither_a_veto_nor_a_catalyst() -> None:
     assert not any("增幅翻倍以上" in line for line in lines)
 
 
-# ---- 双面不对称 -----------------------------------------------------------
+# 双面不对称
 
 
 def snapshot_of(*rows: dict) -> EarningsSnapshot:
@@ -231,9 +227,7 @@ def test_deteriorating_losses_are_removed() -> None:
         forecast_row("000002", "归属于上市公司股东的净利润", "增亏", -60.0),
         forecast_row("000003", "归属于上市公司股东的净利润", "预增", 300.0),
     )
-    kept, verdicts, stats = EarningsScreen(snapshot).filter(
-        ["000001.SZ", "000002.SZ", "000003.SZ"]
-    )
+    kept, verdicts, stats = EarningsScreen(snapshot).filter(["000001.SZ", "000002.SZ", "000003.SZ"])
 
     assert kept == ["000003.SZ"]
     assert stats.blocked == 2
@@ -265,14 +259,12 @@ def test_a_revenue_basis_reading_never_vetoes() -> None:
 
 def test_persistent_loss_handling_is_switchable() -> None:
     """「早就在亏」和「刚开始亏」对市场是两件事，取值尚未被台账验证，所以留开关。"""
-    snapshot = snapshot_of(
-        forecast_row("000001", "归属于上市公司股东的净利润", "续亏", 6.9)
-    )
+    snapshot = snapshot_of(forecast_row("000001", "归属于上市公司股东的净利润", "续亏", 6.9))
 
     strict, _, _ = EarningsScreen(snapshot).filter(["000001.SZ"])
-    relaxed, verdicts, _ = EarningsScreen(
-        snapshot, block_persistent_loss=False
-    ).filter(["000001.SZ"])
+    relaxed, verdicts, _ = EarningsScreen(snapshot, block_persistent_loss=False).filter(
+        ["000001.SZ"]
+    )
 
     assert strict == []
     assert relaxed == ["000001.SZ"]
@@ -321,9 +313,7 @@ def test_missing_data_lets_everything_through_and_says_so(snapshot) -> None:
 
 def test_undisclosed_names_are_not_treated_as_bad_news() -> None:
     """未披露 ≠ 业绩差。大多数公司根本不发预告。"""
-    snapshot = snapshot_of(
-        forecast_row("000001", "归属于上市公司股东的净利润", "首亏", -180.0)
-    )
+    snapshot = snapshot_of(forecast_row("000001", "归属于上市公司股东的净利润", "首亏", -180.0))
     kept, _verdicts, stats = EarningsScreen(snapshot).filter(
         ["000001.SZ", "600519.SH", "300750.SZ"]
     )

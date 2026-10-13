@@ -1,57 +1,53 @@
-"""你手上真正持有的那几只。
+"""手工维护的持仓表，为监控提供成本、股数、建仓日及止损/目标。
 
-这里从前是两份清单：自选股（人维护、永不自动删除）与候选池（每早生成、隔日
-失效），所有接受 `--symbols` 的命令省略参数时都读它们。两份在 2026-08-11 一起
-删掉了，判据是**使用方式变了**：标的由你在提问时直接给出，`advise` / `ask` /
-`chat` 不再替你猜该看哪几只。一份没人维护却仍被当默认输入的清单，比没有清单更
-糟——它会让每条命令都多算十几只你今天根本没在看的票，而结论看起来一样正常。
-
-留下的只有持仓，因为它回答的是另一个问题。持仓不是「想看什么」，是**已经承担
-了风险的那几只**：止损、目标、结构破坏、时间止损、浮盈回吐这五类判断只对它们
-成立，而且必须在盘中被盯着——那不能靠你每次手输代码来触发。
-
-系统只出建议，不下单、不撤单、不接管账户，所以成本价、股数、计划止损与目标
-全部由人手工维护（`ashare-ds position open`），这一层只读写这一个文件。
+查询使用实例快照；每次修改在文件锁内重读最新持仓，成功落盘后才更新实例。
+标的输入与持仓职责见 docs/ARCHITECTURE.md。
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 from pathlib import Path
 
+from ashare_decision_support.numeric import finite, positive
 from ashare_decision_support.state.paths import state_path
-from ashare_decision_support.state.store import read_json, write_json
-from ashare_decision_support.symbols import normalize_symbol
+from ashare_decision_support.state.store import file_lock, read_json, write_json
+from ashare_decision_support.symbols import VALID_SUFFIXES, normalize_symbol
 
 POSITIONS_FILE = "positions.json"
 
 
 def unrealised_pct(cost_price: float | None, price: float | None) -> float | None:
-    """浮动盈亏。没有成本价或没有现价就返回 None，不猜。
-
-    收成自由函数是因为**它此前有两份逐字相同的**：`Position.unrealised_pct` 与
-    `monitor/holdings.py` 的 `HoldingView.unrealised_pct`——后者是前者的投影，
-    连 `round(..., 6)` 都一样。两份的失效方式是安静的：改一处的取整位数或
-    「成本价缺失怎么办」，另一处照旧，于是同一笔持仓在盘中告警里和在 `ask`
-    的上下文里显示的浮盈**差最后一位**，两边都不报错。
-
-    公式放在持有 `cost_price` 的这一层：浮动盈亏是成本价的派生量，不是监控层
-    的判断。
-    """
-    if not cost_price or not price:
+    """持仓和监控视图共用的浮动盈亏；任一价格无效时返回 None。"""
+    cost, last = positive(cost_price), positive(price)
+    if cost is None or last is None:
         return None
-    return round(float(price) / float(cost_price) - 1.0, 6)
+    return finite(round(last / cost - 1.0, 6))
+
+
+def _position_symbol(symbol: str) -> str:
+    normalized = normalize_symbol(symbol)
+    code, _, suffix = normalized.partition(".")
+    if len(code) != 6 or not code.isascii() or not code.isdigit() or suffix not in VALID_SUFFIXES:
+        raise ValueError(f"无法识别的标的代码：{symbol!r}")
+    return normalized
+
+
+def _share_count(value: object) -> int | None:
+    number = positive(value)
+    return int(number) if number is not None and number.is_integer() else None
+
+
+def _required_price(value: object, label: str) -> float:
+    number = positive(value)
+    if number is None:
+        raise ValueError(f"{label}必须是大于 0 的有限数字")
+    return number
 
 
 def _today() -> date:
-    """今天（北京时区）。
-
-    延迟导入：`schedule/__init__` 会把 `daemon` 拉进来，而 `daemon` 又 import
-    `state`——放在模块顶端就成了一个环，且环成不成立取决于**谁先被 import**。
-    这一层只在真正需要日期时才要那个函数，所以放在这里最省事，也最不容易在
-    某次无关的导入顺序改动后突然炸掉。
-    """
+    """北京日期；延迟导入以避开 schedule -> daemon -> state 的初始化环。"""
     from ashare_decision_support.schedule.timezone import beijing_today
 
     return beijing_today()
@@ -70,8 +66,8 @@ class Position:
     name: str | None = None
     cost_price: float | None = None
     shares: int | None = None
-    opened_on: str | None = None      # 建仓日，时间止损从这天算起
-    plan_stop: float | None = None    # 你自己定的止损，优先于系统算出来的
+    opened_on: str | None = None  # 建仓日，时间止损从这天算起
+    plan_stop: float | None = None  # 你自己定的止损，优先于系统算出来的
     plan_target: float | None = None
     note: str | None = None
 
@@ -81,13 +77,13 @@ class Position:
     @classmethod
     def from_dict(cls, payload: dict) -> Position:
         return cls(
-            symbol=normalize_symbol(payload.get("symbol", "")),
+            symbol=_position_symbol(payload.get("symbol", "")),
             name=payload.get("name"),
-            cost_price=payload.get("cost_price"),
-            shares=payload.get("shares"),
+            cost_price=positive(payload.get("cost_price")),
+            shares=_share_count(payload.get("shares")),
             opened_on=payload.get("opened_on"),
-            plan_stop=payload.get("plan_stop"),
-            plan_target=payload.get("plan_target"),
+            plan_stop=positive(payload.get("plan_stop")),
+            plan_target=positive(payload.get("plan_target")),
             note=payload.get("note"),
         )
 
@@ -111,10 +107,20 @@ class Positions:
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path) if path is not None else state_path(POSITIONS_FILE)
+        self.entries = self._load()
+
+    def _load(self) -> list[Position]:
         rows = read_json(self.path, default=[]) or []
-        self.entries: list[Position] = [
-            Position.from_dict(row) for row in rows if isinstance(row, dict)
-        ]
+        entries: dict[str, Position] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                entry = Position.from_dict(row)
+            except ValueError:
+                continue
+            entries[entry.symbol] = entry
+        return list(entries.values())
 
     def symbols(self) -> list[str]:
         return [entry.symbol for entry in self.entries]
@@ -141,28 +147,34 @@ class Positions:
         note: str | None = None,
         today: date | None = None,
     ) -> Position:
-        """建仓或改仓。已存在就就地更新，不会重复插一条。"""
-        code = normalize_symbol(symbol)
-        if not code:
-            raise ValueError(f"无法识别的标的代码：{symbol!r}")
+        """建仓或改仓。省略的字段保留，校验或写入失败时不改变持仓。"""
+        code = _position_symbol(symbol)
+        cost = _required_price(cost_price, "成本价")
+        count = _share_count(shares)
+        if shares is not None and count is None:
+            raise ValueError("持仓股数必须是正整数")
+        if opened_on is not None and type(opened_on) is not date:
+            raise ValueError("建仓日必须是有效日期")
 
-        entry = self.get(code)
-        if entry is None:
-            entry = Position(symbol=code)
-            self.entries.append(entry)
-        entry.cost_price = float(cost_price)
-        entry.shares = shares if shares is None else int(shares)
-        entry.opened_on = str(opened_on or today or _today())
-        # 补填不覆盖：一次不带 `--stop` 的改仓不该把你上次定的止损抹掉。
-        for attribute, value in (
-            ("plan_stop", None if plan_stop is None else float(plan_stop)),
-            ("plan_target", None if plan_target is None else float(plan_target)),
-            ("name", name),
-            ("note", note),
-        ):
-            if value is not None:
-                setattr(entry, attribute, value)
-        self.save()
+        changes = {
+            "cost_price": cost,
+            "shares": count,
+            "plan_stop": None if plan_stop is None else _required_price(plan_stop, "止损价"),
+            "plan_target": None if plan_target is None else _required_price(plan_target, "目标价"),
+            "name": name,
+            "note": note,
+        }
+        changes = {key: value for key, value in changes.items() if value is not None}
+        with file_lock(self.path):
+            entries = self._load()
+            existing = next((item for item in entries if item.symbol == code), None)
+            entry = replace(existing or Position(symbol=code), **changes)
+            if opened_on is not None or not entry.opened_on:
+                entry.opened_on = str(opened_on or today or _today())
+            updated = [entry if item.symbol == code else item for item in entries]
+            if existing is None:
+                updated.append(entry)
+            self._save(updated)
         return entry
 
     def close(self, symbol: str) -> bool:
@@ -172,18 +184,22 @@ class Positions:
         对一只已经卖掉的票没有任何意义。历史留在台账里（`journal/`），那才是
         回答「当时为什么买、后来怎么样了」的地方。
         """
-        entry = self.get(symbol)
-        if entry is None:
-            return False
-        self.entries.remove(entry)
-        self.save()
+        code = normalize_symbol(symbol)
+        with file_lock(self.path):
+            entries = self._load()
+            updated = [item for item in entries if item.symbol != code]
+            if len(updated) == len(entries):
+                self.entries = entries
+                return False
+            self._save(updated)
         return True
 
     def clear(self) -> int:
-        count = len(self.entries)
-        self.entries = []
-        self.save()
+        with file_lock(self.path):
+            count = len(self._load())
+            self._save([])
         return count
 
-    def save(self) -> None:
-        write_json(self.path, [entry.to_dict() for entry in self.entries])
+    def _save(self, entries: list[Position]) -> None:
+        write_json(self.path, [entry.to_dict() for entry in entries])
+        self.entries = entries

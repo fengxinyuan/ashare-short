@@ -15,8 +15,9 @@ from ashare_decision_support.adapters.ths_sector_index import (
     ThsSectorIndexAdapter,
     _parse_line_js,
 )
+from tests.fakes import FakeResponse
 
-# ---- http double ---------------------------------------------------------
+# http double
 
 
 def _by_name(snap) -> dict:
@@ -32,28 +33,18 @@ def _bars(rows: list[tuple[str, float, float, float, float, float]]) -> str:
 
 
 def _flat_series(n: int, close: float, amount: float = 1e9) -> list[tuple]:
-    return [(f"2026{m:02d}{d:02d}", close, close, close, close, amount)
-            for m in (5, 6) for d in range(1, n // 2 + 1)][:n]
+    return [
+        (f"2026{m:02d}{d:02d}", close, close, close, close, amount)
+        for m in (5, 6)
+        for d in range(1, n // 2 + 1)
+    ][:n]
 
 
 def _payload(code: str, name: str, rows: list[tuple]) -> bytes:
-    body = json.dumps({"name": name, "total": str(len(rows)), "data": _bars(rows)},
-                      ensure_ascii=False)
+    body = json.dumps(
+        {"name": name, "total": str(len(rows)), "data": _bars(rows)}, ensure_ascii=False
+    )
     return f"quotebridge_v6_line_bk_{code}_01_last({body})".encode()
-
-
-class _Resp:
-    def __init__(self, body: bytes) -> None:
-        self.body = body
-
-    def read(self):
-        return self.body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
 
 class StubHttp:
@@ -67,18 +58,15 @@ class StubHttp:
         code = request.full_url.split("bk_")[1].split("/")[0]
         self.asked.append(code)
         if code not in self.available:
-            return _Resp(b'quotebridge_v6_line_bk_x_01_last({"name":"","data":""})')
+            return FakeResponse(b'quotebridge_v6_line_bk_x_01_last({"name":"","data":""})')
         name, rows = self.available[code]
-        return _Resp(_payload(code, name, rows))
+        return FakeResponse(_payload(code, name, rows))
 
 
 # 一根「高开冲高、收在当日最低」的日线，接在 26 根平盘之后。
 FADE_ROWS = [*_flat_series(26, 100.0), ("20260731", 104.0, 106.0, 102.0, 102.0, 2000000000.0)]
 # 一根「稳步走高、收在当日最高」的日线。
 STRONG_ROWS = [*_flat_series(26, 100.0), ("20260731", 100.5, 101.0, 100.2, 101.0, 1200000000.0)]
-
-
-# ---- parsing -------------------------------------------------------------
 
 
 def test_parses_the_jsonp_callback_wrapper() -> None:
@@ -103,7 +91,7 @@ def test_a_row_with_missing_cells_is_skipped_not_guessed() -> None:
     assert [b["date"] for b in bars] == ["20260730"]
 
 
-# ---- measurement ---------------------------------------------------------
+# measurement
 
 
 def test_close_position_separates_faded_from_supported() -> None:
@@ -114,8 +102,8 @@ def test_close_position_separates_faded_from_supported() -> None:
     by_name = _by_name(snap)
     assert by_name["半导体"].ret_1d > 0
     assert by_name["白酒"].ret_1d > 0
-    assert by_name["半导体"].close_position == 0.0     # 收在当日最低
-    assert by_name["白酒"].close_position == 100.0     # 收在当日最高
+    assert by_name["半导体"].close_position == 0.0  # 收在当日最低
+    assert by_name["白酒"].close_position == 100.0  # 收在当日最高
 
 
 def test_shape_names_the_pattern_the_return_alone_hides() -> None:
@@ -137,7 +125,10 @@ def test_describe_calls_out_sectors_that_rose_but_closed_at_the_low() -> None:
 
 
 def test_volume_ratio_compares_the_recent_week_against_the_month() -> None:
-    rows = [*_flat_series(26, 100.0, amount=1000000000.0), ("20260731", 100.0, 101.0, 99.0, 100.0, 1000000000.0)]
+    rows = [
+        *_flat_series(26, 100.0, amount=1000000000.0),
+        ("20260731", 100.0, 101.0, 99.0, 100.0, 1000000000.0),
+    ]
     http = StubHttp({"881101": ("测试", rows)})
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101"])
 
@@ -160,7 +151,7 @@ def test_too_short_a_history_is_dropped_instead_of_measured() -> None:
     assert not snap.ok
 
 
-# ---- cross-sector consistency -------------------------------------------
+# cross-sector consistency
 
 
 def test_sectors_stuck_on_an_older_date_are_excluded_not_ranked() -> None:
@@ -199,7 +190,7 @@ def test_everything_down_reports_not_ok_rather_than_an_empty_ranking() -> None:
     assert snap.readings == []
 
 
-# ---- code discovery cache ------------------------------------------------
+# code discovery cache
 
 
 def test_discovery_scans_once_then_caches_the_live_codes(tmp_path) -> None:
@@ -207,13 +198,13 @@ def test_discovery_scans_once_then_caches_the_live_codes(tmp_path) -> None:
     first = ThsSectorIndexAdapter(cache_dir=tmp_path, opener=http).fetch()
 
     assert [r.name for r in first.readings] == ["半导体"]
-    assert len(http.asked) > 300          # 首次扫全区间
+    assert len(http.asked) > 300  # 首次扫全区间
     assert any("首次探测" in note for note in first.notes)
 
     http.asked.clear()
     second = ThsSectorIndexAdapter(cache_dir=tmp_path, opener=http).fetch()
 
-    assert http.asked == ["881101"]        # 之后只打活着的那个
+    assert http.asked == ["881101"]  # 之后只打活着的那个
     assert [r.name for r in second.readings] == ["半导体"]
 
 
@@ -229,7 +220,7 @@ def test_a_cache_without_the_schema_stamp_is_rescanned(tmp_path) -> None:
     assert len(http.asked) > 300
 
 
-# ---- describe 的两条独有读数 ----------------------------------------------
+# describe 的两条独有读数
 
 # 与 STRONG_ROWS 的价格形态完全相同（稳步走高、收在当日最高），只有成交额不同：
 # 近端量能萎缩。两者的区别**只有 volume_ratio 分得开**，涨幅和收位都分不开。
@@ -250,7 +241,7 @@ def test_describe_reports_close_position_even_when_nothing_faded() -> None:
     snap = ThsSectorIndexAdapter(opener=http).fetch(codes=["881101", "881102"])
 
     line = next(line for line in snap.describe() if line.startswith("收盘位置"))
-    assert "2/2" in line                      # 分母跟着出，读的人才能自己判断
+    assert "2/2" in line  # 分母跟着出，读的人才能自己判断
     assert "没有一个冲高回落" in line
 
 

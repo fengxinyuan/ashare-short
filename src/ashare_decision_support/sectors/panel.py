@@ -1,45 +1,54 @@
-"""板块横截面的公共底座：取一格数、对齐一张面板。
+"""板块历史序列的数值读取、日期面板对齐与统计工具。
 
-`rotation.py`（按价格读「谁在涨」）与 `turnover.py`（按成交额读「谁在被交易」）
-是同一张面板的两种读法：输入同为 `ths_sector_index.load_all_series()` 的
-`{code: (板块名, 日线)}`，输出同为一张按板块排的横截面榜。两边原来各写了一份
-`_close` / `_amount` / `_pct` / `_round`，以及一份 35 行、除了 note 措辞之外
-**逐字相同**的 `_align`。
-
-这类重复在对齐这一步上代价格外高，因为它是整层唯一的正确性闸门，而且两条链路
-被它挡住的是**不同严重程度的错误**：
-
-```text
-轮动榜   一个停更三天的板块，它的「5 日涨幅」跨的是别人 8 天的区间
-         → 错的是它自己那一行的名次
-成交额榜 占比的分母是当日全体板块的合计额，缺席的那几天分母整体偏小
-         → 错的是**其余每一个板块**的占比
-```
-
-两份实现里只要有一份漏改，坏掉的不是一行是整张榜——而且是后面那种，坏得静悄悄
-（每个板块的占比都只偏高一点点，没有任何一行看起来不对）。
-
-**措辞不并进来。** `align()` 返回的是事实（留下几个、丢掉几个、对齐到哪天），
-不返回 note 文本。「板块轮动：…」和「成交额迁移：…」是两层各自的词汇表，
-连同「为什么丢」的解释一起留在各自的模块里——共用的是判据，不是说法。
+价格轮动和成交额迁移共用对齐口径，避免缺失日期导致收益窗口或占比分母错位。
+align 返回覆盖事实，展示文案由各调用方组织。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from ashare_decision_support.numeric import positive
 
 # 低于这个板块数就不给结论。横截面统计在小样本上毫无意义——20 个板块算出的秩
 # 相关，随便两个板块换位就能翻号；占比更甚，样本太小时一个板块的异动就能改写
 # 所有其他板块的占比。
-#
+
 # `rotation` / `turnover` / `seesaw` 三处原来各写了一份 `MIN_SECTORS = 20`，而且
 # 后两份的注释各自写着「同 `rotation.py:MIN_SECTORS` 的理由与取值」——**注释里
 # 互相指认，恰好说明它是一个旋钮而不是三个**。三份并存时，把其中一份调到 30
 # 不会让另外两处报错，只会让那两句「同上」的注释从此是假的。收在这里，和
 # `align()` 同一条理由：共用的是判据。
+
+# **2026-08-28 收了第四份。** `sectors/backtest.py` 是这次收口之后才加的，它又
+# 自己写了一遍 `MIN_SECTORS = 20`，用在三处横截面下限上（信号数、面板行数、
+# 市场收益样本数）——和上面三处是同一个判据。这说明「收一次」不等于收干净：
+# 常量收进来了，**但没有任何闸门拦住下一个文件再写一份**，而它照样全绿。
+# 查法在 `tests/test_sector_panel.py`：判据只有一处定义，靠测试守，不靠注释。
 MIN_SECTORS = 20
+
+# 横截面读数交给外部模型看时，名单类列表各留几条。结论与观察是短句，多留几条
+# 就是多几句话；`sectors` 是整张榜，一份轮动读数里 90 行结构相同的板块会把
+# 真正的结论淹掉，整块不带。
+COMPACT_KEEP_NOTES = 3
+COMPACT_KEEP_ROWS = 5
+
+
+def compact_reading(value: Any) -> Any:
+    """压缩横截面读数：省略完整 sectors 榜，其余列表按类别保留前几项。"""
+    if not isinstance(value, dict):
+        return value
+    compact: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "sectors":
+            continue
+        if isinstance(item, list):
+            keep = COMPACT_KEEP_NOTES if key in {"observations", "notes"} else COMPACT_KEEP_ROWS
+            compact[key] = item[:keep]
+        else:
+            compact[key] = item
+    return compact
 
 
 def bar_value(bar: dict, key: str) -> float | None:

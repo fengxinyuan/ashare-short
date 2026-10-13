@@ -5,7 +5,22 @@ from __future__ import annotations
 from typing import Any
 
 CLUSTERS = (
-    ("科技硬件", ("芯片", "半导体", "电子", "通信", "CPO", "光学", "存储", "PCB", "算力", "数据中心", "液冷")),
+    (
+        "科技硬件",
+        (
+            "芯片",
+            "半导体",
+            "电子",
+            "通信",
+            "CPO",
+            "光学",
+            "存储",
+            "PCB",
+            "算力",
+            "数据中心",
+            "液冷",
+        ),
+    ),
     ("资源金属", ("有色", "黄金", "金属", "稀土", "煤炭", "石油", "能源金属")),
     ("农业食品", ("农林牧渔", "种植", "粮食", "转基因", "养殖", "食品", "农业")),
     ("医药医疗", ("医药", "医疗", "生物", "创新药", "中药")),
@@ -22,7 +37,7 @@ def cluster_ranked_sectors(sectors: list[Any]) -> dict[str, Any]:
         if not row:
             continue
         name = str(row.get("name") or "")
-        cluster = _cluster(name)
+        cluster = cluster_of(name)
         if cluster is None:
             ungrouped.append(name)
             continue
@@ -55,13 +70,17 @@ def cluster_ranked_sectors(sectors: list[Any]) -> dict[str, Any]:
         "clusters": clusters,
         "ungrouped": ungrouped,
         "crowded": crowded,
-        "interpretation": (
-            "同一主题簇内的行业/概念高度重叠，只算一组风险暴露，不算多条独立确认。"
-        ),
+        "interpretation": ("同一主题簇内的行业/概念高度重叠，只算一组风险暴露，不算多条独立确认。"),
     }
 
 
-def _cluster(name: str) -> str | None:
+def cluster_of(name: str) -> str | None:
+    """板块名 → 主题簇名；对不上任何簇返回 None。
+
+    公开出来是给 `research/preopen.py` 用的：外盘映射指向的是「半导体」「存储芯片」
+    这类板块名，而盘前假设是按簇立的——「费半 −2% 利空半导体」要能落到「科技硬件」
+    这条假设上，两边得用**同一张**归簇表，否则同一个板块名在两处归到不同的簇。
+    """
     upper = name.upper()
     for cluster, terms in CLUSTERS:
         if any(term.upper() in upper for term in terms):

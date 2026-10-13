@@ -29,7 +29,7 @@ def _snapshot(*limit_up: LimitStock) -> LimitPoolSnapshot:
     return LimitPoolSnapshot(trade_date=date(2026, 8, 7), limit_up=list(limit_up))
 
 
-# ---- 首封时间 -------------------------------------------------------------
+# 首封时间
 
 
 def test_early_seal_ratio_counts_only_stamped_stocks() -> None:
@@ -62,7 +62,7 @@ def test_the_early_late_boundary_is_the_shared_constant() -> None:
     assert snap.early_seal_ratio == 0.0  # 等于分界线算晚，不算早
 
 
-# ---- 封单金额 -------------------------------------------------------------
+# 封单金额
 
 
 def test_median_seal_fund_is_not_dragged_by_one_giant() -> None:
@@ -87,7 +87,7 @@ def test_median_seal_fund_is_none_without_data() -> None:
     assert _snapshot(_stock("甲"), _stock("乙")).median_seal_fund is None
 
 
-# ---- 扎堆方向 -------------------------------------------------------------
+# 扎堆方向
 
 
 def test_sector_distribution_ranks_where_the_limit_ups_cluster() -> None:
@@ -116,7 +116,7 @@ def test_sector_distribution_breaks_ties_by_name_so_it_stays_diffable() -> None:
     assert snap.sector_distribution() == [("A行业", 1), ("B行业", 1)]
 
 
-# ---- 进简报 ---------------------------------------------------------------
+# 进简报
 
 
 def test_describe_carries_all_four_readings() -> None:
@@ -144,7 +144,7 @@ def test_describe_skips_a_reading_it_has_no_data_for() -> None:
     assert "涨停扎堆的行业" not in text
 
 
-# ---- 换手率：封单的另一面 --------------------------------------------------
+# 换手率：封单的另一面
 
 
 def test_median_turnover_reads_the_other_half_of_seal_strength() -> None:

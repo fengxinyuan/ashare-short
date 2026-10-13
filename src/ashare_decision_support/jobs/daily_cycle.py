@@ -11,15 +11,21 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.adapters.global_market import GlobalMarketAdapter
 from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
 from ashare_decision_support.jobs.advise import run_advise
 from ashare_decision_support.jobs.monitor import run_monitor
-from ashare_decision_support.jobs.morning import MorningConfig, Sources, run_morning
+from ashare_decision_support.jobs.morning import (
+    WIDE_MARKET_LIMIT,
+    MorningConfig,
+    Sources,
+    run_morning,
+)
 from ashare_decision_support.jobs.post_close import run_post_close
 from ashare_decision_support.jobs.review import run_review
+from ashare_decision_support.jobs.sources import default_news_source
 from ashare_decision_support.journal import Journal
 from ashare_decision_support.monitor import DEFAULT_LEVELS, SECTOR_EVERY
-from ashare_decision_support.news import AkshareNewsSource, NewsCache
 from ashare_decision_support.schedule import (
     TASK_MONITOR,
     TASK_MORNING,
@@ -54,6 +60,7 @@ def run_daily_cycle(
     sector_every: int = SECTOR_EVERY,
     calendar: TradingCalendar | None = None,
     progress: Callable[[str], Any] | None = None,
+    use_llm_news: bool = False,
     **daemon_kwargs: Any,
 ) -> dict[str, Any]:
     today = trade_date or beijing_today()
@@ -64,8 +71,8 @@ def run_daily_cycle(
 
     def news_task() -> dict:
         """只把当日舆情灌进缓存，让 08:20 的主链路直接命中，不重复拉。"""
-        source = AkshareNewsSource(cache=NewsCache(output))
-        docs, notes = source.fetch_market(today)
+        source = _cached_news()
+        docs, notes = source.fetch_market(today, limit=WIDE_MARKET_LIMIT)
         announcements, notice_notes = source.fetch_announcements(today)
         return {
             "docs": len(docs),
@@ -73,12 +80,9 @@ def run_daily_cycle(
             "notes": notes + notice_notes,
         }
 
-    def _cached_news() -> Any | None:
+    def _cached_news() -> Any:
         """08:00 已经把当日舆情写进缓存，后面的任务复用同一份，不再重复拉。"""
-        try:
-            return AkshareNewsSource(cache=NewsCache(output))
-        except RuntimeError:
-            return None
+        return default_news_source(output)
 
     def morning_task() -> dict:
         industry, concept = static_taxonomies()
@@ -88,6 +92,7 @@ def run_daily_cycle(
                 writer=writer(),
                 debate=debate(),
                 notifiers=notifiers("morning"),
+                global_market_adapter=GlobalMarketAdapter(),
                 industry_taxonomy=industry,
                 concept_taxonomy=concept,
             ),
@@ -96,18 +101,21 @@ def run_daily_cycle(
                 top_sectors=top_sectors,
                 candidates_per_sector=candidates_per_sector,
                 max_constituents=max_constituents,
+                use_llm_news=use_llm_news,
             ),
             trade_date=today,
             progress=progress,
         )
 
     def preopen_task() -> dict:
-        symbols = Positions().symbols()
+        positions = Positions()
+        symbols = positions.symbols()
         if not symbols:
             return {"skipped": "持仓表为空，09:15 这一轮没有要算价位的票"}
         return run_advise(
             adapter=adapter_factory(),
             symbols=symbols,
+            positions=positions,
             output_dir=output,
             trade_date=today,
             writer=writer(),
@@ -125,6 +133,7 @@ def run_daily_cycle(
             trade_date=today,
             alert_levels=alert_levels,
             news_source=_cached_news(),
+            output_dir=output,
             notifiers=notifiers("alerts"),
             sectors=sectors,
             sector_every=sector_every,
@@ -140,6 +149,7 @@ def run_daily_cycle(
             output_dir=str(output),
             trade_date=today,
             debate=debate(),
+            notifiers=notifiers("postclose"),
             security_master_adapter=SecurityMasterAdapter(),
         )
 

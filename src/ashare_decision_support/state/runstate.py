@@ -13,8 +13,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.numeric import as_int
 from ashare_decision_support.state.paths import state_path
-from ashare_decision_support.state.store import read_json, write_json
+from ashare_decision_support.state.store import read_json_object, record_map, write_json
 
 STATE_FILE = "daemon_state.json"
 
@@ -31,19 +32,23 @@ class DaemonState:
     @classmethod
     def load(cls, day: date, path: Path | None = None) -> DaemonState:
         resolved = Path(path) if path is not None else state_path(STATE_FILE)
-        payload = read_json(resolved, default={}) or {}
+        payload = read_json_object(resolved)
         # A state file from a previous day describes a previous day. Starting
         # clean is the only correct reading of it.
         if payload.get("day") != str(day):
             return cls(day=day, path=resolved, tasks={})
-        return cls(day=day, path=resolved, tasks=payload.get("tasks") or {})
+        tasks = {
+            key: {**row, "attempts": max(0, as_int(row.get("attempts")))}
+            for key, row in record_map(payload.get("tasks")).items()
+        }
+        return cls(day=day, path=resolved, tasks=tasks)
 
     def is_done(self, task: str) -> bool:
         """Only a success counts as done — a failed task is retried next tick."""
         return self.tasks.get(task, {}).get("status") == STATUS_OK
 
     def attempts(self, task: str) -> int:
-        return int(self.tasks.get(task, {}).get("attempts", 0))
+        return max(0, as_int(self.tasks.get(task, {}).get("attempts")))
 
     def record(
         self,
@@ -53,11 +58,10 @@ class DaemonState:
         summary: Any = None,
         error: str | None = None,
     ) -> None:
-        previous = self.tasks.get(task, {})
         self.tasks[task] = {
             "status": status,
             "at": now.isoformat(timespec="seconds"),
-            "attempts": int(previous.get("attempts", 0)) + 1,
+            "attempts": self.attempts(task) + 1,
             "summary": summary,
             "error": error,
         }

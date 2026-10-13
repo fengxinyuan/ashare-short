@@ -105,8 +105,6 @@ class FeishuNotifier(Notifier):
         self.last_error = None
         return True
 
-    # ---- internals -------------------------------------------------------
-
     def _mode(self) -> str | None:
         if self.webhook_url:
             return "webhook"
@@ -128,9 +126,8 @@ class FeishuNotifier(Notifier):
             if not value
         ]
         if missing:
-            return (
-                f"未配置飞书推送；需设置 {ENV_WEBHOOK}，或应用凭证模式下的 "
-                + " / ".join(missing)
+            return f"未配置飞书推送；需设置 {ENV_WEBHOOK}，或应用凭证模式下的 " + " / ".join(
+                missing
             )
         return f"未配置 {ENV_WEBHOOK}"
 
@@ -164,7 +161,9 @@ class FeishuNotifier(Notifier):
             return False
         code = body.get("code", body.get("StatusCode", 0))
         if code:
-            self.last_error = f"飞书返回 code={code} msg={body.get('msg') or body.get('StatusMessage')}"
+            self.last_error = (
+                f"飞书返回 code={code} msg={body.get('msg') or body.get('StatusMessage')}"
+            )
             return False
         return True
 

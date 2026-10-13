@@ -43,6 +43,58 @@ EXPECT_INLINE_TERMS = ("符合预期", "持平预期")
 HAWKISH_TERMS = ("加息", "鹰派", "转鹰", "higher for longer", "维持高利率", "缩表")
 DOVISH_TERMS = ("降息", "鸽派", "转鸽", "降准", "降息预期升温", "流动性投放")
 
+# 各话题的触发词。**只写这一份。** 链路函数判「这条新闻归不归这个话题」与
+# `_categories_of` 数覆盖用的必须是同一组词——此前两处各抄一遍，往一边加个词而
+# 忘了另一边，结果是「覆盖计数说有油价新闻」和「链路里没有油价那条」在同一天
+# 同时成立，而两边都不报错。
+OIL_TERMS = ("原油", "布伦特", "WTI")
+GOLD_TERMS = ("黄金", "现货金", "COMEX黄金", "金价")
+USD_TERMS = ("美元指数", "美元", "人民币", "离岸人民币")
+CHINA_MACRO_TERMS = ("PMI", "社融", "信贷", "进出口", "GDP", "CPI", "PPI", "工业增加值")
+US_MACRO_TERMS = ("非农", "美债", "美国CPI", "美国PCE", "美国失业率", "美国通胀")
+EARNINGS_TERMS = ("财报", "业绩", "中报", "半年报", "业绩预告", "业绩快报")
+US_EQUITY_TERMS = ("纳斯达克", "标普500", "道琼斯", "费城半导体", "费半")
+KOREA_TERMS = ("韩国股市", "韩股", "KOSPI", "KOSDAQ", "三星电子", "SK海力士")
+METAL_TERMS = ("铜", "COMEX铜", "伦铜", "铜价", "铝价", "锂价", "稀土")
+GEOPOLITICS_TERMS = (
+    "关税",
+    "制裁",
+    "出口管制",
+    "实体清单",
+    "科技封锁",
+    "中美",
+    "台海",
+    "中东局势",
+    "红海",
+)
+POLICY_TERMS = (
+    "中央汇金",
+    "国家队",
+    "增持ETF",
+    "ETF增持",
+    "平准基金",
+    "维稳",
+    "稳定资本市场",
+    "资本市场改革",
+    "产业支持",
+)
+
+# 覆盖计数按这张表数：一条新闻命中哪些话题。顺序只影响 `coverage` 的键序。
+TOPIC_TERMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (TOPIC_OIL, OIL_TERMS),
+    (TOPIC_GOLD, GOLD_TERMS),
+    (TOPIC_USD, USD_TERMS),
+    (TOPIC_RATES, HAWKISH_TERMS + DOVISH_TERMS),
+    (TOPIC_CHINA_MACRO, CHINA_MACRO_TERMS),
+    (TOPIC_US_MACRO, US_MACRO_TERMS),
+    (TOPIC_EARNINGS, EARNINGS_TERMS),
+    (TOPIC_US_EQUITIES, US_EQUITY_TERMS),
+    (TOPIC_KOREA, KOREA_TERMS),
+    (TOPIC_METALS, METAL_TERMS),
+    (TOPIC_GEOPOLITICS, GEOPOLITICS_TERMS),
+    (TOPIC_POLICY, POLICY_TERMS),
+)
+
 
 @dataclass(frozen=True)
 class MacroLink:
@@ -138,7 +190,18 @@ def read_macro_links(docs: list[NewsDoc] | None) -> MacroDigest:
         text = str(getattr(doc, "text", "") or "").strip()
         if not text:
             continue
-        for category in _categories_of(text):
+        # 利率方向必须由标题直接支持。长篇策略摘要常顺带提到加息/降息，
+        # 不能把整篇里的背景句当作标题所报道的利率事件。
+        #
+        # 校的是 `_trigger_title`（【】里那句或首句）而不是 `doc.title`：新浪快讯把
+        # 整段正文塞进 title，2026-09-14 实测「中信证券：维持对港股红利策略的推荐」
+        # 正文回顾两轮加息周期，按 title 校验照样命中，简报就印出「港股红利 →
+        # 利率偏鹰 → 偏空」。
+        categories = _categories_of(text)
+        trigger = _trigger_title(doc)
+        if TOPIC_RATES in categories and not _contains_any(trigger, HAWKISH_TERMS + DOVISH_TERMS):
+            categories = tuple(category for category in categories if category != TOPIC_RATES)
+        for category in categories:
             coverage[category] = coverage.get(category, 0) + 1
         expectation = expectation_of(text)
         if expectation != EXPECT_NONE:
@@ -173,15 +236,20 @@ def expectation_of(text: str) -> str:
 
 def _links_from_doc(doc: NewsDoc, expectation: str) -> list[MacroLink]:
     text = doc.text
-    title = doc.title or doc.text[:48]
+    title = _trigger_title(doc)
     evidence = (doc.title[:24] if doc.title else text[:24],)
     links: list[MacroLink] = []
 
     links.extend(_commodity_links(text, title, evidence, expectation))
     links.extend(_global_market_links(text, title, evidence, expectation))
-    links.extend(_product_links(text, title, evidence, expectation))
+    # 标题和正文逐句判断，避免把文章中不同段落的品类与涨跌拼成一条事件。
+    # 正文中的有效句子用句子本身作触发证据，不借用无关标题。
+    for sentence in _product_sentences(doc):
+        links.extend(
+            _product_links(sentence, sentence[:TRIGGER_MAX_CHARS], (sentence[:80],), expectation)
+        )
 
-    if _contains_any(text, ("美元指数", "美元", "人民币", "离岸人民币")):
+    if _contains_any(text, USD_TERMS):
         direction = _fx_direction(text)
         if direction != "mixed":
             links.append(
@@ -196,7 +264,7 @@ def _links_from_doc(doc: NewsDoc, expectation: str) -> list[MacroLink]:
                 )
             )
 
-    if _contains_any(text, HAWKISH_TERMS):
+    if _contains_any(title, HAWKISH_TERMS):
         links.append(
             MacroLink(
                 topic=TOPIC_RATES,
@@ -208,7 +276,7 @@ def _links_from_doc(doc: NewsDoc, expectation: str) -> list[MacroLink]:
                 expectation=expectation,
             )
         )
-    elif _contains_any(text, DOVISH_TERMS):
+    elif _contains_any(title, DOVISH_TERMS):
         links.append(
             MacroLink(
                 topic=TOPIC_RATES,
@@ -221,7 +289,7 @@ def _links_from_doc(doc: NewsDoc, expectation: str) -> list[MacroLink]:
             )
         )
 
-    if _contains_any(text, ("PMI", "社融", "信贷", "进出口", "GDP", "CPI", "PPI", "工业增加值")):
+    if _contains_any(text, CHINA_MACRO_TERMS):
         direction = _macro_data_direction(text, expectation, china=True)
         if direction != "mixed":
             links.append(
@@ -236,7 +304,7 @@ def _links_from_doc(doc: NewsDoc, expectation: str) -> list[MacroLink]:
                 )
             )
 
-    if _contains_any(text, ("非农", "美债", "美国CPI", "美国PCE", "美国失业率", "美国通胀")):
+    if _contains_any(text, US_MACRO_TERMS):
         direction = _macro_data_direction(text, expectation, china=False)
         if direction != "mixed":
             links.append(
@@ -251,10 +319,7 @@ def _links_from_doc(doc: NewsDoc, expectation: str) -> list[MacroLink]:
                 )
             )
 
-    if (
-        _contains_any(text, ("财报", "业绩", "中报", "半年报", "业绩预告", "业绩快报"))
-        and expectation != EXPECT_NONE
-    ):
+    if _contains_any(text, EARNINGS_TERMS) and expectation != EXPECT_NONE:
         links.append(
             MacroLink(
                 topic=TOPIC_EARNINGS,
@@ -278,7 +343,7 @@ def _commodity_links(
 ) -> list[MacroLink]:
     links: list[MacroLink] = []
     direction = _price_direction(text)
-    if _contains_any(text, ("原油", "布伦特", "WTI")) and direction != "mixed":
+    if _contains_any(text, OIL_TERMS) and direction != "mixed":
         upstream = ("石油石化", "油服", "油运") if direction == "bullish" else ("石油石化", "油服")
         links.append(
             MacroLink(
@@ -302,7 +367,7 @@ def _commodity_links(
                 expectation,
             )
         )
-    if _contains_any(text, ("黄金", "现货金", "COMEX黄金", "金价")) and direction != "mixed":
+    if _contains_any(text, GOLD_TERMS) and direction != "mixed":
         links.append(
             MacroLink(
                 TOPIC_GOLD,
@@ -397,6 +462,16 @@ def _product_links(
     ]
 
 
+def _product_sentences(doc: NewsDoc) -> tuple[str, ...]:
+    sentences = [doc.title.strip()]
+    sentences.extend(part.strip() for part in re.split(r"[。；;！？!?\n]", doc.summary))
+    return tuple(
+        sentence
+        for sentence in sentences
+        if sentence and not sentence.startswith(("另有报道", "回顾", "此前", "历史上"))
+    )
+
+
 def _product_name(text: str) -> str | None:
     marker = next((item for item in PRODUCT_MARKERS if item in text), None)
     if marker:
@@ -430,19 +505,19 @@ def _global_market_links(
     price_mappings = (
         (
             TOPIC_METALS,
-            ("铜", "COMEX铜", "伦铜", "铜价", "铝价", "锂价", "稀土"),
+            METAL_TERMS,
             "工业金属与资源品价格变化",
             ("有色金属", "资源股", "新能源上游"),
         ),
         (
             TOPIC_US_EQUITIES,
-            ("纳斯达克", "标普500", "道琼斯", "费城半导体", "费半"),
+            US_EQUITY_TERMS,
             "美股风险偏好与科技映射",
             ("AI算力", "半导体", "消费电子", "成长股估值"),
         ),
         (
             TOPIC_KOREA,
-            ("韩国股市", "韩股", "KOSPI", "KOSDAQ", "三星电子", "SK海力士"),
+            KOREA_TERMS,
             "韩股及存储/电子产业链映射",
             ("半导体", "存储芯片", "消费电子", "面板"),
         ),
@@ -454,10 +529,7 @@ def _global_market_links(
                 MacroLink(topic, title, mechanism, targets, direction, evidence, expectation)
             )
 
-    if _contains_any(
-        text,
-        ("关税", "制裁", "出口管制", "实体清单", "科技封锁", "中美", "台海", "中东局势", "红海"),
-    ):
+    if _contains_any(text, GEOPOLITICS_TERMS):
         links.append(
             MacroLink(
                 TOPIC_GEOPOLITICS,
@@ -470,20 +542,7 @@ def _global_market_links(
             )
         )
 
-    if _contains_any(
-        text,
-        (
-            "中央汇金",
-            "国家队",
-            "增持ETF",
-            "ETF增持",
-            "平准基金",
-            "维稳",
-            "稳定资本市场",
-            "资本市场改革",
-            "产业支持",
-        ),
-    ):
+    if _contains_any(text, POLICY_TERMS):
         links.append(
             MacroLink(
                 TOPIC_POLICY,
@@ -499,51 +558,8 @@ def _global_market_links(
 
 
 def _categories_of(text: str) -> tuple[str, ...]:
-    categories: list[str] = []
-    mapping = (
-        (TOPIC_OIL, ("原油", "布伦特", "WTI")),
-        (TOPIC_GOLD, ("黄金", "现货金", "COMEX黄金", "金价")),
-        (TOPIC_USD, ("美元指数", "美元", "人民币", "离岸人民币")),
-        (TOPIC_RATES, HAWKISH_TERMS + DOVISH_TERMS),
-        (TOPIC_CHINA_MACRO, ("PMI", "社融", "信贷", "进出口", "GDP", "CPI", "PPI", "工业增加值")),
-        (TOPIC_US_MACRO, ("非农", "美债", "美国CPI", "美国PCE", "美国失业率", "美国通胀")),
-        (TOPIC_EARNINGS, ("财报", "业绩", "中报", "半年报", "业绩预告", "业绩快报")),
-        (TOPIC_US_EQUITIES, ("纳斯达克", "标普500", "道琼斯", "费城半导体", "费半")),
-        (TOPIC_KOREA, ("韩国股市", "韩股", "KOSPI", "KOSDAQ", "三星电子", "SK海力士")),
-        (TOPIC_METALS, ("铜", "COMEX铜", "伦铜", "铜价", "铝价", "锂价", "稀土")),
-        (
-            TOPIC_GEOPOLITICS,
-            (
-                "关税",
-                "制裁",
-                "出口管制",
-                "实体清单",
-                "科技封锁",
-                "中美",
-                "台海",
-                "中东局势",
-                "红海",
-            ),
-        ),
-        (
-            TOPIC_POLICY,
-            (
-                "中央汇金",
-                "国家队",
-                "增持ETF",
-                "ETF增持",
-                "平准基金",
-                "维稳",
-                "稳定资本市场",
-                "资本市场改革",
-                "产业支持",
-            ),
-        ),
-    )
-    for name, terms in mapping:
-        if _contains_any(text, terms):
-            categories.append(name)
-    return tuple(categories)
+    """一条新闻命中的话题，按 `TOPIC_TERMS` 的顺序。与链路函数用同一张词表。"""
+    return tuple(name for name, terms in TOPIC_TERMS if _contains_any(text, terms))
 
 
 def _price_direction(text: str) -> str:
@@ -570,16 +586,52 @@ def _macro_data_direction(text: str, expectation: str, *, china: bool) -> str:
 
 
 def _fx_direction(text: str) -> str:
-    dollar_up = ("美元指数" in text or "美元" in text) and _contains_any(text, UP_TERMS)
-    dollar_down = ("美元指数" in text or "美元" in text) and _contains_any(text, DOWN_TERMS)
-    rmb_down = ("人民币" in text or "离岸人民币" in text) and _contains_any(text, DOWN_TERMS)
-    rmb_up = ("人民币" in text or "离岸人民币" in text) and _contains_any(text, UP_TERMS)
+    dollar_up = bool(_DOLLAR_UP.search(text))
+    dollar_down = bool(_DOLLAR_DOWN.search(text))
+    rmb_down = bool(_RMB_DOWN.search(text))
+    rmb_up = bool(_RMB_UP.search(text))
 
-    if dollar_up or rmb_down:
+    if (dollar_up or rmb_down) and not (dollar_down or rmb_up):
         return "bullish"
-    if dollar_down or rmb_up:
+    if (dollar_down or rmb_up) and not (dollar_up or rmb_down):
         return "bearish"
     return "mixed"
+
+
+# 方向词必须紧跟在「美元/人民币」后面（中间最多隔几个字），而且「美元」前面不能是
+# 数字或亿/万——「软银投入 650 亿美元 … 股价大跌 13%」全文同时含「美元」和「大跌」，
+# 此前被读成「美元走弱→人民币资产偏多」，与那条新闻的意思正好相反。
+_UNIT_GUARD = r"(?<![\d亿万千百兆.])"
+_UP_ALT = "|".join(sorted((*UP_TERMS, "走强", "升值", "拉升"), key=len, reverse=True))
+_DOWN_ALT = "|".join(sorted((*DOWN_TERMS, "走弱", "贬值", "跳水"), key=len, reverse=True))
+_GAP = r"[^，。；、\d%]{0,6}"
+_DOLLAR_UP = re.compile(_UNIT_GUARD + r"美元(?:指数)?" + _GAP + f"(?:{_UP_ALT})")
+_DOLLAR_DOWN = re.compile(_UNIT_GUARD + r"美元(?:指数)?" + _GAP + f"(?:{_DOWN_ALT})")
+_RMB_UP = re.compile(r"人民币(?:汇率|中间价|指数)?" + _GAP + f"(?:{_UP_ALT})")
+_RMB_DOWN = re.compile(r"人民币(?:汇率|中间价|指数)?" + _GAP + f"(?:{_DOWN_ALT})")
+
+
+def _trigger_title(doc: NewsDoc) -> str:
+    """简报里那一行的触发句。
+
+    快讯源常把整段正文塞在 title 里，一条三百字的「【软银大跌】……」会原样印成
+    一行。有【】标题的取括号里那句；没有的截到第一个句号，再不行就硬截。
+    """
+    raw = (doc.title or doc.text).strip()
+    match = re.match(r"^【([^】]{2,80})】", raw)
+    if match:
+        return match.group(1).strip()
+    if len(raw) <= TRIGGER_MAX_CHARS:
+        return raw
+    head = raw[:TRIGGER_MAX_CHARS]
+    cut = max(head.rfind("。"), head.rfind("；"))
+    if cut >= TRIGGER_MIN_CHARS:
+        return head[:cut]
+    return head.rstrip("，、：") + "…"
+
+
+TRIGGER_MAX_CHARS = 60
+TRIGGER_MIN_CHARS = 16
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:

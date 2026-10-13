@@ -94,9 +94,14 @@ def test_movers_takes_both_ends_not_just_the_winners() -> None:
     只取涨幅榜会让「昨夜费半 −2.1%」整条消失，而那恰好是最该被看到的一条。
     """
     rows = sorted(
-        [_reading("up1", 9.0), _reading("up2", 8.0), _reading("mid", 0.6),
-         *[_reading(f"f{i}", 5.0 - i * 0.1) for i in range(12)],
-         _reading("dn1", -7.0), _reading("dn2", -6.0)],
+        [
+            _reading("up1", 9.0),
+            _reading("up2", 8.0),
+            _reading("mid", 0.6),
+            *[_reading(f"f{i}", 5.0 - i * 0.1) for i in range(12)],
+            _reading("dn1", -7.0),
+            _reading("dn2", -6.0),
+        ],
         key=lambda item: item.change_pct,
         reverse=True,
     )
@@ -124,9 +129,7 @@ def test_movers_below_the_cap_returns_them_all_without_duplicating() -> None:
 def test_not_requested_and_nothing_moved_read_differently() -> None:
     """这两件事对开盘预案是相反的信息，不能长成同一段空白。"""
     not_requested = _overseas_lines({})
-    quiet = _overseas_lines(
-        _overseas_payload(_Adapter([_reading("flat", 0.1, GROUP_COMMODITY)]))
-    )
+    quiet = _overseas_lines(_overseas_payload(_Adapter([_reading("flat", 0.1, GROUP_COMMODITY)])))
 
     assert not_requested == ["- 未请求海外快照；不对隔夜风险偏好作数值判断。"]
     assert any("隔夜平静，不是没取到" in line for line in quiet)
@@ -161,9 +164,7 @@ def test_unavailable_instruments_are_listed_not_silently_dropped() -> None:
 
     assert "未覆盖：VIX（未启用备用源）" in text
     # 取不到读数的不该混进任何一组的排序里。
-    assert all(
-        item["key"] != "vix" for block in payload["groups"] for item in block["movers"]
-    )
+    assert all(item["key"] != "vix" for block in payload["groups"] for item in block["movers"])
 
 
 def test_overseas_payload_carries_cached_base_rates(monkeypatch) -> None:

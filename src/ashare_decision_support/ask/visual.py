@@ -108,9 +108,6 @@ def holding_line(decision: Decision) -> str | None:
     return "　".join(parts)
 
 
-# ---- internals -----------------------------------------------------------
-
-
 def _pos(price: float, low: float, span: float, width: int) -> int:
     if span <= 0:
         return 0

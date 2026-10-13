@@ -1,18 +1,16 @@
-"""交易日历：`refresh_from` 此前调错了适配器的签名，而错误被吞掉了。
-
-`adapters/base.py` 的契约是 **零参数**的 `get_trading_calendar()`，四个适配器
-无一例外。`refresh_from` 却按 `(start, end)` 调它——任何适配器都会抛 `TypeError`，
-而函数里那个 `except Exception: return 0` 把它咽成「这个源没有日历」。
-
-于是刷新永远返回 0、节假日表永远是空的，而这和「免费档确实不提供日历」
-长得一模一样。这组测试就是为了让这两件事再也长得不一样。
-"""
+"""交易日历的适配器契约、缺失数据恢复与刷新范围。"""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
-from ashare_decision_support.schedule.calendar import TradingCalendar
+import pytest
+
+from ashare_decision_support.schedule.calendar import (
+    TradingCalendar,
+    next_session,
+    session_forming,
+)
 
 # 2026-10-01 是周四（工作日却休市 → 应进 holidays）
 # 2026-08-01 是周六（周末却开市 → 应进 workdays，调休）
@@ -92,6 +90,7 @@ def test_the_count_is_this_years_trading_days_not_the_sources_whole_history() ->
 def test_refresh_survives_a_source_that_has_no_calendar() -> None:
     """TickFlow 免费档 `get_trading_calendar()` 返回空列表。保持现状、返回 0，
     而不是把整张表清空——清空等于把已有的节假日信息丢掉。"""
+
     class Empty:
         def get_trading_calendar(self) -> list[date]:
             return []
@@ -123,3 +122,88 @@ def test_an_unconfigured_calendar_says_so_instead_of_claiming_certainty() -> Non
     assert calendar.configured is False
     assert calendar.is_trading_day(date(2026, 8, 3)) is True
     assert "未经假期校验" in calendar.explain(date(2026, 8, 3))
+
+
+@pytest.mark.parametrize(
+    "days",
+    [
+        [date(2025, 8, 1)],
+        ["bad", "2026-08-03"],
+        "2026-08-03",
+        {"date": "2026-08-03"},
+    ],
+)
+def test_unusable_or_wrong_year_calendar_does_not_close_every_weekday(days) -> None:
+    class Source:
+        def get_trading_calendar(self):
+            return days
+
+    calendar = TradingCalendar()
+    calendar.save([NATIONAL_DAY], [MAKEUP_SATURDAY])
+    before = calendar.path.read_bytes()
+
+    assert calendar.refresh_from(Source(), 2026) == 0
+    assert calendar.path.read_bytes() == before
+    assert calendar.is_trading_day(date(2026, 8, 3)) is True
+
+
+def test_partial_history_only_refreshes_covered_dates_and_keeps_other_years() -> None:
+    class Source:
+        def get_trading_calendar(self):
+            return [date(2025, 12, 31), date(2026, 1, 5), date(2026, 1, 7)]
+
+    calendar = TradingCalendar()
+    calendar.save(["2025-10-01", NATIONAL_DAY], [MAKEUP_SATURDAY])
+
+    assert calendar.refresh_from(Source(), 2026) == 2
+
+    reloaded = TradingCalendar()
+    assert reloaded.is_trading_day(date(2026, 1, 6)) is False
+    assert reloaded.is_trading_day(date(2026, 1, 8)) is True
+    assert {"2025-10-01", NATIONAL_DAY} <= reloaded.holidays
+    assert MAKEUP_SATURDAY in reloaded.workdays
+
+
+def test_calendar_refresh_normalizes_date_formats_before_classifying_holidays() -> None:
+    class Source:
+        def get_trading_calendar(self):
+            return ["20260803", "2026-08-04T15:00:00+08:00", "2026-08-04T17:00:00Z"]
+
+    calendar = TradingCalendar()
+    assert calendar.refresh_from(Source(), 2026) == 3
+
+    assert all(calendar.is_trading_day(date(2026, 8, day)) for day in (3, 4, 5))
+    assert calendar.is_trading_day(date(2026, 7, 31)) is True
+    assert calendar.is_trading_day(date(2026, 8, 6)) is True
+
+
+def test_next_session_skips_weekends_and_listed_holidays() -> None:
+    """周日跑的盘前计划是给周一的；国庆当天跑的是给节后第一个交易日的。"""
+    calendar = TradingCalendar()
+    calendar.save([NATIONAL_DAY], [MAKEUP_SATURDAY])
+
+    assert next_session(date(2026, 9, 14), calendar) == date(2026, 9, 14)  # 周一，开市
+    assert next_session(date(2026, 9, 13), calendar) == date(2026, 9, 14)  # 周日 → 周一
+    assert next_session(date(2026, 10, 1), calendar) == date(2026, 10, 2)  # 节假日表
+    assert next_session(date(2026, 8, 1), calendar) == date(2026, 8, 1)  # 调休周六，开市
+    # 不传日历读默认表；用例隔离的状态目录里没有表，退回只排除周末。
+    assert next_session(date(2026, 9, 12)) == date(2026, 9, 14)
+
+
+@pytest.mark.parametrize(
+    "moment, forming",
+    [
+        (datetime(2026, 9, 14, 8, 20), False),  # 盘前：上一交易日的整段
+        (datetime(2026, 9, 14, 9, 15), True),  # 集合竞价开始报价
+        (datetime(2026, 9, 14, 9, 33), True),  # 2026-09-14 实测跑批的时刻
+        (datetime(2026, 9, 14, 12, 0), True),  # 午休：成交额只是上半场
+        (datetime(2026, 9, 14, 15, 0), False),  # 收盘：今天的整段
+        (datetime(2026, 9, 13, 10, 0), False),  # 周日：没有交易日在形成
+        (datetime(2026, 10, 1, 10, 0), False),  # 节假日表里的休市日
+    ],
+)
+def test_session_forming_is_the_intersection_of_calendar_and_clock(moment, forming) -> None:
+    calendar = TradingCalendar()
+    calendar.save([NATIONAL_DAY], [MAKEUP_SATURDAY])
+
+    assert session_forming(moment, calendar) is forming

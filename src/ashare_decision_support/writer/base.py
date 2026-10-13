@@ -25,6 +25,11 @@ class WriteRequest:
     brief — auction discipline, caveats, the disclaimer. It is appended after
     generation rather than described in the prompt, because a model asked to
     "keep the risk warnings" quietly drops them when it summarises.
+
+    `verbatim_sections` names the sections (by heading) that the caller will
+    re-attach from the template if the model leaves them out — the sector
+    ranking and candidate level tables. They are named in the prompt so the
+    model does not paraphrase price levels it was never meant to restate.
     """
 
     title: str
@@ -32,6 +37,7 @@ class WriteRequest:
     fallback_markdown: str
     audience_note: str = ""
     mandatory_suffix: str = ""
+    verbatim_sections: tuple[str, ...] = ()
 
 
 @dataclass

@@ -1,16 +1,7 @@
-"""Command-line entry point.
+"""命令行入口：全天调度、单次分析、持仓维护和诊断。
 
-系统有两种用法，命令集也按这两种组织：
-
-**自动运行**（主体）——`daemon` 按时间表跑全天：舆情采集 → 盘前主链路 → 执行卡 →
-盘中监控 → 盘后复盘 → 兑现核对，结果推到控制台/文件/飞书。见 `docs/ARCHITECTURE.md`。
-
-**手工插问**——`morning` / `advise` / `monitor` / `chat` / `review` 单独跑同一批任务，
-用于调试、补跑，或者你想立刻看一眼。
-
-**标的由你给出。** 接受 `--symbols` 的命令省略它时只回落到持仓表（`position`），
-不存在第二份「系统替你维护的名单」——自选股与候选池已删，见 `state/positions.py`。
-"""
+自动调度与手动命令复用 jobs 任务。个股命令优先使用显式代码，省略时读取持仓。
+参数在各 _parser_* 中维护，处理函数由 COMMANDS 分派。"""
 
 from __future__ import annotations
 
@@ -24,12 +15,11 @@ from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
 
-from ashare_decision_support.adapters.akshare_adapter import AkshareAdapter
+from ashare_decision_support.adapters.akshare_calendar import AkshareCalendarAdapter
 from ashare_decision_support.adapters.base import SUPPORTED_PERIODS, fetch_daily_bars
 from ashare_decision_support.adapters.freshness import check_intraday_freshness
 from ashare_decision_support.adapters.global_market import GlobalMarketAdapter
 from ashare_decision_support.adapters.overseas_history import OverseasHistoryAdapter
-from ashare_decision_support.adapters.qmt_xtdata import QmtAdapterError, QmtXtDataAdapter
 from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
 from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter
 from ashare_decision_support.adapters.ths_sector_index import (
@@ -67,7 +57,9 @@ from ashare_decision_support.jobs import (
     run_pre_open,
     run_review,
 )
+from ashare_decision_support.jobs.daily_review import run_daily_review
 from ashare_decision_support.journal import Journal, summarize
+from ashare_decision_support.journal.records import DEFAULT_STRATEGY_VERSION
 from ashare_decision_support.monitor import (
     DEFAULT_LEVELS,
     LEVEL_ACTION,
@@ -76,6 +68,7 @@ from ashare_decision_support.monitor import (
     SECTOR_EVERY,
 )
 from ashare_decision_support.monitor.sector_triggers import fired_sectors_today
+from ashare_decision_support.notes import compact_notes
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.feishu import FeishuNotifier
 from ashare_decision_support.research import (
@@ -95,11 +88,12 @@ from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing
 from ashare_decision_support.sectors import ThsIndustryTaxonomy, static_taxonomies
 from ashare_decision_support.sectors.backtest import backtest_price_baselines
 from ashare_decision_support.sectors.confirmation_ledger import SectorConfirmationLedger
-from ashare_decision_support.signals import WyckoffAnalyzer
 from ashare_decision_support.state import Positions, state_home
+from ashare_decision_support.state.store import write_text
 from ashare_decision_support.strategy.overnight import (
     PROFILES,
     StrategyScreenConfig,
+    latest_signal_date,
     screen_all_profiles,
     screen_notes,
     screen_overnight,
@@ -117,11 +111,18 @@ from ashare_decision_support.writer.llm import LlmClient
 ALERT_LEVELS = [LEVEL_ACTION, LEVEL_WARN, LEVEL_INFO]
 
 
-# 三组会被多条命令重复添加的参数。提到模块层而不是留在 `build_parser` 里做闭包，
+# 四组会被多条命令重复添加的参数。提到模块层而不是留在 `build_parser` 里做闭包，
 # 是为了让每条命令的注册函数能独立存在——否则拆出去的函数还得把它们当参数传。
+# `--llm-provider` / `--llm-model` 只在 `_add_llm_args` 定义一次：写稿组复用它，
+# 而不是再写一遍同名参数。
 def _add_tickflow_args(sub) -> None:
     sub.add_argument("--api-key", help="TickFlow API key; omit for free mode")
     sub.add_argument("--base-url", help="Optional TickFlow base URL override")
+
+
+def _add_llm_args(sub) -> None:
+    sub.add_argument("--llm-provider", default=DEFAULT_PROVIDER, choices=sorted(PROVIDERS))
+    sub.add_argument("--llm-model", help="Override the provider's default model")
 
 
 def _add_writer_args(sub) -> None:
@@ -131,8 +132,7 @@ def _add_writer_args(sub) -> None:
         choices=["auto", "template", "llm"],
         help="默认 template 只走确定性；auto=有 key 用 LLM 改写，无 key 回退模板；llm 强制用 LLM",
     )
-    sub.add_argument("--llm-provider", default=DEFAULT_PROVIDER, choices=sorted(PROVIDERS))
-    sub.add_argument("--llm-model", help="Override the provider's default model")
+    _add_llm_args(sub)
 
 
 def _add_notify_args(sub) -> None:
@@ -144,12 +144,7 @@ def _add_notify_args(sub) -> None:
     sub.add_argument("--quiet", action="store_true", help="不打印简报正文到控制台")
 
 
-def _add_llm_args(sub) -> None:
-    sub.add_argument("--llm-provider", default=DEFAULT_PROVIDER, choices=sorted(PROVIDERS))
-    sub.add_argument("--llm-model", help="Override the provider's default model")
-
-
-# ---- 每条命令一个注册函数 ------------------------------------------------
+# 每条命令一个注册函数
 # 一条命令的全部参数收在一个函数里，加命令 = 加一个函数 + 在 `build_parser` 里
 # 加一行，而不是往一段两百行的顺序代码里再插十行。
 
@@ -194,7 +189,7 @@ def _parser_morning(subparsers) -> None:
         "morning", help="[需求1] 盘前趋势分析：舆情 → 大盘趋势 → 板块排序 → 板块内选股 → 当日候选"
     )
     morning.add_argument("--output-dir", default="briefs")
-    morning.add_argument("--level", default="SW1", choices=["SW1", "SW2", "SW3"])
+    morning.add_argument("--strategy-version", default=DEFAULT_STRATEGY_VERSION)
     morning.add_argument("--top-sectors", type=int, default=5)
     morning.add_argument("--top-concepts", type=int, default=3)
     morning.add_argument("--per-sector", type=int, default=3)
@@ -202,6 +197,11 @@ def _parser_morning(subparsers) -> None:
         "--position-factor", type=float, help="手工仓位系数 (0-1)，省略用系统建议值"
     )
     morning.add_argument("--no-news", action="store_true", help="跳过舆情与龙虎榜")
+    morning.add_argument(
+        "--force-refresh-daily",
+        action="store_true",
+        help="忽略已完成交易日的日线复用，重新向行情源取板块动量数据",
+    )
     morning.add_argument(
         "--no-llm-news", action="store_true", help="舆情归因只用关键词词典，不调大模型"
     )
@@ -318,6 +318,7 @@ def _parser_advise(subparsers) -> None:
     )
     advise.add_argument("--symbols", nargs="*", help="省略则读持仓")
     advise.add_argument("--output-dir", help="省略则只打印，不落盘")
+    advise.add_argument("--strategy-version", default=DEFAULT_STRATEGY_VERSION)
     advise.add_argument("--period", default="5", choices=list(SUPPORTED_PERIODS))
     advise.add_argument("--no-news", action="store_true", help="跳过个股舆情采集")
     advise.add_argument("--debate", action="store_true", help="开启多空辩论层（需 LLM key）")
@@ -373,7 +374,9 @@ def _parser_facts(subparsers) -> None:
         choices=["json", "text"],
         help="json=结构化事实包；text=直接输出人类可读摘要",
     )
-    facts.add_argument("--full", action="store_true", help="text 模式输出完整事实；默认输出精简摘要")
+    facts.add_argument(
+        "--full", action="store_true", help="text 模式输出完整事实；默认输出精简摘要"
+    )
     facts.add_argument(
         "--sections",
         nargs="+",
@@ -399,7 +402,9 @@ def _parser_preopen_research(subparsers) -> None:
         "preopen-research",
         help="[Codex] 导出盘前研报包：已落盘 facts + 海外市场快照 + 固定研判要求",
     )
-    research.add_argument("--output-dir", default="briefs", help=f"读取 {MORNING_LATEST_NAME} 的目录")
+    research.add_argument(
+        "--output-dir", default="briefs", help=f"读取 {MORNING_LATEST_NAME} 的目录"
+    )
     research.add_argument("--output", help="写入 JSON 研报包；省略则打印到控制台")
     research.add_argument("--format", choices=["json", "markdown"], default="json")
     research.add_argument(
@@ -428,9 +433,25 @@ def _parser_position(subparsers) -> None:
     position_sub.add_parser("clear", help="清空持仓表")
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return number
+
+
 def _parser_review(subparsers) -> None:
     review = subparsers.add_parser("review", help="兑现核对：T+1..T+5 对照实际走势，并出统计")
-    review.add_argument("--horizon", type=int, default=5, help="核对窗口（交易日）")
+    review.add_argument(
+        "--horizon", type=_positive_int, default=5, help="核对窗口（正整数，交易日）"
+    )
+    review.add_argument(
+        "--daily",
+        nargs="?",
+        const="today",
+        metavar="YYYY-MM-DD",
+        help="离线还原指定日的计划、盘中事件与次日复查项；省略日期表示今天",
+    )
     review.add_argument("--output-dir", default="briefs")
     _add_notify_args(review)
     _add_tickflow_args(review)
@@ -466,7 +487,7 @@ def _parser_post_close(subparsers) -> None:
     post_close.add_argument("--output-dir", default="briefs")
     post_close.add_argument("--days", type=int, default=180)
     post_close.add_argument("--top", type=int)
-    post_close.add_argument("--strategy-version", default="rule-v1")
+    post_close.add_argument("--strategy-version", default=DEFAULT_STRATEGY_VERSION)
     post_close.add_argument(
         "--position-factor", type=float, help="手工仓位系数 (0-1)，省略用情绪周期上限"
     )
@@ -478,24 +499,12 @@ def _parser_post_close(subparsers) -> None:
 def _parser_pre_open(subparsers) -> None:
     pre_open = subparsers.add_parser("pre-open-brief", help="次日盘前：把昨日执行卡复述一遍")
     pre_open.add_argument(
-        "--payload", help=f"盘后落盘的 {POST_CLOSE_LATEST_NAME}，省略则读 briefs/ 下最新一份"
+        "--payload",
+        help=f"盘后落盘的 {POST_CLOSE_LATEST_NAME}，省略则读 --output-dir 下那份（默认 briefs/）",
     )
-    pre_open.add_argument("--output-dir")
+    pre_open.add_argument("--output-dir", help="执行卡所在目录，也是本次提示的落盘目录")
     pre_open.add_argument("--refresh", action="store_true", help="重新取价而非复用盘后快照")
     _add_tickflow_args(pre_open)
-
-
-def _parser_wyckoff_scan(subparsers) -> None:
-    wyckoff_scan = subparsers.add_parser("wyckoff-scan", help="历史结构（威科夫）打分")
-    wyckoff_scan.add_argument("--symbols", nargs="+", required=True)
-    wyckoff_scan.add_argument(
-        "--source", default="tickflow", choices=["tickflow", "akshare", "qmt"]
-    )
-    wyckoff_scan.add_argument("--start")
-    wyckoff_scan.add_argument("--end")
-    wyckoff_scan.add_argument("--output")
-    wyckoff_scan.add_argument("--calendar-market", default="SH")
-    _add_tickflow_args(wyckoff_scan)
 
 
 def _parser_strategy_screen(subparsers) -> None:
@@ -512,14 +521,17 @@ def _parser_strategy_screen(subparsers) -> None:
     screen.add_argument("--price-min", type=float, default=3.0)
     screen.add_argument("--price-max", type=float, default=60.0)
     screen.add_argument("--min-amount-yi", type=float, default=5.0)
-    screen.add_argument("--allow-st", action="store_true", help="兼容旧命令：默认已纳入 ST/退市风险标的")
     screen.add_argument("--exclude-st", action="store_true", help="显式排除名称含 ST/退的标的")
-    screen.add_argument("--all-a", action="store_true", help="不限定沪深主板，纳入可识别的其他 A 股")
+    screen.add_argument(
+        "--all-a", action="store_true", help="不限定沪深主板，纳入可识别的其他 A 股"
+    )
     screen.add_argument("--limit", type=int, default=30)
     screen.add_argument("--days", type=int, default=240, help="日线回溯天数")
     screen.add_argument("--min-history-bars", type=int, default=65, help="最少有效日线根数")
     screen.add_argument("--output-dir", default="briefs")
-    screen.add_argument("--output", help=f"另写一份 JSON；省略则写 output-dir/{STRATEGY_SCREEN_LATEST_NAME}")
+    screen.add_argument(
+        "--output", help=f"另写一份 JSON；省略则写 output-dir/{STRATEGY_SCREEN_LATEST_NAME}"
+    )
     screen.add_argument("--min-atr-pct", type=float)
     screen.add_argument("--max-atr-pct", type=float)
     screen.add_argument("--min-range-position", type=float)
@@ -541,16 +553,21 @@ def _parser_external_research(subparsers) -> None:
     )
     leaders.add_argument("--output-dir", default="briefs")
     leaders.add_argument("--refresh", action="store_true", help="重新取全市场日线；默认只读缓存")
+    leaders.add_argument("--level", choices=["industry", "concept", "all"], default="all")
     leaders.add_argument(
-        "--level", choices=["industry", "concept", "all"], default="all"
-    )
-    leaders.add_argument("--industry-level", choices=["SW1", "SW2", "SW3"], default="SW1")
-    leaders.add_argument(
-        "--top", "--top-per-sector", dest="top", type=int, default=3,
+        "--top",
+        "--top-per-sector",
+        dest="top",
+        type=int,
+        default=3,
         help="每个板块保留几只",
     )
     leaders.add_argument(
-        "--days", "--lookback-days", dest="days", type=int, default=180,
+        "--days",
+        "--lookback-days",
+        dest="days",
+        type=int,
+        default=180,
         help="日线回溯自然日",
     )
     leaders.add_argument("--min-history-bars", type=int, default=65)
@@ -586,16 +603,13 @@ def _parser_diagnostics(subparsers) -> None:
         help="auto=按档位自动选；tickflow/sina=强制走某一路，用于两路对比",
     )
 
-    subparsers.add_parser("qmt-health", help="诊断：本地 QMT / xtdata 是否就绪")
     subparsers.add_parser("state", help="诊断：状态目录、持仓、任务完成情况")
 
     calendar_refresh = subparsers.add_parser(
         "calendar-refresh", help="从行情源刷新本地节假日表（holidays.json）"
     )
     calendar_refresh.add_argument("--year", type=int, default=None, help="默认当年")
-    calendar_refresh.add_argument(
-        "--source", default="akshare", choices=["akshare", "tickflow"]
-    )
+    calendar_refresh.add_argument("--source", default="akshare", choices=["akshare", "tickflow"])
     _add_tickflow_args(calendar_refresh)
 
     history = subparsers.add_parser(
@@ -639,7 +653,6 @@ def build_parser() -> argparse.ArgumentParser:
     # 日常闭环
     _parser_post_close(subparsers)
     _parser_pre_open(subparsers)
-    _parser_wyckoff_scan(subparsers)
     _parser_strategy_screen(subparsers)
     _parser_external_research(subparsers)
     # 诊断
@@ -647,30 +660,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# ---- helpers -------------------------------------------------------------
-
-
 def _dump_json(
     payload: object, output_path: str | None = None, *, echo_when_written: bool = False
 ) -> None:
     """写 JSON 产物；指定文件后不再把同一份大对象重复输出到终端。"""
     rendered = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-    if output_path:
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as handle:
-            handle.write(rendered)
-            handle.write("\n")
-        if not echo_when_written:
-            return
-    print(rendered)
+    _write_text(rendered, output_path)
+    if output_path and echo_when_written:
+        print(rendered)
 
 
 def _write_text(rendered: str, output_path: str | None = None) -> None:
     """写文本产物；未指定路径时才输出到终端。"""
     if output_path:
-        target = Path(output_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(rendered + "\n", encoding="utf-8")
+        write_text(Path(output_path), rendered + "\n")
         return
     print(rendered)
 
@@ -682,17 +685,40 @@ def _trim(summary: dict, drop: set[str] = frozenset({"content", "facts"})) -> di
 def _morning_cli_summary(summary: dict) -> dict:
     """Return the operational receipt; the full auditable payload is already on disk."""
     keys = (
-        "title", "trade_date", "market_direction", "market_score", "limit_up",
-        "blowups", "blowup_rate", "max_streak", "sectors_ranked", "sectors_selected",
-        "industry_sectors_selected", "concept_sectors_selected", "candidates",
-        "candidate_symbols", "funnel", "diagnostic", "diagnostic_mode",
-        "suggested_position_factor", "position_factor", "rotation_regime",
-        "rotation_switch", "rotation_adjacent", "turnover_total_change", "journal_records",
-        "writer", "used_fallback", "delivered", "payload_path", "brief_path",
+        "title",
+        "trade_date",
+        "market_direction",
+        "market_score",
+        "limit_up",
+        "blowups",
+        "blowup_rate",
+        "max_streak",
+        "sectors_ranked",
+        "sectors_selected",
+        "industry_sectors_selected",
+        "concept_sectors_selected",
+        "candidates",
+        "candidate_symbols",
+        "execution_ready",
+        "funnel",
+        "diagnostic",
+        "diagnostic_mode",
+        "suggested_position_factor",
+        "position_factor",
+        "rotation_regime",
+        "rotation_switch",
+        "rotation_adjacent",
+        "turnover_total_change",
+        "journal_records",
+        "writer",
+        "used_fallback",
+        "delivered",
+        "payload_path",
+        "brief_path",
     )
     compact = {key: summary.get(key) for key in keys if key in summary}
     notes = summary.get("data_notes") or []
-    compact["data_notes"] = notes[:8]
+    compact["data_notes"] = compact_notes(notes, 8)
     compact["data_notes_omitted"] = max(0, len(notes) - 8)
     compact["full_payload"] = summary.get("payload_path")
     return compact
@@ -746,16 +772,6 @@ def _adjudicator(args) -> LevelAdjudicator | None:
     return judge if judge.configured else None
 
 
-def _news_source(cache_dir: str | Path | None):
-    """公告与舆情源。akshare 没装就返回 None，调用方按缺输入降级。"""
-    try:
-        from ashare_decision_support.news import AkshareNewsSource, NewsCache
-
-        return AkshareNewsSource(cache=NewsCache(cache_dir) if cache_dir else None)
-    except Exception:
-        return None
-
-
 def _notifiers(args, output_dir: str | Path | None, slug: str) -> list:
     """控制台与文件始终保留——飞书挂了，本地仍有完整记录。"""
     channels: list = []
@@ -773,12 +789,7 @@ def _notifiers(args, output_dir: str | Path | None, slug: str) -> list:
 
 
 def _explicit_symbols(args) -> list[str]:
-    """命令行上真正写出来的标的。位置参数与 `--symbols` 等价。
-
-    两者合并在这里而不是各命令自己拼：README 与 USAGE 一直写的是
-    `ashare-ds advise 600519.SH`，而解析器此前只认 `--symbols`——照文档敲的那条
-    命令直接以 `unrecognized arguments` 退出。
-    """
+    """合并位置参数与 --symbols，归一化代码并按输入顺序去重。"""
     raw = [
         *(getattr(args, "symbols_positional", None) or []),
         *(getattr(args, "symbols", None) or []),
@@ -787,40 +798,12 @@ def _explicit_symbols(args) -> list[str]:
 
 
 def _resolve_symbols(args) -> list[str]:
-    """要算哪几只：命令行给的，否则持仓。
-
-    **没有第三种来源。** 自选股与候选池删掉之前，省略 `--symbols` 会静默地把
-    十几只你今天根本没在看的票拉进来算一遍——结论看起来一样正常，代价是几十次
-    取数和一份不知道自己在回答谁的输出。
-    """
+    """使用显式代码；未指定时读取持仓。"""
     return _explicit_symbols(args) or Positions().symbols()
-
-
-def _source_adapter(args):
-    if args.source == "tickflow":
-        return _tickflow(args)
-    if args.source == "akshare":
-        return AkshareAdapter()
-    return QmtXtDataAdapter(calendar_market=args.calendar_market)
 
 
 def _optional_date(value: str | None, fallback: date) -> date:
     return date.fromisoformat(value) if value else fallback
-
-
-def _qmt_health() -> dict:
-    """QMT 未开通是预期状态，诊断命令要如实报告而不是抛栈。"""
-    try:
-        payload = QmtXtDataAdapter().health_check()
-    except QmtAdapterError as exc:
-        return {
-            "adapter": "QmtXtDataAdapter",
-            "ready": False,
-            "connected": False,
-            "reason": str(exc),
-        }
-    payload["ready"] = True
-    return payload
 
 
 def _morning_facts(adapter) -> dict:
@@ -828,7 +811,7 @@ def _morning_facts(adapter) -> dict:
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
-        industry_taxonomy, concept_taxonomy = static_taxonomies("SW1")
+        industry_taxonomy, concept_taxonomy = static_taxonomies()
         run_morning(
             Sources(
                 adapter=adapter,
@@ -843,37 +826,29 @@ def _morning_facts(adapter) -> dict:
         return json.loads((Path(tmp) / MORNING_LATEST_NAME).read_text(encoding="utf-8"))
 
 
-def _security_master_reference() -> SecurityMasterAdapter:
-    return SecurityMasterAdapter()
+def _advise_facts(adapter, symbols: list[str], period: str) -> dict:
+    """ask/facts/chat 共用的现算价位入口，不发送通知、不写台账。"""
+    return run_advise(
+        adapter=adapter,
+        symbols=symbols,
+        period=period,
+        notifiers=[],
+        security_master_adapter=SecurityMasterAdapter(),
+    )["facts"]
 
 
 def _live_facts(args) -> Callable[[list[str]], dict] | None:
     """`ask` / `facts` 用来现算标的价位的回调，`--no-live` 时是 None。
-
-    两条命令要的是同一份东西：给一组代码，回来一份 `advise` 的 facts。此前两边
-    各写了一份逐字相同的闭包——同样的适配器、同样的 `period`、同样的空
-    `notifiers`。分开写没有让任何一边多表达什么，只是让「盘中现算走的是哪条
-    链路」变成了要对着读两处才能确认的事。
 
     闭包而不是直接算：只有真的问到标的时才构造适配器。盘前问「今天板块怎么排」
     不该因为建一个数据源失败而答不出来。
     """
     if args.no_live:
         return None
-
-    def compute(symbols: list[str]) -> dict:
-        return run_advise(
-            adapter=_tickflow(args),
-            symbols=symbols,
-            period=args.period,
-            notifiers=[],
-            security_master_adapter=_security_master_reference(),
-        )["facts"]
-
-    return compute
+    return lambda symbols: _advise_facts(_tickflow(args), symbols, args.period)
 
 
-# ---- dispatch ------------------------------------------------------------
+# dispatch
 
 
 # 命令名 → 处理函数。用表而不是 if/elif 链：链式写法下每加一个命令就多两个分支，
@@ -893,6 +868,7 @@ def _cmd_daemon(args) -> None:
         candidates_per_sector=args.per_sector,
         max_constituents=args.max_constituents,
         alert_levels=tuple(args.alert_levels),
+        use_llm_news=not args.no_llm_news,
         sectors=not getattr(args, "no_sectors", False),
         sector_every=getattr(args, "sector_every", SECTOR_EVERY),
         progress=_progress(args),
@@ -901,19 +877,20 @@ def _cmd_daemon(args) -> None:
 
 
 def _cmd_morning(args) -> None:
-    industry_taxonomy, concept_taxonomy = static_taxonomies(args.level)
+    industry_taxonomy, concept_taxonomy = static_taxonomies()
     summary = run_morning(
         Sources(
             adapter=_tickflow(args),
             writer=_writer(args),
             debate=_debate(args),
             notifiers=_notifiers(args, args.output_dir, "morning"),
+            global_market_adapter=GlobalMarketAdapter(),
             industry_taxonomy=industry_taxonomy,
             concept_taxonomy=concept_taxonomy,
         ),
         args.output_dir,
         config=MorningConfig(
-            sector_level=args.level,
+            strategy_version=args.strategy_version,
             top_sectors=args.top_sectors,
             top_concepts=args.top_concepts,
             candidates_per_sector=args.per_sector,
@@ -928,6 +905,7 @@ def _cmd_morning(args) -> None:
             use_broad_index=not args.no_broad_index,
             use_trade_flow=not args.no_trade_flow,
             use_concepts=not args.no_concepts,
+            force_refresh_daily=args.force_refresh_daily,
         ),
         progress=_progress(args),
     )
@@ -988,7 +966,9 @@ def _cmd_monitor(args) -> None:
         once=args.once,
         max_passes=args.max_passes,
         alert_levels=tuple(args.alert_levels),
-        news_source=None if getattr(args, "no_news", False) else _news_source(args.output_dir),
+        use_news=not getattr(args, "no_news", False),
+        news_cache_dir=args.output_dir,
+        output_dir=args.output_dir,
         use_order_book=not args.no_order_book,
         sectors=not getattr(args, "no_sectors", False),
         sector_every=getattr(args, "sector_every", SECTOR_EVERY),
@@ -1009,6 +989,7 @@ def _cmd_advise(args) -> None:
         symbols=symbols,
         output_dir=args.output_dir,
         period=args.period,
+        strategy_version=args.strategy_version,
         use_news=not args.no_news,
         use_order_book=not args.no_order_book,
         use_earnings=not args.no_earnings,
@@ -1016,11 +997,12 @@ def _cmd_advise(args) -> None:
         adjudicator=_adjudicator(args) if args.adjudicate else None,
         writer=_writer(args),
         notifiers=_notifiers(args, args.output_dir, "advice"),
-        security_master_adapter=_security_master_reference(),
+        security_master_adapter=SecurityMasterAdapter(),
         # 只有 `advise` 这条命令落台账。`ask` / `facts` / `chat` 也调 `run_advise`，
         # 但它们是**查**，不是发建议——把一次随口问的标的记成「系统当天的建议」，
         # 事后统计就分不清哪些是系统主动给的了。
         journal=Journal(),
+        positions=Positions(),
         progress=_progress(args),
     )
     _dump_json(_trim(summary))
@@ -1053,7 +1035,9 @@ def _cmd_facts(args) -> None:
         sections=args.sections,
     )
     if args.format == "text":
-        print(bundle.rendered if args.full else getattr(bundle, "compact_rendered", bundle.rendered))
+        print(
+            bundle.rendered if args.full else getattr(bundle, "compact_rendered", bundle.rendered)
+        )
         return
     _dump_json(bundle.to_dict(), args.output)
 
@@ -1072,19 +1056,10 @@ def _cmd_preopen_research(args) -> None:
 
 
 def _cmd_chat(args) -> None:
+    # 适配器只建一次：单票现算与板块事实共用同一个连接与配额。
     adapter = _tickflow(args)
-
-    def compute_symbols(symbols: list[str]) -> dict:
-        return run_advise(
-            adapter=adapter,
-            symbols=symbols,
-            period=args.period,
-            notifiers=[],
-            security_master_adapter=_security_master_reference(),
-        )["facts"]
-
     run_chat(
-        compute_symbols=compute_symbols,
+        compute_symbols=lambda symbols: _advise_facts(adapter, symbols, args.period),
         compute_sectors=lambda: _morning_facts(adapter),
         symbols=_resolve_symbols(args),
         responder=ChatResponder(LlmClient(provider=args.llm_provider, model=args.llm_model))
@@ -1098,6 +1073,15 @@ def _cmd_position(args) -> None:
 
 
 def _cmd_review(args) -> None:
+    if args.daily is not None:
+        day = beijing_today() if args.daily == "today" else date.fromisoformat(args.daily)
+        summary = run_daily_review(
+            args.output_dir,
+            trade_date=day,
+            notifiers=_notifiers(args, None, "review"),
+        )
+        _dump_json(_trim({key: value for key, value in summary.items() if key != "payload"}))
+        return
     summary = run_review(
         adapter=_tickflow(args),
         horizon=args.horizon,
@@ -1142,7 +1126,8 @@ def _cmd_post_close(args) -> None:
         use_limit_pool=not args.no_limit_pool,
         top_n=args.top,
         debate=_debate(args),
-        security_master_adapter=_security_master_reference(),
+        security_master_adapter=SecurityMasterAdapter(),
+        journal=Journal(),
     )
     _dump_json(_trim(summary))
 
@@ -1155,28 +1140,17 @@ def _cmd_pre_open(args) -> None:
             adapter=_tickflow(args) if args.refresh else None,
         )
     except FileNotFoundError as exc:
-        source = args.payload or f"briefs/{POST_CLOSE_LATEST_NAME}"
-        raise SystemExit(
-            f"未找到盘后执行卡 {source}；先运行 `ashare-ds post-close-brief`"
-        ) from exc
+        source = args.payload or f"{args.output_dir or 'briefs'}/{POST_CLOSE_LATEST_NAME}"
+        raise SystemExit(f"未找到盘后执行卡 {source}；先运行 `ashare-ds post-close-brief`") from exc
     except json.JSONDecodeError as exc:
         raise SystemExit(f"盘后执行卡不是有效 JSON：{exc.msg}") from exc
     _dump_json(_trim(summary))
 
 
-def _cmd_wyckoff_scan(args) -> None:
-    adapter = _source_adapter(args)
-    end = _optional_date(args.end, beijing_today())
-    start = _optional_date(args.start, end.replace(year=end.year - 1))
-    bars = adapter.get_historical_bars(args.symbols, start, end)
-    signals = WyckoffAnalyzer().analyze_many(bars)
-    _dump_json([signal.model_dump(mode="json") for signal in signals], args.output)
-
-
 def _cmd_strategy_screen(args) -> None:
     """Run the deterministic full-universe strategy scanner for AI consumption."""
     # 只要标的画像（名称与行业），不需要概念那一层，所以不走 `static_taxonomies`。
-    taxonomy = ThsIndustryTaxonomy(level="SW1")
+    taxonomy = ThsIndustryTaxonomy()
     profiles = taxonomy.snapshot.profiles
     end = beijing_today()
     print(
@@ -1186,13 +1160,20 @@ def _cmd_strategy_screen(args) -> None:
     )
     fetch_notes: list[str] = []
     bars = fetch_daily_bars(
-        _tickflow(args), sorted(profiles), end - timedelta(days=max(90, args.days)), end,
+        _tickflow(args),
+        sorted(profiles),
+        end - timedelta(days=max(90, args.days)),
+        end,
         notes=fetch_notes,
     )
     usable = sum(bool(rows) for rows in bars.values())
-    print(f"日线读取完成：{usable}/{len(profiles)} 只有数据，正在计算候选…", file=sys.stderr, flush=True)
+    print(
+        f"日线读取完成：{usable}/{len(profiles)} 只有数据，正在计算候选…",
+        file=sys.stderr,
+        flush=True,
+    )
     names = {symbol: profile.name for symbol, profile in profiles.items()}
-    sectors = {symbol: profile.industry("SW1") for symbol, profile in profiles.items()}
+    sectors = {symbol: profile.industry for symbol, profile in profiles.items()}
     common = {
         "price_min": args.price_min,
         "price_max": args.price_max,
@@ -1226,14 +1207,33 @@ def _cmd_strategy_screen(args) -> None:
             sectors=sectors,
             config=StrategyScreenConfig(profile=args.profile, **common),
         ).to_dict()
+    # `trade_date` 是信号日（最后一根日线），`as_of` 是跑批那天。事实包按前者判时效：
+    # 周一盘前读上周五的筛选，是「上一交易日」，不是「时点未知」。
+    signal_date = latest_signal_date(bars)
+    payload["trade_date"] = signal_date
     payload["as_of"] = str(end)
-    payload["data_notes"] = screen_notes(args.days, [*taxonomy.notes, *fetch_notes])
-    _dump_json(
-        payload,
-        args.output or str(Path(args.output_dir) / STRATEGY_SCREEN_LATEST_NAME),
-        # 默认模式既落最新缓存又给人看；显式 --output 通常是脚本调用，不重复刷 JSON。
-        echo_when_written=args.output is None,
+    payload["data_notes"] = screen_notes(
+        args.days, [*taxonomy.notes, *fetch_notes], signal_date=signal_date
     )
+    output_path = args.output or str(Path(args.output_dir) / STRATEGY_SCREEN_LATEST_NAME)
+    _dump_json(payload, output_path)
+    if args.output is None:
+        profiles = payload.get("profiles") or {}
+        counts = {
+            name: item.get("summary", {}).get("matched_total", 0) for name, item in profiles.items()
+        }
+        _dump_json(
+            {
+                "as_of": payload["as_of"],
+                "signal_date": signal_date,
+                "profile_matches": counts or {args.profile: payload["summary"]["matched_total"]},
+                "shortlist": len(
+                    payload.get("diversified_shortlist") or payload.get("candidates") or []
+                ),
+                "data_notes": payload["data_notes"],
+                "full_payload": output_path,
+            }
+        )
 
 
 def _cmd_sector_leaders(args) -> None:
@@ -1242,7 +1242,6 @@ def _cmd_sector_leaders(args) -> None:
         payload = refresh_sector_leaders(
             output_dir=args.output_dir,
             levels=levels,
-            industry_level=args.industry_level,
             top_per_sector=args.top,
             lookback_days=args.days,
             min_bars=args.min_history_bars,
@@ -1287,40 +1286,28 @@ def _cmd_intraday_check(args) -> None:
     )
 
 
-def _cmd_qmt_health(args) -> None:
-    _dump_json(_qmt_health())
-
-
 def _cmd_state(args) -> None:
     _dump_json(_state_report())
 
 
 def _cmd_calendar_refresh(args) -> None:
-    """把行情源的交易日历刷进 `holidays.json`。
-
-    这条命令此前**不存在**，而 `TradingCalendar.refresh_from` 是唯一能写这张表的
-    代码——于是表永远是空的，判定退化成「周末以外都算交易日」。它不是静默错误
-    （`explain()` 会老实说「未经假期校验」，`is_trading_day` 也刻意偏向「跑」），
-    但那张表除了手工编辑之外没有任何补上的办法。
-    """
+    """刷新源数据覆盖范围内的日历，缺数据时保留原表。"""
     calendar = TradingCalendar()
-    year = args.year or beijing_today().year
-    adapter = _tickflow(args) if args.source == "tickflow" else AkshareAdapter()
+    year = args.year if args.year is not None else beijing_today().year
+    adapter = _tickflow(args) if args.source == "tickflow" else AkshareCalendarAdapter()
     trading_days = calendar.refresh_from(adapter, year)
     _dump_json(
         {
             "year": year,
             "source": args.source,
             "path": str(calendar.path),
-            # 0 = 这个源给不出日历（免费档常见）。这时**保持原状**，不会把已有的
-            # 表清空——半张表比没有表更危险，它看起来是校验过的。
             "trading_days": trading_days,
             "holidays": len(calendar.holidays),
             "workdays": len(calendar.workdays),
             "note": (
-                f"{year} 年共 {trading_days} 个交易日，节假日表已更新"
+                f"已读取 {year} 年 {trading_days} 个交易日，仅更新源数据覆盖范围内的日历"
                 if trading_days
-                else f"{args.source} 给不出交易日历，节假日表保持原状（当前 "
+                else f"{args.source} 未提供 {year} 年有效交易日历，节假日表保持原状（当前 "
                 f"{len(calendar.holidays)} 个假日）"
             ),
         }
@@ -1371,13 +1358,11 @@ COMMANDS = {
     "codex-adjudication-validate": _cmd_codex_adjudication_validate,
     "post-close-brief": _cmd_post_close,
     "pre-open-brief": _cmd_pre_open,
-    "wyckoff-scan": _cmd_wyckoff_scan,
     "strategy-screen": _cmd_strategy_screen,
     "sector-leaders": _cmd_sector_leaders,
     "monthly-context": _cmd_monthly_context,
     "tick-health": _cmd_tick_health,
     "intraday-check": _cmd_intraday_check,
-    "qmt-health": _cmd_qmt_health,
     "state": _cmd_state,
     "calendar-refresh": _cmd_calendar_refresh,
     "history-refresh": _cmd_history_refresh,
@@ -1393,8 +1378,8 @@ def main() -> None:
     # 那是接线漏了一条命令，不该悄悄什么都不做。
     try:
         COMMANDS[args.command](args)
-    except RuntimeError as exc:
-        # 数据源不可用时，用户需要的是「哪一路失败」和退出码，不是内部调用栈。
+    except (OSError, RuntimeError, ValueError) as exc:
+        # 数据源不可用或输入不合法时，输出原因和退出码。
         # 详细异常已经在各层 notes 中保留；手工调试仍可直接调用对应 Python API。
         print(f"错误：{exc}", file=sys.stderr)
         raise SystemExit(2) from None
@@ -1415,8 +1400,9 @@ def _position_command(args) -> dict:
         return {"position": entry.to_dict(), "total": len(book)}
 
     if args.action == "close":
-        closed = [symbol for symbol in args.symbols if book.close(symbol)]
-        missing = [normalize_symbol(s) for s in args.symbols if normalize_symbol(s) not in closed]
+        symbols = list(dict.fromkeys(normalize_symbol(symbol) for symbol in args.symbols))
+        closed = [symbol for symbol in symbols if book.close(symbol)]
+        missing = [symbol for symbol in symbols if symbol not in closed]
         return {"closed": closed, "not_found": missing, "total": len(book)}
 
     if args.action == "clear":
@@ -1438,7 +1424,7 @@ def _position_command(args) -> dict:
 def _cached_security_master(entries: list):
     """缓存里的标的元数据；读不到就是 None，归并那一层会说明「没有分类」。
 
-    走 `cached()` 而不是 `_security_master_reference()` 那条：`position list`
+    走 `cached()` 读取本地元数据：`position list`
     是一条随手敲的查询命令，不该为了给持仓打行业标签去打一次外网。不到两只干脆
     不读——归并不出东西，而那份缓存解析一次 58ms（判据同 `MIN_CLUSTER_SYMBOLS`）。
     """
@@ -1488,10 +1474,7 @@ def _state_report() -> dict:
             "verifiable_total": sum(journal_kinds[kind] for kind in VERIFIABLE_KINDS),
             "outcomes": len(outcomes),
             "pending_verification": len(pending_rows),
-            "pending_by_kind": {
-                kind: pending_kinds[kind]
-                for kind in VERIFIABLE_KINDS
-            },
+            "pending_by_kind": {kind: pending_kinds[kind] for kind in VERIFIABLE_KINDS},
             "model_samples": outcome_stats["samples"],
             "model_ready_gap": outcome_stats["model_ready_gap"],
         },

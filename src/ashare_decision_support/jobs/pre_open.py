@@ -1,4 +1,4 @@
-"""次日盘前：把昨日盘后的执行卡复述一遍。
+"""次日盘前：交接昨日盘后的执行卡与复查项。
 
 不产生任何新的市场判断——开盘前没有当日分时，现算只会拿到昨天的数据然后被当成
 今天的。它的职责是在还来得及动手的时候，把价位、仓位上限与竞价纪律摆到眼前。
@@ -17,7 +17,10 @@ from ashare_decision_support.artifacts import POST_CLOSE_LATEST_NAME, SNAPSHOT_L
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier, render_pre_open_brief
 from ashare_decision_support.notify.base import Notifier, publish, written_path
+from ashare_decision_support.research.daily_review import render_next_checks
 from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.signals.series import parse_bar_date
+from ashare_decision_support.state.store import read_json_object
 
 
 def run_pre_open(
@@ -26,7 +29,14 @@ def run_pre_open(
     adapter: Any | None = None,
     notifiers: list[Notifier] | None = None,
 ) -> dict[str, Any]:
-    source = Path(payload_path) if payload_path else Path("briefs") / POST_CLOSE_LATEST_NAME
+    # 执行卡跟着 `output_dir` 走：盘后写到哪个目录，次日就从哪个目录读。此前不传
+    # `--payload` 时固定读 `briefs/`，`--output-dir` 只管写不管读，换个目录跑一轮会
+    # 拿到根目录里几周前的旧卡，而且看起来像正常输出。
+    source = (
+        Path(payload_path)
+        if payload_path
+        else Path(output_dir or "briefs") / POST_CLOSE_LATEST_NAME
+    )
     payload = json.loads(source.read_text(encoding="utf-8"))
 
     target_dir = Path(output_dir) if output_dir else source.parent
@@ -37,7 +47,21 @@ def run_pre_open(
     if snapshot_note:
         data_notes.append(snapshot_note)
 
+    review = payload.get("daily_review")
+    day = parse_bar_date(payload.get("trade_date"))
+    if not isinstance(review, dict) and day is not None:
+        review = read_json_object(source.parent / "daily-reviews" / f"{day}.json")
+    if (
+        not isinstance(review, dict)
+        or day is None
+        or parse_bar_date(review.get("trade_date")) != day
+    ):
+        review = {}
+        data_notes.append("缺少对应日期的每日复盘，次日复查项尚未交接")
+
     content = render_pre_open_brief(payload, snapshots, data_notes)
+    if review:
+        content += f"\n\n{render_next_checks(review)}"
     title = f"盘前提示（对应 {payload.get('trade_date')}）"
 
     file_notifier = FileNotifier(target_dir, slug="pre-open")
@@ -53,6 +77,7 @@ def run_pre_open(
         "data_notes": data_notes,
         "brief_path": written_path(channels, file_notifier),
         "content": content,
+        "next_checks": review.get("next_checks", []),
     }
 
 

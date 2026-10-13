@@ -11,7 +11,9 @@ from ashare_decision_support.scoring import RuleBasedScoreProvider, ScoreInput
 from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
 
 
-def make_bars(symbol: str, count: int = 140, start_price: float = 20.0, drift: float = 0.15) -> list[dict]:
+def make_bars(
+    symbol: str, count: int = 140, start_price: float = 20.0, drift: float = 0.15
+) -> list[dict]:
     """Synthetic daily bars with a steady drift, enough to fill the MA60 window."""
     bars: list[dict] = []
     price = start_price
@@ -53,7 +55,9 @@ class FakeAdapter:
 
 
 class FakeTradeFlow:
-    def __init__(self, symbol: str, buy_ratio: float, net_amount: float, large_net_amount: float) -> None:
+    def __init__(
+        self, symbol: str, buy_ratio: float, net_amount: float, large_net_amount: float
+    ) -> None:
         self.symbol = symbol
         self.buy_ratio = buy_ratio
         self.net_amount = net_amount
@@ -98,7 +102,9 @@ class FakeDetailAdapter:
 def score_for(symbol: str, bars: list[dict]):
     snapshot = DailyTechnicalAnalyzer().analyze(symbol, bars)
     wyckoff = WyckoffAnalyzer().analyze(symbol, bars)
-    return RuleBasedScoreProvider().score(ScoreInput(symbol=symbol, bars=bars, snapshot=snapshot, wyckoff=wyckoff))
+    return RuleBasedScoreProvider().score(
+        ScoreInput(symbol=symbol, bars=bars, snapshot=snapshot, wyckoff=wyckoff)
+    )
 
 
 def test_rule_based_scoring_prefers_uptrend_over_downtrend() -> None:
@@ -130,7 +136,10 @@ def test_file_notifier_reports_failure_instead_of_raising(tmp_path) -> None:
 
 
 def test_post_close_then_pre_open_round_trip(tmp_path) -> None:
-    bars = {"AAA.SH": make_bars("AAA.SH"), "BBB.SZ": make_bars("BBB.SZ", start_price=30.0, drift=0.05)}
+    bars = {
+        "AAA.SH": make_bars("AAA.SH"),
+        "BBB.SZ": make_bars("BBB.SZ", start_price=30.0, drift=0.05),
+    }
     adapter = FakeAdapter(bars)
 
     summary = run_post_close(
@@ -146,7 +155,10 @@ def test_post_close_then_pre_open_round_trip(tmp_path) -> None:
     assert summary["scored"] == 2
     assert summary["actionable"] + summary["watch_only"] == 2
     assert summary["regime"] == "未知"
-    assert Path(summary["brief_path"]).name == f"post-close-{summary['trade_date'].replace('-', '')}.md"
+    assert (
+        Path(summary["brief_path"]).name
+        == f"post-close-{summary['trade_date'].replace('-', '')}.md"
+    )
 
     payload_path = tmp_path / "post_close_latest.json"
     assert payload_path.exists()
@@ -191,9 +203,9 @@ def test_post_close_reports_why_a_name_is_not_buyable(tmp_path) -> None:
     assert summary["actionable"] == 0 and summary["watch_only"] == 1
 
     setup = payload["watch_only"][0]["setup"]
-    explained = [
-        text for entry in setup["rejected"] for text in entry["reasons"]
-    ] + list(setup["blocked_by_regime"])
+    explained = [text for entry in setup["rejected"] for text in entry["reasons"]] + list(
+        setup["blocked_by_regime"]
+    )
     assert explained, "「为什么不能买」必须被序列化出来，否则卡上只剩「没选上」"
 
     assert "只能看，不能做" in summary["content"]
@@ -201,7 +213,10 @@ def test_post_close_reports_why_a_name_is_not_buyable(tmp_path) -> None:
 
 
 def test_post_close_attaches_trade_flow_side_reading(tmp_path) -> None:
-    bars = {"AAA.SH": make_bars("AAA.SH"), "BBB.SZ": make_bars("BBB.SZ", start_price=30.0, drift=0.05)}
+    bars = {
+        "AAA.SH": make_bars("AAA.SH"),
+        "BBB.SZ": make_bars("BBB.SZ", start_price=30.0, drift=0.05),
+    }
 
     summary = run_post_close(
         adapter=FakeAdapter(bars),
@@ -233,18 +248,91 @@ def test_post_close_attaches_only_disclosed_lhb_seats(tmp_path) -> None:
                         "net_by_category": {"机构专用": 12_000_000.0},
                         "concentration": 0.08,
                     }
+
             return Read()
 
     run_post_close(
         adapter=FakeAdapter({"AAA.SH": make_bars("AAA.SH"), "BBB.SZ": make_bars("BBB.SZ")}),
-        symbols=["AAA.SH", "BBB.SZ"], output_dir=tmp_path, notifiers=[], use_limit_pool=False,
-        use_trade_flow=False, lhb_seat_adapter=Seats(),
+        symbols=["AAA.SH", "BBB.SZ"],
+        output_dir=tmp_path,
+        notifiers=[],
+        use_limit_pool=False,
+        use_trade_flow=False,
+        lhb_seat_adapter=Seats(),
     )
 
     payload = json.loads((tmp_path / "post_close_latest.json").read_text(encoding="utf-8"))
     rows = {row["symbol"]: row for row in payload["actionable"] + payload["watch_only"]}
     assert rows["AAA.SH"]["lhb_seats"]["covered"] is True
     assert "lhb_seats" not in rows["BBB.SZ"]
+
+
+def test_post_close_adds_a_compact_sector_confirmation_when_morning_exists(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps({"trade_date": "2026-08-28", "sectors": [{"name": "电子"}]}),
+        encoding="utf-8",
+    )
+
+    def fake_confirmation(output_dir):
+        return {
+            "as_of": "2026-08-28T14:55:00",
+            "data_status": "可确认",
+            "results": [
+                {"name": "电子", "status": "已确认", "breadth": 0.68, "excess_pct": 0.52},
+                {"name": "通信", "status": "部分确认", "breadth": 0.58, "excess_pct": 0.21},
+            ],
+        }
+
+    monkeypatch.setattr(
+        "ashare_decision_support.jobs.post_close.build_sector_confirmation",
+        fake_confirmation,
+    )
+
+    summary = run_post_close(
+        adapter=FakeAdapter({"AAA.SH": make_bars("AAA.SH")}),
+        symbols=["AAA.SH"],
+        output_dir=tmp_path,
+        notifiers=[],
+        use_limit_pool=False,
+    )
+
+    payload = json.loads((tmp_path / "post_close_latest.json").read_text(encoding="utf-8"))
+    assert payload["sector_confirmation"]["data_status"] == "可确认"
+    assert "盘前主线验证" in summary["content"]
+    assert "电子" in summary["content"]
+    assert "已确认" in summary["content"]
+
+
+def test_post_close_skips_stale_sector_confirmation(tmp_path, monkeypatch) -> None:
+    (tmp_path / "morning_latest.json").write_text(
+        json.dumps({"trade_date": "2026-08-27", "sectors": [{"name": "昨日主线"}]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "ashare_decision_support.jobs.post_close.build_sector_confirmation",
+        lambda output_dir: {
+            "target_session": "2026-08-27",
+            "data_status": "可确认",
+            "results": [{"name": "昨日主线", "status": "已确认"}],
+        },
+    )
+
+    summary = run_post_close(
+        adapter=FakeAdapter({"AAA.SH": make_bars("AAA.SH")}),
+        symbols=["AAA.SH"],
+        output_dir=tmp_path,
+        notifiers=[],
+        use_limit_pool=False,
+        trade_date=date(2026, 5, 24),
+    )
+
+    payload = json.loads((tmp_path / "post_close_latest.json").read_text(encoding="utf-8"))
+    assert payload["sector_confirmation"] is None
+    assert "盘前主线验证" not in summary["content"]
+    assert any("与本次盘后交易日" in note for note in payload["data_notes"])
 
 
 def test_post_close_notes_missing_symbols_and_free_tier_limits(tmp_path) -> None:
@@ -279,6 +367,36 @@ def test_pre_open_survives_a_corrupt_snapshot_file(tmp_path) -> None:
     summary = run_pre_open(payload_path=tmp_path / "post_close_latest.json", notifiers=[])
 
     assert any("快照读取失败" in note for note in summary["data_notes"])
+
+
+def test_pre_open_includes_missing_review_in_the_written_brief(tmp_path) -> None:
+    source = tmp_path / "post_close_latest.json"
+    source.write_text(json.dumps({"trade_date": "2026-08-03", "actionable": []}), encoding="utf-8")
+
+    summary = run_pre_open(
+        payload_path=source,
+        notifiers=[FileNotifier(tmp_path, slug="pre-open")],
+    )
+
+    note = next(note for note in summary["data_notes"] if "每日复盘" in note)
+    assert summary["next_checks"] == []
+    assert note in summary["content"]
+    assert note in Path(summary["brief_path"]).read_text(encoding="utf-8")
+
+
+def test_pre_open_reads_the_execution_card_from_the_output_dir(tmp_path) -> None:
+    """不传 `--payload` 时读 `--output-dir` 下那份，不是固定读 `briefs/`。
+
+    2026-09-14 实测：换目录跑完盘后再跑盘前提示，拿到的是根目录里 8 月 28 日的旧卡，
+    而且看起来像正常输出。
+    """
+    source = tmp_path / "post_close_latest.json"
+    source.write_text(json.dumps({"trade_date": "2026-09-11", "actionable": []}), encoding="utf-8")
+
+    summary = run_pre_open(output_dir=tmp_path, notifiers=[])
+
+    assert summary["trade_date"] == "2026-09-11"
+    assert summary["data_notes"][0] == f"执行卡来源：{source}"
 
 
 def test_a_notifier_that_raises_does_not_lose_a_finished_brief(tmp_path) -> None:
@@ -317,9 +435,9 @@ def test_a_notifier_that_raises_does_not_lose_a_finished_brief(tmp_path) -> None
         use_limit_pool=False,
     )
 
-    assert summary["scored"] == 1                     # 分析结果没丢
-    assert recording.messages                         # 后面的渠道照常收到
-    assert "exploding" not in summary["delivered"]    # 抛了的那个不算投递成功
+    assert summary["scored"] == 1  # 分析结果没丢
+    assert recording.messages  # 后面的渠道照常收到
+    assert "exploding" not in summary["delivered"]  # 抛了的那个不算投递成功
     assert "recording" in summary["delivered"]
 
 

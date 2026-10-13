@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from ashare_decision_support.adapters.base import DAILY_LOOKBACK_DAYS, fetch_daily_bars
@@ -20,6 +20,7 @@ from ashare_decision_support.news.discovery import matching_docs
 from ashare_decision_support.news.events import EventEvidence, detect_events
 from ashare_decision_support.news.relevance import filter_company_news
 from ashare_decision_support.news.sentiment import LexiconSentiment
+from ashare_decision_support.schedule.calendar import default_calendar, is_session
 from ashare_decision_support.schedule.timezone import beijing_naive_now
 from ashare_decision_support.sectors import SectorMomentum
 from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
@@ -107,8 +108,10 @@ class NewsAgent:
         notes.extend(weigh_notes)
         stats = getattr(source, "last_market_stats", {})
         raw_by_source = stats.get("raw_by_source", {}) if isinstance(stats, dict) else {}
-        retained_by_source = (
-            stats.get("retained_by_source", {}) if isinstance(stats, dict) else {}
+        retained_by_source = stats.get("retained_by_source", {}) if isinstance(stats, dict) else {}
+        latest_by_source = stats.get("latest_by_source", {}) if isinstance(stats, dict) else {}
+        effective_by_source = (
+            stats.get("effective_by_source", {}) if isinstance(stats, dict) else {}
         )
         if raw_by_source:
             notes.append(
@@ -119,6 +122,14 @@ class NewsAgent:
                 )
                 + "（保留/采到）"
             )
+            if latest_by_source:
+                notes.append(
+                    "市场舆情各源最新发布时间："
+                    + "、".join(
+                        f"{name} {stamp}（72小时有效 {effective_by_source.get(name, 0)} 条）"
+                        for name, stamp in sorted(latest_by_source.items())
+                    )
+                )
 
         # 入库在**去重之后**：批内重复的合并掉再入，库里的 seen_count 才是
         # 「这条被采集到过几轮」，而不是「这一轮有几个源转了它」——后者由
@@ -133,6 +144,14 @@ class NewsAgent:
                     "raw": dict(raw_by_source),
                     "retained": dict(retained_by_source),
                     "weighted": source_counts(weighted),
+                    "effective_doc_count": stats.get("effective_doc_count")
+                    if isinstance(stats, dict)
+                    else None,
+                    "expired_before_budget": stats.get("expired_before_budget", 0)
+                    if isinstance(stats, dict)
+                    else 0,
+                    "latest_by_source": latest_by_source,
+                    "effective_by_source": effective_by_source,
                 },
                 "announcements": announcements,
                 "net_inflow": net_inflow,
@@ -153,9 +172,7 @@ class NewsAgent:
             return {"docs": [], "raw_doc_count": 0}, []
 
         try:
-            docs, fetch_notes = source.fetch_market(
-                ctx.trade_date, limit=SECTOR_SUPPLEMENT_LIMIT
-            )
+            docs, fetch_notes = source.fetch_market(ctx.trade_date, limit=SECTOR_SUPPLEMENT_LIMIT)
         except Exception as exc:
             return {}, [f"板块定向舆情补抓失败（{type(exc).__name__}），保留首轮结果"]
 
@@ -293,24 +310,48 @@ class SymbolNewsAgent:
 
 
 class SectorMetricsAgent:
-    """申万分类 + 成分股日线聚合成板块动量。链路里最慢的一环，所以要和舆情并行。"""
+    """同花顺板块成分股日线聚合成动量，与舆情采集并行。"""
 
     name = "sector_metrics"
 
-    def __init__(self, definitions: list, symbols: list[str]) -> None:
+    def __init__(
+        self, definitions: list, symbols: list[str], *, reuse_completed: bool = True
+    ) -> None:
         self.definitions = definitions
         self.symbols = symbols
+        self.reuse_completed = reuse_completed
 
     def run(self, ctx: AgentContext) -> tuple[dict, list[str]]:
         start = ctx.trade_date - timedelta(days=METRIC_LOOKBACK_DAYS)
         notes: list[str] = []
-        bars = fetch_daily_bars(ctx.adapter, self.symbols, start, ctx.trade_date, notes)
+        bars = fetch_daily_bars(
+            ctx.adapter,
+            self.symbols,
+            start,
+            ctx.trade_date,
+            notes,
+            reuse_through=_completed_day_for_metrics(ctx.trade_date)
+            if self.reuse_completed
+            else None,
+        )
         metrics = SectorMomentum().measure(self.definitions, bars)
         covered = sum(1 for rows in bars.values() if rows)
         return (
             {"metrics": metrics, "bars": bars},
             [*notes, f"板块动量样本：{covered}/{len(self.symbols)} 只成分股有可用日线"],
         )
+
+
+def _completed_day_for_metrics(day: date) -> date:
+    """Most recent full session eligible for the daily momentum cache."""
+    now = beijing_naive_now()
+    calendar = default_calendar()
+    may_be_forming = day == now.date() and now.time() < time(15, 5)
+    for offset in range(1 if may_be_forming else 0, 31):
+        previous = day - timedelta(days=offset)
+        if is_session(previous, calendar):
+            return previous
+    return day
 
 
 class SymbolDailyAgent:
@@ -439,7 +480,6 @@ class OrderBookAgent:
         return {"readings": readings, "snapshots": snapshots}, notes
 
 
-
 def _announcement_docs(announcements: list[dict], symbols: list[str]) -> dict[str, list[NewsDoc]]:
     """当日公告按标的归并。公告类型并进标题——它是交易所给的标签，比正文可靠。"""
     wanted = {bare_code(symbol) for symbol in symbols}
@@ -472,7 +512,6 @@ def _guard(call, fallback, notes: list[str], label: str):
     except Exception as exc:
         notes.append(f"{label}源不可用（{type(exc).__name__}），本次缺该项输入")
         return fallback
-
 
 
 def _doc_key(doc: NewsDoc) -> str:

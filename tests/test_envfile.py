@@ -58,6 +58,14 @@ def test_existing_environment_wins(tmp_path, monkeypatch):
     assert os.environ["TICKFLOW_API_KEY"] == "tk_from_shell"
 
 
+def test_explicit_empty_environment_disables_a_file_credential(tmp_path, monkeypatch):
+    (tmp_path / ".env.tickflow").write_text("TICKFLOW_API_KEY=tk_from_file\n", encoding="utf-8")
+    monkeypatch.setenv("TICKFLOW_API_KEY", "")
+
+    assert envfile.load_env_files() == []
+    assert os.environ["TICKFLOW_API_KEY"] == ""
+
+
 def test_env_tickflow_beats_dot_env(tmp_path, monkeypatch):
     (tmp_path / ".env.tickflow").write_text("TICKFLOW_API_KEY=specific\n", encoding="utf-8")
     (tmp_path / ".env").write_text("TICKFLOW_API_KEY=generic\n", encoding="utf-8")

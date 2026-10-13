@@ -1,8 +1,4 @@
-"""⑥ 发布：渲染简报、拼接各分节、按通道推送。
-
-从 `jobs/morning.py` 搬出来的一段。这一段**不做任何判断**：进来什么就印什么，
-分节的插入位置是排版问题。判定全在前面四段。
-"""
+"""渲染盘前简报、组合分节并按通道发布；沿用前序阶段的判定。"""
 
 from __future__ import annotations
 
@@ -23,12 +19,40 @@ from ashare_decision_support.news import MacroDigest
 from ashare_decision_support.notify import ConsoleNotifier, FileNotifier
 from ashare_decision_support.notify.base import publish, written_path
 from ashare_decision_support.notify.render import (
+    DISCIPLINE_HEADING,
+    MARKET_READ_HEADING,
+    SECTOR_CANDIDATES_HEADING,
+    SECTOR_RANKING_HEADING,
+    THEME_RADAR_HEADING,
+    render_candidate_levels_table,
     render_sector_brief,
+    render_sector_ranking_table,
     render_theme_radar,
     sector_mandatory_block,
 )
-from ashare_decision_support.sectors import CONCEPT_LEVEL
+from ashare_decision_support.sectors import LEVEL_CONCEPT
 from ashare_decision_support.writer import TemplateWriter, WriteRequest
+
+READ_HEADING = "## 舆情通读"
+MACRO_HEADING = "## 宏观联动"
+
+
+def _execution_banner(facts: dict[str, Any]) -> str:
+    if facts.get("execution_ready", True):
+        return ""
+    reasons = "；".join(facts.get("execution_blocks") or [])
+    return (
+        "⚠️ **本报告当前不可用于买入。** "
+        f"{reasons}。"
+        f"选股所用个股日线主要截至 {facts.get('data_date') or '未知'}；"
+        "下方结构参考收盘价来自完整日线；盘中快照单独列示，不能替代实时买点确认。\n\n"
+    )
+
+
+def _decorate_execution_markdown(markdown: str, facts: dict[str, Any]) -> str:
+    if facts.get("execution_ready", True):
+        return markdown
+    return _execution_banner(facts) + markdown
 
 
 def stage_publish(
@@ -53,12 +77,21 @@ def stage_publish(
         notes.extend(result.notes)
         debate_block = result.markdown()
 
+    # 落最后一笔之后去重，原地改——`notes` 是贯穿全程的那一个列表，下面渲染与
+    # payload 两处读的必须是同一份。
+
+    # 重复不是假想：舆情那一路会 `fetch_market` **两次**（首轮 + 板块定向补抓），
+    # 两次都把数据源健康报一遍，于是「美国劳工统计局 不可用」「华尔街见闻快讯 1620
+    # 条」这类**描述同一次采集**的行各出现两次。读者看到的是「两个源挂了」，
+    # 而事实是一个源挂了两次被数了两遍。压缩视图只留前 8 条，重复行还会挤掉真信息。
+    notes[:] = list(dict.fromkeys(notes))
+
     baseline = render_sector_brief(
         trade_date=today,
         outlooks=fusion.selected,
         candidates=candidates,
         market=market,
-        position_factor=fusion.effective_factor,
+        position_factor=fusion.effective_factor if facts.get("execution_ready", True) else 0.0,
         data_notes=notes,
         market_outlook=market,
         rotation=fusion.rotation.to_dict(),
@@ -71,13 +104,15 @@ def stage_publish(
     # 后面那些排序的前提。放在最后等于让人先看结论再看背景。
     read_block = fusion.daily_read.markdown()
     if read_block:
-        baseline = _insert_read(baseline, read_block)
+        read_block = f"{READ_HEADING}\n\n{read_block}"
+        baseline = _insert_section(baseline, read_block)
     macro_block = _macro_block(fusion.macro_links)
     if macro_block:
-        baseline = _insert_macro(baseline, macro_block)
+        macro_block = f"{MACRO_HEADING}\n\n{macro_block}"
+        baseline = _insert_section(baseline, macro_block)
     theme_block = render_theme_radar(facts.get("theme_radar"))
-    if theme_block and "## 主题雷达" not in baseline:
-        baseline = _insert_theme(baseline, theme_block)
+    if theme_block and THEME_RADAR_HEADING not in baseline:
+        baseline = _insert_section(baseline, theme_block)
     if debate_block:
         baseline = f"{baseline}\n\n## 多空视角\n\n{debate_block}"
 
@@ -86,19 +121,22 @@ def stage_publish(
             title=f"盘前简报 {today}",
             facts=facts,
             fallback_markdown=baseline,
-            mandatory_suffix=sector_mandatory_block(fusion.effective_factor),
+            mandatory_suffix=sector_mandatory_block(facts.get("position_factor", 0.0)),
+            verbatim_sections=(SECTOR_RANKING_HEADING, SECTOR_CANDIDATES_HEADING),
         )
     )
     notes.extend(written.notes)
     markdown = written.markdown
-    if read_block and "## 舆情通读" not in markdown:
+    if read_block and READ_HEADING not in markdown:
         # LLM 写稿层可能把这一节改写掉或整段吞掉。通读带的是**原文引用**，被改写
         # 就失去了可核对性，所以按原样补回去，和下面的多空视角同一个处理。
-        markdown = _insert_read(markdown, read_block)
-    if macro_block and "## 宏观联动" not in markdown:
-        markdown = _insert_macro(markdown, macro_block)
-    if theme_block and "## 主题雷达" not in markdown:
-        markdown = _insert_theme(markdown, theme_block)
+        markdown = _insert_section(markdown, read_block)
+    if macro_block and MACRO_HEADING not in markdown:
+        markdown = _insert_section(markdown, macro_block)
+    if theme_block and THEME_RADAR_HEADING not in markdown:
+        markdown = _insert_section(markdown, theme_block)
+    markdown = _restore_tables(markdown, fusion.selected, candidates, notes)
+    markdown = _decorate_execution_markdown(markdown, facts)
     if debate_block and debate_block not in markdown:
         markdown = f"{markdown}\n\n## 多空视角\n\n{debate_block}"
 
@@ -108,7 +146,9 @@ def stage_publish(
         sources.notifiers if sources.notifiers is not None else [ConsoleNotifier(), file_notifier]
     )
     delivered = publish(channels, title, markdown)
-    file_notifier.write_payload(facts, MORNING_LATEST_NAME)
+    payload_path = file_notifier.write_payload(facts, MORNING_LATEST_NAME)
+    if payload_path is None:
+        notes.append("盘前事实包保存失败，后续读取将缺少本轮结果")
     brief_path = written_path(channels, file_notifier)
     report("⑤ 盘前简报已完成")
 
@@ -137,13 +177,14 @@ def stage_publish(
         "sectors_ranked": len(fusion.outlooks),
         "sectors_selected": [item.name for item in fusion.selected],
         "industry_sectors_selected": [
-            item.name for item in fusion.selected if item.level != CONCEPT_LEVEL
+            item.name for item in fusion.selected if item.level != LEVEL_CONCEPT
         ],
         "concept_sectors_selected": [
-            item.name for item in fusion.selected if item.level == CONCEPT_LEVEL
+            item.name for item in fusion.selected if item.level == LEVEL_CONCEPT
         ],
         "candidates": len(candidates),
         "candidate_symbols": [item["symbol"] for item in candidates],
+        "execution_ready": facts.get("execution_ready", True),
         "funnel": dict(selection.funnel),
         "diagnostic": dict(selection.diagnostic),
         "diagnostic_mode": bool(selection.diagnostic),
@@ -174,53 +215,51 @@ def stage_publish(
         ),
         "earnings_blocked": sum(1 for item in earnings_verdicts.values() if item.is_blocked),
         "earnings_catalysts": sum(1 for item in earnings_verdicts.values() if item.catalysts),
-        "position_factor": fusion.effective_factor,
+        "position_factor": facts.get("position_factor", 0.0),
         "journal_records": ledger.recorded,
         "writer": written.writer,
         "used_fallback": written.used_fallback,
         "delivered": delivered,
         "data_notes": notes,
-        "payload_path": str(output_path / MORNING_LATEST_NAME),
+        "payload_path": str(payload_path) if payload_path is not None else None,
+        "plan_id": facts.get("plan_id"),
+        "plan_revision": facts.get("plan_revision"),
+        "strategy_version": facts.get("strategy_version"),
         "brief_path": brief_path,
         "content": markdown,
     }
 
-def _insert_read(markdown: str, block: str) -> str:
-    """把通读插在「大盘趋势」之前，插不进去就放最前面。
 
-    按标题定位而不是按行号：写稿层换一种措辞、多一行提示，行号就错位了，而
-    `## 大盘趋势` 是模板与 LLM 两条路都会保留的锚点（`mandatory_suffix` 之外
-    唯一稳定的那个）。
+def _restore_tables(markdown: str, outlooks: list, candidates: list[dict], notes: list[str]) -> str:
+    """板块排序表与候选价位表按原样补回写稿层丢掉的那份。
+
+    2026-09-14 实测：LLM 稿把 18 只候选一只都没点名，价位只剩在 JSON 里——而价位
+    正是这份简报里要照着执行的那部分，不能经过改写，也不能让读的人去翻
+    `morning_latest.json`。补的是表不是明细卡：叙述交给写稿层，数字表原样保留。
     """
-    section = f"## 舆情通读\n\n{block}"
-    anchor = "## 大盘趋势"
-    head, sep, tail = markdown.partition(anchor)
-    if not sep:
-        return f"{markdown}\n\n{section}"
-    return f"{head}{section}\n\n{sep}{tail}"
+    for heading, table in (
+        (SECTOR_RANKING_HEADING, render_sector_ranking_table(outlooks)),
+        (SECTOR_CANDIDATES_HEADING, render_candidate_levels_table(candidates)),
+    ):
+        if heading not in markdown:
+            markdown = _insert_section(markdown, table)
+            notes.append(f"写稿层未保留「{heading.lstrip('#').strip()}」，已按模板原样补回")
+    return markdown
 
 
-def _insert_macro(markdown: str, block: str) -> str:
-    section = f"## 宏观联动\n\n{block}"
-    anchor = "## 大盘趋势"
-    head, sep, tail = markdown.partition(anchor)
-    if not sep:
-        return f"{markdown}\n\n{section}"
-    return f"{head}{section}\n\n{sep}{tail}"
-
-
-def _insert_theme(markdown: str, block: str) -> str:
-    anchor = "## 大盘怎么读"
-    head, sep, tail = markdown.partition(anchor)
-    if not sep:
-        return f"{markdown}\n\n{block}"
-    return f"{head}{block}\n\n{sep}{tail}"
+def _insert_section(markdown: str, block: str) -> str:
+    """按共用标题锚点插入分节：大盘解读之前，其次纪律提醒之前，最后才追加到末尾。"""
+    for anchor in (MARKET_READ_HEADING, DISCIPLINE_HEADING):
+        head, sep, tail = markdown.partition(anchor)
+        if sep:
+            return f"{head}{block}\n\n{sep}{tail}"
+    return f"{markdown}\n\n{block}"
 
 
 def _macro_block(digest: MacroDigest) -> str:
     if not digest.ok or not digest.links:
         return ""
-    lines: list[str] = []
+    lines: list[str] = ["以下为新闻自动提取的传导线索；商品报价未独立核验。"]
     for item in digest.links[:6]:
         targets = "、".join(item.targets) if item.targets else "相关链路"
         label = {"bullish": "偏多", "bearish": "偏空", "mixed": "中性"}.get(

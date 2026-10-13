@@ -18,7 +18,7 @@ from ashare_decision_support.schedule.clock import minutes_since_open
 from ashare_decision_support.signals.intraday import IntradayAnalyzer, _minutes_since_open
 from ashare_decision_support.symbols import prefixed_code
 
-# ---- symbol normalization ------------------------------------------------
+# symbol normalization
 
 
 def test_prefixed_code_covers_every_input_shape() -> None:
@@ -33,7 +33,7 @@ def test_prefixed_code_covers_every_input_shape() -> None:
     assert prefixed_code("730001") == "sh730001"
 
 
-# ---- intraday fetch ------------------------------------------------------
+# intraday fetch
 
 
 def minute_rows(day: str, count: int, start_price: float = 10.0, step: float = 0.01) -> list[dict]:
@@ -103,11 +103,13 @@ def test_intraday_adapter_rejects_an_unsupported_period() -> None:
         raise AssertionError("expected ValueError")
 
 
-# ---- intraday structure --------------------------------------------------
+# intraday structure
 
 
 def bars_from(rows: list[dict], symbol: str = "600519.SH") -> list[dict]:
-    return SinaIntradayAdapter(ak_module=FakeSinaAk(rows=rows)).get_minute_bars([symbol], "5")[0][symbol]
+    return SinaIntradayAdapter(ak_module=FakeSinaAk(rows=rows)).get_minute_bars([symbol], "5")[0][
+        symbol
+    ]
 
 
 def test_minutes_since_open_skips_the_lunch_break() -> None:
@@ -209,7 +211,9 @@ def test_day_change_is_given_directly_not_left_for_the_reader_to_compose() -> No
 
 
 def test_snapshot_uses_only_the_latest_session() -> None:
-    rows = minute_rows("2026-07-30", 48, start_price=5.0) + minute_rows("2026-07-31", 48, start_price=10.0)
+    rows = minute_rows("2026-07-30", 48, start_price=5.0) + minute_rows(
+        "2026-07-31", 48, start_price=10.0
+    )
     snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(rows))
 
     assert snapshot is not None
@@ -278,7 +282,9 @@ def test_volume_ratio_still_flags_a_genuinely_heavy_open() -> None:
     for row in today:
         row["volume"] *= 2.0
 
-    snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", bars_from(baseline + today))
+    snapshot = IntradayAnalyzer(today=date(2026, 7, 31)).analyze(
+        "600519.SH", bars_from(baseline + today)
+    )
 
     assert snapshot is not None
     assert snapshot.volume_ratio is not None
@@ -301,7 +307,7 @@ def test_volume_ratio_drops_a_baseline_day_with_no_volume_yet() -> None:
     assert 0.95 <= snapshot.volume_ratio <= 1.05
 
 
-# ---- 尾盘量能 -------------------------------------------------------------
+# 尾盘量能
 
 
 def session_rows(
@@ -441,7 +447,7 @@ def test_snapshot_returns_none_without_usable_bars() -> None:
     assert IntradayAnalyzer(today=date(2026, 7, 31)).analyze("600519.SH", []) is None
 
 
-# ---- advice --------------------------------------------------------------
+# advice
 
 
 def price_level(side: str, price: float) -> PriceLevel:
@@ -450,7 +456,9 @@ def price_level(side: str, price: float) -> PriceLevel:
     )
 
 
-def daily_snapshot(last_close: float, supports: list[float], resistances: list[float]) -> DailyTechnicalSnapshot:
+def daily_snapshot(
+    last_close: float, supports: list[float], resistances: list[float]
+) -> DailyTechnicalSnapshot:
     return DailyTechnicalSnapshot(
         symbol="600519.SH",
         bar_count=120,
@@ -565,28 +573,37 @@ def test_advice_with_no_data_at_all_says_so() -> None:
     assert any("无法给出任何判断" in warning for warning in advice.warnings)
 
 
-# ---- chat ----------------------------------------------------------------
+# chat
 
 
 ADVICE_FACTS = {
     "trade_date": "2026-08-01",
     "symbols": [
-        {"symbol": "600519.SH", "name": "贵州茅台", "last_price": 1350.6,
-         "entry_low": 1333.93, "entry_high": 1337.53, "stop": 1285.46,
-         "targets": [1355.72], "rrr": 4.08,
-         "trade_context": {"turnover_ratio": 2.36, "session_amount": 12686185800.0},
-         "shortline": {
-             "action": "wait_trigger",
-             "score": 3,
-             "summary": "结构尚可，优先看回踩承接，突破再加速",
-             "reasons": ["现价位于分时均价上方 0.32%", "换手率 2.36%"],
-         }},
+        {
+            "symbol": "600519.SH",
+            "name": "贵州茅台",
+            "last_price": 1350.6,
+            "entry_low": 1333.93,
+            "entry_high": 1337.53,
+            "stop": 1285.46,
+            "targets": [1355.72],
+            "rrr": 4.08,
+            "trade_context": {"turnover_ratio": 2.36, "session_amount": 12686185800.0},
+            "shortline": {
+                "action": "wait_trigger",
+                "score": 3,
+                "summary": "结构尚可，优先看回踩承接，突破再加速",
+                "reasons": ["现价位于分时均价上方 0.32%", "换手率 2.36%"],
+            },
+        },
     ],
 }
 
 
 class FakeClient:
-    def __init__(self, reply: str = "结构完好。", configured: bool = True, boom: bool = False) -> None:
+    def __init__(
+        self, reply: str = "结构完好。", configured: bool = True, boom: bool = False
+    ) -> None:
         self.reply = reply
         self._configured = configured
         self.boom = boom
@@ -754,14 +771,14 @@ def test_debate_command_reports_a_missing_key_instead_of_failing() -> None:
     assert "未配置 LLM key" in message
 
 
-# ---- freshness probe -----------------------------------------------------
+# freshness probe
 
 
 def test_in_session_matches_the_a_share_clock() -> None:
-    assert in_session(datetime(2026, 7, 31, 10, 0))       # Friday morning
-    assert in_session(datetime(2026, 7, 31, 14, 0))       # Friday afternoon
-    assert not in_session(datetime(2026, 7, 31, 12, 0))   # lunch
-    assert not in_session(datetime(2026, 8, 1, 10, 0))    # Saturday
+    assert in_session(datetime(2026, 7, 31, 10, 0))  # Friday morning
+    assert in_session(datetime(2026, 7, 31, 14, 0))  # Friday afternoon
+    assert not in_session(datetime(2026, 7, 31, 12, 0))  # lunch
+    assert not in_session(datetime(2026, 8, 1, 10, 0))  # Saturday
 
 
 class StubIntraday:
@@ -793,7 +810,20 @@ def test_freshness_passes_a_live_feed() -> None:
     report = check_intraday_freshness(stub, ["600519.SH"], now=now, sleep=lambda _: None)
 
     assert report["in_session"]
-    assert "暂不需要付费" in report["verdict"]
+    assert report["median_lag_minutes"] == 1.0
+    assert report["advanced_within_gap"] == {"600519.SH": True}
+    assert "正在更新" in report["verdict"]
+
+
+def test_future_minute_end_stamp_does_not_report_negative_lag() -> None:
+    now = datetime(2026, 9, 14, 13, 0, 30)
+    stub = StubIntraday(now + timedelta(seconds=30), now + timedelta(minutes=1, seconds=30))
+
+    report = check_intraday_freshness(stub, ["600519.SH"], now=now, sleep=lambda _: None)
+
+    assert report["median_lag_minutes"] == 0.0
+    assert report["advanced_within_gap"] == {"600519.SH": True}
+    assert any("晚于采样时刻" in note for note in report["notes"])
 
 
 def test_freshness_flags_a_feed_that_does_not_advance() -> None:
@@ -804,7 +834,7 @@ def test_freshness_flags_a_feed_that_does_not_advance() -> None:
     )
 
     assert "没有前进" in report["verdict"]
-    assert "付费" in report["verdict"]
+    assert report["advanced_within_gap"] == {"600519.SH": False}
 
 
 def test_freshness_flags_an_unusable_lag() -> None:
@@ -812,4 +842,5 @@ def test_freshness_flags_an_unusable_lag() -> None:
     stub = StubIntraday(now - timedelta(minutes=20), now - timedelta(minutes=18))
     report = check_intraday_freshness(stub, ["600519.SH"], now=now, sleep=lambda _: None)
 
-    assert "建议开通付费档" in report["verdict"]
+    assert report["median_lag_minutes"] == 20.0
+    assert "盘中决策不可靠" in report["verdict"]

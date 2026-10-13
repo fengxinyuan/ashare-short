@@ -55,7 +55,7 @@ def bars(
     return rows
 
 
-# ---- 量纲 -----------------------------------------------------------------
+# 量纲
 
 
 def test_volume_unit_is_inferred_not_assumed() -> None:
@@ -90,18 +90,14 @@ def test_turnover_rate_needs_float_shares_and_says_so() -> None:
     assert any("流通股本" in note for note in with_shares.notes)
 
 
-# ---- 四象限 ---------------------------------------------------------------
+# 四象限
 
 
 def test_quadrant_separates_price_direction_from_volume_level() -> None:
-    up_expand = measure_volume_price(
-        bars(volume_scale=lambda i: 3.0 if i == 119 else 1.0)
-    )
+    up_expand = measure_volume_price(bars(volume_scale=lambda i: 3.0 if i == 119 else 1.0))
     assert up_expand.quadrant == QUADRANT_UP_EXPAND
 
-    up_contract = measure_volume_price(
-        bars(volume_scale=lambda i: 0.4 if i == 119 else 1.0)
-    )
+    up_contract = measure_volume_price(bars(volume_scale=lambda i: 0.4 if i == 119 else 1.0))
     assert up_contract.quadrant == QUADRANT_UP_CONTRACT
 
     down_expand = measure_volume_price(
@@ -113,7 +109,7 @@ def test_quadrant_separates_price_direction_from_volume_level() -> None:
     assert down_expand.quadrant == QUADRANT_DOWN_EXPAND
 
 
-# ---- 量能趋势 -------------------------------------------------------------
+# 量能趋势
 
 
 def test_sustained_expansion_is_distinguished_from_a_single_spike() -> None:
@@ -122,12 +118,8 @@ def test_sustained_expansion_is_distinguished_from_a_single_spike() -> None:
     最小二乘斜率答不了这个问题：[1,1,1,1,3] 的斜率和 [1.4,1.8,2.2,2.6,3.0] 同号。
     这条断言就是为了钉住那个区分——第一版实现正是栽在这里。
     """
-    spike = measure_volume_price(
-        bars(volume_scale=lambda i: 3.0 if i == 119 else 1.0)
-    )
-    sustained = measure_volume_price(
-        bars(volume_scale=lambda i: 1.0 + 0.4 * max(0, i - 114))
-    )
+    spike = measure_volume_price(bars(volume_scale=lambda i: 3.0 if i == 119 else 1.0))
+    sustained = measure_volume_price(bars(volume_scale=lambda i: 1.0 + 0.4 * max(0, i - 114)))
 
     # 两者当日量比都明显 >1.2，单看它无法区分。
     assert spike.vol_ratio_20d and spike.vol_ratio_20d > 1.2
@@ -139,7 +131,7 @@ def test_sustained_expansion_is_distinguished_from_a_single_spike() -> None:
     assert spike.expanding is False
 
 
-# ---- 日环比量能 -----------------------------------------------------------
+# 日环比量能
 
 
 def test_daily_ratio_and_20d_ratio_disagree_on_what_counts_as_doubling() -> None:
@@ -178,7 +170,7 @@ def test_daily_ratio_needs_a_previous_bar() -> None:
     assert result.vol_ratio_1d is None
 
 
-# ---- 方向性成交量 ---------------------------------------------------------
+# 方向性成交量
 
 
 def test_up_down_volume_ratio_is_none_when_one_side_is_empty() -> None:
@@ -203,7 +195,7 @@ def test_up_down_volume_ratio_detects_a_sold_off_pullback() -> None:
     assert result.up_down_vol_ratio < 1.0
 
 
-# ---- 卖出判据 -------------------------------------------------------------
+# 卖出判据
 
 
 class _VP:
@@ -237,9 +229,7 @@ def test_climax_stall_is_a_trim() -> None:
 
 def test_top_divergence_does_not_apply_without_a_gain() -> None:
     """顶背离是**兑现**判据。对还在亏损的仓位说「减仓落袋」没有意义。"""
-    with_gain = assess_exits(
-        volume_price=_VP(divergence=DIVERGENCE_TOP), has_unrealised_gain=True
-    )
+    with_gain = assess_exits(volume_price=_VP(divergence=DIVERGENCE_TOP), has_unrealised_gain=True)
     without_gain = assess_exits(
         volume_price=_VP(divergence=DIVERGENCE_TOP), has_unrealised_gain=False
     )
@@ -262,15 +252,14 @@ def test_regime_downgrade_speaks_to_existing_positions() -> None:
 
 
 def test_freezing_regime_escalates_to_exit() -> None:
-    frozen = classify_regime(
-        blowup_rate=0.9, max_streak=1, limit_up_count=3, limit_down_count=40
-    )
+    frozen = classify_regime(blowup_rate=0.9, max_streak=1, limit_up_count=3, limit_down_count=40)
     assert frozen.cycle is EmotionCycle.FREEZING
-    assert assess_exits(regime=frozen).strongest == EXIT_EXIT
+    result = assess_exits(regime=frozen)
+    assert result.strongest == EXIT_EXIT
+    assert any("优先核对退出" in text for signal in result.signals for text in signal.detail)
+    assert not any("不是清仓信号" in text for signal in result.signals for text in signal.detail)
 
 
 def test_healthy_regime_produces_no_environment_exit() -> None:
-    healthy = classify_regime(
-        blowup_rate=0.15, max_streak=5, limit_up_count=60, limit_down_count=1
-    )
+    healthy = classify_regime(blowup_rate=0.15, max_streak=5, limit_up_count=60, limit_down_count=1)
     assert assess_exits(regime=healthy).signals == []

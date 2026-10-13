@@ -18,7 +18,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from ashare_decision_support.advice.engine import StockAdvice
+from ashare_decision_support.advice.engine import (
+    MIN_RRR,
+    StockAdvice,
+    meets_min_rrr,
+    risk_reward,
+)
 from ashare_decision_support.advice.view import trade_context_parts
 from ashare_decision_support.monitor.holdings import (
     TIME_STOP_DAYS,
@@ -29,8 +34,10 @@ from ashare_decision_support.monitor.holdings import (
     effective_stop,
     effective_targets,
     structure_broken,
+    t_plus_one_lines,
     time_stop_due,
 )
+from ashare_decision_support.numeric import finite
 from ashare_decision_support.signals.intraday import IntradaySnapshot
 from ashare_decision_support.signals.stabilise import Stabilisation
 from ashare_decision_support.state.alerts import AlertState
@@ -59,7 +66,7 @@ BREAKOUT_ACTIONS = frozenset({"buy_pullback", "breakout_follow"})
 # BREAKOUT_*，因为它当初只接在突破路径上；低吸那一路漏掉了，于是被业绩否决、
 # 盈亏比 1.09 的票照样能推出 ACTION 买点。改名是为了让「它管两条路」这件事
 # 写在名字里，而不是只写在注释里。
-#
+
 # 「业绩否决」是后补的：它由 `jobs/advise.py` 写进 warnings，语义比盈亏比更硬
 # ——盈亏比是算出来的估计，业绩否决是公司自己签字披露的事实。
 ENTRY_BLOCKING_WARNINGS = (
@@ -92,14 +99,18 @@ POLICIES: dict[str, TriggerPolicy] = {
         TriggerPolicy("entry_watch", LEVEL_WARN, "进入买入区间（未止跌）", cooldown_minutes=30),
         # 进了区间但**买不进**：封涨停。和上面那条同为 WARN，成因完全不同——
         # 那条是「该等」，这条是「想动也动不了」。合成一条会让人以为还能挂单。
-        TriggerPolicy("entry_sealed", LEVEL_WARN, "进入买入区间（封涨停买不进）", cooldown_minutes=30),
+        TriggerPolicy(
+            "entry_sealed", LEVEL_WARN, "进入买入区间（封涨停买不进）", cooldown_minutes=30
+        ),
         # 进了区间但**不该买**：盈亏比不达标，或命中业绩否决这类警告。和上面两条
         # 同为 WARN，成因又不同——那两条是「等」和「动不了」，这条是「这只票本身
         # 就被系统否了」。质量闸门 `_entry_quality_blocked` 原先只接在突破路径上，
         # 低吸路径漏掉了，于是一只盈亏比 1.09、命中业绩否决的票照样能推 ACTION 买点，
         # 这和简报自己写的「盈亏比不足 1.5 的机会直接放弃」是矛盾的。区间确实进了，
         # 所以照发，但只发 WARN。
-        TriggerPolicy("entry_blocked", LEVEL_WARN, "进入买入区间（质量不达标）", cooldown_minutes=30),
+        TriggerPolicy(
+            "entry_blocked", LEVEL_WARN, "进入买入区间（质量不达标）", cooldown_minutes=30
+        ),
         # 跌势停了。这才是低吸真正的进场信号。
         TriggerPolicy("entry_confirmed", LEVEL_ACTION, "止跌确认", cooldown_minutes=30),
         # 弱票先收回观察线再看修复。给 WARN，不给 ACTION：收回不是买点，
@@ -117,7 +128,7 @@ POLICIES: dict[str, TriggerPolicy] = {
         TriggerPolicy("scenario_shift", LEVEL_WARN, "情景切换", cooldown_minutes=15),
         TriggerPolicy("volume_spike", LEVEL_WARN, "放量异动", cooldown_minutes=30),
         TriggerPolicy("risk_notice", LEVEL_WARN, "突发风险公告", once_per_session=True),
-        # ---- 只对持仓触发 --------------------------------------------------
+        # 只对持仓触发
         # 结构破坏比止损早一步：支撑是当初买入的依据，依据没了就该重新评估，
         # 而不是等价格再跌到止损位。给 ACTION 是因为它要求一个决定。
         TriggerPolicy("structure_break", LEVEL_ACTION, "跌破结构支撑", once_per_session=True),
@@ -213,7 +224,9 @@ class _Crossing:
 
     def plan_detail(self) -> list[str]:
         return [
-            *_entry_plan_detail(self.advice, self.holding, self.targets),
+            *_entry_plan_detail(
+                self.advice, self.holding, self.targets, current_price=self.intraday.last_price
+            ),
             *_execution_guard_detail(self.advice),
         ]
 
@@ -273,8 +286,16 @@ class TriggerEngine:
         def emit(trigger: str, headline: str, detail: list[str]) -> None:
             alerts.extend(
                 self._emit(
-                    state, now, symbol, advice, intraday, trigger, headline,
-                    detail, holding=holding, book=book,
+                    state,
+                    now,
+                    symbol,
+                    advice,
+                    intraday,
+                    trigger,
+                    headline,
+                    detail,
+                    holding=holding,
+                    book=book,
                 )
             )
 
@@ -292,14 +313,14 @@ class TriggerEngine:
         self._context_crossings(ctx, emit)
         return alerts
 
-    # ---- crossings -------------------------------------------------------
+    # crossings
 
     def _entry_crossings(self, ctx: _Crossing, emit: Any) -> None:
         """买点那一路：进区间 → 止跌确认 → 收回观察线 → 突破确认。"""
         advice, current, previous = ctx.advice, ctx.current, ctx.previous
         label, price = ctx.label, ctx.price
         # 质量闸门对低吸和突破是同一条标准，只是原先只接在突破那一路上。
-        quality_blocked = _entry_quality_blocked(advice)
+        quality_blocked = _entry_quality_blocked(advice, ctx.intraday.last_price)
         stabilisation = ctx.stabilisation
 
         if current.get("vs_entry") == "inside" and previous.get("vs_entry") != "inside":
@@ -325,10 +346,10 @@ class TriggerEngine:
 
         # 已经在区间里，随后才出现止跌——这是低吸最典型的进场顺序：先跌进来，
         # 再等企稳。只看「进入区间」那一刻会永远错过它。
-        #
+
         # 封涨停时不发：封板价上的「止跌确认」恒成立（价格贴着上沿不动），
         # 而它指向的动作——现在买——恰恰是此刻做不到的那个。
-        #
+
         # 质量不达标时同样不发：止跌确认是这条链路上唯一的 ACTION 买点，而
         # 「跌势停了」并不能把一只盈亏比不足或被业绩否决的票变成可买。
         if (
@@ -383,6 +404,8 @@ class TriggerEngine:
         """卖点那一路：止损 / 结构 / 期限 / 回吐 / 目标。后三条只对持仓成立。"""
         advice, current = ctx.advice, ctx.current
         label, price = ctx.label, ctx.price
+        # 今日建仓的持仓，这一路的每一条都只能明天处理——T+1 的提示统一挂在末尾。
+        emit = _with_t_plus_one(ctx.holding, emit)
 
         if ctx.crossed("stop_broken"):
             # 报出来的必须是**实际生效的**那个止损。走 plan_stop 时 advice.stop
@@ -443,7 +466,9 @@ class TriggerEngine:
             emit("vwap_lost", f"{label} 跌破分时均价", detail)
 
         if current.get("vs_vwap") == "above" and previous.get("vs_vwap") == "below":
-            emit("vwap_regain", f"{label} 站上分时均价", [f"现价 {price}，均价 {intraday.vwap:.2f}"])
+            emit(
+                "vwap_regain", f"{label} 站上分时均价", [f"现价 {price}，均价 {intraday.vwap:.2f}"]
+            )
 
         if current.get("scenario") != previous.get("scenario") and current.get("scenario"):
             emit(
@@ -465,7 +490,7 @@ class TriggerEngine:
         if ctx.risk_note:
             emit("risk_notice", f"{label} 触发风险公告否决", [ctx.risk_note])
 
-    # ---- policy ----------------------------------------------------------
+    # policy
 
     def _startup_alerts(self, ctx: _Crossing, emit: Any) -> None:
         """首轮补报：已经成立的**可执行**事实不能因为「没有跨越」而静默。"""
@@ -481,6 +506,7 @@ class TriggerEngine:
         current = ctx.current
         label, price = ctx.label, ctx.price
         holding = ctx.holding
+        emit = _with_t_plus_one(holding, emit)
 
         if current.get("stop_broken"):
             level = effective_stop(holding, ctx.advice.stop)
@@ -564,7 +590,7 @@ class TriggerEngine:
 
         if ctx.sealed_up:
             emit("entry_sealed", f"{label} 已在买入区间，但封涨停买不进", detail)
-        elif _entry_quality_blocked(advice):
+        elif _entry_quality_blocked(advice, ctx.intraday.last_price):
             emit("entry_blocked", f"{label} 已在买入区间，但质量不达标", detail)
         elif stabilisation is not None and stabilisation.confirmed:
             emit(
@@ -611,7 +637,7 @@ class TriggerEngine:
         state.mark_fired(symbol, trigger, now)
         lag = None
         if intraday.last_timestamp is not None:
-            lag = round((now - intraday.last_timestamp).total_seconds() / 60.0, 1)
+            lag = round(max(0.0, (now - intraday.last_timestamp).total_seconds() / 60.0), 1)
         context_lines = _advice_context_lines(advice)
         if context_lines:
             detail = list(detail) + context_lines
@@ -635,7 +661,9 @@ class TriggerEngine:
                 detail=detail,
                 name=advice.name,
                 holding=holding is not None,
-                unrealised_pct=None if holding is None else holding.unrealised_pct(intraday.last_price),
+                unrealised_pct=None
+                if holding is None
+                else holding.unrealised_pct(intraday.last_price),
                 as_of=intraday.last_timestamp,
                 lag_minutes=lag,
                 session_date=str(intraday.session_date),
@@ -643,7 +671,7 @@ class TriggerEngine:
         ]
 
 
-# ---- state derivation ----------------------------------------------------
+# state derivation
 
 
 def _derive_state(
@@ -662,19 +690,17 @@ def _derive_state(
     levels = effective_targets(holding, advice.targets) if targets is None else targets
     return {
         "vs_entry": _vs_entry(advice, last),
-        "vs_vwap": None if intraday.vwap is None else ("above" if last >= intraday.vwap else "below"),
+        "vs_vwap": None
+        if intraday.vwap is None
+        else ("above" if last >= intraday.vwap else "below"),
         "scenario": _scenario(intraday),
         # Before the levels are pinned there is no stop to break, and reporting
         # False would look identical to "checked and fine".
-        #
         # 持仓例外：plan_stop 是你自己定的绝对价位，不依赖当日结构成型，所以
         # 不受 armed 约束——开盘第一分钟跌破它也该报。
-        "stop_broken": (
-            stop is not None and last < stop and (armed or _manual_stop(holding))
-        ),
+        "stop_broken": (stop is not None and last < stop and (armed or _manual_stop(holding))),
         # 同理：`_apply_pinned_levels` 在开盘 15 分钟内会把系统算的目标清空，
         # 但你手填的目标价跟当日结构无关，第一分钟摸到就该报。
-        #
         # 这里只认 `plan_target`，不认 `plan_stop`：**只设了止损不等于给目标也
         # 开了口子**，那会让系统算的目标在开盘头 15 分钟提前触发，而它正是那道
         # 约束要拦的东西。
@@ -684,7 +710,8 @@ def _derive_state(
             else []
         ),
         "armed": armed,
-        "volume_spike": intraday.volume_ratio is not None and intraday.volume_ratio >= VOLUME_SPIKE_RATIO,
+        "volume_spike": intraday.volume_ratio is not None
+        and intraday.volume_ratio >= VOLUME_SPIKE_RATIO,
         "at_high": _at_high(intraday),
         "vs_reclaim": _vs_reclaim(advice, last),
         "breakout_confirmed": holding is None and _breakout_confirmed(advice, intraday),
@@ -704,6 +731,23 @@ def _manual_targets(holding: HoldingView | None) -> bool:
     return bool(holding is not None and holding.plan_target)
 
 
+def _with_t_plus_one(holding: HoldingView | None, emit: Any) -> Any:
+    """卖出告警的 emit 包一层：今日建仓的持仓，每条卖出提示末尾都带上 T+1 那句。
+
+    包在 emit 上而不是逐条追加，是因为这一路有五个出口（止损 / 结构 / 期限 /
+    回吐 / 目标）加首轮补报的四个，逐条改漏一条就会有一条 ACTION 催人做当天
+    做不成的事。级别不降：卖不出不等于不重要，它是明早开盘第一件要处理的事。
+    """
+    lines = t_plus_one_lines(holding)
+    if not lines:
+        return emit
+
+    def wrapped(trigger: str, headline: str, detail: list[str]) -> None:
+        emit(trigger, headline, [*detail, *lines])
+
+    return wrapped
+
+
 def _targets_line(holding: HoldingView | None, targets: list[float]) -> str:
     """目标价那一行。你自己设的要标出来——否则你会以为那是系统算的。"""
     prefix = "目标（你设定的）" if _manual_targets(holding) else "目标"
@@ -714,20 +758,29 @@ def _entry_plan_detail(
     advice: StockAdvice,
     holding: HoldingView | None,
     targets: list[float],
+    current_price: float | None = None,
 ) -> list[str]:
     """Stop, target and R/R lines shared by entry-zone and confirmation alerts."""
     lines: list[str] = []
     if advice.stop is not None:
-        gap = (advice.entry_low - advice.stop) / advice.entry_low if advice.entry_low else None
+        basis = current_price or getattr(advice, "entry_high", None) or advice.entry_low
+        gap = (basis - advice.stop) / basis if basis and basis > advice.stop else None
+        label = "按现价" if current_price else "按计划买入上沿"
         lines.append(
-            f"止损 {advice.stop:.2f}" + (f"（-{gap:.1%}）" if gap is not None else "")
+            f"止损 {advice.stop:.2f}"
+            + (f"（{label} {basis:.2f}：-{gap:.1%}）" if gap is not None else "")
         )
     if targets:
         lines.append(_targets_line(holding, targets))
     # 盈亏比是拿系统那串目标算的。你自己设了目标价时它对不上号，
     # 把两者并排印出来只会让人不知道该信哪个。
-    if advice.rrr is not None and not _manual_targets(holding):
-        lines.append(f"盈亏比 {advice.rrr}")
+    if not _manual_targets(holding):
+        if current_price:
+            current_rrr = risk_reward(advice, entry_price=current_price)
+            if current_rrr is not None:
+                lines.append(f"按现价盈亏比 {current_rrr:.2f}")
+        elif advice.rrr is not None:
+            lines.append(f"计划价盈亏比 {advice.rrr}")
     return lines
 
 
@@ -762,7 +815,11 @@ def _volume_confirm_line(volume: Any) -> str:
 def _giveback_detail(giveback: Giveback | None) -> list[str]:
     if giveback is None:
         return []
-    return [*giveback.describe(), ("止损没破、目标没到、支撑还在、期限没满——四条卖出触发一条都不会响，而浮盈已经吐掉一半"), "系统不替你决定走留：它只负责让这件事不再无声发生"]
+    return [
+        *giveback.describe(),
+        ("止损没破、目标没到、支撑还在、期限没满——四条卖出触发一条都不会响，而浮盈已经吐掉一半"),
+        "系统不替你决定走留：它只负责让这件事不再无声发生",
+    ]
 
 
 def _time_stop_detail(holding: HoldingView | None, price: float | None) -> list[str]:
@@ -813,19 +870,31 @@ def _reclaim_level(advice: StockAdvice) -> float | None:
 def _breakout_confirmed(advice: StockAdvice, intraday: IntradaySnapshot) -> bool:
     if _shortline_action(advice) not in BREAKOUT_ACTIONS:
         return False
-    if _entry_quality_blocked(advice):
+    # An intraday high is not an entry trigger when price has already run far
+    # above the planned band. Requiring proximity prevents late chase alerts.
+    if advice.entry_high is not None and intraday.last_price > advice.entry_high * 1.03:
+        return False
+    if _entry_quality_blocked(advice, intraday.last_price):
         return False
     if not _at_high(intraday):
         return False
     return not (intraday.volume_ratio is None or intraday.volume_ratio < BREAKOUT_MIN_VOLUME_RATIO)
 
 
-def _entry_quality_blocked(advice: StockAdvice) -> bool:
+def _entry_quality_blocked(advice: StockAdvice, current_price: float | None = None) -> bool:
     warnings = [str(item) for item in getattr(advice, "warnings", []) or []]
     if any(any(token in warning for token in ENTRY_BLOCKING_WARNINGS) for warning in warnings):
         return True
-    rrr = getattr(advice, "rrr", None)
-    return isinstance(rrr, (int, float)) and rrr < 1.5
+    rrr = finite(getattr(advice, "rrr", None))
+    if rrr is not None and rrr < MIN_RRR:
+        return True
+    plan_ratio = risk_reward(advice, rounded=False)
+    if not meets_min_rrr(plan_ratio):
+        return True
+    if current_price is not None:
+        live_ratio = risk_reward(advice, entry_price=current_price, rounded=False)
+        return not meets_min_rrr(live_ratio)
+    return False
 
 
 def _scenario(intraday: IntradaySnapshot) -> str:

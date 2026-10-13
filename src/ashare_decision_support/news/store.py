@@ -1,35 +1,7 @@
-"""持久舆情语料库：把「今天采到了什么」变成「这条消息是什么时候第一次出现的」。
+"""SQLite 舆情语料库，按板块、标的和时间检索原文及归因。
 
-`news/cache.py` 解决的是**重复拉取**——同一个早上跑两次不要再打一遍上游，TTL 一小时、
-按天分目录、放在输出目录里，跑完即弃。它不解决、也不该解决下面这件事：
-
-**对超短线，同一条利好「10 分钟前第一次出现」和「已经发酵三天」是完全不同的两件事。**
-前者是机会，后者往往是接盘位置。而在临时缓存里两者长得一模一样，因为它只存
-「今天见到的」——昨天见过没见过，明天就查不到了。
-
-`published_at` 顶不上这个位置，两个原因都是实测出来的：
-
-1. **大量源不给时间戳**（新闻联播只给日期），`dedup.py` 对这类文档刻意不折减。
-   拿一个一半为空的字段当「第一次出现」的依据，等于给这些源随机赋新鲜度。
-2. **转发会带上新的 published_at。** 财联社与东财大量转发同一条内容，标题常常
-   一字不差。按发布时间看，一条隔夜消息会在第二天早上「重新变新」。
-
-所以语料库自己记 `first_seen_at`——**系统什么时候第一次知道这件事**。这个时钟是
-可靠的，因为它由本地采集动作定义，不依赖上游给不给、给得准不准。
-
-## 为什么这里用 SQLite，而全仓其余地方用 JSON/JSONL
-
-这是系统里**唯一需要查询**的数据：按板块、按标的、按时间窗、按 first_seen 回查，
-而且会长期累积。JSONL 要回答「这个板块过去一周的舆情热度曲线」只能全量扫，且扫的量
-每天都在涨。台账用 JSONL 是因为它纯追加、按月分片、每次统计本来就要全读——那是另一种
-访问模式。
-
-`sqlite3` 在标准库里，所以这不引入依赖。
-
-## 失败契约
-
-**任何一步失败都不抛异常，只返回计数并记 note。** 和 `NewsCache` 同一条约定：调用方
-此时已经拿到了实时文档，语料库写不进去是分析能力的损失，绝不能变成链路中断。
+first_seen_at 和 last_seen_at 记录本地首次及最近观察时间，与上游 published_at 分开。
+重复传播只更新观察记录。存储失败通过计数、状态与 notes 报告，保留本轮已采集文档。
 """
 
 from __future__ import annotations
@@ -44,11 +16,10 @@ from typing import Any
 
 from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.dedup import dedup_key, parse_published
-from ashare_decision_support.schedule.timezone import beijing_naive_now
+from ashare_decision_support.schedule.timezone import beijing_naive_now, to_beijing_naive
 from ashare_decision_support.state.paths import state_path
 
-# 语料库的 schema 版本。和 `sectors/taxonomy.py` 的缓存戳同一个理由——结构变了之后，
-# 老库里按旧口径写的行会静默参与新口径的统计。版本不匹配时建新表而不是猜。
+# 语料库的 schema 版本。结构变更时避免旧字段静默参与新口径统计。
 SCHEMA_VERSION = 1
 
 DEFAULT_RELATIVE_PATH = ("news", "corpus.sqlite3")
@@ -59,7 +30,7 @@ DEFAULT_BUCKET_HOURS = 1
 
 # 一次 `IN (...)` 里塞多少个 key。SQLite 的变量上限旧版是 999，取 500 留足余量——
 # 这个数只影响分几批，不影响结果。
-_SOURCE_COUNT_CHUNK = 500
+_KEY_QUERY_CHUNK = 500
 
 
 @dataclass(frozen=True)
@@ -85,7 +56,8 @@ class StoredDoc:
 
     def age_hours(self, now: datetime) -> float:
         """距**第一次被看到**多久，不是距发布多久。"""
-        return round(max(0.0, (now - self.first_seen_at).total_seconds() / 3600.0), 2)
+        elapsed = (to_beijing_naive(now) - to_beijing_naive(self.first_seen_at)).total_seconds()
+        return round(max(0.0, elapsed / 3600.0), 2)
 
     def is_fresh(self, now: datetime, within_hours: float = 1.0) -> bool:
         return self.age_hours(now) <= within_hours
@@ -212,7 +184,7 @@ class NewsStore:
         except Exception as exc:  # sqlite3.Error, OSError, ...
             self.error = f"{type(exc).__name__}: {exc}"
 
-    # ---- 写 --------------------------------------------------------------
+    # 写
 
     def ingest(
         self,
@@ -234,7 +206,7 @@ class NewsStore:
         if not docs:
             return result
 
-        stamp = (now or beijing_naive_now()).replace(microsecond=0)
+        stamp = to_beijing_naive(now or beijing_naive_now()).replace(microsecond=0)
         day = str(trade_date) if trade_date else ""
 
         try:
@@ -300,14 +272,7 @@ class NewsStore:
         return True
 
     def label_many(self, labels: dict[str, DocAttribution]) -> int:
-        """整批写归因，**一次连接**。返回写进去的条数。
-
-        逐条 `label()` 在盘前是 600 次 `sqlite3.connect` + 600 次 WAL pragma——
-        写的东西一模一样，代价全在连接上。归因是每天一次的批量动作，本来就该批量写。
-
-        和 `ingest` 分开的理由写在 `label` 的 docstring 里：入库发生在采集之后、
-        归因之前，归因还可能整批作废退回词典。入库不该等归因。
-        """
+        """在一次事务中写入归因；失败整批回滚并返回 0。"""
         if not self.ok or not labels:
             return 0
         written = 0
@@ -329,10 +294,10 @@ class NewsStore:
                     written += 1
         except Exception as exc:
             self._note_read_failure(exc)
-            return written
+            return 0
         return written
 
-    # ---- 读 --------------------------------------------------------------
+    # 读
 
     def recent(
         self,
@@ -359,7 +324,7 @@ class NewsStore:
         if not self.ok:
             return []
         column = "last_seen_at" if by == "last_seen" else "first_seen_at"
-        stamp = now or beijing_naive_now()
+        stamp = to_beijing_naive(now or beijing_naive_now())
         floor = (stamp - timedelta(hours=within_hours)).isoformat(timespec="seconds")
 
         sql = ["SELECT d.* FROM docs d"]
@@ -370,13 +335,15 @@ class NewsStore:
         if symbol:
             sql.append("JOIN doc_symbols y ON y.key = d.key AND y.symbol = ?")
             params.append(symbol)
-        sql.append(f"WHERE d.{column} >= ? ORDER BY d.first_seen_at DESC LIMIT ?")
-        params.extend([floor, max(1, int(limit))])
+        sql.append(
+            f"WHERE d.{column} >= ? AND d.{column} <= ? ORDER BY d.first_seen_at DESC LIMIT ?"
+        )
+        params.extend([floor, stamp.isoformat(timespec="seconds"), max(1, int(limit))])
 
         try:
             with self._connect() as conn:
                 rows = conn.execute(" ".join(sql), params).fetchall()
-                return [self._hydrate(conn, row) for row in rows]
+                return self._hydrate(conn, rows)
         except Exception as exc:
             self._note_read_failure(exc)
             return []
@@ -388,16 +355,13 @@ class NewsStore:
         bucket_hours: int = DEFAULT_BUCKET_HOURS,
         now: datetime | None = None,
     ) -> list[HeatPoint]:
-        """板块热度时间序列：每个时间桶里**第一次出现**的文档数。
+        """截至 now 的新故事数及跨源覆盖数，按首次出现时间分桶。
 
-        数 first_seen 而不是数全部提及，理由和 `dedup.py` 丢重复是同一条——
-        一条消息被四个源转发不代表热度翻四倍，那只是同一个故事。热度要测的是
-        **有多少新故事进来**。跨源覆盖数单独作为第二列给出，它测的是另一件事：
-        这批新故事传播得有多广。
+        重复传播不增加故事数；历史回看排除观察时点之后的记录。
         """
         if not self.ok:
             return []
-        stamp = now or beijing_naive_now()
+        stamp = to_beijing_naive(now or beijing_naive_now())
         bucket = max(1, int(bucket_hours))
         floor = stamp - timedelta(hours=within_hours)
 
@@ -406,8 +370,13 @@ class NewsStore:
                 rows = conn.execute(
                     "SELECT d.first_seen_at, d.key FROM docs d "
                     "JOIN doc_sectors s ON s.key = d.key AND s.sector = ? "
-                    "WHERE d.first_seen_at >= ? ORDER BY d.first_seen_at",
-                    (sector, floor.isoformat(timespec="seconds")),
+                    "WHERE d.first_seen_at >= ? AND d.first_seen_at <= ? "
+                    "ORDER BY d.first_seen_at",
+                    (
+                        sector,
+                        floor.isoformat(timespec="seconds"),
+                        stamp.isoformat(timespec="seconds"),
+                    ),
                 ).fetchall()
                 if not rows:
                     return []
@@ -435,7 +404,7 @@ class NewsStore:
         ]
 
     def first_seen(self, doc: NewsDoc | str) -> datetime | None:
-        """这条消息第一次被看到是什么时候。库里没有就是 None（即「全新」）。"""
+        """保留单条查询接口以兼容现有调用；未找到或读取失败返回 None，失败见 read_error。"""
         if not self.ok:
             return None
         key = doc if isinstance(doc, str) else dedup_key(doc)
@@ -454,19 +423,36 @@ class NewsStore:
     def annotate_freshness(
         self, docs: list[NewsDoc], now: datetime | None = None
     ) -> tuple[list[NewsDoc], list[str]]:
-        """标出哪些是全新的、哪些已经在库里躺了一阵。不改权重，只回报。
+        """批量读取首次出现时间，报告新增或重复播报，不改文档及其权重。
 
-        刻意不动 `NewsDoc.weight`：时效折权归 `dedup.py` 按发布时间算，两套折减
-        叠在一起会把同一件事扣两遍，而且事后拆不开是哪一层扣的。这里只产出给人看
-        的读数——要不要因为「这条已经播了三天」而回避，是人的判断。
+        读取失败只报告缺失，不能把无法核对的文档当作首次出现。
         """
         if not self.ok or not docs:
             return docs, []
-        stamp = now or beijing_naive_now()
+        stamp = to_beijing_naive(now or beijing_naive_now())
+        keys = [dedup_key(doc) for doc in docs]
+        usable = [key for key in keys if key]
+        seen_by_key: dict[str, datetime | None] = {}
+        if usable:
+            try:
+                with self._connect() as conn:
+                    seen_by_key = {
+                        key: _parse_iso(value)
+                        for key, value in _query_keys(
+                            conn,
+                            "SELECT key, first_seen_at FROM docs WHERE key IN ({})",
+                            usable,
+                        )
+                    }
+            except Exception as exc:
+                self._note_read_failure(exc)
+                return docs, [
+                    f"舆情首次出现时间读取失败（{type(exc).__name__}），本次未判断新增或重复"
+                ]
         brand_new = 0
         stale = 0
-        for doc in docs:
-            seen = self.first_seen(doc)
+        for key in keys:
+            seen = seen_by_key.get(key)
             if seen is None:
                 brand_new += 1
             elif (stamp - seen).total_seconds() > 24 * 3600:
@@ -485,9 +471,9 @@ class NewsStore:
         try:
             with self._connect() as conn:
                 docs = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
-                sectors = conn.execute(
-                    "SELECT COUNT(DISTINCT sector) FROM doc_sectors"
-                ).fetchone()[0]
+                sectors = conn.execute("SELECT COUNT(DISTINCT sector) FROM doc_sectors").fetchone()[
+                    0
+                ]
                 span = conn.execute(
                     "SELECT MIN(first_seen_at), MAX(first_seen_at) FROM docs"
                 ).fetchone()
@@ -502,7 +488,7 @@ class NewsStore:
             "latest": span[1],
         }
 
-    # ---- 内部 ------------------------------------------------------------
+    # 内部
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -597,65 +583,59 @@ class NewsStore:
 
     @staticmethod
     def _source_counts(conn: sqlite3.Connection, keys: list[str]) -> dict[str, int]:
-        """这几条各自被几个源报道过。
-
-        **只数用得上的那几条。** 这里原来是一句无 WHERE 的
-        `SELECT key, COUNT(*) FROM doc_sources GROUP BY key`——语料库按设计是
-        跨日累积的（那是这个模块存在的理由），于是它把整张表聚合一遍，只为取回
-        窗口里那几十个 key；而板块热度现在每个盘前要按选中板块调好几次。
-
-        分批是因为 SQLite 的变量个数有上限，而窗口内的 key 数不由这一层控制。
-        """
-        counts: dict[str, int] = {}
-        unique = list(dict.fromkeys(keys))
-        for start in range(0, len(unique), _SOURCE_COUNT_CHUNK):
-            chunk = unique[start : start + _SOURCE_COUNT_CHUNK]
-            # 拼进 SQL 的只有问号个数，key 本身仍然走参数绑定。
-            placeholders = ",".join("?" * len(chunk))
-            counts.update(
-                conn.execute(
-                    f"SELECT key, COUNT(*) FROM doc_sources WHERE key IN ({placeholders}) "
-                    "GROUP BY key",
-                    chunk,
-                ).fetchall()
+        """只聚合本批文档的跨源覆盖数，避免扫描整个历史库。"""
+        return dict(
+            _query_keys(
+                conn,
+                "SELECT key, COUNT(*) FROM doc_sources WHERE key IN ({}) GROUP BY key",
+                keys,
             )
-        return counts
+        )
 
-    @staticmethod
-    def _hydrate(conn: sqlite3.Connection, row: tuple) -> StoredDoc:
-        key = row[0]
-        sectors = tuple(
-            item[0]
-            for item in conn.execute(
-                "SELECT sector FROM doc_sectors WHERE key = ? ORDER BY sector", (key,)
-            ).fetchall()
-        )
-        source_count = conn.execute(
-            "SELECT COUNT(*) FROM doc_sources WHERE key = ?", (key,)
-        ).fetchone()[0]
-        return StoredDoc(
-            key=key,
-            title=row[1],
-            summary=row[2],
-            source=row[3],
-            published_at=row[4],
-            url=row[5],
-            first_seen_at=_parse_iso(row[7]) or datetime.min,
-            last_seen_at=_parse_iso(row[8]) or datetime.min,
-            seen_count=row[9],
-            source_count=max(1, source_count),
-            sectors=sectors,
-            direction=row[10],
-            event_type=row[11],
-        )
+    @classmethod
+    def _hydrate(cls, conn: sqlite3.Connection, rows: list[tuple]) -> list[StoredDoc]:
+        keys = [row[0] for row in rows]
+        sectors: dict[str, list[str]] = {}
+        for key, sector in _query_keys(
+            conn,
+            "SELECT key, sector FROM doc_sectors WHERE key IN ({}) ORDER BY key, sector",
+            keys,
+        ):
+            sectors.setdefault(key, []).append(sector)
+        sources = cls._source_counts(conn, keys)
+        return [
+            StoredDoc(
+                key=row[0],
+                title=row[1],
+                summary=row[2],
+                source=row[3],
+                published_at=row[4],
+                url=row[5],
+                first_seen_at=_parse_iso(row[7]) or datetime.min,
+                last_seen_at=_parse_iso(row[8]) or datetime.min,
+                seen_count=row[9],
+                source_count=max(1, sources.get(row[0], 0)),
+                sectors=tuple(sectors.get(row[0], ())),
+                direction=row[10],
+                event_type=row[11],
+            )
+            for row in rows
+        ]
+
+
+def _query_keys(conn: sqlite3.Connection, query: str, keys: list[str]) -> Iterator[tuple]:
+    """对内部 SQL 模板分批绑定去重后的文档键，兼容 SQLite 的参数个数上限。"""
+    unique = list(dict.fromkeys(keys))
+    for start in range(0, len(unique), _KEY_QUERY_CHUNK):
+        chunk = unique[start : start + _KEY_QUERY_CHUNK]
+        yield from conn.execute(query.format(",".join("?" * len(chunk))), chunk)
 
 
 def _parse_iso(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value
     try:
-        return datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        return to_beijing_naive(parsed)
+    except (TypeError, ValueError, OverflowError):
         # 库里存的一律是 isoformat，走到这里说明有人手改过或版本迁移出了岔子。
         # 退回通用解析器，它认得各源那些花样格式。
         return parse_published(str(value))

@@ -7,42 +7,27 @@ Every fallback is reported by the caller so stale data cannot look current.
 
 from __future__ import annotations
 
-import json
 import re
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.jsoncache import read_stamped
+from ashare_decision_support.signals.series import bar_date
 from ashare_decision_support.state.paths import state_path
+from ashare_decision_support.state.store import file_lock, write_json
 
 SCHEMA = "ashare-daily-bars-cache-v1"
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-def _stamp(value: Any) -> str | None:
-    if isinstance(value, datetime):
-        return value.date().isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    text = str(value or "").strip()
-    if not text:
-        return None
-    for candidate in (text[:10], text[:8]):
-        try:
-            if len(candidate) == 8:
-                return datetime.strptime(candidate, "%Y%m%d").date().isoformat()
-            return date.fromisoformat(candidate).isoformat()
-        except ValueError:
-            continue
-    return None
-
-
-def row_date(row: dict[str, Any]) -> date | None:
-    for key in ("timestamp", "date", "datetime", "日期", "时间"):
-        stamp = _stamp(row.get(key))
-        if stamp:
-            return date.fromisoformat(stamp)
-    return None
+def _dated_rows(rows: Any) -> dict[date, dict[str, Any]]:
+    """日线按交易日唯一；同一天不同时间格式的后到记录覆盖旧记录。"""
+    if not isinstance(rows, list):
+        return {}
+    return {
+        stamp: row for row in rows if isinstance(row, dict) and (stamp := bar_date(row)) is not None
+    }
 
 
 class DailyBarsCache:
@@ -58,48 +43,32 @@ class DailyBarsCache:
         return self.root / f"{self.namespace}__{safe}.json"
 
     def read(self, symbol: str, start: date, end: date) -> list[dict[str, Any]]:
-        try:
-            payload = json.loads(self._path(symbol).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        payload = read_stamped(self._path(symbol), SCHEMA)
+        if payload is None or payload.get("symbol") != symbol:
             return []
-        if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
-            return []
-        rows = payload.get("rows")
-        if not isinstance(rows, list):
-            return []
-        result = [
-            row
-            for row in rows
-            if isinstance(row, dict) and (stamp := row_date(row)) is not None
-            and start <= stamp <= end
-        ]
-        return sorted(result, key=lambda row: row_date(row) or date.min)
+        dated = _dated_rows(payload.get("rows"))
+        return [dated[stamp] for stamp in sorted(dated) if start <= stamp <= end]
 
     def latest_date(self, rows: list[dict[str, Any]]) -> date | None:
-        dates = [stamp for row in rows if (stamp := row_date(row)) is not None]
+        dates = [stamp for row in rows if (stamp := bar_date(row)) is not None]
         return max(dates) if dates else None
 
     def write(self, symbol: str, rows: list[dict[str, Any]]) -> None:
-        if not rows:
+        fresh = _dated_rows(rows)
+        if not fresh:
             return
         path = self._path(symbol)
-        existing: list[dict[str, Any]] = []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict) and payload.get("schema") == SCHEMA:
-                existing = [row for row in payload.get("rows", []) if isinstance(row, dict)]
-        except (OSError, json.JSONDecodeError):
-            pass
-        merged = {
-            (row_date(row), str(row.get("timestamp") or row.get("date") or "")): row
-            for row in [*existing, *rows]
-            if row_date(row) is not None
-        }
-        ordered = sorted(merged.values(), key=lambda row: row_date(row) or date.min)
-        payload = {"schema": SCHEMA, "symbol": symbol, "rows": ordered}
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
-        temp.replace(path)
+        with file_lock(path):
+            stored = read_stamped(path, SCHEMA)
+            merged = (
+                _dated_rows(stored.get("rows"))
+                if stored is not None and stored.get("symbol") == symbol
+                else {}
+            )
+            merged.update(fresh)
+            ordered = [merged[stamp] for stamp in sorted(merged)]
+            payload = {"schema": SCHEMA, "symbol": symbol, "rows": ordered}
+            write_json(path, payload, indent=None)
 
 
 def cache_for(adapter: Any) -> DailyBarsCache:

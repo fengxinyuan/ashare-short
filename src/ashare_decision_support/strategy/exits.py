@@ -1,37 +1,8 @@
-"""卖出判据：什么时候该走。与 `playbook.py` 对称——那个回答「凭什么买」。
+"""持仓的日线量价退出条件与情绪环境提醒。
 
-`monitor/holdings.py` 已经有五类卖点（止损 / 目标 / 结构破坏 / 时间止损 / 浮盈
-回吐），质量很高，但**没有一条是量价触发，也没有一条是环境触发**。这个模块补的
-就是那两类。
-
-## 为什么不放进盘中监控
-
-盘中告警走的是分钟线。这里的判据全部算自**日线**——而盘中拿到的日线最后一根通常
-还是昨天那根（当日那根要收盘才完整）。把日线口径的「天量滞涨」当成盘中告警发出去，
-说的是昨天的事，却带着此刻的时间戳，那比不报更糟。
-
-所以它们的位置在**日线是新鲜的那几个时刻**：
-
-```text
-post_close   收盘后，当日日线已完整 → 持仓的卖出判据在这里说
-advise       你主动问一只票 → 连同买入判据一起说
-morning      盘前 → 昨日收盘的判据，用来定今天的处置计划
-```
-
-盘中那五类保持不动。它们本来就是分钟线口径的，是对的。
-
-## 环境类为什么单列一条
-
-「今天行情很差」必须能直接对**已有持仓**说话。改造前 `strategy/regime.py` 只在
-盘前选股时生效——情绪周期从发酵切到退潮，选股侧立刻收紧，而持仓侧一句话都没有。
-仓位上限管的是「今天能买多少」，管不了「手上这些该不该减」。
-
-**它是提示降仓，不是清仓信号**，所以永远带上判定当时的三个原始读数（炸板率、
-最高连板、跌停家数），让人能自己复核而不是只看到一个标签。
-
-## 阈值
-
-同 `playbook.py`：先验设定，不是标定出来的。作用是让这些话第一次有确定的判据。
+用于盘后、盘前计划和主动单票分析，数据日期随读数保留。
+环境判断提供降仓提示及原始情绪读数；盘中止损等实时触发由 monitor/holdings.py 处理。
+阈值为规则先验，尚非收益标定结果。
 """
 
 from __future__ import annotations
@@ -136,14 +107,12 @@ def assess_exits(
     return ExitAssessment(signals=signals)
 
 
-def _volume_price_exits(
-    vp: Any, snapshot: Any, has_gain: bool | None
-) -> list[ExitSignal]:
+def _volume_price_exits(vp: Any, snapshot: Any, has_gain: bool | None) -> list[ExitSignal]:
     signals: list[ExitSignal] = []
     if vp is None:
         return signals
 
-    # ---- 天量滞涨 --------------------------------------------------------
+    # 天量滞涨
     # 五类卖点没有一条会响：止损远在下方、目标没到、支撑没破、期限没到、浮盈
     # 还在。而买盘已经在这一天被吃完了。
     if getattr(vp, "climax_stall", False):
@@ -160,7 +129,7 @@ def _volume_price_exits(
             )
         )
 
-    # ---- 放量跌破 MA20 ---------------------------------------------------
+    # 放量跌破 MA20
     # 「缩量回踩不破 MA20」是买点，这是它的镜像。同一条均线，放着量跌穿。
     if getattr(vp, "breakdown_on_volume", False):
         ma20 = getattr(snapshot, "ma20", None)
@@ -176,7 +145,7 @@ def _volume_price_exits(
             )
         )
 
-    # ---- 顶背离 ----------------------------------------------------------
+    # 顶背离
     # **减仓不清仓**：价还在创新高，只是推动力在衰减。把它当清仓信号会在主升段
     # 中途下车，而那正是这套系统最该避免的一类错。
     # 没有浮盈就没有可兑现的东西，这条不适用。
@@ -214,7 +183,11 @@ def _environment_exit(regime: Any) -> ExitSignal | None:
     cap = getattr(regime, "position_cap", None)
     if cap is not None:
         detail.append(f"该档位仓位上限 {cap:.2f}")
-    detail.append("这是降仓提示，不是清仓信号——先按上限对齐总仓位，再逐只看个股判据")
+    detail.append(
+        "冰点档暂停新开仓；已有持仓优先核对退出，结合个股结构与可卖数量执行"
+        if cycle is EmotionCycle.FREEZING
+        else "这是降仓提示，不是清仓信号——先按上限对齐总仓位，再逐只看个股判据"
+    )
 
     return ExitSignal(
         trigger="regime_derisk",

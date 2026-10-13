@@ -1,26 +1,18 @@
-"""把多路舆情源合成一路。
+"""组合舆情源：市场快讯并集，其余数据取首个非空结果。
 
-**为什么需要它。** 舆情的四种取数（市场快讯 / 个股新闻 / 公告 / 龙虎榜）来源并不
-对称：`AkshareNewsSource` 四种全给，`WallstreetNewsSource` 只补市场快讯里的宏观段。
-调用方（`jobs/morning.py`）不该为此分叉。
-
-**合并规则只有一条：市场快讯取并集，其余取第一个能给出结果的源。** 前者是因为
-不同源的覆盖面本来就互补（实测：东财+财联社覆盖地缘 66 次命中、宏观数据 0 次命中，
-华尔街见闻正好相反）；后者是因为公告与龙虎榜是**同一份交易所数据**，两路取到的
-只会是同一批，取并集除了制造重复没有别的作用。
-
-跨源重复由 `news/dedup.py` 在下游按标题归并，这里不做——去重要和时效加权一起做，
-拆开会让同一条消息在两个地方各算一次权重。
+市场快讯按时效筛选后分配来源配额；跨源去重与权重处理由 news/dedup.py 完成。
 """
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time
 from typing import Any
 
 from ashare_decision_support.fanout import gather
-from ashare_decision_support.news.balance import retain_market_docs
+from ashare_decision_support.news.balance import retain_market_docs, source_counts
 from ashare_decision_support.news.base import NewsDoc, NewsSource
+from ashare_decision_support.news.dedup import parse_published, recency_weight
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 
 
 class CompositeNewsSource(NewsSource):
@@ -34,19 +26,14 @@ class CompositeNewsSource(NewsSource):
             raise ValueError("CompositeNewsSource 至少需要一路源")
         self.last_market_stats: dict[str, object] = {}
 
-    # ---- market-wide -----------------------------------------------------
+    # market-wide
 
     def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
         docs: list[NewsDoc] = []
         notes: list[str] = []
         alive = 0
 
-        # 四路源各自内部已经并发，但**源与源之间**此前还是串行的——那等于把
-        # akshare、华尔街见闻、国内官方、海外 RSS 四段等待首尾相接。这四路彼此
-        # 毫无依赖，谁也不读谁的结果，所以整层一起放开。
-        #
-        # 保序展开：`retain_market_docs` 按来源发配额，同一来源内取列表前缀。
-        # 完成顺序若能影响拼接顺序，同一个盘前跑两次就会得到两批不同的文档。
+        # 并发采集后按来源顺序展开，保证相同时间的文档排序稳定。
         fetched, unreachable = gather(
             self.sources,
             lambda source: source.fetch_market(trade_date, limit=limit),
@@ -65,14 +52,44 @@ class CompositeNewsSource(NewsSource):
             # 少一路就是少一块覆盖面，不能让它读起来像「都取到了」。
             notes.append(f"市场快讯来自 {alive}/{len(self.sources)} 路源")
         raw_count = len(docs)
-        balanced, self.last_market_stats = retain_market_docs(docs, limit)
+        # 先剔除过期稿件再分配配额；最新发布时间仍覆盖所有原始稿件。
+        observed_at = beijing_naive_now()
+        moment = (
+            observed_at
+            if trade_date == observed_at.date()
+            else datetime.combine(trade_date, time.max)
+        )
+        current: list[NewsDoc] = []
+        latest_by_source: dict[str, datetime] = {}
+        for doc in docs:
+            stamp = parse_published(doc.published_at)
+            if recency_weight(stamp, moment) > 0:
+                current.append(doc)
+            if stamp is not None:
+                previous = latest_by_source.get(doc.source)
+                if previous is None or stamp > previous:
+                    latest_by_source[doc.source] = stamp
+
+        balanced, stats = retain_market_docs(current, limit)
+        self.last_market_stats = {
+            **stats,
+            "raw_doc_count": raw_count,
+            "raw_by_source": source_counts(docs),
+            "effective_doc_count": len(current),
+            "effective_by_source": stats["raw_by_source"],
+            "expired_before_budget": raw_count - len(current),
+            "latest_by_source": {
+                source: stamp.isoformat(timespec="seconds")
+                for source, stamp in sorted(latest_by_source.items())
+            },
+        }
+        if raw_count > len(current):
+            notes.append(f"超过 72 小时的快讯在分配来源预算前剔除 {raw_count - len(current)} 条")
         if raw_count > len(balanced):
-            notes.append(
-                f"市场快讯原始 {raw_count} 条，按来源均衡保留 {len(balanced)} 条"
-            )
+            notes.append(f"市场快讯原始 {raw_count} 条，按来源均衡保留 {len(balanced)} 条")
         return balanced, notes
 
-    # ---- 其余：第一个给出非空结果的源说了算 --------------------------------
+    # 其余：第一个给出非空结果的源说了算
 
     def fetch_for_symbols(self, symbols: list[str], **kwargs):
         return self._first("fetch_for_symbols", {}, symbols, **kwargs)

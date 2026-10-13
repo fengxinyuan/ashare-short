@@ -1,50 +1,15 @@
-"""标的元数据：中文名 · 同花顺三级行业 · 概念标签。
+"""标的元数据：中文名、一个同花顺行业和概念标签。
 
-数据源是一个 miniserve 目录（`ASHARE_DS_SECURITY_MASTER_URL`，默认
-`https://files.688798.xyz/ths/`），两个 JSON，每天早上 08:00 前后更新一次：
+默认读取第三方托管的同花顺分类快照，地址可由 ASHARE_DS_SECURITY_MASTER_URL
+覆盖。行业与板块分类共用导入规则，只保留上游 industries 数组的第二项；其他
+层级不进入画像和报告。行业、概念文件按股票代码取并集，缺行业时仍保留概念。
+这个源不提供英文名，name_en 保持 None。
 
-```text
-industries.json   5446 只   {"symbol","name","industries":[一级,二级,三级]}
-concepts.json     5546 只   {"symbol","name","concepts":[...]}
-```
+concepts 保留原始标签；themes() 在持仓归并时排除覆盖过广的标签，板块排序的
+概念筛选由 sectors/ths_taxonomy.py 负责。
 
-2026-08-04 实测：`industries` 每条**恰好三级**，`concepts` 每只中位 7–8 个标签；
-两份的标的集合是包含关系（concepts ⊇ industries），代码已经是 `NNNNNN.XX` 规范形式，
-覆盖 SH 2280 / SZ 2837 / BJ 329。
-
-## 这个源**没有英文名**
-
-原始需求里提到「中英文名称」，但两份文件的字段只有 `symbol` / `name` / `industries`
-或 `concepts`——`name` 是中文简称，**没有任何英文字段**。所以 `name_en` 一律为 None，
-不用拼音、不用代码、不去别处凑一个。缺字段就是缺字段，编一个出来会让下游以为它是
-真的（同 `SecurityInfo` 的契约：缺了就是 None / 空，不猜）。
-
-## 概念为什么不进打分
-
-概念的粒度和申万行业不是一回事：一只票可以同时挂 11 个概念，而板块打分的分母是
-成分股数量。硬融进去会造出一个看起来精确的错数——`jobs/morning.py` 对同花顺行业指数
-已经做过同样的判断（并列呈现，刻意不参与打分），这里沿用。
-
-它先只做两件事：**简报/告警里显示**，和**问答检索**（「半导体有哪些票」「这只票
-属于哪些概念」）。超短线看题材，而申万行业分类里没有「题材」这个东西。
-
-## 不是每个「概念」都是题材
-
-2026-08-04 实测 389 个概念标签里，`融资融券` 挂了 **3841/5546** 只——它是一个
-**可交易属性**，不是题材。同类的还有 `深股通`/`沪股通`/`证金持股` 这种。一个覆盖
-七成市场的标签在题材轮动里没有任何信息量，混进去只会让「今天哪个题材在动」永远
-指向它。
-
-所以 `themes()` 按成分占比设了一道上限（`MAX_THEME_SHARE`）。**这不是把它们删掉**
-——`get(symbol).concepts` 仍然原样返回全部标签，因为「这只票能不能融资」是个真实
-且有用的事实。只是在「哪个题材在动」这个问题上，它们不参与。
-
-## 缓存
-
-参考数据变动很慢（一天一次），每次跑都拉一遍是浪费，且上游挂了会拖垮整条链路。
-落 `~/.ashare-ds/reference/security_master.json`，带 `fetched_at` 与 schema 版本戳。
-过期只是**重新拉一次的理由**，不是拒绝使用的理由——拉不到就继续用旧的并标注，
-因为一份三天前的行业分类仍然基本正确，而没有分类是彻底不能用。
+缓存带 fetched_at 和版本戳，兼容读取旧的行业数组。刷新失败时继续使用缓存
+并标注；只需本地画像的问答和持仓查询使用 cached()，不隐式发起网络请求。
 """
 
 from __future__ import annotations
@@ -58,10 +23,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ashare_decision_support.adapters.http import BROWSER_USER_AGENT, fetch_text
 from ashare_decision_support.adapters.ths_taxonomy import (
     BASE_URL,
     CONCEPT_FILE,
     INDUSTRY_FILE,
+    industry_from_path,
+    normalize_industry,
 )
 from ashare_decision_support.jsoncache import read_stamped, write_stamped
 from ashare_decision_support.state.paths import state_path
@@ -69,15 +37,15 @@ from ashare_decision_support.symbols import normalize_symbol
 
 # 地址与两个文件名从 `adapters/ths_taxonomy.py` 取，那边是按这个源命名的模块，
 # 理由写在它的常量上方：同一台主机的同两份 JSON 被两个适配器各读一遍。
-#
+
 # **可被 env 覆盖的只有这一边，这是有意的**：`ENV_URL` 指的是「标的元数据从哪
 # 取」，换镜像时板块分类那边并不跟着换。两边共用的是**默认地址**，不是同一个
 # 开关——共用默认值让「上游换地址」只需改一处，各自的开关仍然各归各。
 ENV_URL = "ASHARE_DS_SECURITY_MASTER_URL"
 
-# 缓存 schema 版本。结构变了之后老缓存里按旧口径写的行会静默参与新口径的查询，
-# 所以版本不匹配时重建而不是猜——同 `news/store.py:SCHEMA_VERSION`。
-SCHEMA_VERSION = 1
+# 新缓存只保存单个行业；旧版本只在读取边界投影，不混用层级。
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 CACHE_RELATIVE_PATH = ("reference", "security_master.json")
 
 # 超过这个时长就该重新拉。**不是过期即失效**，见模块 docstring。
@@ -98,22 +66,12 @@ class SecurityInfo:
     name: str | None = None
     # 这个源没有英文名。字段留着是因为契约需要它，值恒为 None。
     name_en: str | None = None
-    industries: tuple[str, ...] = ()
+    industry: str | None = None
     concepts: tuple[str, ...] = ()
-
-    @property
-    def industry(self) -> str | None:
-        """一级行业。"""
-        return self.industries[0] if self.industries else None
-
-    @property
-    def industry_leaf(self) -> str | None:
-        """最细一级（实测恒为三级）。"""
-        return self.industries[-1] if self.industries else None
 
     def describe(self) -> str:
         """简报里跟在代码后面的那一小段。"""
-        parts = [item for item in (self.name, self.industry_leaf) if item]
+        parts = [item for item in (self.name, self.industry) if item]
         if self.concepts:
             parts.append("、".join(self.concepts[:3]) + ("…" if len(self.concepts) > 3 else ""))
         return "　".join(parts)
@@ -123,7 +81,7 @@ class SecurityInfo:
             "symbol": self.symbol,
             "name": self.name,
             "name_en": self.name_en,
-            "industries": list(self.industries),
+            "industry": self.industry,
             "concepts": list(self.concepts),
         }
 
@@ -167,7 +125,7 @@ class SecurityMaster:
 
     def stats(self) -> dict[str, Any]:
         with_concepts = sum(1 for info in self.entries.values() if info.concepts)
-        with_industry = sum(1 for info in self.entries.values() if info.industries)
+        with_industry = sum(1 for info in self.entries.values() if info.industry)
         themes = self.themes()
         return {
             "symbols": len(self.entries),
@@ -204,7 +162,7 @@ class SecurityMasterAdapter:
         # 注入点，测试用。默认走 urllib，不引入 requests 依赖。
         self._opener = opener or _urlopen
 
-    # ---- public ----------------------------------------------------------
+    # public
 
     def load(
         self, max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS, force: bool = False
@@ -261,7 +219,7 @@ class SecurityMasterAdapter:
         )
         return payload
 
-    # ---- fetch -----------------------------------------------------------
+    # fetch
 
     def _fetch(self) -> tuple[SecurityMaster | None, list[str]]:
         notes: list[str] = []
@@ -292,22 +250,19 @@ class SecurityMasterAdapter:
                 entries[parsed.symbol] = SecurityInfo(
                     symbol=existing.symbol,
                     name=existing.name or parsed.name,
-                    industries=existing.industries,
+                    industry=existing.industry,
                     concepts=parsed.concepts,
                 )
 
         if not entries:
             return None, [*notes, "元数据文件解析后为空，按不可用处理"]
 
-        master = SecurityMaster(
-            entries=entries, fetched_at=time.time(), source=self.base_url
-        )
-        # 覆盖率必须报出来。一份少了几百只的分类外观上完全正常——
-        # `sectors/taxonomy.py` 的缺片教训就是这么来的。
-        missing_industry = sum(1 for info in entries.values() if not info.industries)
+        master = SecurityMaster(entries=entries, fetched_at=time.time(), source=self.base_url)
+        # 缺行业不应被误读为不存在这只股票。
+        missing_industry = sum(1 for info in entries.values() if not info.industry)
         if missing_industry:
             master.notes.append(
-                f"{missing_industry}/{len(entries)} 只没有行业分类（概念文件独有的标的）"
+                f"{missing_industry}/{len(entries)} 只缺少同花顺行业，已保留名称与概念"
             )
         return master, notes
 
@@ -325,7 +280,7 @@ class SecurityMasterAdapter:
             return None, f"{filename} 顶层不是数组（实为 {type(payload).__name__}），拒绝解析"
         return payload, None
 
-    # ---- cache -----------------------------------------------------------
+    # cache
 
     def _fresh(self, master: SecurityMaster, max_age_seconds: float) -> bool:
         if master.fetched_at is None:
@@ -333,7 +288,9 @@ class SecurityMasterAdapter:
         return (time.time() - master.fetched_at) < max_age_seconds
 
     def _read_cache(self) -> SecurityMaster | None:
-        payload = read_stamped(self.cache_path, SCHEMA_VERSION)
+        payload = read_stamped(self.cache_path, SCHEMA_VERSION) or read_stamped(
+            self.cache_path, LEGACY_SCHEMA_VERSION
+        )
         if payload is None:
             return None
         rows = payload.get("entries")
@@ -350,7 +307,11 @@ class SecurityMasterAdapter:
             entries[symbol] = SecurityInfo(
                 symbol=symbol,
                 name=row.get("name") or None,
-                industries=tuple(row.get("industries") or ()),
+                industry=(
+                    industry_from_path(row.get("industries"))
+                    if payload.get("schema") == LEGACY_SCHEMA_VERSION
+                    else normalize_industry(row.get("industry"))
+                ),
                 concepts=tuple(row.get("concepts") or ()),
             )
         if not entries:
@@ -382,17 +343,26 @@ def _parse_row(row: Any, key: str) -> SecurityInfo | None:
     if not symbol:
         return None
     values = row.get(key)
-    tags = tuple(str(item).strip() for item in values if str(item).strip()) if isinstance(values, list) else ()
+    tags = (
+        tuple(str(item).strip() for item in values if str(item).strip())
+        if isinstance(values, list)
+        else ()
+    )
     name = row.get("name")
     return SecurityInfo(
         symbol=symbol,
         name=str(name).strip() if isinstance(name, str) and name.strip() else None,
-        industries=tags if key == "industries" else (),
+        industry=industry_from_path(values) if key == "industries" else None,
         concepts=tags if key == "concepts" else (),
     )
 
 
 def _urlopen(url: str, timeout: float) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "ashare-ds/1.0"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8")
+    # 与 `adapters/ths_taxonomy.py` 打的是同一台主机、同两份文件，请求头也用同一套。
+    return fetch_text(
+        urllib.request.urlopen,
+        url,
+        timeout=timeout,
+        user_agent=BROWSER_USER_AGENT,
+        errors="strict",
+    )

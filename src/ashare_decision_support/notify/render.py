@@ -23,6 +23,20 @@ ADVICE_CAVEAT = (
     "盘中时效未经实测，收盘后取到的是最后一个交易日的完整数据。"
 )
 
+# 盘前简报里「大盘怎么读」那一节的标题。`jobs/morning_publish.py` 拿它当锚点，
+# 把通读、宏观联动、主题雷达插在它前面——锚点与标题必须是同一个字符串，各存
+# 一份的话改标题不报错，三节会静默落到简报末尾（纪律提醒之后）。
+MARKET_READ_HEADING = "## 大盘怎么读"
+# 主题雷达那一节的标题。发布层按它判断 LLM 写稿有没有把这一节吞掉。
+THEME_RADAR_HEADING = "## 主题雷达"
+# 板块排序表与候选价位表的标题。发布层按它们判断 LLM 写稿有没有把名单吞掉，吞了
+# 就把表按原样补回——价位是要照着执行的数，不能经过改写，也不能只留在 JSON 里。
+SECTOR_RANKING_HEADING = "## 板块怎么排"
+SECTOR_CANDIDATES_HEADING = "## 板块里先看谁"
+# 纪律提醒的标题。写稿层把它作为强制后缀附在稿末；发布层拿它当第二锚点——LLM 稿
+# 里没有「大盘怎么读」，补回的小节就插在纪律提醒之前，而不是落到它后面。
+DISCIPLINE_HEADING = "## 纪律提醒"
+
 
 def _fmt(value: float | None, digits: int = 2, suffix: str = "") -> str:
     if value is None:
@@ -81,6 +95,89 @@ def _sector_lead(market_outlook, outlooks: list, position_factor: float) -> str:
     return _join(parts)
 
 
+def _market_stance(market_outlook: Any, position_factor: float) -> str:
+    """把分数/方向翻成盘前计划语言。
+
+    这里不引入新判据，只把已经算出的 `direction + position_factor + trusted`
+    翻成读者能直接使用的环境档位。真实仓位仍以 `position_factor` 为准。
+    """
+    if market_outlook is None or not getattr(market_outlook, "trusted", True):
+        return "空仓观察"
+    direction = str(getattr(market_outlook, "direction", "") or "")
+    if position_factor <= 0.0:
+        return "空仓观察"
+    # 「中性偏空」含「偏空」二字，上一行已经收进防守档；这里只剩「中性」。
+    if position_factor <= 0.3 or "偏空" in direction:
+        return "防守"
+    if position_factor <= 0.6 or direction == "中性":
+        return "试错"
+    return "进攻"
+
+
+def _candidate_action_line(item: dict) -> str:
+    """候选股的盘中触发条件。只用已有结构字段，不制造新价位。"""
+    pieces: list[str] = []
+    if item.get("playbook"):
+        pieces.append(f"打法 {item['playbook']} 的判据继续成立")
+    sector = item.get("sector")
+    if sector:
+        pieces.append(f"{sector} 仍在主线或盘中转强队列")
+    target = item.get("target_reference")
+    if target is not None:
+        pieces.append(f"向目标参考 {_fmt(target)} 延续")
+    if item.get("trade_flow"):
+        pieces.append("逐笔资金旁证不转弱")
+    return "；".join(pieces) if pieces else "等待板块和个股形态共同确认"
+
+
+def _candidate_invalidation_line(item: dict) -> str:
+    """候选股的失效条件。止损是硬边界，其余来自已有风险字段。"""
+    pieces: list[str] = []
+    stop = item.get("stop_reference")
+    if stop is not None:
+        pieces.append(f"跌破止损参考 {_fmt(stop)}")
+    if item.get("warnings"):
+        pieces.append("风险项未解除：" + "；".join(str(text) for text in item["warnings"][:2]))
+    sector = item.get("sector")
+    if sector:
+        pieces.append(f"{sector} 盘中被证伪或明显跑输")
+    return "；".join(pieces) if pieces else "板块不确认或个股结构转弱"
+
+
+def _conditional_plan_section(
+    market_outlook: Any,
+    outlooks: list,
+    candidates: list[dict],
+    position_factor: float,
+) -> list[str]:
+    """盘前条件式计划：给边界和触发条件，不假装精确预测。"""
+    stance = _market_stance(market_outlook, position_factor)
+    lines = ["## 条件预案"]
+    lines.append(f"- 今日环境：**{stance}**；总仓位上限按系数 **{position_factor:.2f}** 执行。")
+
+    if outlooks:
+        lead = "、".join(item.name for item in outlooks[:3])
+        lines.append(f"- 板块线索：先看 {lead}；它们是观察优先级，不是买入指令。")
+    else:
+        lines.append("- 板块线索：暂无达标主线，盘中只记录异动，不主动扩大候选。")
+
+    if candidates:
+        lines.append(
+            f"- 候选观察池：{len(candidates)} 只；只有板块确认、个股打法仍成立、"
+            "风险边界未破时，才从观察升级为行动。"
+        )
+    else:
+        lines.append("- 候选观察池：为空；候选不足时不放宽门槛回填。")
+
+    lines.append(
+        "- 盘中修正：突发利好/利空先进入事件队列，必须经过来源可信、价格/成交额确认、"
+        "风险闸门三步，不直接触发买入。"
+    )
+    lines.append("- 作废条件：大盘转弱、主线板块被证伪、候选跌破自身失效位，任一出现即降级。")
+    lines.append("")
+    return lines
+
+
 def _advice_price_parts(item: Any) -> list[str]:
     """价位那一半：买点、止损、目标、盈亏比。
 
@@ -108,11 +205,12 @@ def _advice_price_parts(item: Any) -> list[str]:
 
 def _advice_lead(item: Any) -> str:
     parts: list[str] = []
-    # 打法排在最前。它回答的是「今天这只票能不能做、凭什么做」，而后面全是
-    # 「做的话在哪个价」——顺序反过来，读的人会先记住价位再想起该不该做。
+    # 形态判据与执行条件分开：突破形态成立，不代表上方有足够收益空间。
     playbook = getattr(item, "playbook", None)
     if playbook:
-        parts.append(f"打法 {playbook}")
+        rrr = getattr(item, "rrr", None)
+        suffix = "（暂不满足执行条件）" if rrr is None or rrr < 1.5 else ""
+        parts.append(f"打法 {playbook}{suffix}")
     elif getattr(item, "setup", None):
         parts.append("今日无可用打法")
     shortline = getattr(item, "shortline", None)
@@ -185,9 +283,15 @@ def _render_notes_section(notes: list[str], heading: str = "数据边界") -> li
         return []
 
     buckets = [
-        ("采集与覆盖", ("快讯", "成分股", "行业指数", "全市场", "舆情", "采样", "回溯", "入库", "缓存")),
+        (
+            "采集与覆盖",
+            ("快讯", "成分股", "行业指数", "全市场", "舆情", "采样", "回溯", "入库", "缓存"),
+        ),
         ("筛选与样本", ("过滤", "剔除", "ST", "退市", "可交易", "低吸", "候选", "样本")),
-        ("异常与回退", ("失败", "不可用", "分歧", "回退", "缺失", "旧数据", "过时", "对不上", "校验")),
+        (
+            "异常与回退",
+            ("失败", "不可用", "分歧", "回退", "缺失", "旧数据", "过时", "对不上", "校验"),
+        ),
         ("记录与台账", ("台账", "对照组", "兑现", "核对", "first_seen", "last_seen", "journal")),
     ]
     grouped: dict[str, list[str]] = {name: [] for name, _ in buckets}
@@ -218,7 +322,7 @@ def render_theme_radar(signals: list[dict[str, Any]] | None) -> str:
     """Render the discovery-only theme evidence carried by the facts bundle."""
     if not signals:
         return ""
-    lines = ["## 主题雷达", "- 主题雷达用于提前发现线索，不改变板块评分，也不构成买卖指令。"]
+    lines = [THEME_RADAR_HEADING, "- 主题雷达用于提前发现线索，不改变板块评分，也不构成买卖指令。"]
     for item in signals[:10]:
         name = item.get("name") or "未命名主题"
         stage = item.get("stage") or "—"
@@ -247,7 +351,10 @@ def render_theme_radar(signals: list[dict[str, Any]] | None) -> str:
 def _candidate_table(rows: list[dict]) -> list[str]:
     """候选行的标准表。盘前、盘后、执行卡三处同一份行结构（`SelectedSymbol.to_row`），
     所以共用同一张表——列错位在这里是最容易发生也最难看出来的一类 bug。"""
-    lines = ["| 标的 | 打法 | 评分 | 现价 | 趋势 | 止损参考 | 目标参考 |", "|---|---|---|---|---|---|---|"]
+    lines = [
+        "| 标的 | 打法 | 评分 | 现价 | 趋势 | 止损参考 | 目标参考 |",
+        "|---|---|---|---|---|---|---|",
+    ]
     for row in rows:
         name = f" {row['name']}" if row.get("name") else ""
         lines.append(
@@ -313,7 +420,11 @@ def _lhb_seat_summary(reading: Any) -> str | None:
     if not isinstance(reading, dict) or not reading.get("covered"):
         return None
     categories = reading.get("net_by_category") or {}
-    parts = [f"{name}净额 {value / 1e4:+.0f} 万" for name, value in categories.items() if isinstance(value, (int, float))]
+    parts = [
+        f"{name}净额 {value / 1e4:+.0f} 万"
+        for name, value in categories.items()
+        if isinstance(value, (int, float))
+    ]
     concentration = reading.get("concentration")
     if isinstance(concentration, (int, float)):
         parts.append(f"最大席位占成交 {concentration:.1%}")
@@ -381,14 +492,36 @@ def _watch_only_card(row: dict) -> list[str]:
     return lines
 
 
+def _post_close_sector_confirmation_section(payload: dict) -> list[str]:
+    confirmation = payload.get("sector_confirmation") or {}
+    results = [item for item in confirmation.get("results") or [] if isinstance(item, dict)]
+    if not results:
+        return []
+
+    lines = ["## 盘前主线验证"]
+    status = confirmation.get("data_status")
+    as_of = confirmation.get("as_of")
+    head = f"截至 {as_of}" if as_of else "盘中截面"
+    lines.append(f"- {head}：{status or '暂无状态'}。")
+    for row in results[:3]:
+        pieces = [str(row.get("status") or "未知")]
+        breadth = row.get("breadth")
+        excess = row.get("excess_pct")
+        if isinstance(breadth, (int, float)):
+            pieces.append(f"广度 {breadth:.0%}")
+        if isinstance(excess, (int, float)):
+            pieces.append(f"超额 {excess:+.2f}%")
+        lines.append(f"- **{row.get('name') or '未命名主线'}**：" + "；".join(pieces))
+    lines.append("")
+    return lines
+
+
 def render_post_close_brief(payload: dict) -> str:
     """盘后简报。输入是 `jobs/post_close.py` 落盘的那份 payload，不是模型对象——
     简报与执行卡读同一份字典，两边就不可能对不上。"""
     lines: list[str] = []
     trade_date = payload.get("trade_date")
-    lines.append(
-        f"**交易日** {trade_date}　**策略版本** {payload.get('strategy_version') or '—'}"
-    )
+    lines.append(f"**交易日** {trade_date}　**策略版本** {payload.get('strategy_version') or '—'}")
     lines.append(_regime_line(payload))
     lines.append("")
 
@@ -398,6 +531,8 @@ def render_post_close_brief(payload: dict) -> str:
     lines.append("## 先看结论")
     lines.append(_post_close_conclusion(actionable, watch_only))
     lines.append("")
+
+    lines.extend(_post_close_sector_confirmation_section(payload))
 
     lines.append("## 明天可以做的")
     if not actionable:
@@ -429,7 +564,7 @@ def render_post_close_brief(payload: dict) -> str:
 def _market_read_section(market_outlook) -> list[str]:
     if market_outlook is None:
         return []
-    lines = ["## 大盘怎么读"]
+    lines = [MARKET_READ_HEADING]
     if not getattr(market_outlook, "trusted", True):
         # "没测出来" 和 "测出来是中性" 必须长得不一样。
         lines.append(f"**{market_outlook.direction}** — 覆盖率不足，本次不给方向判断。")
@@ -479,8 +614,7 @@ def _rotation_price_section(rotation_price: dict | None) -> list[str]:
         heading += f"　**{adjacent}**（周度）"
     lines = [
         "## 轮动到哪了（指数价格口径）",
-        heading
-        + f"　{rotation_price.get('sectors') or 0} 个板块指数，"
+        heading + f"　{rotation_price.get('sectors') or 0} 个板块指数，"
         f"截至 {rotation_price.get('trade_date') or '—'}",
     ]
     lines.extend(f"- {text}" for text in rotation_price.get("observations") or [])
@@ -532,8 +666,13 @@ def _earnings_section(earnings: dict | None) -> list[str]:
     return lines
 
 
-def _sector_ranking_section(outlooks: list) -> list[str]:
-    lines = ["## 板块怎么排"]
+def render_sector_ranking_table(outlooks: list) -> str:
+    """板块排序表本身，不带逐板块的看点与风险——LLM 稿丢了名单时按原样补回的那部分。"""
+    return "\n".join(_sector_ranking_table(outlooks))
+
+
+def _sector_ranking_table(outlooks: list) -> list[str]:
+    lines = [SECTOR_RANKING_HEADING]
     if not outlooks:
         lines.append("无可用板块读数。")
         return lines
@@ -547,6 +686,13 @@ def _sector_ranking_section(outlooks: list) -> list[str]:
             f"{_fmt(metrics.volume_ratio)} | {metrics.covered}/{metrics.constituents} |"
         )
     lines.append("")
+    return lines
+
+
+def _sector_ranking_section(outlooks: list) -> list[str]:
+    lines = _sector_ranking_table(outlooks)
+    if not outlooks:
+        return lines
     for item in outlooks:
         lines.append(f"### {item.name}（{item.score:.1f}　{item.direction}）")
         if item.reasons:
@@ -575,8 +721,8 @@ def _candidate_profile_lines(item: dict) -> list[str]:
     """
     lines: list[str] = []
     labels = []
-    if item.get("industry_path"):
-        labels.append(str(item["industry_path"]))
+    if item.get("industry"):
+        labels.append(str(item["industry"]))
     concepts = list(item.get("concepts") or [])
     if concepts:
         labels.append("题材 " + "、".join(concepts[:3]) + ("…" if len(concepts) > 3 else ""))
@@ -585,11 +731,12 @@ def _candidate_profile_lines(item: dict) -> list[str]:
     theme_context = list(item.get("theme_context") or [])
     if theme_context:
         theme_summary = "；".join(
-            f"{theme.get('name', '—')}（{theme.get('stage', '—')}）"
-            for theme in theme_context[:3]
+            f"{theme.get('name', '—')}（{theme.get('stage', '—')}）" for theme in theme_context[:3]
         )
         lines.append(f"  - 主题链路（只作背景，不进个股评分）：{theme_summary}")
-        invalidation = [str(theme.get("invalidation")) for theme in theme_context if theme.get("invalidation")]
+        invalidation = [
+            str(theme.get("invalidation")) for theme in theme_context if theme.get("invalidation")
+        ]
         if invalidation:
             lines.append("  - 主题失效条件：" + "；".join(invalidation[:2]))
     return lines
@@ -602,13 +749,19 @@ def _sector_candidate_card(item: dict) -> list[str]:
     if item.get("trend_state"):
         summary.append(f"趋势 {item['trend_state']}")
     if item.get("last_close") is not None:
-        summary.append(f"现价 {_fmt(item.get('last_close'))}")
+        summary.append(f"结构参考收盘价 {_fmt(item.get('last_close'))}")
+    if item.get("live_price") is not None:
+        summary.append(
+            f"盘中快照 {_fmt(item.get('live_price'))}（{str(item.get('live_quote_as_of'))[11:16]}）"
+        )
     if item.get("stop_reference") is not None:
         summary.append(f"止损 {_fmt(item.get('stop_reference'))}")
     if item.get("target_reference") is not None:
         summary.append(f"目标 {_fmt(item.get('target_reference'))}")
     if summary:
         lines.append("  - 先看什么：" + "；".join(summary))
+    lines.append("  - 触发条件：" + _candidate_action_line(item))
+    lines.append("  - 失效条件：" + _candidate_invalidation_line(item))
     lines.extend(_candidate_profile_lines(item))
     if item.get("reasons"):
         lines.append("  - 为什么：" + "；".join(item["reasons"]))
@@ -622,20 +775,60 @@ def _sector_candidate_card(item: dict) -> list[str]:
     return lines
 
 
-def _sector_candidates_section(candidates: list[dict]) -> list[str]:
-    lines = ["## 板块里先看谁"]
+def render_candidate_levels_table(candidates: list[dict]) -> str:
+    """候选价位表本身，不带逐只的明细卡——同 `render_sector_ranking_table`。"""
+    return "\n".join(_candidate_levels_table(candidates))
+
+
+def _candidate_levels_table(candidates: list[dict]) -> list[str]:
+    lines = [SECTOR_CANDIDATES_HEADING]
     if not candidates:
         lines.append("入选板块中无标的通过筛选（ST/公告风险过滤后为空）。")
         return lines
-    lines.append("| 标的 | 所属板块 | 评分 | 现价 | 趋势 | 止损参考 | 目标参考 |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append(
+        "| 标的 | 所属板块 | 评分 | 结构参考收盘价 | 盘中快照 | 趋势 | 止损参考 | 目标参考 | 盈亏比 |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for item in candidates:
         lines.append(
             f"| {_symbol_label(item)} | {item['sector']} | {item['score']:.1f} | "
-            f"{_fmt(item.get('last_close'))} | {item.get('trend_state') or '—'} | "
-            f"{_fmt(item.get('stop_reference'))} | {_fmt(item.get('target_reference'))} |"
+            f"{_fmt(item.get('last_close'))} | {_fmt(item.get('live_price'))} | "
+            f"{item.get('trend_state') or '—'} | "
+            f"{_fmt(item.get('stop_reference'))} | {_fmt(item.get('target_reference'))} | "
+            f"{_reward_risk_cell(item)} |"
         )
     lines.append("")
+    return lines
+
+
+# 盘中执行门槛，与 `scoring/rule_based.py:_score_risk_reward` 写警告的那条线一致。
+REWARD_RISK_EXECUTION_FLOOR = 1.5
+
+
+def _reward_risk_cell(item: dict) -> str:
+    """候选表里的盈亏比一格：目标距离 ÷ 止损距离，按表里印出来的那两个价位算。
+
+    此前这个数只在明细卡的风险栏里以「仅供观察」出现，表里九只票看着都能买。
+    这里印的是**原始**比值（不带打分层按波幅定的分母下限）——表里就是这两个价位，
+    读者按它们下单，得到的就是这个比值。低于执行门槛的加标记。
+    """
+    close = item.get("last_close")
+    stop = item.get("stop_reference")
+    target = item.get("target_reference")
+    try:
+        close, stop, target = float(close), float(stop), float(target)
+    except (TypeError, ValueError):
+        return "—"
+    if close <= 0 or stop >= close or target <= close:
+        return "—"
+    ratio = (target / close - 1.0) / (1.0 - stop / close)
+    return f"{ratio:.2f}" + ("" if ratio >= REWARD_RISK_EXECUTION_FLOOR else " ⚠️")
+
+
+def _sector_candidates_section(candidates: list[dict]) -> list[str]:
+    lines = _candidate_levels_table(candidates)
+    if not candidates:
+        return lines
     for item in candidates:
         lines.extend(_sector_candidate_card(item))
     lines.append("")
@@ -679,6 +872,7 @@ def render_sector_brief(
     lines.append("这页只回答今天先看哪里，不回答必然涨跌；板块排序是优先级，不是预测。")
     lines.append("")
 
+    lines.extend(_conditional_plan_section(market_outlook, outlooks, candidates, position_factor))
     lines.extend(_market_read_section(market_outlook))
     lines.extend(_rotation_memory_section(rotation))
     lines.extend(_rotation_price_section(rotation_price))
@@ -694,8 +888,16 @@ def render_sector_brief(
     lines.extend(_sector_candidates_section(candidates))
     lines.extend(_position_section(market))
 
-    lines.extend(_render_notes_section(data_notes or []))
-    if data_notes:
+    # 轮动、成交额的观察句与业绩面的摘要同时进了 data_notes（给 facts / MCP 的外部
+    # 读者）和上面各自的小节。简报里只印一遍：这里把已经成节的那几句从数据边界里去掉。
+    rendered = (
+        set((rotation_price or {}).get("observations") or [])
+        | set((turnover or {}).get("observations") or [])
+        | set((earnings or {}).get("summary") or [])
+    )
+    boundary_notes = [note for note in (data_notes or []) if note not in rendered]
+    lines.extend(_render_notes_section(boundary_notes))
+    if boundary_notes:
         lines.append("")
 
     lines.append(sector_mandatory_block(position_factor))
@@ -711,7 +913,7 @@ def sector_mandatory_block(position_factor: float) -> str:
     """
     return "\n".join(
         [
-            "## 纪律提醒",
+            DISCIPLINE_HEADING,
             "- 板块排序解决的是「今天先看哪里」，不解决「买不买」；个股仍需逐一确认。",
             "- 集合竞价一旦要参与，委托必须在 **09:24:58 之前**发出；09:20-09:25 **不接受撤单**。",
             f"- 单日总仓位不超过仓位系数 {position_factor:.2f} 对应的上限。",
@@ -731,6 +933,9 @@ def _pct(value: float | None, signed: bool = True) -> str:
 def _advice_levels_table(advices: list) -> list[str]:
     lines = [
         "## 价位地图",
+        "",
+        "盈亏比按买入区间上沿与最近目标核算，未计费用、滑点及隔夜跳空；盘中仍须按现价复核。",
+        "",
         "| 标的 | 名称 | 打法 | 现价 | 买入区间 | 止损 | 目标 | 盈亏比 | 趋势 |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
@@ -792,9 +997,7 @@ def _no_playbook_line(item: Any) -> str | None:
     if not setup or setup.get("matched"):
         return None
     reasons = [
-        text
-        for entry in (setup.get("rejected") or [])
-        for text in (entry.get("reasons") or [])
+        text for entry in (setup.get("rejected") or []) for text in (entry.get("reasons") or [])
     ]
     return "- 今日无可用打法：" + "；".join(reasons) if reasons else None
 
@@ -814,6 +1017,10 @@ def _advice_readings_lines(item: Any) -> list[str]:
     lead = _advice_lead(item)
     if lead:
         lines.append("- 先看什么：" + lead)
+    holding = getattr(item, "holding", None) or {}
+    if holding.get("lines"):
+        lines.append("- 持仓：" + "；".join(holding["lines"]))
+    lines.extend(f"- 回本：{line}" for line in getattr(item, "breakeven_lines", []) or [])
     no_playbook = _no_playbook_line(item)
     if no_playbook:
         lines.append(no_playbook)
@@ -922,7 +1129,11 @@ def _levels_provenance(item: Any) -> list[str]:
     lines: list[str] = []
     chosen = [
         (label, leg)
-        for label, leg in (("买入", verdict.entry), ("止损", verdict.stop), ("目标", verdict.target))
+        for label, leg in (
+            ("买入", verdict.entry),
+            ("止损", verdict.stop),
+            ("目标", verdict.target),
+        )
         if leg is not None
     ]
     if chosen:
@@ -950,7 +1161,7 @@ def _decider_label(verdict: Any) -> str:
 
 def advice_mandatory_block() -> str:
     """Discipline text that must reach the reader on every channel."""
-    return f"## 纪律提醒\n- 价位是**结构位**，不是预测；触发前不动，触发后按纪律执行，不临场改止损。\n- 情景之间没有概率，本系统**没有拟合模型**，给不出「多大概率上涨」这类数字。\n- 单笔亏损控制在总资金可承受范围内；盈亏比不足 1.5 的机会直接放弃。\n\n{ADVICE_CAVEAT}\n{DISCLAIMER}"
+    return f"{DISCIPLINE_HEADING}\n- 价位是**结构位**，不是预测；触发前不动，触发后按纪律执行，不临场改止损。\n- 情景之间没有概率，本系统**没有拟合模型**，给不出「多大概率上涨」这类数字。\n- 单笔亏损控制在总资金可承受范围内；盈亏比不足 1.5 的机会直接放弃。\n\n{ADVICE_CAVEAT}\n{DISCLAIMER}"
 
 
 def _pre_open_execution_section(
@@ -1000,7 +1211,7 @@ def _pre_open_skip_section(watch_only: list[dict]) -> list[str]:
 
 def _pre_open_discipline_section(factor: float | None) -> list[str]:
     lines = [
-        "## 纪律提醒",
+        DISCIPLINE_HEADING,
         "- 集合竞价一旦要参与，委托必须在 **09:24:58 之前**发出；09:25 撮合完成后再下单只能算开盘单。",
         "- 09:20-09:25 期间**不接受撤单**，报价前先确认仓位与价格。",
     ]
@@ -1044,7 +1255,7 @@ def render_pre_open_brief(
     return "\n".join(lines)
 
 
-# ---- intraday alerts -----------------------------------------------------
+# intraday alerts
 
 LEVEL_BADGE = {"ACTION": "🔴", "WARN": "🟠", "INFO": "🔵"}
 
@@ -1110,15 +1321,7 @@ def _sort_alerts(alerts: list) -> list:
 
 
 def alert_title(alerts: list) -> str:
-    """告警推送的标题：有 ACTION 就把条数点出来，否则只说共几条。
-
-    和 `render_alerts` 放在一起，是因为两条投递路径都要它——`jobs/monitor.py`
-    的单次跑批与 `monitor/loop.py` 的轮询循环，此前各写了一份逐字相同的。
-
-    标题是**用户在手机通知栏里唯一看得见的那一行**：正文要展开推送才读得到，
-    而「3 条 ACTION」和「盘中观察提醒 3 条」决定他要不要现在就打开。两份实现
-    各自演化的后果，是同一套系统按投递路径给出不同措辞的通知。
-    """
+    """优先在推送标题中标明 ACTION 数量，否则显示告警总数。"""
     action = sum(1 for alert in alerts if getattr(alert, "level", "") == "ACTION")
     if action:
         return f"盘中买卖点提醒 {action} 条 ACTION / 共 {len(alerts)} 条"
@@ -1126,7 +1329,7 @@ def alert_title(alerts: list) -> str:
 
 
 def render_alerts(alerts: list, health) -> str:
-    """Compact alert card. Deliberately template-only — see docs/ARCHITECTURE.md §五.
+    """Compact alert card. Template-only; see the output guard in docs/ARCHITECTURE.md.
 
     Every alert carries the as-of timestamp of the bar it was computed from.
     Without it a push is indistinguishable from one built on yesterday's close,
@@ -1159,6 +1362,15 @@ def render_alerts(alerts: list, health) -> str:
 
 def render_feed_suspension(health) -> str:
     """The one message sent when the gate closes, and the one when it reopens."""
+    if getattr(health, "verdict", None) == "closed":
+        return "\n".join(
+            [
+                "⏸️ **当前非连续交易时段，盘中监控暂停信号**",
+                f"　{health.reason}",
+                "　开盘后将重新检查分钟线时效。",
+                DISCLAIMER,
+            ]
+        )
     if getattr(health, "usable", False):
         return "\n".join(
             [
@@ -1177,7 +1389,7 @@ def render_feed_suspension(health) -> str:
     )
 
 
-# ---- 板块告警 --------------------------------------------------------------
+# 板块告警
 
 # 与文件顶部的 `SECTOR_CAVEAT` 是两件事：那条讲的是**盘后板块打分**的权重未经
 # 回测，这条讲的是**盘中截面**根本不打分。名字必须分开——同名会静默覆盖，
@@ -1201,6 +1413,24 @@ _SECTOR_ACTION = {
 }
 
 
+def _sector_next_step(alert: Any) -> str:
+    """板块异动之后做什么。只翻译现有状态，不新增信号。"""
+    trigger = str(getattr(alert, "trigger", ""))
+    tag = str(getattr(alert, "plan_tag", ""))
+    watched = getattr(alert, "touches_watched", False)
+    if trigger == "fade":
+        return "下一步：属于这个方向的持仓/候选先降级，逐只检查止损、均价与结构支撑。"
+    if watched:
+        return "下一步：先打开命中的标的看买卖点；板块确认只是加权，不替代个股触发。"
+    if tag == "盘中新线索":
+        return "下一步：只登记为新线索，等连续性和个股买点确认，不临时追高。"
+    if tag == "盘前主线":
+        return "下一步：按盘前候选池逐只核对触发条件，没到买点仍不动。"
+    if tag == "盘前观察":
+        return "下一步：从观察升级为重点盯盘，但仍等个股价位触发。"
+    return "下一步：先看板块持续性，再回到个股买卖点。"
+
+
 def sector_alert_title(alerts: list) -> str:
     """标题是通知栏里唯一看得见的那一行，所以点名**具体板块**而不是只报条数。
 
@@ -1222,7 +1452,7 @@ def sector_alert_title(alerts: list) -> str:
 
 def render_sector_alerts(alerts: list, snapshot=None) -> str:
     """板块告警卡片。与 `render_alerts` 同为模板渲染，不碰 LLM——理由见
-    `docs/ARCHITECTURE.md` §五：告警是时效敏感的，加两秒网络延迟买不到任何东西。
+    `docs/ARCHITECTURE.md` 的“输出闸门”：告警是时效敏感的，加两秒网络延迟买不到任何东西。
     """
     lines: list[str] = []
     ordered = list(alerts)
@@ -1232,7 +1462,10 @@ def render_sector_alerts(alerts: list, snapshot=None) -> str:
         badge = LEVEL_BADGE.get(getattr(alert, "level", ""), "•")
         trigger = str(getattr(alert, "trigger", ""))
         action = _SECTOR_ACTION.get(trigger, "")
-        lines.append(f"- {badge} **{alert.headline}**" + (f"　{action}" if action else ""))
+        tag = getattr(alert, "plan_tag", "")
+        prefix = f"【{tag}】" if tag else ""
+        lines.append(f"- {badge} {prefix}**{alert.headline}**" + (f"　{action}" if action else ""))
+        lines.append(f"  - {_sector_next_step(alert)}")
 
     lines.append("")
     lines.append("## 触发依据")
@@ -1242,7 +1475,9 @@ def render_sector_alerts(alerts: list, snapshot=None) -> str:
         # 命中你在盯的票的板块标出来。同一条「退潮」，发生在你有仓位的方向上
         # 和发生在一个你没碰过的方向上，紧急程度差一个量级。
         flag = "【命中你盯的票】" if getattr(alert, "touches_watched", False) else ""
-        lines.append(f"{badge} **[{alert.level}] {flag}{alert.headline}**　as-of {stamp}")
+        tag = getattr(alert, "plan_tag", "")
+        plan = f"【{tag}】" if tag else ""
+        lines.append(f"{badge} **[{alert.level}] {plan}{flag}{alert.headline}**　as-of {stamp}")
         lines.extend(f"　{item}" for item in getattr(alert, "detail", []) or [])
         lines.append("")
 

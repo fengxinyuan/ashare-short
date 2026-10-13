@@ -1,51 +1,8 @@
-"""把整份新闻清单交给大模型，读出**传导链**：某件事影响哪个品种、通过什么机制。
+"""用模型归纳跨新闻传导链、主线、风险和持仓消息。
 
-**为什么加这一层。** 在它之前，舆情的唯一出路是 `llm_classifier.py`：每条快讯被
-压成 `(板块, 方向, 事件)` 三个标签，再由规则层折算成板块分里封顶 ±12 的一项。
-那条路解决的是「板块排序要不要动」，它做得很好，但它丢掉了新闻里**唯一不能被压成
-标签的东西**——跨市场、跨品种的因果链。
-
-逐条打标签答不了的，正是这类问题：
-
-| 事件 | 传导 | 落到 A 股 |
-|---|---|---|
-| 中东冲突升级 | 原油供给风险溢价 | 石油石化、油运；航空反向 |
-| 韩股 SK海力士涨停、美股存储指数 +17% | 存储周期共振 | 半导体、存储、PCB |
-| 海外消费龙头财报超预期 | 全球消费需求读数 | 食品饮料、家电的情绪锚 |
-| 美联储转鸽 | 无风险利率下行 | 成长股估值、红利股相对走弱 |
-
-这些链条里，**原因和结果分属不同的新闻条目**，甚至分属不同的市场。按条打标签时，
-「以色列袭击伊朗」会被归到「国防军工」，「原油涨 3%」会被归到「石油石化」，而
-**把两者连起来的那句话不会出现在任何输出里**。连接需要跨条目的语义综合，所以它
-该交给模型整段去读。
-
-2026-08-02 实测当日语料 1205 条去重快讯的领域分布：地缘 113、国外炒作热点 99、
-美股大科技 66、白宫与美国政治 64、韩股日股 52、美联储 36、美股指数盘面 27。
-覆盖是够的——缺的一直是把它们连起来的那一步。
-
-## 这一层能做什么、不能做什么
-
-**能**：说出传导链（事件 → 机制 → 受影响品种 → 方向），点出主线与风险，给持仓
-与持仓股单独标注属于它们自己的消息。
-
-**不能**：产生任何新数字。约束方式和 `writer/llm.py` 完全一样——复用它的
-`factcheck.py` 那道闸门，输出里每一个数字都必须能在**喂进去的标题原文**里找到。
-模型可以引用「韩国综指涨 17.91%」，因为那句话就在语料里；它编不出「A 股半导体今日
-大概率涨 3%」，因为 3% 无处可查，那一条会被整条丢弃。
-
-**不进打分。** 这一层的产物是给人读的段落，不参与板块分、不参与选股、不写台账。
-系统的数字仍然只从确定性层来。把它接进打分，等于让模型的叙述反过来改自己的输入。
-
-## 关键词只用来分组，不用来判断
-
-`_ROUTES` 决定一条快讯被放进提示词的哪一节，仅此而已。分错节最多让模型在「海外
-市场」那段读到一条政策新闻，它照样能读懂；而让关键词去判断**含义**才是
-`llm_classifier.py` 文档里说的那种错法。机械的部分给规则，语义的部分给模型。
-
-## 失败契约
-
-没有 key、网络挂了、返回不是 JSON、结论引用不到原文——任何一种都返回空读数加一条
-note，调用方照常出简报。和这个包里其余模块同一条约定。
+关键词只分配输入分节；结论须引用原文，数字须通过事实校验。
+结果用于报告解释，不修改评分或候选排序。
+未配置模型、调用失败或输出无效时返回空读数与 notes。
 """
 
 from __future__ import annotations
@@ -58,6 +15,7 @@ from typing import Any
 from ashare_decision_support.factcheck import review_output
 from ashare_decision_support.llmreply import anchor_text, parse_object
 from ashare_decision_support.news.base import NewsDoc
+from ashare_decision_support.news.cache import analysis_cache_key
 from ashare_decision_support.news.dedup import parse_published
 
 # 单次喂给模型的市场快讯上限。240 条标题约 8k token，一次装得下。再多就是当天的
@@ -83,49 +41,145 @@ _ROUTES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "海外市场",
         (
-            "美股", "纳斯达克", "纳指", "道琼斯", "标普", "费城半导体", "罗素",
-            "韩国", "首尔", "KOSPI", "三星", "海力士", "韩元",
-            "日经", "东证", "日本央行", "欧洲央行", "富时", "DAX", "斯托克",
-            "恒生", "港股", "中概", "新兴市场",
+            "美股",
+            "纳斯达克",
+            "纳指",
+            "道琼斯",
+            "标普",
+            "费城半导体",
+            "罗素",
+            "韩国",
+            "首尔",
+            "KOSPI",
+            "三星",
+            "海力士",
+            "韩元",
+            "日经",
+            "东证",
+            "日本央行",
+            "欧洲央行",
+            "富时",
+            "DAX",
+            "斯托克",
+            "恒生",
+            "港股",
+            "中概",
+            "新兴市场",
         ),
     ),
     (
         "美国政治与货币",
         (
-            "白宫", "特朗普", "美国总统", "国会", "参议院", "众议院", "关税",
-            "贝森特", "美联储", "鲍威尔", "FOMC", "点阵图", "美债", "非农",
-            "美国政府", "商务部长", "行政令",
+            "白宫",
+            "特朗普",
+            "美国总统",
+            "国会",
+            "参议院",
+            "众议院",
+            "关税",
+            "贝森特",
+            "美联储",
+            "鲍威尔",
+            "FOMC",
+            "点阵图",
+            "美债",
+            "非农",
+            "美国政府",
+            "商务部长",
+            "行政令",
         ),
     ),
     (
         "海外公司",
         (
-            "微软", "亚马逊", "谷歌", "Alphabet", "Meta", "苹果", "英伟达",
-            "特斯拉", "博通", "AMD", "OpenAI", "甲骨文", "台积电", "美光",
-            "闪迪", "西部数据", "希捷", "可口可乐", "耐克", "星巴克", "麦当劳",
-            "礼来", "诺和诺德", "波音", "马斯克",
+            "微软",
+            "亚马逊",
+            "谷歌",
+            "Alphabet",
+            "Meta",
+            "苹果",
+            "英伟达",
+            "特斯拉",
+            "博通",
+            "AMD",
+            "OpenAI",
+            "甲骨文",
+            "台积电",
+            "美光",
+            "闪迪",
+            "西部数据",
+            "希捷",
+            "可口可乐",
+            "耐克",
+            "星巴克",
+            "麦当劳",
+            "礼来",
+            "诺和诺德",
+            "波音",
+            "马斯克",
         ),
     ),
     (
         "地缘与安全",
         (
-            "伊朗", "中东", "以色列", "俄乌", "俄罗斯", "乌克兰", "哈马斯",
-            "台海", "南海", "制裁", "禁运", "军演", "冲突", "袭击",
+            "伊朗",
+            "中东",
+            "以色列",
+            "俄乌",
+            "俄罗斯",
+            "乌克兰",
+            "哈马斯",
+            "台海",
+            "南海",
+            "制裁",
+            "禁运",
+            "军演",
+            "冲突",
+            "袭击",
         ),
     ),
     (
         "大宗与汇率",
         (
-            "原油", "布伦特", "WTI", "黄金", "白银", "铜", "铝", "铁矿",
-            "碳酸锂", "人民币", "美元指数", "比特币", "以太坊", "稳定币", "天然气",
+            "原油",
+            "布伦特",
+            "WTI",
+            "黄金",
+            "白银",
+            "铜",
+            "铝",
+            "铁矿",
+            "碳酸锂",
+            "人民币",
+            "美元指数",
+            "比特币",
+            "以太坊",
+            "稳定币",
+            "天然气",
         ),
     ),
     (
         "国内政策",
         (
-            "国务院", "发改委", "央行", "财政部", "证监会", "政治局", "工信部",
-            "商务部", "国资委", "印发", "出台", "国常会", "部署",
-            "降准", "降息", "逆回购", "MLF", "LPR", "新闻联播",
+            "国务院",
+            "发改委",
+            "央行",
+            "财政部",
+            "证监会",
+            "政治局",
+            "工信部",
+            "商务部",
+            "国资委",
+            "印发",
+            "出台",
+            "国常会",
+            "部署",
+            "降准",
+            "降息",
+            "逆回购",
+            "MLF",
+            "LPR",
+            "新闻联播",
         ),
     ),
     (
@@ -281,15 +335,19 @@ class DailyRead:
         }
 
     def markdown(self) -> str:
-        """给简报用的段落。空读数返回空串，调用方直接跳过这一节。"""
+        """给简报用的段落。空读数返回空串，调用方直接跳过这一节。
+
+        小节用三级标题：调用方（`jobs/morning_publish.py`）把它整段挂在「## 舆情通读」
+        之下，此前这里也用二级，结果「舆情通读」成了一个空标题，四个小节看着与它平级。
+        """
         if not self.ok or not self.item_count:
             return ""
         blocks: list[str] = []
         if self.summary:
-            blocks.append("## 舆情判断")
+            blocks.append("### 舆情判断")
             blocks.append(f"> {self.summary}")
         if self.chains:
-            lines = ["## 传导链"]
+            lines = ["### 传导链"]
             for chain in self.chains:
                 lines.append(f"- {chain.line()}")
                 if chain.evidence:
@@ -298,7 +356,7 @@ class DailyRead:
         for title, items in (("今天先盯什么", self.mainlines), ("需要防什么", self.risks)):
             if not items:
                 continue
-            lines = [f"## {title}"]
+            lines = [f"### {title}"]
             for item in items:
                 tag = f"（{'、'.join(item.sectors)}）" if item.sectors else ""
                 lines.append(f"- {item.text}{tag}")
@@ -306,7 +364,7 @@ class DailyRead:
                     lines.append(f"  - 依据：{' / '.join(item.evidence)}")
             blocks.append("\n".join(lines))
         if self.holdings:
-            lines = ["## 持仓"]
+            lines = ["### 持仓"]
             for item in self.holdings:
                 lines.append(f"- **{item.symbol or ''}** {item.text}")
                 if item.evidence:
@@ -358,13 +416,15 @@ class DailyNewsReader:
         if not self.configured:
             return DailyRead(notes=["未配置 LLM key，本次不出舆情通读"])
 
-        cached = self._read_cache(trade_date)
-        if cached is not None:
-            cached.notes.append("舆情通读命中当日缓存，未重复调用模型")
-            return cached
-
         picked, counts = _pick_market_docs(docs)
         prompt, corpus = _build_prompt(picked, symbol_docs or {}, names or {})
+        cache_key = analysis_cache_key("daily_news_read_v2", [SYSTEM_PROMPT, prompt], self.client)
+        cached = self._read_cache(trade_date, cache_key, picked, symbol_docs or {}, corpus)
+        if cached is not None:
+            cached.headline_count = len(picked)
+            cached.section_counts = counts
+            cached.notes.append("舆情通读命中当日同输入缓存，未重复调用模型")
+            return cached
 
         try:
             raw = self.client.chat(
@@ -404,61 +464,44 @@ class DailyNewsReader:
             + f"），产出传导链 {len(result.chains)} 条、结论 {result.item_count} 条，"
             "全部附带原文依据（这一层只读不算，不参与打分）"
         )
-        self._write_cache(trade_date, result)
+        self._write_cache(trade_date, cache_key, result)
         return result
 
-    # ---- 缓存 ------------------------------------------------------------
+    # 缓存
 
-    def _read_cache(self, trade_date: date | None) -> DailyRead | None:
+    def _read_cache(
+        self,
+        trade_date: date | None,
+        key: str,
+        docs: list[NewsDoc],
+        symbol_docs: dict[str, list[NewsDoc]],
+        corpus: str,
+    ) -> DailyRead | None:
         if self.cache is None or trade_date is None:
             return None
         try:
-            payload = self.cache.read(trade_date, "daily_news_read")
+            payload = self.cache.read(trade_date, key)
+            if not isinstance(payload, dict) or payload.get("ok") is not True:
+                return None
+            # 缓存和模型响应共用引用与数字闸门，损坏的旧结论不能绕过校验。
+            result = _harvest(payload, docs, symbol_docs)
+            if not result.item_count or not review_output(_all_text(result), corpus).ok:
+                return None
         except Exception:
             return None
-        if not isinstance(payload, dict) or not payload.get("ok"):
-            return None
-        return DailyRead(
-            ok=True,
-            summary=str(payload.get("summary") or ""),
-            headline_count=int(payload.get("headline_count") or 0),
-            section_counts=dict(payload.get("section_counts") or {}),
-            chains=[
-                Chain(
-                    trigger=str(row.get("trigger") or ""),
-                    mechanism=str(row.get("mechanism") or ""),
-                    targets=tuple(row.get("targets") or ()),
-                    direction=str(row.get("direction") or "mixed"),
-                    evidence=tuple(row.get("evidence") or ()),
-                )
-                for row in (payload.get("chains") or [])
-                if isinstance(row, dict) and row.get("trigger")
-            ],
-            **{
-                name: [
-                    ReadItem(
-                        text=str(row.get("text") or ""),
-                        evidence=tuple(row.get("evidence") or ()),
-                        sectors=tuple(row.get("sectors") or ()),
-                        symbol=row.get("symbol"),
-                    )
-                    for row in (payload.get(name) or [])
-                    if isinstance(row, dict) and row.get("text")
-                ]
-                for name in (*TEXT_SECTIONS, "holdings")
-            },
-        )
+        result.ok = True
+        return result
 
-    def _write_cache(self, trade_date: date | None, result: DailyRead) -> None:
+    def _write_cache(self, trade_date: date | None, key: str, result: DailyRead) -> None:
         if self.cache is None or trade_date is None:
             return
         try:
-            self.cache.write(trade_date, "daily_news_read", result.to_dict())
+            self.cache.write(trade_date, key, result.to_dict())
         except Exception:
             return
 
 
-# ---- 提示词组装 ------------------------------------------------------------
+# 提示词组装
 
 
 def route_of(doc: NewsDoc) -> str:
@@ -481,6 +524,7 @@ def _pick_market_docs(docs: list[NewsDoc]) -> tuple[list[NewsDoc], dict[str, int
     所以每一节都有配额：小众但关键的节（宏观数据往往只有几条）全要，A 股那节量最大
     而边际信息最少，用它填剩下的额度。
     """
+
     def has_stamp(doc: NewsDoc) -> bool:
         return parse_published(doc.published_at) is not None
 
@@ -546,7 +590,7 @@ def _build_prompt(
     )
 
 
-# ---- 解析与核对 ------------------------------------------------------------
+# 解析与核对
 
 
 def _harvest(
@@ -564,7 +608,8 @@ def _harvest(
 
     def cited(row: dict) -> tuple[str, ...]:
         return tuple(
-            item for item in _as_list(row.get("evidence"))
+            item
+            for item in _as_list(row.get("evidence"))
             if isinstance(item, str) and _cites(item, corpus)
         )[:3]
 

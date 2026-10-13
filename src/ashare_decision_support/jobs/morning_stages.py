@@ -1,13 +1,6 @@
-"""盘前主链路的调参项、外部通道，以及六个阶段之间的五张交接单。
+"""盘前配置、外部通道和各阶段共享的交接数据。
 
-单独成模块是拆分的**前提**：`morning.py` 只剩编排，四个判定阶段各自成文件，
-而它们全都要读同一批交接单。放在任何一个阶段文件里，其余三个就得反过来 import
-那个文件——五张单子会替代 `morning.py` 成为新的中心。
-
-交接单**不是领域模型**：字段就是下一阶段真正读到的那些值。它们存在的意义是让
-「第 3 段依赖第 2 段的哪些东西」变成签名里看得见的事——原来这是 530 行里靠 60
-多个局部变量隐式串起来的。
-"""
+阶段依赖通过字段显式传递；配置值与数据源对象分别放在 MorningConfig 和 Sources。"""
 
 from __future__ import annotations
 
@@ -16,18 +9,15 @@ from typing import Any
 
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.journal import Journal
+from ashare_decision_support.journal.records import DEFAULT_STRATEGY_VERSION
 from ashare_decision_support.news import DailyRead, MacroDigest
 from ashare_decision_support.news.llm_classifier import ClassifyResult
 from ashare_decision_support.notify.base import Notifier
 from ashare_decision_support.scoring import ScoreProvider
-from ashare_decision_support.sectors import DEFAULT_LEVEL
 from ashare_decision_support.strategy.regime import RegimeVerdict
 from ashare_decision_support.writer.base import BriefWriter
 
 
-# 下面五个 `_Stage*` 是**阶段之间的交接单**，不是领域模型：字段就是下一阶段真正
-# 读到的那些值。它们存在的意义是让「第 3 段依赖第 2 段的哪些东西」变成签名里
-# 看得见的事——原来这是 530 行里靠 60 多个局部变量隐式串起来的。
 @dataclass(slots=True)
 class Universe:
     """① 板块与成分股。"""
@@ -88,6 +78,10 @@ class Fusion:
     theme_validation: dict[str, Any]
     sector_forecast_validation: dict[str, Any]
     sector_news_memory: list[dict[str, Any]]
+    # 外盘 → A 股板块的映射读数（`sectors/overseas_link.OverseasRead`）。**不进板块分**，
+    # 只挂到候选行与台账：它说的是「昨夜费半跌了 2%，半导体候选今天多一条风险」，
+    # 不是「半导体板块少 3 分」。没取到时为 None。
+    overseas: Any = None
 
 
 @dataclass(slots=True)
@@ -110,22 +104,15 @@ class Ledger:
     state: Any
     recorded: int
 
+
 @dataclass(slots=True)
 class MorningConfig:
-    """盘前主链路的调参项——全是**取值**，不含任何数据源对象。
-
-    和 `Sources` 分开的理由：这里的字段改了只影响产出的宽窄（选几个板块、每个
-    板块几只票、手工仓位压多少），而 `Sources` 的字段改了是**换掉取数通道**。
-    两类东西原来混在一个 32 参数的签名里，调用方无从判断改哪个是安全的。
-    """
+    """盘前调参值与取数开关；不持有数据源对象。"""
 
     top_sectors: int = 5
-    # 概念板块单独取几个。**和 `top_sectors` 分开数**，因为两层是分开排名的：
-    # 合成一个名额会让 346 个概念把 31 个行业整体挤出去（概念数量多，出极值的
-    # 机会也多），而行业回答的「这是什么生意」并不因此变得不重要。
+    # 行业与概念分别排名和取名额，避免数量更多的概念挤占行业名额。
     top_concepts: int = 3
     candidates_per_sector: int = 3
-    sector_level: str = DEFAULT_LEVEL
     position_factor: float | None = None
     max_constituents: int | None = None
 
@@ -141,19 +128,18 @@ class MorningConfig:
     use_earnings: bool = True
     use_broad_index: bool = True
     use_trade_flow: bool = True
-    # 概念板块进不进盘前排序。盘中监控（`sectors/intraday.py`）从 2026-08-09 起
-    # 就是行业+概念两层，盘前一直只有行业——同一天同一套分类，两条链路看到的
-    # 板块集合不一样，这本身就是一处口径分叉。
+    force_refresh_daily: bool = False
+    # 概念与行业分别排序，由各自的配额选取。
     use_concepts: bool = True
+    strategy_version: str = DEFAULT_STRATEGY_VERSION
 
 
 @dataclass(slots=True)
 class Sources:
-    """盘前主链路的全部外部通道：行情、舆情、评分、写稿、推送、台账。
+    """盘前使用的行情、舆情、评分、写稿、通知和台账通道。
 
-    `adapter` 是唯一必填项——没有行情源这条链路无从开始。其余全部可空，空的含义
-    统一是「按默认建一个」；要真正关掉某一路，用 `MorningConfig.use_*`。
-    """
+    行情适配器必填，其余通道使用注入值或任务默认值。取数开关独立于适配器，
+    由 MorningConfig.use_* 显式禁用。"""
 
     adapter: Any
     news_source: Any | None = None
@@ -170,6 +156,10 @@ class Sources:
     market_scan_adapter: Any | None = None
     earnings_adapter: Any | None = None
     broad_index_adapter: Any | None = None
+    # 海外快照源（`adapters/global_market.GlobalMarketAdapter`）。**没有默认实现**：
+    # 其余取数器缺省时会自己建默认适配器，这一个不建——测试与 chat 上下文里的
+    # 晨报不该为了一段旁证去打 40 多个海外行情代码。CLI 与 daemon 显式传入。
+    global_market_adapter: Any | None = None
     trade_flow_adapter: Any | None = None
     industry_taxonomy: Any | None = None
     concept_taxonomy: Any | None = None

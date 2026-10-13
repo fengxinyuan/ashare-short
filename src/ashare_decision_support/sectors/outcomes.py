@@ -10,12 +10,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from statistics import median
 from typing import Any
 
-from ashare_decision_support.sectors.base import SectorMetrics, SectorOutlook
+from ashare_decision_support.numeric import compound, median_of
+from ashare_decision_support.sectors.base import SectorMetrics, SectorOutlook, daily_returns
+from ashare_decision_support.sectors.panel import rounded
 from ashare_decision_support.state.paths import state_path
-from ashare_decision_support.state.store import read_json, write_json
+from ashare_decision_support.state.store import file_lock, read_json_object, write_json
 
 SCHEMA = "sector-forecast-outcomes-v2"
 HORIZONS = (1, 3, 5)
@@ -40,48 +41,45 @@ class SectorForecastOutcomeStore:
         data_date: date | None = None,
         top: int = DEFAULT_TOP,
     ) -> dict[str, Any]:
-        payload = self._load()
-        stamp = str(trade_date)
-        information_stamp = str(data_date or trade_date)
-        returns = {
-            name: item.ret_1d
-            for name, item in metrics.items()
-            if item.ret_1d is not None and item.coverage_ratio > 0
-        }
-        payload["daily"] = [
-            row for row in payload["daily"] if row.get("trade_date") != information_stamp
-        ]
-        payload["daily"].append(
-            {
-                "trade_date": information_stamp,
-                "returns": returns,
-                "market_return": median(returns.values()) if returns else None,
-            }
-        )
+        with file_lock(self.path):
+            payload = self._load()
+            stamp = str(trade_date)
+            information_stamp = str(data_date or trade_date)
+            returns = daily_returns(metrics)
+            payload["daily"] = [
+                row for row in payload["daily"] if row.get("trade_date") != information_stamp
+            ]
+            payload["daily"].append(
+                {
+                    "trade_date": information_stamp,
+                    "returns": returns,
+                    "market_return": median_of(returns.values()),
+                }
+            )
 
-        ranked = [item for item in outlooks if item.trusted][: max(1, top)]
-        payload["forecasts"] = [
-            row for row in payload["forecasts"] if row.get("trade_date") != stamp
-        ]
-        payload["forecasts"].extend(
-            {
-                "trade_date": stamp,
-                "information_date": information_stamp,
-                "sector": item.name,
-                "level": item.level,
-                "rank": rank,
-                "score": item.score,
-                "direction": item.direction,
-            }
-            for rank, item in enumerate(ranked, start=1)
-        )
-        payload["daily"].sort(key=lambda row: str(row.get("trade_date") or ""))
-        payload["forecasts"].sort(
-            key=lambda row: (str(row.get("trade_date") or ""), int(row.get("rank") or 999))
-        )
-        self._assess(payload)
-        write_json(self.path, payload)
-        return self.summary(payload)
+            ranked = [item for item in outlooks if item.trusted][: max(1, top)]
+            payload["forecasts"] = [
+                row for row in payload["forecasts"] if row.get("trade_date") != stamp
+            ]
+            payload["forecasts"].extend(
+                {
+                    "trade_date": stamp,
+                    "information_date": information_stamp,
+                    "sector": item.name,
+                    "level": item.level,
+                    "rank": rank,
+                    "score": item.score,
+                    "direction": item.direction,
+                }
+                for rank, item in enumerate(ranked, start=1)
+            )
+            payload["daily"].sort(key=lambda row: str(row.get("trade_date") or ""))
+            payload["forecasts"].sort(
+                key=lambda row: (str(row.get("trade_date") or ""), int(row.get("rank") or 999))
+            )
+            self._assess(payload)
+            write_json(self.path, payload)
+            return self.summary(payload)
 
     def summary(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = payload or self._load()
@@ -107,14 +105,26 @@ class SectorForecastOutcomeStore:
         }
 
     def _load(self) -> dict[str, Any]:
-        payload = read_json(self.path, default={}) or {}
+        payload = read_json_object(self.path)
         if payload.get("schema") != SCHEMA:
             return {"schema": SCHEMA, "daily": [], "forecasts": []}
         if not isinstance(payload.get("daily"), list) or not isinstance(
             payload.get("forecasts"), list
         ):
             return {"schema": SCHEMA, "daily": [], "forecasts": []}
-        return payload
+        return {
+            **payload,
+            "daily": [
+                row
+                for row in payload["daily"]
+                if isinstance(row, dict) and isinstance(row.get("returns"), dict)
+            ],
+            "forecasts": [
+                row
+                for row in payload["forecasts"]
+                if isinstance(row, dict) and isinstance(row.get("sector"), str)
+            ],
+        }
 
     @staticmethod
     def _assess(payload: dict[str, Any]) -> None:
@@ -131,12 +141,16 @@ class SectorForecastOutcomeStore:
                 window = daily[start + 1 : start + 1 + horizon]
                 if len(window) < horizon:
                     continue
-                sector_steps = [row.get("returns", {}).get(forecast.get("sector")) for row in window]
+                sector_steps = [
+                    row.get("returns", {}).get(forecast.get("sector")) for row in window
+                ]
                 market_steps = [row.get("market_return") for row in window]
-                if not all(isinstance(value, (int, float)) for value in [*sector_steps, *market_steps]):
+                if not all(
+                    isinstance(value, (int, float)) for value in [*sector_steps, *market_steps]
+                ):
                     continue
-                sector_return = _compound(sector_steps)
-                market_return = _compound(market_steps)
+                sector_return = compound(sector_steps)
+                market_return = compound(market_steps)
                 outcomes[str(horizon)] = {
                     "sessions": horizon,
                     "return": round(sector_return, 6),
@@ -146,13 +160,6 @@ class SectorForecastOutcomeStore:
                 }
             if outcomes:
                 forecast["outcomes"] = outcomes
-
-
-def _compound(values: list[float]) -> float:
-    result = 1.0
-    for value in values:
-        result *= 1.0 + value
-    return result - 1.0
 
 
 def _stats(horizon: int, values: list[float]) -> dict[str, Any]:
@@ -169,5 +176,5 @@ def _stats(horizon: int, values: list[float]) -> dict[str, Any]:
         "samples": len(values),
         "win_rate": round(sum(value > 0 for value in values) / len(values), 4),
         "mean_excess_return": round(sum(values) / len(values), 6),
-        "median_excess_return": round(median(values), 6),
+        "median_excess_return": rounded(median_of(values)),
     }

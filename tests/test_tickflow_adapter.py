@@ -78,9 +78,7 @@ class FakeKlines:
 class FakeInstruments:
     def batch(self, *args, **kwargs):
         symbols = args[0] if args else kwargs.get("symbols", [])
-        return {
-            "data": [{"symbol": symbol, "name": f"Name-{symbol}"} for symbol in symbols]
-        }
+        return {"data": [{"symbol": symbol, "name": f"Name-{symbol}"} for symbol in symbols]}
 
 
 class FakeClient:
@@ -188,12 +186,12 @@ def test_free_mode_tests_are_not_silently_upgraded_by_an_exported_key() -> None:
     assert adapter.supports_depth is False
 
 
-# ---- 批次大小护栏 ---------------------------------------------------------
-#
+# 批次大小护栏
+
 # 直觉上「一次要更多只」应该更快，实测正相反。2026-08-02 付费档全 A 5534 只、
 # 120 天日线：chunk=100 拿到 5534/5534 用 27.8s；chunk=500 只剩 4434 只、53.6s；
 # chunk=1000 剩 4034 只、51.2s；chunk=2000 **一只都没有**、36.2s。
-#
+
 # 丢掉的标的返回空列表，与「这只票确实没有日线」无法区分——又慢又静默丢数据。
 # 小样本（2000 只）测出来的结论是反的，所以这里用调用记录钉死批次上限。
 
@@ -231,7 +229,9 @@ class ChunkRecordingModule:
 def _batch_sizes(chunk_size: int, symbol_count: int = 250) -> list[int]:
     adapter = TickFlowAdapter(api_key="k", tickflow_module=ChunkRecordingModule())
     symbols = [f"{600000 + index}.SH" for index in range(symbol_count)]
-    adapter.get_historical_bars_batch(symbols, date(2026, 4, 1), date(2026, 7, 31), chunk_size=chunk_size)
+    adapter.get_historical_bars_batch(
+        symbols, date(2026, 4, 1), date(2026, 7, 31), chunk_size=chunk_size
+    )
     return adapter.client.klines.batch_sizes
 
 
@@ -257,7 +257,7 @@ def test_every_symbol_comes_back_when_the_chunking_is_right() -> None:
     assert all(rows for rows in bars.values())
 
 
-# ---- 列式载荷：这一支此前是全仓唯一不过 `finite` 的取数路径 ----------------
+# 列式载荷：这一支此前是全仓唯一不过 `finite` 的取数路径
 
 
 class _ColumnarKlines:
@@ -274,11 +274,13 @@ def _columnar_adapter(payload: dict) -> TickFlowAdapter:
     module = type(
         "Mod",
         (),
-        {"TickFlow": staticmethod(lambda **kw: type("C", (), {"klines": _ColumnarKlines(payload)})())},
+        {
+            "TickFlow": staticmethod(
+                lambda **kw: type("C", (), {"klines": _ColumnarKlines(payload)})()
+            )
+        },
     )
-    return TickFlowAdapter(
-        api_key="k", tickflow_module=module, auto_connect=False, rate_limit=None
-    )
+    return TickFlowAdapter(api_key="k", tickflow_module=module, auto_connect=False, rate_limit=None)
 
 
 def test_columnar_bars_drop_non_finite_readings() -> None:
@@ -301,7 +303,9 @@ def test_columnar_bars_drop_non_finite_readings() -> None:
         }
     )
 
-    bars = adapter.get_historical_bars(["600519.SH"], date(2026, 8, 1), date(2026, 8, 3))["600519.SH"]
+    bars = adapter.get_historical_bars(["600519.SH"], date(2026, 8, 1), date(2026, 8, 3))[
+        "600519.SH"
+    ]
 
     # close 为 NaN 的那一根整根丢掉——和 close 缺失是同一种情况。
     assert len(bars) == 2
@@ -326,7 +330,9 @@ def test_columnar_bars_tolerate_short_columns() -> None:
         }
     )
 
-    bars = adapter.get_historical_bars(["600519.SH"], date(2026, 8, 1), date(2026, 8, 2))["600519.SH"]
+    bars = adapter.get_historical_bars(["600519.SH"], date(2026, 8, 1), date(2026, 8, 2))[
+        "600519.SH"
+    ]
 
     assert len(bars) == 2
     assert bars[1]["amount"] is None

@@ -1,14 +1,11 @@
-"""⑤ 台账：把这一轮的结论与被否掉的候选一起落盘。
-
-从 `jobs/morning.py` 搬出来的一段。**被否的也要记**：只记选中的那批，事后就无法
-回答「那条规则救过我们没有」——被它否掉的票后来涨了还是跌了，是这条规则唯一的
-证据来源。
-"""
+"""归档盘前计划及入选、对照、否决样本，供事后核对筛选效果。"""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 from ashare_decision_support.jobs.morning_facts import build_facts, market_state
@@ -16,11 +13,13 @@ from ashare_decision_support.jobs.morning_stages import (
     Collected,
     Fusion,
     Ledger,
+    MorningConfig,
     Selection,
     Sources,
 )
 from ashare_decision_support.journal import Journal
 from ashare_decision_support.journal.records import (
+    DEFAULT_STRATEGY_VERSION,
     KIND_CONTROL,
     KIND_RECOMMENDATION,
     KIND_VETOED,
@@ -28,6 +27,8 @@ from ashare_decision_support.journal.records import (
     facts_hash,
 )
 from ashare_decision_support.news import macro_context_of
+from ashare_decision_support.signals.series import bar_date
+from ashare_decision_support.state.workflow import archive_plan
 
 
 def stage_record(
@@ -38,6 +39,12 @@ def stage_record(
     today: date,
     notes: list[str],
     report: Callable[[str], Any],
+    *,
+    config: MorningConfig | None = None,
+    output_path: Path | None = None,
+    actionable: bool = True,
+    execution_blocks: list[str] | None = None,
+    metric_date: str | None = None,
 ) -> Ledger:
     """⑤ 落台账。
 
@@ -54,7 +61,7 @@ def stage_record(
         fusion.selected,
         candidates,
         fusion.market,
-        fusion.effective_factor,
+        fusion.effective_factor if actionable else 0.0,
         notes,
         collected.news_as_of,
         fusion.limit_snapshot,
@@ -74,12 +81,24 @@ def stage_record(
         theme_validation=fusion.theme_validation,
         sector_forecast_validation=fusion.sector_forecast_validation,
         sector_news_memory=fusion.sector_news_memory,
+        overseas=fusion.overseas,
+        metric_date=metric_date,
     )
     if selection.diagnostic:
         facts["diagnostic"] = dict(selection.diagnostic)
+    facts["execution_ready"] = actionable
+    facts["execution_blocks"] = execution_blocks or []
+    cfg = config or MorningConfig()
+    facts["strategy_version"] = cfg.strategy_version
+    facts["strategy_parameters"] = asdict(cfg)
+    if output_path is not None:
+        try:
+            facts.update(archive_plan(output_path, facts))
+        except (OSError, TypeError, ValueError) as exc:
+            notes.append(f"盘前计划归档失败（{type(exc).__name__}），本轮无法按计划版本回放")
     state = market_state(
         fusion.market,
-        fusion.effective_factor,
+        fusion.effective_factor if actionable else 0.0,
         fusion.limit_snapshot,
         fusion.regime,
         rotation_price=fusion.rotation_price,
@@ -92,28 +111,30 @@ def stage_record(
     macro_context = macro_context_of(fusion.macro_links)
     recorded = _record_journal(
         journal,
-        candidates,
+        candidates if actionable else [],
         today,
         facts,
         state,
         macro_context=macro_context,
+        reference_date=metric_date,
     )
     # 对照组和入选组走同一套记录与兑现流程，只是 kind 不同、不推送、不进候选。
     recorded_control = _record_journal(
         journal,
-        selection.control,
+        selection.control if actionable else [],
         today,
         facts,
         state,
         kind=KIND_CONTROL,
         macro_context=macro_context,
+        reference_date=metric_date,
     )
     # 否决组：被业绩闸门移除的那些。它们在打分之前就消失了，所以必须单独从
     # `metric_bars` 里取参考价补记——不补的话，这道**明知有代价还是加了**的闸门
     # 永远无法被自己的台账验证，代价只能停留在设计者的自述里。
     recorded_vetoed = _record_vetoed(
         journal,
-        selection.earnings_verdicts,
+        selection.earnings_verdicts if actionable else {},
         collected.metric_bars,
         selection.selected_sector_of,
         today,
@@ -139,6 +160,7 @@ def stage_record(
     report(f"④ 当日候选共 {len(candidates)} 只，正在整理晨报与多空辩论")
     return Ledger(facts=facts, state=state, recorded=recorded)
 
+
 def _pct_against(value: Any, reference: float) -> float | None:
     """相对参考价的涨跌幅。
 
@@ -148,6 +170,27 @@ def _pct_against(value: Any, reference: float) -> float | None:
     而且不会报错，只会让台账里的百分比整体偏掉。
     """
     return None if not value else round(float(value) / reference - 1.0, 6)
+
+
+def _reward_risk(stop_pct: float | None, target_pct: float | None) -> float | None:
+    """原始盈亏比：目标距离 ÷ 止损距离，不带打分层那个按波幅定的分母下限。
+
+    台账要的是计划发出时**报出去的**那两个价位之比，用来事后分桶（`journal/stats.py`
+    的 `by_rrr`）；打分层的下限是为了不让 0.04% 的止损算出 172 的比值拿满分，
+    那是打分的事，不该改写台账里的事实。
+    """
+    if stop_pct is None or target_pct is None or stop_pct >= 0 or target_pct <= 0:
+        return None
+    return round(target_pct / -stop_pct, 4)
+
+
+def _last_bar_date(bars: list[dict]) -> str | None:
+    """这批日线最后一根的交易日；被否决标的的参考价就是它的收盘。"""
+    for bar in reversed(bars):
+        if isinstance(bar.get("close"), (int, float)) and bar["close"]:
+            stamp = bar_date(bar)
+            return stamp.isoformat() if stamp is not None else None
+    return None
 
 
 def _record_vetoed(
@@ -183,11 +226,8 @@ def _record_vetoed(
             continue
         if symbol not in sector_of:
             continue
-        closes = [
-            bar.get("close")
-            for bar in (bars_by_symbol.get(symbol) or [])
-            if isinstance(bar.get("close"), (int, float))
-        ]
+        bars = bars_by_symbol.get(symbol) or []
+        closes = [bar.get("close") for bar in bars if isinstance(bar.get("close"), (int, float))]
         if not closes or not closes[-1]:
             continue
         forecast = verdict.to_dict().get("forecast") or {}
@@ -198,6 +238,7 @@ def _record_vetoed(
                 source="morning",
                 sector=sector_of.get(symbol),
                 reference_price=float(closes[-1]),
+                reference_date=_last_bar_date(bars),
                 earnings=forecast,
                 reasons=[],
                 warnings=list(verdict.blocking),
@@ -205,9 +246,43 @@ def _record_vetoed(
                 macro_context=dict(macro_context or {}),
                 facts_hash=digest,
                 kind=KIND_VETOED,
+                strategy_version=facts.get("strategy_version") or DEFAULT_STRATEGY_VERSION,
+                plan_id=facts.get("plan_id"),
             )
         )
     return journal.record_many(records)
+
+
+def record_candidate_rows(
+    journal: Journal,
+    rows: list[dict],
+    today: date,
+    facts: dict,
+    *,
+    source: str,
+    market_state: dict[str, Any] | None = None,
+    kind: str = KIND_RECOMMENDATION,
+    macro_context: dict[str, Any] | None = None,
+    reference_date: str | None = None,
+) -> int:
+    """给其他链路用的入口：把 `SelectedSymbol.to_row()` 那种行落台账。
+
+    盘后执行卡（`jobs/post_close.py`）产出的候选行和晨报是同一个形状，此前却从不进
+    台账——那张卡说「明天可以做的」，事后没有任何地方核对它做对了没有。来源标签
+    必须区别于 `morning`：`journal/stats.py:_screened` 只拿晨报那条链路算入选/对照
+    差值，别的来源进总体与分组统计，不混进那个差值。
+    """
+    return _record_journal(
+        journal,
+        rows,
+        today,
+        facts,
+        market_state,
+        kind=kind,
+        macro_context=macro_context,
+        reference_date=reference_date,
+        source=source,
+    )
 
 
 def _record_journal(
@@ -218,11 +293,17 @@ def _record_journal(
     market_state: dict[str, Any] | None = None,
     kind: str = KIND_RECOMMENDATION,
     macro_context: dict[str, Any] | None = None,
+    reference_date: str | None = None,
+    source: str = "morning",
 ) -> int:
     """把候选落台账。
 
     参考价与止损/目标都取自**前复权日线**，所以三者同口径，相对百分比有效。
     核对时也用前复权序列，见 `journal/verify.py`。
+
+    `reference_date` 是参考价那根日线的交易日——盘前跑的话是上一交易日，不是
+    `today`。每一行自带的 `bar_date` 优先（停牌股的最后一根可能更早），缺了才用
+    整批的 `metric_date`。
     """
     digest = facts_hash(facts)
     records: list[Recommendation] = []
@@ -238,16 +319,19 @@ def _record_journal(
             Recommendation(
                 symbol=item["symbol"],
                 trade_date=str(today),
-                source="morning",
+                source=source,
                 name=item.get("name"),
                 sector=item.get("sector"),
                 score=item.get("score"),
                 reference_price=reference,
+                reference_date=item.get("bar_date") or reference_date,
                 stop_price=item.get("stop_reference"),
                 target_prices=[item["target_reference"]] if item.get("target_reference") else [],
-                # 盘前没有分时，买入区间留空；核对时 entered 只对有区间的记录有意义。
+                # 盘前没有分时，买入区间留空；核对时 entered 只对有区间的记录有意义，
+                # 执行口径则按计划日开盘价成交（`journal/verify.py:_replay_execution`）。
                 stop_pct=stop_pct,
                 target_pcts=[target_pct] if target_pct is not None else [],
+                rrr=_reward_risk(stop_pct, target_pct),
                 trend_state=item.get("trend_state"),
                 wyckoff_bias=item.get("wyckoff_bias"),
                 playbook=item.get("playbook"),
@@ -270,6 +354,8 @@ def _record_journal(
                 warnings=item.get("warnings") or [],
                 facts_hash=digest,
                 kind=kind,
+                strategy_version=facts.get("strategy_version") or DEFAULT_STRATEGY_VERSION,
+                plan_id=facts.get("plan_id"),
             )
         )
     return journal.record_many(list(records))

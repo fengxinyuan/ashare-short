@@ -25,17 +25,17 @@ from ashare_decision_support.numeric import finite, mean
 from ashare_decision_support.signals.series import change, series
 
 # 回调深度的档位，单位是**这只票自己的日均真实波幅（ATR%）**，不是绝对百分比。
-#
+
 # 用绝对百分比是错的，2026-08-02 实测八只票一年日线，「回撤 5%~12% 算理想」这套
 # 固定档位两头都坏：
-#
+
 #   长江电力（日振幅 1.82%）  ideal 只占  8% 的交易日，deep 一次都没到过
 #   计算机题材（日振幅 6.23%） deep 占了 49% —— 一个本该意味着「趋势可能已破坏」
 #                             的档位成了它的常态，等于没有告警能力
-#
+
 # 归一化之后同一档位在不同波动的票上含义才一致：建行一年最大回撤 -11.47%、长电
 # -7.85%，绝对值差 46%，除以各自日振幅后是 4.4 与 4.3 —— 几乎相同。
-#
+
 # 下面三个数是拿八只票（五只红利蓝筹 + 计算机/传媒/茅台）的档位分布标定出来的，
 # 目标是**每只票四个档位都填得满、且没有哪一档吞掉一半以上**。这是先验校准，
 # 不是收益验证——哪一档真的更值得买，要等台账样本回答。
@@ -79,15 +79,15 @@ class DipFeatures:
     dist_to_ma20_pct: float | None = None
 
     # L2 回调到位了吗
-    pullback_pct: float | None = None          # 距 20 日最高的回撤，≤0。原始百分比，给人看
-    atr_pct: float | None = None               # 日均真实波幅占价格的比例，归一化的分母
-    pullback_atr: float | None = None          # 回撤 ÷ 日振幅：回调了「几个日常波动」
-    pullback_band: str | None = None           # none | shallow | ideal | deep，按 ATR 口径分
-    down_days: int | None = None               # 从 20 日高点算起，走了几天
-    dist_to_support_pct: float | None = None   # 距最近支撑，正=支撑在下方
+    pullback_pct: float | None = None  # 距 20 日最高的回撤，≤0。原始百分比，给人看
+    atr_pct: float | None = None  # 日均真实波幅占价格的比例，归一化的分母
+    pullback_atr: float | None = None  # 回撤 ÷ 日振幅：回调了「几个日常波动」
+    pullback_band: str | None = None  # none | shallow | ideal | deep，按 ATR 口径分
+    down_days: int | None = None  # 从 20 日高点算起，走了几天
+    dist_to_support_pct: float | None = None  # 距最近支撑，正=支撑在下方
 
     # 回调质量：缩量回调是健康的，放量回调是出货
-    volume_contraction: float | None = None    # 近 3 日均量 / 20 日均量
+    volume_contraction: float | None = None  # 近 3 日均量 / 20 日均量
     shrinking: bool | None = None
 
     # 成交成本代理。它不是筹码平均成本，只是窗口内成交额 / 成交量。
@@ -131,7 +131,7 @@ def measure_dip(bars: list[dict], snapshot: Any = None) -> DipFeatures:
 
     pullback, down_days = _pullback(highs[-MEDIUM_WINDOW:], last)
     contraction = _contraction(volumes)
-    atr_pct = _atr_pct(bars[-MEDIUM_WINDOW - 1:])
+    atr_pct = _atr_pct(bars[-MEDIUM_WINDOW - 1 :])
     normalised = _normalise(pullback, atr_pct)
     turnover_cost_15 = _turnover_cost(bars, COST_SHORT_WINDOW)
     turnover_cost_30 = _turnover_cost(bars, COST_MEDIUM_WINDOW)
@@ -182,9 +182,7 @@ def _atr_pct(bars: list[dict]) -> float | None:
             continue
         true_range = high - low
         if previous_close is not None:
-            true_range = max(
-                true_range, abs(high - previous_close), abs(low - previous_close)
-            )
+            true_range = max(true_range, abs(high - previous_close), abs(low - previous_close))
         if close > 0:
             ranges.append(true_range / close)
         previous_close = close
@@ -254,7 +252,7 @@ def _turnover_cost(bars: list[dict], window: int) -> float | None:
     volume_total = 0.0
     for row in bars[-window:]:
         amount = finite(row.get("amount"))
-        volume = _normalised_volume(row)
+        volume = normalised_volume(row)
         if amount is None or amount <= 0 or volume is None or volume <= 0:
             return None
         amount_total += amount
@@ -275,7 +273,14 @@ def normalised_volume(row: dict) -> float | None:
     volume = finite(row.get("volume"))
     amount = finite(row.get("amount"))
     close = finite(row.get("close"))
-    if volume is None or volume <= 0 or amount is None or amount <= 0 or close is None or close <= 0:
+    if (
+        volume is None
+        or volume <= 0
+        or amount is None
+        or amount <= 0
+        or close is None
+        or close <= 0
+    ):
         return None
 
     implied_unit = amount / (volume * close)
@@ -283,10 +288,6 @@ def normalised_volume(row: dict) -> float | None:
         if low <= implied_unit <= high:
             return volume * multiplier
     return None
-
-
-def _normalised_volume(row: dict) -> float | None:
-    return normalised_volume(row)
 
 
 def _distance_to_cost(price: float, cost: float | None) -> float | None:

@@ -10,11 +10,15 @@ from __future__ import annotations
 import math
 import random
 
+import pytest
+
 from ashare_decision_support.sectors.panel import pearson
 from ashare_decision_support.sectors.seesaw import (
     MIN_HALF_POINTS,
+    NEGATIVE_THRESHOLD,
     SeesawRead,
     _returns,
+    critical_correlation,
     explain_divergence,
     read_seesaw,
 )
@@ -23,8 +27,11 @@ from ashare_decision_support.sectors.seesaw import (
 def _series(name: str, closes: list[float], start: int = 1) -> tuple[str, list[dict]]:
     """一条板块指数序列。日期用 2026 年 1 月起的连续整数戳，与落盘格式一致。"""
     bars = [
-        {"date": f"2026{(start + index) // 100 + 1:02d}{(start + index) % 100 + 1:02d}",
-         "close": close, "amount": 1e8}
+        {
+            "date": f"2026{(start + index) // 100 + 1:02d}{(start + index) % 100 + 1:02d}",
+            "close": close,
+            "amount": 1e8,
+        }
         for index, close in enumerate(closes)
     ]
     return name, bars
@@ -38,7 +45,10 @@ def _walk(steps: list[float], base: float = 100.0) -> list[float]:
 
 
 def _panel(pairs: dict[str, list[float]]) -> dict[str, tuple[str, list[dict]]]:
-    return {f"BK{index:04d}": _series(name, closes) for index, (name, closes) in enumerate(pairs.items())}
+    return {
+        f"BK{index:04d}": _series(name, closes)
+        for index, (name, closes) in enumerate(pairs.items())
+    }
 
 
 def _opposite(count: int, amplitude: float = 0.02) -> tuple[list[float], list[float]]:
@@ -69,27 +79,37 @@ def _filler(count: int, bars: int) -> dict[str, list[float]]:
     return {f"陪跑{index}": _walk(_noise(bars - 1, index * 11 + 3)) for index in range(count)}
 
 
-# ---- 闸门 1：两个半窗必须同号 ----------------------------------------------
+# 闸门 1：两个半窗必须同号
 
 
-def test_a_pair_that_only_diverged_in_one_half_is_not_a_seesaw() -> None:
-    """一段行情里偶然反向走了三周的两个板块，不是跷跷板。
-
-    这正是「跷跷板」这个词最容易被误用的地方：整窗系数为负，但那个负号全部来自
-    后半段，前半段两者其实同涨同跌。60 日滚动窗口在 A 股上的稳定性本身存疑
-    （`docs/ROADMAP.md` §5.2 的原话），所以判据是**两半都为负**才报。
-    """
+@pytest.mark.parametrize("same_direction_first", [True, False])
+def test_a_pair_that_only_diverged_in_one_half_is_not_a_seesaw(same_direction_first) -> None:
+    """任一半窗同向，都不足以构成稳定的反向关系。"""
     bars = 61
     half = (bars - 1) // 2
     up, down = _opposite(bars - 1)
-    # 前半段同向（把 down 的前半段翻回来），后半段反向。
-    wobbly = [-value for value in down[:half]] + down[half:]
+    wobbly = up[:half] + down[half:] if same_direction_first else down[:half] + up[half:]
 
     panel = {"甲": _walk(up), "乙": _walk(wobbly), **_filler(20, bars)}
     read = read_seesaw(_panel(panel))
 
     assert read.trusted
     assert read.correlation_of("甲", "乙") is None
+
+
+@pytest.mark.parametrize("flat_first", [True, False])
+def test_a_pair_with_a_flat_half_is_not_reported(flat_first) -> None:
+    bars = 61
+    half = (bars - 1) // 2
+    up, down = _opposite(bars - 1)
+    flat = [0.0] * half
+    partial = flat + down[half:] if flat_first else down[:half] + flat
+    panel = {"甲": _walk(up), "半窗停更": _walk(partial), **_filler(20, bars)}
+
+    read = read_seesaw(_panel(panel))
+
+    assert read.trusted
+    assert all("半窗停更" not in {pair.left, pair.right} for pair in read.pairs)
 
 
 def test_a_pair_negative_in_both_halves_is_reported_with_both_coefficients() -> None:
@@ -109,7 +129,7 @@ def test_a_pair_negative_in_both_halves_is_reported_with_both_coefficients() -> 
     assert "前半段" in pair.describe() and "后半段" in pair.describe()
 
 
-# ---- 闸门 2：多重比较必须写在脸上 ------------------------------------------
+# 闸门 2：多重比较必须写在脸上
 
 
 def test_the_notes_say_how_many_pairs_were_tested_and_at_what_threshold() -> None:
@@ -122,6 +142,7 @@ def test_the_notes_say_how_many_pairs_were_tested_and_at_what_threshold() -> Non
     read = read_seesaw(_panel(_filler(22, bars)))
 
     assert read.pairs_tested == 22 * 21 // 2
+    assert read.threshold == round(critical_correlation(22 * 21 // 2, bars - 1), 4)
     assert any(str(read.pairs_tested) in note for note in read.notes)
     assert any("Bonferroni" in note for note in read.notes)
     assert read.to_dict()["threshold"] == read.threshold
@@ -133,8 +154,6 @@ def test_the_threshold_tightens_as_more_pairs_are_tested() -> None:
     -0.35 那个常量只是地板：单对看 p≈0.006 挺显著，乘上 3240 对，光噪声就该出
     约 9 个假阳性——而这张榜通常只有几行。
     """
-    from ashare_decision_support.sectors.seesaw import NEGATIVE_THRESHOLD, critical_correlation
-
     assert critical_correlation(1, 60) == NEGATIVE_THRESHOLD  # 对数少时不放宽
     assert critical_correlation(3240, 60) < critical_correlation(231, 60) < NEGATIVE_THRESHOLD
     # 点数太少时 Fisher z 变换没有定义，退回地板而不是报错。
@@ -176,7 +195,7 @@ def test_a_one_versus_many_structure_is_called_out_as_one_finding() -> None:
     assert any("一对多结构" in line and "枢纽" in line for line in read.observations)
 
 
-# ---- 逐日配对 --------------------------------------------------------------
+# 逐日配对
 
 
 def test_returns_are_paired_by_trade_date_not_by_index() -> None:
@@ -215,7 +234,7 @@ def test_returns_are_paired_by_trade_date_not_by_index() -> None:
     assert by_index > pair.correlation + 0.3
 
 
-# ---- 不预设、不预测 --------------------------------------------------------
+# 不预设、不预测
 
 
 def test_a_pair_off_the_board_is_called_unknown_not_unrelated() -> None:
@@ -254,7 +273,7 @@ def test_no_divergence_means_nothing_to_explain() -> None:
     assert explain_divergence(read, "甲", "乙", None, -0.02) is None
 
 
-# ---- 「没有」和「算不出来」是两件事 ----------------------------------------
+# 「没有」和「算不出来」是两件事
 
 
 def test_an_empty_board_is_a_conclusion_not_a_failure() -> None:

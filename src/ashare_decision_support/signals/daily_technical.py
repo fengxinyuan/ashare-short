@@ -8,7 +8,7 @@ from ashare_decision_support.models.enums import TrendState
 from ashare_decision_support.models.schemas import DailyTechnicalSnapshot, PriceLevel
 from ashare_decision_support.numeric import clamp
 from ashare_decision_support.schedule.timezone import beijing_naive_now
-from ashare_decision_support.signals.series import normalize_bars
+from ashare_decision_support.signals.series import normalize_bars, volume_ratio
 
 # 止损距离的上下限，单位是标的自身的 ATR。低于下限的止损是随机噪声（必被打掉），
 # 高于上限的止损保护不了任何东西。用 ATR 而非固定百分比，理由见 `_stop_reference`。
@@ -38,7 +38,9 @@ class DailyTechnicalAnalyzer:
         self.support_resistance_window = support_resistance_window
         self.max_levels = max_levels
 
-    def analyze_many(self, bars_by_symbol: dict[str, list[dict]]) -> dict[str, DailyTechnicalSnapshot]:
+    def analyze_many(
+        self, bars_by_symbol: dict[str, list[dict]]
+    ) -> dict[str, DailyTechnicalSnapshot]:
         return {symbol: self.analyze(symbol, bars) for symbol, bars in bars_by_symbol.items()}
 
     def analyze(self, symbol: str, bars: list[dict]) -> DailyTechnicalSnapshot:
@@ -72,7 +74,9 @@ class DailyTechnicalAnalyzer:
         stop_reference = self._stop_reference(last["close"], supports, ma10 or ma20, atr14)
         target_reference = resistances[0].price if resistances else None
         explanation = self._explanation(trend_state, supports, resistances, ma20, ma60, atr14)
-        setups = self._setups(last["close"], trend_state, supports, resistances, ma20, volume_ratio_20d)
+        setups = self._setups(
+            last["close"], trend_state, supports, resistances, ma20, volume_ratio_20d
+        )
 
         return DailyTechnicalSnapshot(
             symbol=symbol,
@@ -146,18 +150,20 @@ class DailyTechnicalAnalyzer:
         for index in range(1, len(rows)):
             row = rows[index]
             prev_close = rows[index - 1]["close"]
-            true_ranges.append(max(row["high"] - row["low"], abs(row["high"] - prev_close), abs(row["low"] - prev_close)))
+            true_ranges.append(
+                max(
+                    row["high"] - row["low"],
+                    abs(row["high"] - prev_close),
+                    abs(row["low"] - prev_close),
+                )
+            )
         if len(true_ranges) < window:
             return None
         return round(fmean(true_ranges[-window:]), 4)
 
     def _volume_ratio(self, rows: list[dict], window: int) -> float | None:
-        if len(rows) < window + 1:
-            return None
-        baseline = [row["volume"] for row in rows[-(window + 1):-1] if row["volume"] > 0]
-        if not baseline:
-            return None
-        return round(rows[-1]["volume"] / fmean(baseline), 4)
+        """从日线提取成交量后复用 signals.series.volume_ratio。"""
+        return volume_ratio([row["volume"] for row in rows], window, digits=4)
 
     def _range_position(self, rows: list[dict], window: int) -> float | None:
         data = rows[-window:] if len(rows) >= window else rows
@@ -181,11 +187,20 @@ class DailyTechnicalAnalyzer:
             return TrendState.DOWNTREND
         return TrendState.RANGE
 
-    def _levels(self, rows: list[dict], last_close: float, atr: float) -> tuple[list[PriceLevel], list[PriceLevel]]:
+    def _levels(
+        self, rows: list[dict], last_close: float, atr: float
+    ) -> tuple[list[PriceLevel], list[PriceLevel]]:
         pivots = self._find_pivots(rows)
         threshold = max(atr * 0.8, last_close * 0.012)
-        supports = self._cluster_levels([pivot for pivot in pivots if pivot.side == "support"], threshold, last_close, "support")
-        resistances = self._cluster_levels([pivot for pivot in pivots if pivot.side == "resistance"], threshold, last_close, "resistance")
+        supports = self._cluster_levels(
+            [pivot for pivot in pivots if pivot.side == "support"], threshold, last_close, "support"
+        )
+        resistances = self._cluster_levels(
+            [pivot for pivot in pivots if pivot.side == "resistance"],
+            threshold,
+            last_close,
+            "resistance",
+        )
         return supports[: self.max_levels], resistances[: self.max_levels]
 
     def _find_pivots(self, rows: list[dict]) -> list[_Pivot]:
@@ -211,7 +226,8 @@ class DailyTechnicalAnalyzer:
         filtered = [
             pivot
             for pivot in pivots
-            if (side == "support" and pivot.price <= last_close) or (side == "resistance" and pivot.price >= last_close)
+            if (side == "support" and pivot.price <= last_close)
+            or (side == "resistance" and pivot.price >= last_close)
         ]
         filtered.sort(key=lambda item: item.price)
 
@@ -242,10 +258,7 @@ class DailyTechnicalAnalyzer:
                 )
             )
 
-        if side == "support":
-            levels.sort(key=lambda item: (abs(item.distance_pct), -item.strength))
-        else:
-            levels.sort(key=lambda item: (abs(item.distance_pct), -item.strength))
+        levels.sort(key=lambda item: (abs(item.distance_pct), -item.strength))
         return levels
 
     def _explanation(
@@ -281,15 +294,24 @@ class DailyTechnicalAnalyzer:
         nearest_support = supports[0] if supports else None
         nearest_resistance = resistances[0] if resistances else None
 
-        if trend_state in {TrendState.UPTREND, TrendState.REBOUND} and nearest_resistance is not None:
+        if (
+            trend_state in {TrendState.UPTREND, TrendState.REBOUND}
+            and nearest_resistance is not None
+        ):
             setups.append(
                 {
                     "setup": "breakout_follow",
                     "bias": "bullish",
                     "trigger_price": round(nearest_resistance.price * 1.003, 4),
-                    "stop_price": round((nearest_support.price if nearest_support else (ma20 or last_close * 0.97)) * 0.997, 4),
+                    "stop_price": round(
+                        (nearest_support.price if nearest_support else (ma20 or last_close * 0.97))
+                        * 0.997,
+                        4,
+                    ),
                     "target_price": round(nearest_resistance.price * 1.05, 4),
-                    "confidence": round(0.66 + (0.08 if volume_ratio_20d and volume_ratio_20d >= 1.1 else 0.0), 4),
+                    "confidence": round(
+                        0.66 + (0.08 if volume_ratio_20d and volume_ratio_20d >= 1.1 else 0.0), 4
+                    ),
                     "reason": "趋势未坏，接近上沿，适合做突破跟随。",
                 }
             )
@@ -301,13 +323,19 @@ class DailyTechnicalAnalyzer:
                     "bias": "bullish" if trend_state != TrendState.DOWNTREND else "neutral",
                     "trigger_price": round(nearest_support.price * 1.01, 4),
                     "stop_price": round(nearest_support.price * 0.985, 4),
-                    "target_price": round((nearest_resistance.price if nearest_resistance else last_close * 1.04), 4),
+                    "target_price": round(
+                        (nearest_resistance.price if nearest_resistance else last_close * 1.04), 4
+                    ),
                     "confidence": round(0.58 + min(nearest_support.strength / 20.0, 0.15), 4),
                     "reason": "靠近有效支撑，适合观察回踩修复。",
                 }
             )
 
-        if trend_state == TrendState.RANGE and nearest_support is not None and nearest_resistance is not None:
+        if (
+            trend_state == TrendState.RANGE
+            and nearest_support is not None
+            and nearest_resistance is not None
+        ):
             setups.append(
                 {
                     "setup": "range_rotation",
@@ -327,7 +355,9 @@ class DailyTechnicalAnalyzer:
                     "bias": "bearish",
                     "trigger_price": round(nearest_resistance.price * 0.995, 4),
                     "stop_price": round(nearest_resistance.price * 1.015, 4),
-                    "target_price": round((nearest_support.price if nearest_support else last_close * 0.96), 4),
+                    "target_price": round(
+                        (nearest_support.price if nearest_support else last_close * 0.96), 4
+                    ),
                     "confidence": 0.55,
                     "reason": "下跌趋势未修复，优先防守反弹受阻。",
                 }

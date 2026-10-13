@@ -49,9 +49,7 @@ def _tasks(monkeypatch, tmp_path, **overrides) -> dict[str, Any]:
     def fake_run_daemon(tasks, **kwargs):
         captured["tasks"] = {task.key: task for task in tasks}
         captured["daemon_kwargs"] = kwargs
-        return type(
-            "R", (), {"ran": [], "failed": [], "skipped": [], "notes": []}
-        )()
+        return type("R", (), {"ran": [], "failed": [], "skipped": [], "notes": []})()
 
     monkeypatch.setattr(daily_cycle, "run_daemon", fake_run_daemon)
     run_daily_cycle(

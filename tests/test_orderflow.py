@@ -23,6 +23,7 @@ from ashare_decision_support.signals.orderflow import (
     read_order_book,
 )
 from ashare_decision_support.state.alerts import AlertState
+from tests.fakes import FakeResponse
 
 ALERT_NOW = datetime(2026, 8, 3, 10, 30)
 
@@ -57,7 +58,7 @@ def snapshot(
     )
 
 
-# ---- 量纲 ----------------------------------------------------------------
+# 量纲
 
 
 TENCENT_LINE = (
@@ -65,7 +66,7 @@ TENCENT_LINE = (
     "395.28~5~395.26~14~395.25~1~395.60~22~395.66~2~395.74~2~395.80~2~395.81~1~~20260731161442~"
     "-6.58~-1.64~400.20~389.00~395.30/394149/15602984033~394149~1560298~0.93~21.52~~400.20~389.00~"
     "2.79~16840.10~18289.17~4.82~482.26~321.50~1.01~0~395.86~21.13~25.33~~~1.17~1560298.4033~"
-    '252.9920~64~ A A~GP-A-CYB~9.70~3.21~1.97~22.41~8.03~468.75~249.81~9.81~4.03~-12.47~4260081019~'
+    "252.9920~64~ A A~GP-A-CYB~9.70~3.21~1.97~22.41~8.03~468.75~249.81~9.81~4.03~-12.47~4260081019~"
     '4626654919~0.00~6.25~4260081019~~~53.99~-0.41~~CNY~0~~396.00~-115~";'
 )
 
@@ -75,20 +76,7 @@ class StubHttp:
         self.body = body
 
     def __call__(self, request, timeout=None):
-        class Response:
-            def __init__(self, payload: bytes) -> None:
-                self.payload = payload
-
-            def read(self) -> bytes:
-                return self.payload
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        return Response(self.body.encode("gbk", errors="replace"))
+        return FakeResponse(self.body, encoding="gbk")
 
 
 def test_tencent_volumes_are_normalised_to_the_same_unit_as_sina() -> None:
@@ -113,7 +101,7 @@ def test_tencent_volumes_are_normalised_to_the_same_unit_as_sina() -> None:
     assert snap.bids[0].volume == 6 * TENCENT_VOLUME_TO_SHARES
 
 
-# ---- 委比 ----------------------------------------------------------------
+# 委比
 
 
 def test_imbalance_is_signed_and_bounded() -> None:
@@ -156,7 +144,7 @@ def test_limit_state_stays_unknown_when_no_limit_price_was_published() -> None:
     assert reading.at_limit_down is None
 
 
-# ---- 挂单墙 --------------------------------------------------------------
+# 挂单墙
 
 
 def test_a_dominant_level_is_reported_as_a_wall() -> None:
@@ -266,7 +254,7 @@ def test_a_wall_always_carries_the_caveat_that_it_can_be_pulled() -> None:
     assert any("撤单成本为零" in note for note in reading.notes)
 
 
-# ---- 价差与缺数据 --------------------------------------------------------
+# 价差与缺数据
 
 
 def test_a_wide_spread_warns_against_quoting_the_book_price() -> None:
@@ -301,8 +289,8 @@ def test_read_many_skips_unreadable_symbols_without_failing_the_batch() -> None:
     assert list(readings) == ["600519.SH"]
 
 
-# ---- 盘口进告警 ----------------------------------------------------------
-#
+# 盘口进告警
+
 # 读数进了候选价位还不够。告警回答的是「现在做什么」，而五档回答的恰恰是
 # **这件事此刻做不做得成**——封死涨停买不进、封死跌停卖不出。少了这一层，
 # 监控会照常发一条 ACTION 催人去做一个做不到的动作。
@@ -335,8 +323,12 @@ class Intraday:
 
 def fire(engine, state, advice, intraday, book=None, holding=None):
     return engine.evaluate(
-        advice=advice, intraday=intraday, state=state, now=ALERT_NOW,
-        holding=holding, book=book,
+        advice=advice,
+        intraday=intraday,
+        state=state,
+        now=ALERT_NOW,
+        holding=holding,
+        book=book,
     )
 
 
@@ -346,9 +338,7 @@ def fresh():
 
 def sealed_up_book() -> object:
     """封死涨停：卖盘五档全空，价格贴在涨停价上。"""
-    return read_order_book(
-        snapshot(bids=[(22.00, 500000.0)], asks=[], last=22.00, limit_up=22.00)
-    )
+    return read_order_book(snapshot(bids=[(22.00, 500000.0)], asks=[], last=22.00, limit_up=22.00))
 
 
 def test_a_sealed_limit_up_downgrades_the_buy_alert_instead_of_urging_a_trade() -> None:
@@ -360,8 +350,8 @@ def test_a_sealed_limit_up_downgrades_the_buy_alert_instead_of_urging_a_trade() 
     engine, state = fresh()
     book = sealed_up_book()
 
-    fire(engine, state, Advice(), Intraday(19.00), book)             # 区间外，建立基线
-    alerts = fire(engine, state, Advice(), Intraday(20.00), book)    # 进区间
+    fire(engine, state, Advice(), Intraday(19.00), book)  # 区间外，建立基线
+    alerts = fire(engine, state, Advice(), Intraday(20.00), book)  # 进区间
 
     assert [item.trigger for item in alerts] == ["entry_sealed"]
     assert alerts[0].level == "WARN"
@@ -377,8 +367,8 @@ def test_an_unknown_limit_state_never_suppresses_a_buy_alert() -> None:
 
     assert book.at_limit_up is None
 
-    fire(engine, state, Advice(), Intraday(19.00), book)
-    alerts = fire(engine, state, Advice(), Intraday(20.00), book)
+    fire(engine, state, Advice(targets=(23.0,)), Intraday(19.00), book)
+    alerts = fire(engine, state, Advice(targets=(23.0,)), Intraday(20.00), book)
 
     assert [item.trigger for item in alerts] == ["entry_zone"]
     assert alerts[0].level == "ACTION"
@@ -415,8 +405,8 @@ def test_an_actionable_alert_carries_the_book_as_bounded_side_evidence() -> None
         )
     )
 
-    fire(engine, state, Advice(), Intraday(19.00), book)
-    alerts = fire(engine, state, Advice(), Intraday(20.00), book)
+    fire(engine, state, Advice(targets=(23.0,)), Intraday(19.00), book)
+    alerts = fire(engine, state, Advice(targets=(23.0,)), Intraday(20.00), book)
 
     line = next(item for item in alerts[0].detail if item.startswith("盘口"))
     assert "买盘墙" in line

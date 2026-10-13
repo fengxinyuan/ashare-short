@@ -4,7 +4,9 @@ from ashare_decision_support.models.enums import EffortResult, WyckoffBias
 from ashare_decision_support.signals.wyckoff import WyckoffAnalyzer
 
 
-def _build_sideways_bars(base: float, last_close: float, last_low: float, last_high: float, volume: float):
+def _build_sideways_bars(
+    base: float, last_close: float, last_low: float, last_high: float, volume: float
+):
     bars = []
     for idx in range(24):
         price = base + (0.01 * ((idx % 3) - 1))
@@ -35,7 +37,9 @@ def test_wyckoff_analyzer_identifies_accumulation_spring() -> None:
     analyzer = WyckoffAnalyzer()
     signal = analyzer.analyze(
         "300001.SZ",
-        _build_sideways_bars(base=10.0, last_close=10.28, last_low=9.72, last_high=10.34, volume=1800),
+        _build_sideways_bars(
+            base=10.0, last_close=10.28, last_low=9.72, last_high=10.34, volume=1800
+        ),
     )
 
     assert signal.spring is True
@@ -47,7 +51,9 @@ def test_wyckoff_analyzer_identifies_distribution_upthrust() -> None:
     analyzer = WyckoffAnalyzer()
     signal = analyzer.analyze(
         "600001.SH",
-        _build_sideways_bars(base=20.0, last_close=19.95, last_low=19.82, last_high=20.35, volume=1900),
+        _build_sideways_bars(
+            base=20.0, last_close=19.95, last_low=19.82, last_high=20.35, volume=1900
+        ),
     )
 
     assert signal.upthrust is True
@@ -124,3 +130,36 @@ def test_exhaustion_scores_by_direction_not_by_a_dead_branch() -> None:
         # 两个分数各自已经 round 到 2 位，作差要再 round 一次：28.01 - 36.01 在
         # 二进制浮点里是 -7.999999999999996。
         assert round(exhausted.score - baseline.score, 2) == expected
+
+
+def _trending_bars(total_return_pct: float, days: int = 25) -> list[dict]:
+    """平稳上行、收在区间上沿的一段：结构分落在 12..35 之间，只有涨幅不同。"""
+    bars = []
+    step = total_return_pct / 100.0 / days
+    price = 10.0
+    for idx in range(days):
+        price *= 1.0 + step
+        bars.append(
+            {
+                "timestamp": f"2026-08-{idx + 1:02d}",
+                "open": price * 0.995,
+                "high": price * 1.01,
+                "low": price * 0.99,
+                "close": price,
+                "volume": 1000,
+            }
+        )
+    return bars
+
+
+def test_moderate_structure_after_a_large_advance_is_markup_not_accumulation() -> None:
+    """20 日已涨 12% 的票不是吸筹末端。同一档结构分，涨幅小的才判 ACCUMULATION。"""
+    analyzer = WyckoffAnalyzer()
+    advanced = analyzer.analyze("003816.SZ", _trending_bars(12.0))
+    quiet = analyzer.analyze("000001.SZ", _trending_bars(4.0))
+
+    assert advanced.medium_return_pct > 8.0
+    assert advanced.bias is not WyckoffBias.ACCUMULATION
+    assert quiet.bias in {WyckoffBias.ACCUMULATION, WyckoffBias.MARKUP}
+    if 12 <= quiet.score < 35 and not quiet.sign_of_strength:
+        assert quiet.bias is WyckoffBias.ACCUMULATION

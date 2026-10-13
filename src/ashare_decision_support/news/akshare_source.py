@@ -47,7 +47,7 @@ CCTV_LOOKBACK_DAYS = 3
 # 财经早餐单源取多少条。它返回的是**跨月历史归档**（实测 400 条），而每天只有
 # 一份。不限量的话这一路会占掉 `fetch_market` 整个 limit 预算的三分之二，把
 # 真正实时的几路快讯挤出去——而被挤掉的恰恰是时效最好的那批。
-#
+
 # 时效折减在 `news/dedup.py` 里做（超 72 小时整条丢弃），所以这里只要留够
 # 「一周份」就行，多出来的会在下游被丢掉，白占预算。
 CJZC_LIMIT = 8
@@ -70,7 +70,7 @@ class AkshareNewsSource(NewsSource):
         self.cache = cache
         self.last_market_stats: dict[str, Any] = {}
 
-    # ---- market-wide -----------------------------------------------------
+    # market-wide
 
     def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
         docs: list[NewsDoc] = []
@@ -182,7 +182,7 @@ class AkshareNewsSource(NewsSource):
             notes.append("所有市场级舆情源均不可用，本次板块打分不含舆情项")
         return docs, notes
 
-    # ---- per-stock -------------------------------------------------------
+    # per-stock
 
     def _latest_cctv(self, trade_date: date) -> Any:
         """最近一期有稿的新闻联播。空表和抛异常都算「这天没有」。"""
@@ -240,7 +240,7 @@ class AkshareNewsSource(NewsSource):
             notes.append(f"以下标的个股新闻拉取失败：{reasons}")
         return result, notes
 
-    # ---- announcements ---------------------------------------------------
+    # announcements
 
     def fetch_announcements(self, trade_date: date) -> tuple[list[dict], list[str]]:
         """Whole-market announcements, walking back to the last day that has any.
@@ -291,11 +291,13 @@ class AkshareNewsSource(NewsSource):
                 return parsed, notes
 
         return [], [
-            (f"回溯 {ANNOUNCEMENT_LOOKBACK_DAYS} 天内没有取到任何公告，"
-            "本次**没有公告风险否决**，候选未经该层过滤")
+            (
+                f"回溯 {ANNOUNCEMENT_LOOKBACK_DAYS} 天内没有取到任何公告，"
+                "本次**没有公告风险否决**，候选未经该层过滤"
+            )
         ]
 
-    # ---- capital flow ----------------------------------------------------
+    # capital flow
 
     def fetch_dragon_tiger(self, start: date, end: date) -> tuple[list[dict], list[str]]:
         """Dragon-tiger board rows, used as the money-confirmation input.
@@ -345,8 +347,6 @@ class AkshareNewsSource(NewsSource):
         return probe_feeds(
             "akshare", probes, lambda probe: probe[0], lambda probe: records(probe[1]())
         )
-
-    # ---- internals -------------------------------------------------------
 
     def _cached_rows(
         self,

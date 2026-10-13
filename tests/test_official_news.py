@@ -5,33 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from ashare_decision_support.news.official_source import OfficialListing, OfficialNewsSource
-
-
-class Response:
-    def __init__(self, body: str) -> None:
-        self.body = body.encode("utf-8")
-
-    def read(self) -> bytes:
-        return self.body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class Http:
-    def __init__(self, pages: dict[str, str], dead: set[str] | None = None) -> None:
-        self.pages = pages
-        self.dead = dead or set()
-
-    def __call__(self, request, timeout=None):
-        url = request.full_url
-        if url in self.dead:
-            raise OSError("down")
-        return Response(self.pages[url])
-
+from tests.fakes import PageOpener as Http
 
 PAGE = """
 <ul>
@@ -73,13 +47,10 @@ def test_source_balances_each_official_publisher() -> None:
     pbc = OfficialListing("中国人民银行", "https://official.example/pbc", "中国人民银行")
     csrc = OfficialListing("中国证监会", "https://official.example/csrc", "中国证监会")
     many = "".join(
-        f'<a href="/{i}.html">中国人民银行第{i}项公开市场操作公告</a>2026-08-07'
-        for i in range(5)
+        f'<a href="/{i}.html">中国人民银行第{i}项公开市场操作公告</a>2026-08-07' for i in range(5)
     )
     one = '<a href="/a.html">证监会发布上市公司监管规则适用指引</a>2026-08-07'
-    source = OfficialNewsSource(
-        opener=Http({pbc.url: many, csrc.url: one}), listings=(pbc, csrc)
-    )
+    source = OfficialNewsSource(opener=Http({pbc.url: many, csrc.url: one}), listings=(pbc, csrc))
 
     docs, _ = source.fetch_market(date(2026, 8, 8), limit=3)
 
@@ -87,7 +58,7 @@ def test_source_balances_each_official_publisher() -> None:
     assert sum(doc.source == "中国证监会" for doc in docs) == 1
 
 
-# ---- 站点噪声：带日期、带链接，和一条公告只差在长得不像标题 ----------------
+# 站点噪声：带日期、带链接，和一条公告只差在长得不像标题
 
 
 def _one(page: str) -> list:
@@ -117,7 +88,10 @@ def test_navigation_bar_is_not_a_publication() -> None:
     """导航条与页脚同样带日期带链接，只能靠长度和分隔符认出来。"""
     nav = "首页 | 简 | 繁 | EN | 登录 个人中心 退出 | 邮箱 | 无障碍 EN"
     more = "更多>> 国务院公报 政策解读 新华时评：“发力提效”释放鲜明政策信号"
-    footer = "网站纠错 主办单位：国务院办公厅 运行维护单位：中国政府网运行中心 " + "版权所有：中国政府网 " * 6
+    footer = (
+        "网站纠错 主办单位：国务院办公厅 运行维护单位：中国政府网运行中心 "
+        + "版权所有：中国政府网 " * 6
+    )
     page = "".join(
         f'<a href="/{i}.html">{text}</a> 2026-08-07'
         for i, text in enumerate([nav, more, footer, "国务院关于印发全民健身计划的通知"])

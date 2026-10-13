@@ -23,9 +23,10 @@ from ashare_decision_support.emotion_scale import (
     STREAK_WEAK,
 )
 from ashare_decision_support.models.enums import EmotionCycle, Playbook
+from ashare_decision_support.numeric import finite
 
 # 涨停家数。太少说明没有赚钱效应，太多且伴随高连板是情绪透支。
-#
+
 # 这三个留在本模块：只有闸门读它们，不构成跨层的那把尺子。
 LIMIT_UP_THIN = 15
 LIMIT_UP_CROWDED = 80
@@ -34,16 +35,14 @@ LIMIT_UP_CROWDED = 80
 LIMIT_DOWN_PANIC = 15
 
 # 每个周期允许的打法与仓位上限。
-#
+
 # 低吸（PULLBACK）几乎每一档都在，但**它在退潮期是主力打法、在启动期只是备选**
 # ——两者的区别由仓位上限和 `_LEADER_ONLY` 表达，不由是否允许表达。
 _ALLOWED: dict[EmotionCycle, frozenset[Playbook]] = {
     # 冰点：空集。不是仓位压到很低，是**不出手**。
     EmotionCycle.FREEZING: frozenset(),
     EmotionCycle.LAUNCH: frozenset({Playbook.BREAKOUT, Playbook.PULLBACK}),
-    EmotionCycle.MOMENTUM: frozenset(
-        {Playbook.BREAKOUT, Playbook.PULLBACK, Playbook.RANGE_LOW}
-    ),
+    EmotionCycle.MOMENTUM: frozenset({Playbook.BREAKOUT, Playbook.PULLBACK, Playbook.RANGE_LOW}),
     # 高潮：只减不加。留 PULLBACK 是因为强势股回踩仍是可执行的进场，但仓位砍半，
     # 且这一档的真正重点在卖点侧（`monitor/`），不在选股侧。
     EmotionCycle.CLIMAX: frozenset({Playbook.PULLBACK}),
@@ -107,36 +106,41 @@ def classify_regime(
 ) -> RegimeVerdict:
     """从涨停池读数判定情绪周期。
 
-    `blowup_rate` 缺失时返回 UNKNOWN 而不是猜一个——涨停池是这一层唯一的输入，
-    没有它就没有判断，只有一个偏保守的兜底。
+    缺失或无效的读数保留未知，不能用零补齐。已验证的恐慌指标仍可独立停止
+    新开仓；其余周期要求完整读数，避免缺少跌停统计时给出高仓位。
     """
     reasons: list[str] = []
     warnings: list[str] = []
 
-    if blowup_rate is None:
+    blowup_rate = finite(blowup_rate)
+    if blowup_rate is not None and not 0.0 <= blowup_rate <= 1.0:
+        blowup_rate = None
+    streak = _count(max_streak)
+    ups = _count(limit_up_count)
+    downs = _count(limit_down_count)
+    missing = [
+        label
+        for label, value in (
+            ("炸板率", blowup_rate),
+            ("最高连板", streak),
+            ("涨停家数", ups),
+            ("跌停家数", downs),
+        )
+        if value is None
+    ]
+    if missing:
+        warnings.append(f"情绪读数缺失或无效：{'、'.join(missing)}；缺失未按零计入")
+
+    panic = _panic_reason(blowup_rate, streak, ups, downs)
+    if panic is not None:
+        reasons.append(panic)
+        return _verdict(EmotionCycle.FREEZING, reasons, warnings)
+
+    if missing:
         warnings.append(
-            "涨停池不可用，情绪周期未知。已按退潮档压仓位并只保留回踩打法——"
-            "未知不等于中性"
+            "涨停池读数不完整，情绪周期未知。已按退潮档压仓位并只保留回踩打法——未知不等于中性"
         )
         return _verdict(EmotionCycle.UNKNOWN, reasons, warnings, trusted=False)
-
-    streak = max_streak or 0
-    ups = limit_up_count or 0
-    downs = limit_down_count or 0
-
-    # 恐慌与冰点先判。这三条任意一条成立，后面的封板质量读数都不再有意义。
-    if downs >= LIMIT_DOWN_PANIC:
-        reasons.append(f"跌停 {downs} 家（≥{LIMIT_DOWN_PANIC}），恐慌盘")
-        return _verdict(EmotionCycle.FREEZING, reasons, warnings)
-    if blowup_rate >= BLOWUP_FROZEN and streak <= STREAK_WEAK:
-        reasons.append(
-            f"炸板率 {blowup_rate:.1%}（≥{BLOWUP_FROZEN:.0%}）且最高连板仅 {streak} 板，"
-            "封板意愿与接力资金同时缺席"
-        )
-        return _verdict(EmotionCycle.FREEZING, reasons, warnings)
-    if ups <= LIMIT_UP_THIN:
-        reasons.append(f"涨停仅 {ups} 家（≤{LIMIT_UP_THIN}），没有赚钱效应")
-        return _verdict(EmotionCycle.FREEZING, reasons, warnings)
 
     if blowup_rate >= BLOWUP_STRESSED:
         reasons.append(
@@ -169,6 +173,27 @@ def classify_regime(
         f"最高连板 {streak} 板，多空分歧"
     )
     return _verdict(EmotionCycle.DIVERGENCE, reasons, warnings)
+
+
+def _count(value: object) -> int | None:
+    number = finite(value)
+    return int(number) if number is not None and number >= 0 and number.is_integer() else None
+
+
+def _panic_reason(
+    rate: float | None, streak: int | None, ups: int | None, downs: int | None
+) -> str | None:
+    """只让已测得的风险触发冰点，不让其他字段的缺失盖过已知恐慌。"""
+    if downs is not None and downs >= LIMIT_DOWN_PANIC:
+        return f"跌停 {downs} 家（≥{LIMIT_DOWN_PANIC}），恐慌盘"
+    if rate is not None and rate >= BLOWUP_FROZEN and streak is not None and streak <= STREAK_WEAK:
+        return (
+            f"炸板率 {rate:.1%}（≥{BLOWUP_FROZEN:.0%}）且最高连板仅 {streak} 板，"
+            "封板意愿与接力资金同时缺席"
+        )
+    if ups is not None and ups <= LIMIT_UP_THIN:
+        return f"涨停仅 {ups} 家（≤{LIMIT_UP_THIN}），没有赚钱效应"
+    return None
 
 
 def regime_from_limit_pool(limit_pool: object | None) -> RegimeVerdict:

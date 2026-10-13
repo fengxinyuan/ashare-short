@@ -33,6 +33,7 @@ from ashare_decision_support.notify.render import (
     render_alerts,
     render_feed_suspension,
 )
+from ashare_decision_support.schedule.timezone import beijing_naive_now
 
 # Poll intervals in seconds, from normal to most conservative. The loop walks
 # this ladder down on sustained failure and back up on sustained success.
@@ -72,7 +73,7 @@ def run_monitor_loop(
     session: MonitorSession,
     watch_symbols: Callable[[], list[str]],
     notifiers: list[Notifier],
-    now_fn: Callable[[], datetime] = datetime.now,
+    now_fn: Callable[[], datetime] = beijing_naive_now,
     sleep: Callable[[float], None] = time.sleep,
     max_passes: int | None = None,
     until: clock_time = MONITOR_END,
@@ -117,6 +118,7 @@ def run_monitor_loop(
 
         stats.passes += 1
         stats.interval_seconds = INTERVAL_LADDER[level]
+        stats.notes.extend(note for note in result.notes if note not in stats.notes)
 
         if (
             refresh_risk is not None
@@ -135,7 +137,11 @@ def run_monitor_loop(
                 suspended = False
             if result.alerts:
                 stats.alerts += len(result.alerts)
-                publish(notifiers, alert_title(result.alerts), render_alerts(result.alerts, result.health))
+                publish(
+                    notifiers,
+                    alert_title(result.alerts),
+                    render_alerts(result.alerts, result.health),
+                )
         elif result.verdict_changed and not suspended and active:
             # One message when the gate closes, not one per pass.
             publish(notifiers, "分时监控挂起", render_feed_suspension(result.health))
@@ -144,7 +150,7 @@ def run_monitor_loop(
 
         # 板块 pass。**只在盘中做**：休市时全市场行情不动，落进序列的是一串重复
         # 截面，会把「较上轮」那一列变成噪声。
-        #
+
         # 它不受个股那条时效闸门（`result.health.usable`）约束，因为两者读的是
         # 完全不同的源：个股走分钟线适配器，板块走新浪全市场快照。分钟线停更
         # 不代表快照也停了，用前者去否决后者会在最该看板块的那天把它关掉。

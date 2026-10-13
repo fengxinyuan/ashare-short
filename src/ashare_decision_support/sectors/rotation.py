@@ -1,55 +1,10 @@
-"""板块轮动：从「今天谁强」到「资金正在从哪里挪到哪里」。
+"""用板块指数历史序列测量价格轮动。
 
-`sectors/momentum.py` + `sectors/predict.py` 给的是**当日截面**——今天哪个板块强。
-`sectors/history.py` 给的是**系统自己排名的记忆**——我给出的前五名稳不稳。
-这一层给的是第三样东西，前两样都答不了：**用板块指数的真实价格序列，回答过去
-一周到一个月里资金的移动方向**。
+输出相对强弱排名及变化、前期与近期涨幅的横截面秩相关、相邻日期领涨名单的重合度。
+负秩相关表示历史高低切换，正相关表示延续，不预设方向，也不推断未来资金流。
 
-三者的区别值得说清楚，否则很容易重复实现：
-
-| | 输入 | 从哪天开始有答案 |
-|---|---|---|
-| `momentum.py` | 今天的成分股日线 | 当天 |
-| `history.py` | 系统每天自己的排名 | **系统连续跑 N 天之后** |
-| 本模块 | 同花顺板块指数序列 | **第一次跑就有**（`last.js` 一次回当年 140 根） |
-
-最后一列是本模块存在的主要理由：轮动规律是一个关于**过去一个月**的问题，而一个
-今天才上线的记忆层要到下个月才能回答它。价格序列是现成的，落盘代码也已经在跑
-（`adapters/ths_sector_index.py:_persist_history`），只是从来没有人读回来算过。
-
-## 三个读数
-
-**1. 相对强弱排名与排名变化。** 板块相对全体板块中位数的超额收益 → 排名。
-**排名变化比排名本身更有用**：排在第 3 名说明它已经强了，从第 40 名升到第 12 名
-说明**资金正在往这里挪**。后者才是「轮动到哪了」。
-
-**2. 高低切换度量。** 这是那句「资金从高估值板块流向低估值板块」的可测版本。
-做法：算「前期涨幅」与「近期涨幅」在**横截面上**的秩相关。
-
-```text
-相关系数明显为负  →  前期涨得多的最近在跌、前期跌的在涨  =  高低切换
-相关系数明显为正  →  前期强的继续强                      =  强者恒强
-接近 0            →  两者没关系，说不出轮动方向
-```
-
-**这是测量，不是预设。** 「该高低切换了」是一个每天都有人说的判断，本模块不假设
-它成立——它把这个月实际发生的是切换还是延续算出来，包括算出「与流行说法相反」
-这个结论。同一条纪律写在 `docs/ROADMAP.md` §5.2 的跷跷板那一段里：不预设关系，
-由数据说。
-
-**3. 主线持续度。** 近 N 个交易日每天涨幅前 5，相邻两天的重合度取平均。
-接近 1 = 主线明确，跟随有意义；接近 0 = 无主线的快速轮动，超短最容易两头挨打。
-
-## 不做的事
-
-- **不给权重、不进打分。** 和五档、同花顺指数、量价形态完全一样的处置：先进简报
-  与台账，等 `review` 能回答「排名上升最快的板块里选出来的票兑现率高多少」，
-  再谈要不要给它分。
-- **不预测。** 「明天该轮到低位板块了」不写。本模块的全部输出都是对**已经发生的
-  事**的陈述句。
-- **不跨源映射。** 同花顺 90 个板块 ≈ 申万二级粒度，不往申万一级 31 个上硬映
-  （`ths_sector_index.py` 开头已论证过）。这一层的板块名就是同花顺的板块名。
-"""
+本模块读取实际价格历史；history.py 保存系统自身的排名，momentum.py 计算成分股截面。
+三者回答不同问题。指数分类保持原口径，读数作为研究旁证，不直接影响筛选与评分。"""
 
 from __future__ import annotations
 
@@ -98,7 +53,7 @@ class SectorTrend:
     ret_5d: float | None = None
     ret_20d: float | None = None
     # 「前期」涨幅：20 个交易日前到 5 个交易日前，**不含最近 5 日**。
-    #
+
     # 这个字段存在的全部理由是它与 `ret_5d` 不重叠。用 `ret_20d` 当前期涨幅是
     # 一个不会报错的错误：20 日窗口**包含**最近 5 日，于是本周暴涨的板块会自动
     # 显得「前期已经涨高了」，给高低切换的相关系数注入一个纯机械的正偏——
@@ -146,13 +101,13 @@ class RotationRead:
     switch_correlation: float | None = None
     switch_label: str = LABEL_INSUFFICIENT
     # 相邻等长窗口的秩相关：上一个 short_window 与这一个 short_window。
-    #
+
     # 与 `switch_correlation` 是两个问题，不是同一个问题的两种算法：
-    #
+
     # - `switch_correlation` 比的是**前 15 个交易日**与**近 5 日**，长窗口对短窗口，
     #   回答「一个月级别的强弱有没有反转」；
     # - 这个比的是**相邻两个 5 日**，等长对等长，回答「上周的强弱这周有没有掉个头」。
-    #
+
     # 两者经常反号，而那不是矛盾：月线还在跌的板块，完全可以在最近一周变成最强。
     # 对超短来说后者更贴近决策周期，所以它必须单独出一个数，不能被长窗口那个盖住。
     # 它也是唯一与 `rank_change` 同口径的相关系数——排名变化本来就用这两个窗口算，
@@ -229,7 +184,7 @@ def read_rotation(
         )
         return read
 
-    # ---- 涨幅与超额 ------------------------------------------------------
+    # 涨幅与超额
     rows: list[tuple[str, str, float | None, float | None, float | None, float | None]] = []
     for code, name, bars in aligned:
         closes = panel.closes(bars)
@@ -273,7 +228,7 @@ def read_rotation(
     ]
     read.trusted = True
 
-    # ---- 高低切换 --------------------------------------------------------
+    # 高低切换
     # 前期用 `excess_prior`（不含最近 5 日）而不是 `excess_20d`：两个窗口重叠
     # 会让「本周涨得猛」同时抬高「前期涨得高」，把相关系数机械地推向正号，
     # 也就是**系统性地把高低切换误判成强者恒强**。见 `SectorTrend.ret_prior`。
@@ -286,7 +241,7 @@ def read_rotation(
     read.switch_correlation = panel.rounded(correlation, 4)
     read.switch_label = _switch_label(correlation)
 
-    # ---- 周度切换：相邻等长窗口 -------------------------------------------
+    # 周度切换：相邻等长窗口
     # 复用算排名用的那两份超额收益，所以这个相关系数与 `rank_change` 严格同口径：
     # 排名变化说「谁从第 90 名冲到第 7 名」，它说「这种对调是整体现象还是个例」。
     # 少了它，简报里就只有一堆个别板块的名次剧变，没有一个数能回答「这周到底是
@@ -296,13 +251,11 @@ def read_rotation(
         for (_, prev), (_, now) in zip(prev_pairs, now_pairs, strict=True)
         if prev is not None and now is not None
     ]
-    adjacent = _spearman(
-        [a for a, _ in adjacent_paired], [b for _, b in adjacent_paired]
-    )
+    adjacent = _spearman([a for a, _ in adjacent_paired], [b for _, b in adjacent_paired])
     read.adjacent_correlation = panel.rounded(adjacent, 4)
     read.adjacent_label = _switch_label(adjacent)
 
-    # ---- 主线持续度 ------------------------------------------------------
+    # 主线持续度
     persistence, days, leaders, recurring = _leadership(aligned, rank_lookback)
     read.persistence = panel.rounded(persistence, 4)
     read.persistence_days = days
@@ -311,9 +264,6 @@ def read_rotation(
 
     read.observations = _observations(read, long_window, short_window, rank_lookback)
     return read
-
-
-# ---- internals -----------------------------------------------------------
 
 
 def _align(
@@ -374,8 +324,7 @@ def _leadership(
         return None, len(tops), tuple(tops[-1]) if tops else (), ()
 
     overlaps = [
-        len(set(tops[i]) & set(tops[i - 1])) / float(LEADER_COUNT)
-        for i in range(1, len(tops))
+        len(set(tops[i]) & set(tops[i - 1])) / float(LEADER_COUNT) for i in range(1, len(tops))
     ]
     counts: dict[str, int] = {}
     for names in tops:
@@ -418,8 +367,7 @@ def _persistence_verdict(persistence: float) -> str:
 
 def _rank_line(prefix: str, items: list[SectorTrend]) -> str:
     return prefix + "、".join(
-        f"{item.name}（{item.rank_prev}→{item.rank_now}，{item.rank_change:+d}）"
-        for item in items
+        f"{item.name}（{item.rank_prev}→{item.rank_now}，{item.rank_change:+d}）" for item in items
     )
 
 
@@ -456,8 +404,7 @@ def _observations(
         )
     if read.recurring_leaders:
         lines.append(
-            f"反复进入领涨前 {LEADER_COUNT} 的方向："
-            + "、".join(read.recurring_leaders[:6])
+            f"反复进入领涨前 {LEADER_COUNT} 的方向：" + "、".join(read.recurring_leaders[:6])
         )
 
     rising = read.rising(5)
@@ -476,10 +423,10 @@ def _observations(
     # 切换标签比的是「前 15 个交易日 vs 近 5 日」，排名变化比的是「前 5 日 vs
     # 近 5 日」。实测 2026-08-03：半导体前期 -22.8% 之后再跌 -12.8%（弱者恒弱，
     # 支持 +0.45 的相关），但它在 -10→-5 那段反弹到第 6 名，于是排名读数是 6→89。
-    #
+
     # 不加这一行的话，简报里「强者恒强」会紧挨着「半导体 6→90」出现，读的人只能
     # 二选一地相信其中一个——而正确的读法是两个都对，它们回答的不是同一个问题。
-    #
+
     # 有了 `adjacent_correlation` 之后这句话才真正有支撑：两个窗口各自的相关系数
     # 都算出来了，谁正谁负是量出来的，不再需要读的人自己去猜。实测同一天长窗口
     # +0.45（月度弱者恒弱）、短窗口 -0.47（周度高低切换），一正一负。

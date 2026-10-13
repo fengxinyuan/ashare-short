@@ -33,7 +33,7 @@ SINA_MAX_BARS = 1970
 # measured 1.0 s/symbol serial, 0.19 s/symbol at 8 workers. The monitor loop
 # only closes at that speed, so concurrency here is a requirement rather than
 # an optimisation. Kept modest because sustained polling against Sina has not
-# been rate-limit tested — see docs/DATA_SOURCES.md §九.
+# been rate-limit tested — see the diagnostics section in docs/DATA_SOURCES.md.
 DEFAULT_WORKERS = 8
 
 
@@ -131,7 +131,6 @@ def _to_bars(table: Any, symbol: str) -> list[dict]:
             }
         )
     return bars
-
 
 
 def _parse_ts(value: Any) -> datetime | None:

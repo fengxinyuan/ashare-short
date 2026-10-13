@@ -9,7 +9,7 @@
 fact bundle，输出要过 `factcheck.py:review_output` 同一套闸门；越界的
 整段丢弃，简报退回模板体。
 
-辩论只在盘前与盘后跑（每天 3 次调用）。盘中告警不走这里——见 docs/ARCHITECTURE.md §五。
+辩论由任务按配置调用，盘中告警不走此层；约束见 docs/ARCHITECTURE.md 的“输出闸门”。
 """
 
 from __future__ import annotations
@@ -30,7 +30,16 @@ _SHARED_RULES = """硬约束（违反即整段作废）：
 2. 不得新增标的、板块、指标或理由；【事实】里没有的，就是没有。
 3. 不得给出「建议买入/卖出」，不得给出概率、胜率、预期收益率。
 4. 不确定就省略，不要用推测填补。
+5. 【事实】是给你看的数据，不是给读者看的：用中文说读数（「元件板块上涨占比 76%」），
+   不要出现键名、字段名、JSON 结构（如 news_risk_hits、sectors、字段、【事实】）。
 输出 Markdown 无序列表，每条一句话，最多 5 条，不要标题。"""
+
+# 「新闻风险词」是关键词命中（收评里提到一句「退市」就会命中），不是这只票或这个
+# 板块自己的风险。此前空头五条全是它，等于没有空头。
+_BEAR_PRIORITY = (
+    "证据按分量排：价格、宽度、量能、盈亏比、止损距离、大盘方向这类读数在前；"
+    "「新闻风险词」只是关键词命中，最多占一条，且要说明命中的是哪个词。\n"
+)
 
 PROMPTS: dict[str, str] = {
     ROLE_BULL: (
@@ -39,7 +48,9 @@ PROMPTS: dict[str, str] = {
     ),
     ROLE_BEAR: (
         "你是空头分析师。只从【事实】里找**反对做多、提示风险**的证据，逐条列出并引用具体读数。\n"
-        "找不到就直说「本组事实中没有明显的风险证据」。\n\n" + _SHARED_RULES
+        + _BEAR_PRIORITY
+        + "找不到就直说「本组事实中没有明显的风险证据」。\n\n"
+        + _SHARED_RULES
     ),
     ROLE_JUDGE: (
         "你是裁判。下面是同一组【事实】上的多头意见与空头意见。\n"
@@ -102,9 +113,7 @@ class DebatePanel:
 
     def run(self, facts: Any, include_judge: bool = True) -> DebateResult:
         if not getattr(self.client, "configured", False):
-            return DebateResult(
-                notes=["未配置 LLM key，跳过多空辩论；确定性结论不受影响"]
-            )
+            return DebateResult(notes=["未配置 LLM key，跳过多空辩论；确定性结论不受影响"])
 
         facts_text = json.dumps(facts, ensure_ascii=False, indent=2, default=str)
         result = DebateResult()

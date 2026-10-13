@@ -1,29 +1,10 @@
-"""Real-time snapshots with a full five-level order book, from Sina and Tencent.
+"""Real-time snapshots and five-level order books from Sina and Tencent.
 
-Why this exists after `sina_intraday.py` already fetches minute bars: the
-monitor needs *current price* for N symbols every couple of minutes, and a
-minute-bar call costs one HTTP round trip per symbol (measured 1.0 s serial,
-0.19 s at 8 workers). These endpoints answer for a **batch** of symbols in one
-request — measured 161 ms for one symbol and sub-second for hundreds — and they
-carry the order book on top.
-
-Two things this makes possible that the project previously recorded as
-impossible:
-
-- **Order-book depth.** `docs/SOLUTION.md` used to state that five-level depth
-  needed the paid tier because 东财's `stock_bid_ask_em` (on the unreachable
-  `push2` host) was the only known source. Sina's quote host is reachable and
-  carries bid1-5/ask1-5. See `docs/DATA_SOURCES.md`.
-- **Real limit prices.** Tencent returns 涨停价/跌停价 directly, so limit-up
-  detection no longer has to approximate with "rose ≥ 9.5%" — an approximation
-  that cannot tell a 10% board from a 20% ChiNext/STAR board at all.
-
-腾讯那一路**同时**带五档和涨跌停价，所以要五档的调用方直接 `prefer="tencent"`
-一次请求拿全，不需要为了涨跌停价再打一次新浪。代价是它的量纲是手/万元——已在
-解析层归一化，见 `Snapshot` 的量纲契约。
-
-Standard library only. `easyquotation` wraps these same endpoints, but the
-parsing is thirty lines and the package deliberately has no HTTP dependency.
+Both quote endpoints support batches. Tencent also returns explicit limit-up
+and limit-down prices, so callers needing both use prefer="tencent". Its lots
+and ten-thousand-yuan fields are normalised to shares and yuan during parsing.
+Fetching and parsing use only the standard library. Source measurements and
+unit contracts are documented in docs/DATA_SOURCES.md.
 """
 
 from __future__ import annotations
@@ -42,6 +23,7 @@ from ashare_decision_support.adapters.http import (
     TENCENT_REFERER,
     fetch_text,
 )
+from ashare_decision_support.adapters.validate import LOTS_TO_SHARES
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.numeric import positive
 from ashare_decision_support.symbols import normalize_symbol, prefixed_code
@@ -54,7 +36,7 @@ DEFAULT_TIMEOUT = 10.0
 # 2026-08-02 实测 600519，两边同一时刻的读数比值是 99.999 和 10000.004——不是
 # 近似，是单位。归一化放在解析层，因为 `Snapshot` 只有一个 `volume` 字段，让它
 # 的含义取决于 `source` 等于把量纲错误埋进每一个下游消费者。
-TENCENT_VOLUME_TO_SHARES = 100.0
+TENCENT_VOLUME_TO_SHARES = LOTS_TO_SHARES
 TENCENT_AMOUNT_TO_YUAN = 10000.0
 
 # Symbols per request. Both hosts accept long comma-separated lists; keeping
@@ -194,7 +176,7 @@ class SnapshotAdapter:
             },
         }
 
-    # ---- fetchers --------------------------------------------------------
+    # fetchers
 
     def _fetch_sina(self, codes: list[str]) -> tuple[dict[str, Snapshot], list[str]]:
         return self._fetch(codes, SINA_QUOTE_URL, SINA_REFERER, "新浪", _parse_sina)
@@ -232,12 +214,13 @@ class SnapshotAdapter:
 
     def _get(self, url: str, referer: str, encoding: str) -> str:
         return fetch_text(
-            self._opener, url, timeout=self.timeout, referer=referer, encoding=encoding,
+            self._opener,
+            url,
+            timeout=self.timeout,
+            referer=referer,
+            encoding=encoding,
             errors="replace",
         )
-
-
-# ---- parsing -------------------------------------------------------------
 
 
 def _parse_sina(line: str, symbol: str) -> Snapshot | None:
@@ -256,11 +239,15 @@ def _parse_sina(line: str, symbol: str) -> Snapshot | None:
         return None
 
     bids = [
-        OrderBookLevel(price=positive(fields[11 + i * 2]) or 0.0, volume=positive(fields[10 + i * 2]) or 0.0)
+        OrderBookLevel(
+            price=positive(fields[11 + i * 2]) or 0.0, volume=positive(fields[10 + i * 2]) or 0.0
+        )
         for i in range(5)
     ]
     asks = [
-        OrderBookLevel(price=positive(fields[21 + i * 2]) or 0.0, volume=positive(fields[20 + i * 2]) or 0.0)
+        OrderBookLevel(
+            price=positive(fields[21 + i * 2]) or 0.0, volume=positive(fields[20 + i * 2]) or 0.0
+        )
         for i in range(5)
     ]
     return Snapshot(

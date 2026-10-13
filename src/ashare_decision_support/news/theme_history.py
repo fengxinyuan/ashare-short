@@ -15,9 +15,10 @@ from statistics import median
 from typing import Any
 
 from ashare_decision_support.news.theme_radar import ThemeSignal
-from ashare_decision_support.sectors.base import SectorMetrics
+from ashare_decision_support.numeric import compound, median_of
+from ashare_decision_support.sectors.base import SectorMetrics, daily_returns
 from ashare_decision_support.state.paths import state_path
-from ashare_decision_support.state.store import read_json, write_json
+from ashare_decision_support.state.store import file_lock, read_json_object, write_json
 
 SCHEMA = "theme-outcome-v1"
 HORIZONS = (1, 5, 20)
@@ -34,24 +35,30 @@ class ThemeOutcomeStore:
     def record(
         self, trade_date: date, signals: list[ThemeSignal], metrics: dict[str, SectorMetrics]
     ) -> dict[str, Any]:
-        payload = self._load()
-        daily = self._daily(metrics)
-        payload["daily"] = [
-            item for item in payload["daily"] if item.get("trade_date") != str(trade_date)
-        ]
-        payload["daily"].append({"trade_date": str(trade_date), **daily})
+        with file_lock(self.path):
+            payload = self._load()
+            daily = self._daily(metrics)
+            payload["daily"] = [
+                item for item in payload["daily"] if item.get("trade_date") != str(trade_date)
+            ]
+            payload["daily"].append({"trade_date": str(trade_date), **daily})
 
-        keys = {(str(trade_date), item.name) for item in signals}
-        payload["signals"] = [
-            item for item in payload["signals"]
-            if (item.get("trade_date"), item.get("name")) not in keys
-        ]
-        payload["signals"].extend({"trade_date": str(trade_date), **item.to_dict()} for item in signals)
-        payload["daily"].sort(key=lambda item: str(item.get("trade_date") or ""))
-        payload["signals"].sort(key=lambda item: (str(item.get("trade_date") or ""), str(item.get("name") or "")))
-        self._assess(payload)
-        write_json(self.path, payload)
-        return self.summary(payload)
+            keys = {(str(trade_date), item.name) for item in signals}
+            payload["signals"] = [
+                item
+                for item in payload["signals"]
+                if (item.get("trade_date"), item.get("name")) not in keys
+            ]
+            payload["signals"].extend(
+                {"trade_date": str(trade_date), **item.to_dict()} for item in signals
+            )
+            payload["daily"].sort(key=lambda item: str(item.get("trade_date") or ""))
+            payload["signals"].sort(
+                key=lambda item: (str(item.get("trade_date") or ""), str(item.get("name") or ""))
+            )
+            self._assess(payload)
+            write_json(self.path, payload)
+            return self.summary(payload)
 
     def summary(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = payload or self._load()
@@ -78,22 +85,31 @@ class ThemeOutcomeStore:
         }
 
     def _load(self) -> dict[str, list[dict[str, Any]]]:
-        payload = read_json(self.path, default={}) or {}
+        payload = read_json_object(self.path)
         if payload.get("schema") != SCHEMA:
             return {"schema": SCHEMA, "daily": [], "signals": []}
         daily = payload.get("daily")
         signals = payload.get("signals")
         if not isinstance(daily, list) or not isinstance(signals, list):
             return {"schema": SCHEMA, "daily": [], "signals": []}
-        return {"schema": SCHEMA, "daily": daily, "signals": signals}
+        return {
+            "schema": SCHEMA,
+            "daily": [
+                item
+                for item in daily
+                if isinstance(item, dict) and isinstance(item.get("returns"), dict)
+            ],
+            "signals": [
+                item
+                for item in signals
+                if isinstance(item, dict) and isinstance(item.get("sectors"), list)
+            ],
+        }
 
     @staticmethod
     def _daily(metrics: dict[str, SectorMetrics]) -> dict[str, Any]:
-        returns = {
-            name: value.ret_1d for name, value in metrics.items()
-            if value.ret_1d is not None and value.coverage_ratio > 0
-        }
-        return {"returns": returns, "market_return": median(returns.values()) if returns else None}
+        returns = daily_returns(metrics)
+        return {"returns": returns, "market_return": median_of(returns.values())}
 
     @staticmethod
     def _assess(payload: dict[str, list[dict[str, Any]]]) -> None:
@@ -121,8 +137,8 @@ class ThemeOutcomeStore:
                     market_steps.append(market_return)
                 if len(sector_steps) != horizon:
                     continue
-                sector_return = _compound(sector_steps)
-                market_return = _compound(market_steps)
+                sector_return = compound(sector_steps)
+                market_return = compound(market_steps)
                 outcomes[str(horizon)] = {
                     "sessions": horizon,
                     "return": round(sector_return, 6),
@@ -130,10 +146,3 @@ class ThemeOutcomeStore:
                 }
             if outcomes:
                 signal["outcomes"] = outcomes
-
-
-def _compound(returns: list[float]) -> float:
-    value = 1.0
-    for item in returns:
-        value *= 1.0 + item
-    return value - 1.0

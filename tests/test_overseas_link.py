@@ -16,6 +16,7 @@ from ashare_decision_support.adapters.global_market import (
     GlobalMarketReading,
     GlobalMarketSnapshot,
 )
+from ashare_decision_support.adapters.ths_taxonomy import industry_from_path
 from ashare_decision_support.sectors.overseas_link import (
     BEARISH,
     BULLISH,
@@ -58,15 +59,12 @@ def test_every_target_exists_in_the_real_taxonomy() -> None:
     profiles = json.loads(LIVE_TAXONOMY.read_text(encoding="utf-8"))["profiles"]
     known: set[str] = set()
     for row in profiles:
-        known.update(row.get("industries") or [])
+        industry = row.get("industry") or industry_from_path(row.get("industries"))
+        if industry:
+            known.add(industry)
         known.update(row.get("concepts") or [])
 
-    unknown = {
-        target
-        for mapping in MAPPINGS
-        for target in mapping.targets
-        if target not in known
-    }
+    unknown = {target for mapping in MAPPINGS for target in mapping.targets if target not in known}
     assert not unknown, f"这些板块名在分类里不存在，映射会永远匹配不上：{sorted(unknown)}"
 
 
@@ -166,11 +164,11 @@ def test_direction_follows_the_move_for_same_sign_mappings() -> None:
 
 
 def test_a_negative_sign_flips_the_direction_on_the_same_reading() -> None:
-    """油价涨：石油石化利多、航空利空。**同一个读数，两个方向。**"""
+    """油价涨：油气开采利多、航空利空。同一个读数，两个方向。"""
     read = read_overseas_links(_snapshot(("wti", "WTI原油", 4.5)))
 
-    upstream = next(item for item in read.links if "石油石化" in item.targets)
-    airline = next(item for item in read.links if "航空运输" in item.targets)
+    upstream = next(item for item in read.links if "油气开采及服务" in item.targets)
+    airline = next(item for item in read.links if "机场航运" in item.targets)
 
     assert upstream.direction == BULLISH
     assert airline.direction == BEARISH
@@ -182,9 +180,7 @@ def test_by_sector_keeps_conflicting_links_instead_of_netting_them() -> None:
 
     压成一个符号就把分歧本身丢掉了，而分歧恰恰是要给人看的东西。
     """
-    read = read_overseas_links(
-        _snapshot(("sox", "费城半导体", -3.5), ("kospi", "KOSPI", 4.0))
-    )
+    read = read_overseas_links(_snapshot(("sox", "费城半导体", -3.5), ("kospi", "KOSPI", 4.0)))
     semis = read.by_sector()["半导体"]
 
     assert len(semis) == 2
@@ -192,9 +188,7 @@ def test_by_sector_keeps_conflicting_links_instead_of_netting_them() -> None:
 
 
 def test_links_sort_strong_first() -> None:
-    read = read_overseas_links(
-        _snapshot(("sox", "费城半导体", -1.6), ("gold", "COMEX黄金", -2.5))
-    )
+    read = read_overseas_links(_snapshot(("sox", "费城半导体", -1.6), ("gold", "COMEX黄金", -2.5)))
 
     assert [item.strength for item in read.links] == [STRENGTH_STRONG, STRENGTH_NOTABLE]
 
@@ -215,6 +209,16 @@ def test_notes_never_claim_a_prediction() -> None:
     assert "不是对A股次日走势的预测" in " ".join(read.notes)
     for word in ("将会", "预计", "明天会", "必然"):
         assert word not in text
+
+
+def test_notes_do_not_point_readers_at_a_ledger_that_was_never_built() -> None:
+    """兑现率账本（原注释里的 `journal/catalyst.py`）从未建过；给读者的话不能装作有。"""
+    read = read_overseas_links(_snapshot(("sox", "费城半导体", -3.5)))
+    text = " ".join(read.notes)
+
+    assert "见台账" not in text
+    assert "分组统计" not in text
+    assert "没有账本可查" in text
 
 
 def test_custom_thresholds_are_honoured() -> None:

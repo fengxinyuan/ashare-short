@@ -1,32 +1,79 @@
-"""JSON-file persistence with atomic writes.
+"""JSON 状态读写：有限数校验、原子替换与协作式更新锁。
 
-Atomic matters more than it looks: the monitor loop rewrites the alert state
-every couple of minutes, and a crash mid-write on a plain `open(...,"w")`
-leaves a truncated file that fails to parse on the next run. The system then
-re-fires every alert it had already sent. Write to a temp file in the same
-directory and rename — rename is atomic on POSIX.
-
-**NaN 在这一层两个方向都要挡住，而 Python 的 `json` 默认两个方向都放行。**
-
-- 写：`json.dump` 对 NaN 会写出裸的 `NaN` —— 这**不是合法 JSON**。文件从此
-  `jq` 读不了、别的语言读不了，而 Python 自己读得回来，所以在这套系统内部完全
-  没有症状。持仓成本、止损、台账都存在这里。
-- 读：`json.load` **默认接受** `NaN` / `Infinity` 字面量并还原成 float。于是一个
-  被写坏过一次的状态文件会**永久**把 NaN 喂给每一次跑批：成本是 NaN，浮盈是
-  NaN，「跌破止损」的比较恒为 False。
-
-写侧改成 `allow_nan=False`（抛错，暴露在写入点，而不是在三天后的某次告警里）；
-读侧把这两个字面量当成文件损坏，走既有的「返回 default、调用方重建」那条路 ——
-那正是本模块开头承诺的处置方式。
+读取失败返回调用方的默认值；写入失败保留原文件。原子替换防止半份文件，
+需要合并旧状态的调用方还必须在 `file_lock` 内完成读取、修改和写入，避免丢更新。
+锁只覆盖本机上使用同一协议的写入者，不协调手工编辑或跨机器共享文件。
 """
 
 from __future__ import annotations
 
+import errno
 import json
+import math
 import os
 import tempfile
+from _thread import LockType
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+from functools import partial
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, TextIO
+from weakref import WeakValueDictionary
+
+_THREAD_LOCKS: WeakValueDictionary[Path, LockType] = WeakValueDictionary()
+_THREAD_LOCKS_GUARD = Lock()
+
+
+class FileLockBusyError(RuntimeError):
+    """所需文件锁已被另一个线程或进程占用。"""
+
+
+@contextmanager
+def file_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
+    """串行化同一路径的读改写；不要嵌套获取同一把锁。
+
+    锁固定的旁路文件，不能锁会被原子替换的 JSON 本身，也不能在释放后删锁文件：
+    等待者仍可能持有旧文件句柄。系统在进程退出时释放文件锁。
+    """
+    resolved = path.resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with _THREAD_LOCKS_GUARD:
+        local_lock = _THREAD_LOCKS.setdefault(resolved, Lock())
+    if not local_lock.acquire(blocking=blocking):
+        raise FileLockBusyError(str(resolved))
+    try:
+        with open(resolved.with_name(f".{resolved.name}.lock"), "a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                try:
+                    msvcrt.locking(
+                        handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1
+                    )
+                except OSError as exc:
+                    if not blocking and exc.errno in (errno.EAGAIN, errno.EACCES, errno.EDEADLK):
+                        raise FileLockBusyError(str(resolved)) from exc
+                    raise
+                release = partial(msvcrt.locking, handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                except BlockingIOError as exc:
+                    raise FileLockBusyError(str(resolved)) from exc
+                release = partial(fcntl.flock, handle.fileno(), fcntl.LOCK_UN)
+            try:
+                yield
+            finally:
+                release()
+    finally:
+        local_lock.release()
 
 
 def _reject_constant(name: str) -> Any:
@@ -34,63 +81,122 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"state file contains a non-finite JSON constant: {name}")
 
 
-def read_json(path: Path, default: Any = None) -> Any:
-    """Read JSON, returning `default` for missing or corrupt files.
+def _parse_float(value: str) -> float:
+    number = float(value)
+    # `1e999` 是合法 JSON 数字，但 float 会把它溢出成 inf；parse_constant 看不到它。
+    if not math.isfinite(number):
+        _reject_constant(value)
+    return number
 
-    A corrupt state file must not take down a run. The caller gets the default
-    and rebuilds, which for every store here is a recoverable position.
-    """
+
+def read_json(path: Path, default: Any = None) -> Any:
+    """文件缺失、不可读或 JSON 损坏时返回 default；数据形状由调用方校验。"""
     try:
         with open(path, encoding="utf-8") as handle:
-            return json.load(handle, parse_constant=_reject_constant)
+            return json.load(handle, parse_constant=_reject_constant, parse_float=_parse_float)
     except (OSError, ValueError):
         return default
 
 
-def write_json(path: Path, payload: Any) -> None:
+def read_json_object(path: Path) -> dict[str, Any]:
+    """读取对象状态；语法正确但顶层类型错误的 JSON 同样按缺失处理。"""
+    payload = read_json(path)
+    return payload if isinstance(payload, dict) else {}
+
+
+def record_map(value: Any) -> dict[str, dict]:
+    """读取按名称索引的状态记录，坏记录不影响同表内的其他记录。"""
+    if not isinstance(value, dict):
+        return {}
+    return {key: row for key, row in value.items() if isinstance(row, dict)}
+
+
+def write_json(
+    path: Path,
+    payload: Any,
+    *,
+    indent: int | None = 2,
+    default: Callable[[Any], Any] | None = str,
+) -> None:
+    with _atomic_text_file(path) as handle:
+        json.dump(
+            payload, handle, ensure_ascii=False, indent=indent, default=default, allow_nan=False
+        )
+
+
+def write_text(path: Path, content: str) -> None:
+    """文本报告与 JSON 使用相同的原子替换和失败恢复约定。"""
+    with _atomic_text_file(path) as handle:
+        handle.write(content)
+
+
+@contextmanager
+def _atomic_text_file(path: Path) -> Iterator[TextIO]:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 — 下面 `with handle:` 接管，失败路径显式 unlink
         mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
     )
     try:
         with handle:
-            # `allow_nan=False`：宁可在写入点抛，也不要写出一个别的工具读不了、
-            # 而 Python 自己读得回来的文件——后者三天后才会以「止损没触发」暴露。
-            json.dump(
-                payload, handle, ensure_ascii=False, indent=2, default=str, allow_nan=False
-            )
+            yield handle
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(handle.name, path)
     except BaseException:
-        Path(handle.name).unlink(missing_ok=True)
+        with suppress(OSError):
+            Path(handle.name).unlink(missing_ok=True)
         raise
 
 
 def append_jsonl(path: Path, record: dict) -> None:
-    """Append one record. Used by the journal, which is write-once-per-event."""
+    """追加并同步一条记录；合并或去重的调用方须持有 file_lock。"""
+    encoded = (json.dumps(record, ensure_ascii=False, default=str, allow_nan=False) + "\n").encode(
+        "utf-8"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, default=str, allow_nan=False))
-        handle.write("\n")
+    with open(path, "a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        offset = handle.tell()
+        prefix = b""
+        if offset:
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                prefix = b"\n"
+        try:
+            handle.write(prefix + encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            with suppress(OSError):
+                handle.truncate(offset)
+                handle.flush()
+            raise
 
 
-def read_jsonl(path: Path) -> list[dict]:
+def read_jsonl(path: Path, notes: list[str] | None = None) -> list[dict]:
     """Read a JSONL file, skipping unparseable lines rather than failing."""
     rows: list[dict] = []
     try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
+        with open(path, "rb") as handle:
+            for number, line in enumerate(handle, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    record = json.loads(line, parse_constant=_reject_constant)
+                    record = json.loads(
+                        line, parse_constant=_reject_constant, parse_float=_parse_float
+                    )
                 except ValueError:
                     # 台账是逐行独立的，坏一行只丢一行——含 NaN 的那条同理。
+                    if notes is not None:
+                        notes.append(f"{path.name} 第 {number} 行损坏，已跳过")
                     continue
                 if isinstance(record, dict):
                     rows.append(record)
-    except OSError:
+                elif notes is not None:
+                    notes.append(f"{path.name} 第 {number} 行不是记录对象，已跳过")
+    except OSError as exc:
+        if notes is not None and path.exists():
+            notes.append(f"读取 {path.name} 失败：{type(exc).__name__}")
         return []
     return rows

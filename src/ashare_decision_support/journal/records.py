@@ -1,19 +1,7 @@
-"""台账记录的两种形态：建议（当时）与兑现（事后）。
+"""台账中的建议与兑现记录。
 
-**对照组。** 建议分两类：`recommendation` 是真的推给你的，`control` 是同一轮
-筛选里紧挨着落选的那些——不推送、不进候选，**只记录**。没有它，台账里全是
-正样本，永远回答不了「筛选规则本身有没有用」：入选组次日平均涨 1.2% 听起来
-不错，但如果落选组涨 1.4%，这套规则就是负价值。两组都记，差值才有意义。
-
-**否决组。** `vetoed` 是被硬闸门（当前只有业绩层）移除的那些。它和对照组解决的
-是**不同的**问题：对照组回答「排序有没有用」，否决组回答「这道闸门拦对了没有」。
-
-后者此前无法回答，而且缺得最严重——被否决的标的在打分之前就消失了，台账里
-连它们的名字都没有。于是一道会挡掉「亏损但正当红的题材股」的闸门，其代价
-永远停留在设计者的自述里。现在它们按同一套流程兑现：**如果否决组的次日收益
-持续高于入选组，那这道闸门就是负价值**，而这是一个有数据能回答的问题。
-
-三组都走**完全相同的兑现流程**，`Outcome.rec_kind` 保留它来自哪一组。
+recommendation 保存入选判断，control 保存相邻落选对照，vetoed 保存业绩否决样本。
+三组共用兑现流程，由 Outcome.rec_kind 保留归属，用于比较排序与风险闸门效果。
 """
 
 from __future__ import annotations
@@ -24,6 +12,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any
 
+from ashare_decision_support.signals.series import parse_bar_date
+from ashare_decision_support.symbols import normalize_symbol
+
 KIND_RECOMMENDATION = "recommendation"
 KIND_CONTROL = "control"
 KIND_VETOED = "vetoed"
@@ -31,6 +22,9 @@ KIND_OUTCOME = "outcome"
 
 # 会被兑现流程核对的三类记录。对照组与否决组必须在内，否则它们记了也白记。
 VERIFIABLE_KINDS = (KIND_RECOMMENDATION, KIND_CONTROL, KIND_VETOED)
+# v2：买入区间上沿核算风险、门槛用未舍入值、缺失情绪读数不补零。
+# 已有台账中的版本原样保留；新建议另行分组，便于比较规则变更前后表现。
+DEFAULT_STRATEGY_VERSION = "rule-v2"
 
 
 @dataclass
@@ -78,23 +72,23 @@ class Recommendation:
     # 决定了「这是不是一个低吸位置」，而它们此前完全没有被记录过。
     dip: dict[str, Any] = field(default_factory=dict)
     # 建议发出当时的业绩读数（`adapters/earnings.py`）。
-    #
+
     # **不存它，业绩层就是不可验证的。** 上面 `score_components` 的注释里写着要能
     # 回答「这套规则是靠板块关系、资金流还是业绩催化选对的」，而业绩催化那一项
     # 在这个字段建起来之前根本没进过台账——`screens/earnings.py` 刻意只标注不加分，
     # 于是它对结果的影响**完全不体现在分数里**，只体现在这里。
-    #
+
     # 存的是裁决而不是原始预告：`kind`（预增/首亏…）、`metric`（哪个口径）、
     # `change_pct`、`is_fresh`。有了它，「带新鲜大幅预增的建议兑现率高多少」
     # 是一个 60 个交易日后能用 `journal/stats.py` 分组回答的问题。
     earnings: dict[str, Any] = field(default_factory=dict)
     # 建议发出当时的**上一交易日逐笔资金**（`adapters/tencent_detail.py`）：
     # 主动买占比、大单净额、尾盘 30 分钟净额。
-    #
+
     # 与上面 `earnings` 完全同一条理由——**它刻意不进分数，所以台账是它唯一的
     # 可验证出口**。不存的话，「大单净额为正的候选兑现率是不是更高」这个问题
     # 永远问不出口，于是这一层要么永远停在旁证状态，要么某天凭感觉被提成因子。
-    #
+
     # 存摘要不存逐笔：4000+ 笔明细进 JSONL 会把台账撑爆，而分组统计要的只是
     # 那几个汇总数。方向是腾讯按盘口的推断（非交易所委托方向），这一条写在
     # 适配器里，用这个字段做统计时必须记得。
@@ -107,7 +101,7 @@ class Recommendation:
     # 买卖点的三层裁决记录。存的是**两套结论**：规则默认排序选的那组价，和
     # 模型裁决选的那组价。只存最终结论的话，「模型裁决比规则默认准不准」这个
     # 问题永远答不了——那正是加这一层时唯一没法在设计阶段回答的问题。
-    #
+
     # `basis` 尤其要存：它让统计能按**依据类别**分组（分时均价回踩 vs 五档买盘墙
     # vs 日线支撑），而不是只能按最终价格分。哪一类出处更靠谱是可以被测出来的。
     adjudication: dict[str, Any] = field(default_factory=dict)
@@ -117,6 +111,18 @@ class Recommendation:
     warnings: list[str] = field(default_factory=list)
     facts_hash: str | None = None
     kind: str = KIND_RECOMMENDATION
+    decision_id: str | None = None
+    recorded_at: str | None = None
+    strategy_version: str = DEFAULT_STRATEGY_VERSION
+    plan_id: str | None = None
+    revision: int = 1
+    strategy_revision: int = 1
+    supersedes: str | None = None
+    # 参考价格所在交易日。晨报是上一交易日收盘；分时建议用同日开盘价对齐
+    # 复权尺度。参考日不等于计划执行日，核对窗口不能早于计划日。
+    reference_date: str | None = None
+    # 分时参考价与日线通过同日开盘价对齐复权尺度，不能把盘中最新价当成收盘价。
+    reference_open_price: float | None = None
 
     @classmethod
     def from_advice(
@@ -156,10 +162,22 @@ class Recommendation:
             rrr=advice.rrr,
             trend_state=advice.trend_state,
             wyckoff_bias=advice.wyckoff_bias,
+            playbook=getattr(advice, "playbook", None),
+            setup=dict(getattr(advice, "setup", {}) or {}),
             reasons=list(advice.reasons),
             warnings=list(advice.warnings),
             adjudication=_adjudication_record(advice),
             facts_hash=facts_hash(facts) if facts is not None else None,
+            strategy_version=(facts.get("strategy_version") or DEFAULT_STRATEGY_VERSION)
+            if isinstance(facts, dict)
+            else DEFAULT_STRATEGY_VERSION,
+            plan_id=facts.get("plan_id") if isinstance(facts, dict) else None,
+            # 原始分钟开盘价在同一日内不变，可以与事后的复权日线开盘配对，
+            # 不借用盘中建议发出之后的收盘价重设参考价格。
+            reference_date=(
+                str(advice.session_date) if getattr(advice, "session_date", None) else None
+            ),
+            reference_open_price=(getattr(advice, "intraday", {}) or {}).get("open"),
         )
 
     def to_dict(self) -> dict:
@@ -167,18 +185,18 @@ class Recommendation:
 
 
 def record_key(row: Any) -> str:
-    """建议与兑现的关联键：`symbol|trade_date|source`。
+    """以股票、日期、来源关联建议与兑现，新记录再按判断编号区分修订。
 
-    这个键是台账唯一的 join——`Journal.pending()` 拿它判断一条建议有没有被兑现，
-    对不上的那些会被永远当成「还没结算」。所以它必须只有一处定义：此前
-    `Recommendation` 与 `Outcome` 各挂了一个同式的 `key` 属性，而**真正做 join 的
-    是 `store.py` 里的两句裸 f-string**，两个属性一个调用方都没有。三份并存时改
-    任何一份都不报错，只会让兑现悄悄停止匹配。
-
-    入参是**读回来的行**而不是 dataclass：台账是 JSONL，`pending()` 手里只有
-    `dict`。写入端要算这个键的话，`to_dict()` 之后同样能用。
+    保留旧记录的关联方式；编号重复或损坏时也不能把其他股票的记录视为已核对。
+    输入为读回的 JSONL 行，写入与待核对查询共用此定义。
     """
-    return f"{row.get('symbol')}|{row.get('trade_date')}|{row.get('source')}"
+    symbol = normalize_symbol(row.get("symbol") or "")
+    day = parse_bar_date(row.get("trade_date")) or row.get("trade_date")
+    base = f"{symbol}|{day}|{row.get('source')}"
+    decision_id = row.get("decision_id")
+    if isinstance(decision_id, str) and decision_id:
+        return f"{base}|decision:{decision_id}"
+    return base
 
 
 def _adjudication_record(advice: Any) -> dict[str, Any]:
@@ -265,6 +283,22 @@ class Outcome:
     macro_context: dict[str, Any] = field(default_factory=dict)
     note: str | None = None
     kind: str = KIND_OUTCOME
+    decision_id: str | None = None
+    recorded_at: str | None = None
+    strategy_version: str | None = None
+    plan_id: str | None = None
+    revision: int | None = None
+    strategy_revision: int | None = None
+    # 百分比价位实际锚定在哪一根日线的收盘上（见 `Recommendation.reference_date`）。
+    anchor_date: str | None = None
+    # 建议发出时的盈亏比与止损距离。统计要按它们分桶——「盈亏比高的计划兑现率
+    # 是不是真的更高」「三个日波幅的止损是不是太宽」都是只有台账能回答的问题。
+    rrr: float | None = None
+    stop_pct: float | None = None
+    # 可执行口径的重放（`journal/verify.py:_replay_execution`）：先成交、T+1 起可卖、
+    # 跳空按开盘价。上面的 `first_hit` / `mfe_pct` 是从参考收盘起算的信号口径，
+    # 不管有没有买到；两套并存，各回答各的问题。
+    execution: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

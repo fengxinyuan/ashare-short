@@ -27,6 +27,7 @@ from ashare_decision_support.advice.view import (
 )
 from ashare_decision_support.factcheck import OutputGuard, review_output
 from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.symbols import normalize_symbol
 from ashare_decision_support.writer.llm import LlmClient
 
 SYSTEM_PROMPT = """你是一名 A 股短线分析助手，服务于一位自己做超短线的交易者。
@@ -70,18 +71,22 @@ class ChatSession:
 
     def add_symbols(self, symbols: list[str]) -> list[str]:
         """Add symbols not already tracked. Returns the ones actually added."""
-        added = [s for s in symbols if s not in self.symbols]
+        normalized = dict.fromkeys(normalize_symbol(symbol) for symbol in symbols)
+        added = [symbol for symbol in normalized if symbol and symbol not in self.symbols]
         self.symbols.extend(added)
         return added
 
     def remove_symbol(self, symbol: str) -> bool:
+        symbol = normalize_symbol(symbol)
         if symbol not in self.symbols:
             return False
         self.symbols.remove(symbol)
         for bundle in self.facts.values():
             if isinstance(bundle, dict) and isinstance(bundle.get("symbols"), list):
                 bundle["symbols"] = [
-                    item for item in bundle["symbols"] if item.get("symbol") != symbol
+                    item
+                    for item in bundle["symbols"]
+                    if normalize_symbol(item.get("symbol")) != symbol
                 ]
         return True
 
@@ -101,9 +106,7 @@ class ChatSession:
             *({"role": turn.role, "content": turn.content} for turn in recent),
             {
                 "role": "user",
-                "content": (
-                    f"当前事实：\n```json\n{self.facts_text()}\n```\n\n问题：{question}"
-                ),
+                "content": (f"当前事实：\n```json\n{self.facts_text()}\n```\n\n问题：{question}"),
             },
         ]
 
@@ -128,8 +131,10 @@ class ChatResponder:
             return (answer, ["默认不开模型对话；如需模型分析请显式开启 `--llm`"])
         if self.client is None or not self.client.configured:
             return (
-                (f"未配置 {self.client.provider.api_key_env if self.client else 'LLM'}，对话功能不可用。"
-                "价位和情景可以直接用 `/show` 查看。"),
+                (
+                    f"未配置 {self.client.provider.api_key_env if self.client else 'LLM'}，对话功能不可用。"
+                    "价位和情景可以直接用 `/show` 查看。"
+                ),
                 ["LLM 未配置"],
             )
         if not session.has_facts:
@@ -143,7 +148,7 @@ class ChatResponder:
         # Same gate as the brief writer: a number with no basis in the facts
         # is a fabrication, and in a conversation it is more dangerous than in a
         # report because it arrives without the surrounding table.
-        #
+
         # 尺子从 `sectors` 那一包里取——`/sectors` 装进来的正是盘前那份读数，里面
         # 有当天的仓位系数。没装过它时 `from_facts` 拿到 None，此时只查数字与措辞，
         # 不判立场：判不了的时候不判（同 `factcheck.OutputGuard`）。
@@ -152,10 +157,7 @@ class ChatResponder:
         )
         if not review.ok:
             return (
-                (
-                    f"本轮回答{review.reason()}，已丢弃。"
-                    "请换个问法，或用 `/show` 直接看原始数据。"
-                ),
+                (f"本轮回答{review.reason()}，已丢弃。请换个问法，或用 `/show` 直接看原始数据。"),
                 [f"口径拦截：{review.reason()}"],
             )
 
@@ -250,7 +252,9 @@ def _render_advice_summary(bundle: dict[str, Any]) -> list[str]:
         if item.get("rrr") is not None:
             parts.append(f"盈亏比 {item.get('rrr')}")
         parts.extend(trade_context_parts_from_dict(item))
-        lines.append(f"- {item.get('symbol')} {item.get('name') or ''}".rstrip() + "：" + "；".join(parts))
+        lines.append(
+            f"- {item.get('symbol')} {item.get('name') or ''}".rstrip() + "：" + "；".join(parts)
+        )
         reasons = shortline.get("reasons") or []
         if reasons:
             lines.append("  - 短线依据：" + "；".join(str(reason) for reason in reasons[:4]))
@@ -399,10 +403,15 @@ def handle_command(  # noqa: PLR0911, PLR0912, C901 - 见下
     if command == "/add":
         if not args:
             return "用法：/add 600519.SH 000001.SZ"
+        previous_symbols = list(session.symbols)
         added = session.add_symbols(args)
         if not added:
             return "这些标的已在上下文里。"
-        session.set_facts("advice", compute_symbols(session.symbols))
+        try:
+            session.set_facts("advice", compute_symbols(list(session.symbols)))
+        except Exception:
+            session.symbols[:] = previous_symbols
+            raise
         return f"已加入 {'、'.join(added)}，并完成计算。用 /show 查看。"
     if command == "/drop":
         if not args:
@@ -483,9 +492,7 @@ def _load_alerts(session: ChatSession) -> str:
     if not fired and not sectors:
         return "今天还没有触发任何告警。"
 
-    session.set_facts(
-        "alerts", {"date": str(today), "fired": fired, "sectors": sectors}
-    )
+    session.set_facts("alerts", {"date": str(today), "fired": fired, "sectors": sectors})
     lines: list[str] = []
     if fired:
         lines.append(f"今日已触发 {len(fired)} 条个股告警，先看持仓，再看候选。")

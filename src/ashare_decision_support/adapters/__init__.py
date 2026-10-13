@@ -1,6 +1,6 @@
 """Data adapters."""
 
-from ashare_decision_support.adapters.akshare_adapter import AkshareAdapter
+from ashare_decision_support.adapters.akshare_calendar import AkshareCalendarAdapter
 from ashare_decision_support.adapters.broad_index import (
     BroadIndexAdapter,
     BroadIndexRead,
@@ -17,14 +17,13 @@ from ashare_decision_support.adapters.global_market import (
     GlobalMarketReading,
     GlobalMarketSnapshot,
 )
-from ashare_decision_support.adapters.qmt_xtdata import QmtXtDataAdapter
 from ashare_decision_support.adapters.sina_intraday import SinaIntradayAdapter
 from ashare_decision_support.adapters.tencent_detail import TencentDetailAdapter
 from ashare_decision_support.adapters.ths_taxonomy import ThsTaxonomySource
 from ashare_decision_support.adapters.tickflow_adapter import TickFlowAdapter
 
 __all__ = [
-    "AkshareAdapter",
+    "AkshareCalendarAdapter",
     "BroadIndexAdapter",
     "BroadIndexRead",
     "EarningsAdapter",
@@ -33,7 +32,6 @@ __all__ = [
     "GlobalMarketAdapter",
     "GlobalMarketReading",
     "GlobalMarketSnapshot",
-    "QmtXtDataAdapter",
     "SinaIntradayAdapter",
     "TencentDetailAdapter",
     "ThsTaxonomySource",

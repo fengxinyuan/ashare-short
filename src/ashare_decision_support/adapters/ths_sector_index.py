@@ -1,31 +1,15 @@
-"""同花顺行业指数：市场口径的板块行情，独立于申万成分股聚合。
+"""同花顺行业指数：指数行情与成分股宽度分别呈现。
 
-**为什么要第二套板块读数。** 现有的 `sectors/momentum.py` 是从申万成分股日线
-**聚合**出来的（等权中位数），这是免费档下唯一能拿到 breadth / 涨停家数 /
-站上 MA20 占比的办法。但它拿不到两样东西：
+直接读取 d.10jqka.com.cn 的日线，不占用 TickFlow 配额。指数涨跌、日内收位和
+量比用于观察板块趋势；成分股中位涨跌、上涨占比、涨停家数仍由成分股行情计算。
+两者的统计方法不同，不能互相替代。
 
-1. **市值加权的板块指数本身**——所有人嘴里的「半导体今天跌了多少」说的是这个，
-   不是成分股涨跌幅的中位数。两者经常不一样，而**不一样的时候恰恰是信息**：
-   指数涨、宽度弱 = 权重股拉抬；指数平、宽度强 = 普涨但大票不动。
-2. **板块级的日内位置**——收盘落在当日区间的哪个分位。2026-07-31 实测：半导体
-   +4.23% 却收在当日**最低**（收位 0%），同日白酒 +0.63% 收在当日**最高**
-   （收位 97%）。「涨了多少」两者都是正的，「谁在被卖」只有收位看得见。
-
-**为什么用同花顺而不是东财。** 东财 `push2` 系板块接口在本机不可达（见
-`docs/DATA_SOURCES.md` §四）。同花顺 `d.10jqka.com.cn` 全系可用，**且没有限流**——
-这一点很重要：申万聚合要吃掉 TickFlow 60 次/分钟配额里的 45 次，同花顺 90 个板块
-一次都不占。
-
-**口径。** 日频，收盘后定格。`last.js` 只回当年数据（2026 年 140 根），够算 20 日
-窗口。不做任何跨源合并——这一层是**独立读数**，与申万排序并列呈现，不去猜两套
-行业分类之间的映射（同花顺 90 个 ≈ 申万二级粒度，硬映到申万一级 31 个只会造出
-一个看起来精确的错数）。
+行业名称与静态分类对齐，但静态成分来自第三方快照，不能据此认定官方成分完全
+相同。last.js 提供当年日线，历史序列在缓存中累积；这些读数不代表分钟级行情。
 """
 
 from __future__ import annotations
 
-import json
-import re
 import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -33,9 +17,15 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 
-from ashare_decision_support.adapters.http import BROWSER_USER_AGENT, fetch_text
+from ashare_decision_support.adapters.http import BROWSER_USER_AGENT, fetch_text, jsonp_payload
 from ashare_decision_support.fanout import gather
-from ashare_decision_support.jsoncache import read_stamped, write_stamped
+from ashare_decision_support.jsoncache import (
+    merge_series,
+    read_series,
+    read_stamped,
+    series_bars,
+    write_stamped,
+)
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_home
@@ -61,11 +51,11 @@ CACHE_NAME = "ths_sector_codes.json"
 CACHE_SCHEMA = "ths-bk-v1"
 
 # 日线序列的落盘位置与格式。
-#
+
 # **取数已经把整条序列拿回来了，这里只是别再扔掉它。** `last.js` 一次回当年全部
 # 日线（2026 年 140 根），而 `_measure` 只留最新一根——板块轮动、跷跷板、相对强弱
 # 排名要的历史因此每天被丢一次，尽管它一分钱额外成本都没有。
-#
+
 # 落在状态目录而不是 `--output-dir`：后者常按日期命名，那样序列会散成一天一份、
 # 永远拼不起来，而这份数据的全部价值就在于跨日累积。同 `jobs/morning.py` 里
 # 语料库那段的理由。
@@ -84,8 +74,6 @@ MIN_BARS = 25
 # 收在下沿 = 卖压在兑现。`shape` 与 `describe()` 两处都要用，写死两遍必然漂。
 HIGH_CLOSE = 80.0
 LOW_CLOSE = 20.0
-
-_CALLBACK = re.compile(r"\((.*)\)\s*;?\s*$", re.DOTALL)
 
 
 def _yi(amount: float | None) -> str:
@@ -139,6 +127,7 @@ class BackfillResult:
     latest: str | None = None
     failures: int = 0
     notes: list[str] = field(default_factory=list)
+    write_failures: int = 0
 
     @property
     def ok(self) -> bool:
@@ -153,6 +142,7 @@ class BackfillResult:
             "earliest": self.earliest,
             "latest": self.latest,
             "failures": self.failures,
+            "write_failures": self.write_failures,
             "notes": list(self.notes),
         }
 
@@ -179,20 +169,18 @@ class SectorIndexSnapshot:
         losers = self.top("ret_1d", n, reverse=False)
         if gainers:
             lines.append(
-                "同花顺行业涨幅前列："
-                + "、".join(f"{r.name} {r.ret_1d:+.2%}" for r in gainers)
+                "同花顺行业涨幅前列：" + "、".join(f"{r.name} {r.ret_1d:+.2%}" for r in gainers)
             )
         if losers:
             lines.append(
-                "同花顺行业跌幅前列："
-                + "、".join(f"{r.name} {r.ret_1d:+.2%}" for r in losers)
+                "同花顺行业跌幅前列：" + "、".join(f"{r.name} {r.ret_1d:+.2%}" for r in losers)
             )
         # 「涨了但收在最低」是这一层独有的读数，单独点名。
         lines.extend(self._close_position_lines(n))
         lines.extend(self._volume_position_lines(n))
         return lines
 
-    # ---- describe 的两条独有读数 ------------------------------------------
+    # describe 的两条独有读数
 
     def _close_position_lines(self, n: int) -> list[str]:
         """收盘位置的横截面分布。
@@ -221,8 +209,7 @@ class SectorIndexSnapshot:
         )
         if faded:
             line += "（冲高回落，卖压在兑现）：" + "、".join(
-                f"{r.name}（{r.ret_1d:+.2%}，收位 {r.close_position:.0f}%）"
-                for r in faded[:n]
+                f"{r.name}（{r.ret_1d:+.2%}，收位 {r.close_position:.0f}%）" for r in faded[:n]
             )
         elif risers:
             line += "——**没有一个冲高回落**，尾盘承接强。"
@@ -231,20 +218,9 @@ class SectorIndexSnapshot:
         return [line]
 
     def _volume_position_lines(self, n: int) -> list[str]:
-        """上涨板块按量能位置分两组，每一组都带上量级。
+        """上涨板块按量能分组，展示近 5 日 / 20 日均额比及绝对成交额。
 
-        `volume_ratio`（近 5 日均额 / 近 20 日均额）此前**算了但没有任何人读**——
-        它是这一层第二个独有读数，而且是分辨「反弹有没有钱」的那一个：
-        2026-08-07 实测同为大涨，小金属 1.29、贵金属 1.19 是放量，半导体 0.85、
-        军工电子 0.94 是缩量。只报涨幅，这两类在简报上长得一模一样。
-
-        **比值必须配量级，否则会读出一个反过来的结论。** 同日教育量能 1.68 排在
-        放量榜首，但它日均只有 43 亿；半导体量能 0.85 垫底，日均却有 3835 亿。
-        只看比值会得出「教育是最大的流入方向」，而当天真正的资金事实是**半导体
-        那一侧在失血，且失的血比教育的全部成交额还多一个数量级**。
-        `sectors/turnover.py:by_amount_delta` 早就写下过同一条理由（占比答「钱挪去
-        哪了」，绝对额答「哪里的钱最多地消失了」）——这一层此前漏了后半句，而
-        `amount_5d` 一直就在手边。
+        比值和金额并列，避免将小板块的高量比误读为更大的交易规模。
         """
         risers = [
             r
@@ -269,8 +245,7 @@ class SectorIndexSnapshot:
             lines.append(
                 "⚠️ 涨但缩量（涨幅在榜、量能没跟上，更像空头回补而不是新钱进场）："
                 + "、".join(
-                    f"{r.name}（{r.ret_1d:+.2%}，量能 {r.volume_ratio:.2f}，"
-                    f"{_yi(r.amount_5d)}）"
+                    f"{r.name}（{r.ret_1d:+.2%}，量能 {r.volume_ratio:.2f}，{_yi(r.amount_5d)}）"
                     for r in shrinking[:n]
                 )
             )
@@ -299,11 +274,12 @@ class ThsSectorIndexAdapter:
         self.persist_history = persist_history
         self.history_written = 0
 
-    # ---- public ----------------------------------------------------------
+    # public
 
     def fetch(self, codes: Iterable[str] | None = None) -> SectorIndexSnapshot:
+        self.history_written = 0
         notes: list[str] = []
-        wanted = list(codes) if codes is not None else self._codes(notes)
+        wanted = list(dict.fromkeys(codes if codes is not None else self._codes(notes)))
         if not wanted:
             return SectorIndexSnapshot(notes=[*notes, "同花顺行业指数：没有可用板块代码"], ok=False)
 
@@ -320,7 +296,12 @@ class ThsSectorIndexAdapter:
         readings = [r for r in (_measure(c, n, b) for c, n, b in parsed) if r is not None]
         # 落盘在 `_measure` 之后、闸门之前：即使某个板块的最新交易日对不齐、
         # 当日读数被排除，它的历史序列仍然是好的，没有理由跟着丢。
-        self._persist_history(parsed)
+        written = self._persist_history(parsed)
+        if self.persist_history and written < len(parsed):
+            notes.append(
+                f"同花顺行业历史 {len(parsed) - written}/{len(parsed)} 个板块保存失败，"
+                "当日读数仍可用，原有历史保留"
+            )
         if failures:
             kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors}))
             notes.append(
@@ -340,9 +321,7 @@ class ThsSectorIndexAdapter:
                 "（不同交易日的读数不可比）"
             )
 
-        notes.append(
-            f"同花顺行业指数 {len(readings)} 个板块，最新交易日 {readings[0].trade_date}"
-        )
+        notes.append(f"同花顺行业指数 {len(readings)} 个板块，最新交易日 {readings[0].trade_date}")
         return SectorIndexSnapshot(readings=readings, notes=notes, ok=True)
 
     def backfill(
@@ -372,7 +351,7 @@ class ThsSectorIndexAdapter:
         有洞，而「2015 年缺失」和「整个板块没有历史」在下游是两件事——前者由
         基准率层的样本量报出来，后者是取数彻底失败。
         """
-        wanted = list(codes) if codes is not None else self._codes([])
+        wanted = list(dict.fromkeys(codes if codes is not None else self._codes([])))
         if not wanted:
             return BackfillResult(notes=["同花顺行业指数：没有可用板块代码，无法回填"])
 
@@ -391,30 +370,34 @@ class ThsSectorIndexAdapter:
 
         root = self.history_dir()
         written = 0
+        write_failed: list[str] = []
         for code, bars in by_code.items():
             if not bars:
                 continue
-            # 名字取序列文件里已有的那个（`last.js` 那次写入的）。回填这条路
-            # 拿不到板块名，用代码顶替会把「电子」写成「881105」，而那个名字
-            # 是排行榜和驱动映射两处都要读的。
-            if _write_series(root, code, _series_name(root, code) or code, bars):
+            # 年线没有板块名；在更新锁内读取最新名称，避免覆盖同时完成的日常刷新。
+            if _write_series(root, code, None, bars):
                 written += 1
+            else:
+                write_failed.append(code)
 
-        stored = load_all_series(root)
-        stamps = [bar["date"] for _name, bars in stored.values() for bar in bars[:1]]
-        tails = [bars[-1]["date"] for _name, bars in stored.values() if bars]
+        bars_after, earliest, latest = _history_coverage(root, wanted)
         result = BackfillResult(
             codes=written,
             years=years,
-            bars_after=sum(len(bars) for _name, bars in stored.values()),
-            earliest=min(stamps) if stamps else None,
-            latest=max(tails) if tails else None,
+            bars_after=bars_after,
+            earliest=earliest,
+            latest=latest,
             failures=len(errors),
+            write_failures=len(write_failed),
         )
         result.notes.append(
             f"回填 {written}/{len(wanted)} 个板块，{years[0]}..{years[-1]} 共 {len(jobs)} 次取数，"
             f"落盘后合计 {result.bars_after} 根（{result.earliest}..{result.latest}）"
         )
+        if write_failed:
+            result.notes.append(
+                f"板块历史保存失败：{'、'.join(write_failed)}；原有历史保留，可重试"
+            )
         if errors:
             kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors})[:4])
             result.notes.append(
@@ -422,8 +405,6 @@ class ThsSectorIndexAdapter:
                 "序列允许有洞，缺哪几年由基准率层的样本量报出来"
             )
         return result
-
-    # ---- internals -------------------------------------------------------
 
     def _codes(self, notes: list[str]) -> list[str]:
         cached = self._read_cache()
@@ -449,8 +430,11 @@ class ThsSectorIndexAdapter:
 
     def _fetch_one(self, code: str) -> tuple[str, list[dict]] | None:
         text = fetch_text(
-            self._opener, BASE_URL.format(code=code), timeout=self.timeout,
-            referer=REFERER, user_agent=BROWSER_USER_AGENT,
+            self._opener,
+            BASE_URL.format(code=code),
+            timeout=self.timeout,
+            referer=REFERER,
+            user_agent=BROWSER_USER_AGENT,
         )
         return _parse_line_js(text)
 
@@ -458,18 +442,23 @@ class ThsSectorIndexAdapter:
         """一个 (板块, 年份) 的日线。上市之前的年份返回空列表，不算失败。"""
         code, year = job
         text = fetch_text(
-            self._opener, YEAR_URL.format(code=code, year=year), timeout=self.timeout,
-            referer=REFERER, user_agent=BROWSER_USER_AGENT,
+            self._opener,
+            YEAR_URL.format(code=code, year=year),
+            timeout=self.timeout,
+            referer=REFERER,
+            user_agent=BROWSER_USER_AGENT,
         )
         return _parse_year_js(text) or []
 
     def _cache_path(self) -> Path | None:
         return None if self.cache_dir is None else self.cache_dir / CACHE_NAME
 
-    # ---- 日线序列落盘 ------------------------------------------------------
+    # 日线序列落盘
 
     def history_dir(self) -> Path:
-        return self._history_dir if self._history_dir is not None else state_home() / HISTORY_DIR_NAME
+        return (
+            self._history_dir if self._history_dir is not None else state_home() / HISTORY_DIR_NAME
+        )
 
     def _persist_history(self, parsed: list[tuple[str, str, list[dict]]]) -> int:
         """把整条日线按日期并进已有序列。**失败只降速，不影响当日读数。**
@@ -477,6 +466,7 @@ class ThsSectorIndexAdapter:
         并而不是覆盖：`last.js` 只回当年的数据，跨年之后覆盖会把去年整段抹掉，
         而那正是 60 日以上窗口要用的部分。
         """
+        self.history_written = 0
         if not self.persist_history:
             return 0
         written = 0
@@ -499,32 +489,24 @@ class ThsSectorIndexAdapter:
         return write_stamped(self._cache_path(), {"codes": codes}, CACHE_SCHEMA)
 
 
-# ---- 日线序列的读写 -------------------------------------------------------
+# 日线序列的读写
 
 
 def _series_path(root: Path, code: str) -> Path:
     return root / f"{code}.json"
 
 
-def _series_name(root: Path, code: str) -> str | None:
-    """已落盘序列里记着的板块名。回填那条路拿不到名字，只能回读这一份。"""
-    payload = read_stamped(_series_path(root, str(code)), HISTORY_SCHEMA)
-    name = str((payload or {}).get("name") or "").strip()
-    return name or None
+def _write_series(root: Path, code: str, name: str | None, bars: list[dict]) -> bool:
+    """在更新锁内合并历史和名称；锁或保存失败时保留旧文件并返回 False。
 
+    回填那一路没有板块名（`_parse_year_js` 的说明），所以名字要从旧文件里续用。
+    """
 
-def _write_series(root: Path, code: str, name: str, bars: list[dict]) -> bool:
-    if not bars:
-        return False
-    merged = {str(bar["date"]): bar for bar in load_series(code, root)}
-    merged.update({str(bar["date"]): bar for bar in bars})
-    # 原子写在这里格外要紧：这一步是**整份重写**（旧序列并上新的），写到一半
-    # 断掉丢的不是今天这根，是这个板块攒下来的整条历史。
-    return write_stamped(
-        _series_path(root, code),
-        {"code": code, "name": name, "bars": [merged[key] for key in sorted(merged)]},
-        HISTORY_SCHEMA,
-    )
+    def header(stored: dict[str, Any] | None) -> dict[str, Any]:
+        stored_name = str((stored or {}).get("name") or "").strip()
+        return {"code": code, "name": name or stored_name or code}
+
+    return merge_series(_series_path(root, code), HISTORY_SCHEMA, bars, header)
 
 
 def load_series(code: str, root: str | Path | None = None) -> list[dict]:
@@ -533,16 +515,21 @@ def load_series(code: str, root: str | Path | None = None) -> list[dict]:
     这是板块轮动那一层（主线持续度、跷跷板相关性、相对强弱排名）唯一的输入口。
     """
     directory = Path(root) if root is not None else state_home() / HISTORY_DIR_NAME
-    payload = read_stamped(_series_path(directory, str(code)), HISTORY_SCHEMA)
-    return _usable_bars(payload)
+    return read_series(_series_path(directory, str(code)), HISTORY_SCHEMA)
 
 
-def _usable_bars(payload: dict[str, Any] | None) -> list[dict]:
-    """序列文件里能用的那些根。没有 `date` 的行丢掉——它排不进序，也对不上前一天。"""
-    bars = (payload or {}).get("bars")
-    if not isinstance(bars, list):
-        return []
-    return [bar for bar in bars if isinstance(bar, dict) and bar.get("date")]
+def _history_coverage(root: Path, codes: Iterable[str]) -> tuple[int, str | None, str | None]:
+    """逐个汇总所选板块，避免为三个统计量同时驻留全部多年日线。"""
+    count = 0
+    starts: list[str] = []
+    ends: list[str] = []
+    for code in codes:
+        bars = load_series(code, root)
+        if bars:
+            count += len(bars)
+            starts.append(bars[0]["date"])
+            ends.append(bars[-1]["date"])
+    return count, min(starts) if starts else None, max(ends) if ends else None
 
 
 def load_all_series(root: str | Path | None = None) -> dict[str, tuple[str, list[dict]]]:
@@ -563,15 +550,12 @@ def load_all_series(root: str | Path | None = None) -> dict[str, tuple[str, list
         return result
     for path in paths:
         payload = read_stamped(path, HISTORY_SCHEMA)
-        usable = _usable_bars(payload)
+        usable = series_bars(payload)
         if not payload or not usable:
             continue
         code = str(payload.get("code") or path.stem)
         result[code] = (str(payload.get("name") or code), usable)
     return result
-
-
-# ---- parsing -------------------------------------------------------------
 
 
 def _parse_line_js(text: str) -> tuple[str, list[dict]] | None:
@@ -607,13 +591,7 @@ def _parse_year_js(text: str) -> list[dict] | None:
 
 def _parse_callback(text: str) -> dict[str, Any] | None:
     """剥掉 JSONP 外壳，拿到里面那个对象。"""
-    match = _CALLBACK.search(text.strip())
-    if not match:
-        return None
-    try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
+    payload = jsonp_payload(text)
     return payload if isinstance(payload, dict) else None
 
 
@@ -664,9 +642,7 @@ def _measure(code: str, name: str, bars: list[dict]) -> SectorIndexReading | Non
         ret_1d=_pct(bars[-2]["close"], close),
         ret_5d=_pct(bars[-6]["close"], close) if len(bars) >= 6 else None,
         ret_20d=_pct(bars[-21]["close"], close) if len(bars) >= 21 else None,
-        close_position=(
-            round((close - last["low"]) / span * 100, 1) if span > 0 else 50.0
-        ),
+        close_position=(round((close - last["low"]) / span * 100, 1) if span > 0 else 50.0),
         off_20d_high=_pct(max(highs), close) if highs and max(highs) > 0 else None,
         volume_ratio=(
             round(fmean(amounts[-VOLUME_WINDOW:]) / fmean(amounts[-HIGH_WINDOW:]), 4)

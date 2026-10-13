@@ -10,7 +10,7 @@ does not decide when to run or where to send them (that is `loop.py`).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -19,17 +19,23 @@ from ashare_decision_support.adapters.base import (
     fetch_daily_bars,
     security_names,
 )
-from ashare_decision_support.advice.engine import AdviceEngine, StockAdvice, risk_reward
+from ashare_decision_support.advice.engine import AdviceEngine, StockAdvice, refresh_level_risk
 from ashare_decision_support.monitor.feed import FeedHealth, assess_feed
-from ashare_decision_support.monitor.holdings import HoldingView
+from ashare_decision_support.monitor.holdings import (
+    HoldingView,
+    breakeven_lines,
+    effective_stop,
+    effective_targets,
+)
 from ashare_decision_support.monitor.triggers import DEFAULT_LEVELS, Alert, TriggerEngine
 from ashare_decision_support.screens import AnnouncementScreen
 from ashare_decision_support.signals import DailyTechnicalAnalyzer, WyckoffAnalyzer
-from ashare_decision_support.signals.breakeven import measure_breakeven
 from ashare_decision_support.signals.intraday import IntradayAnalyzer
 from ashare_decision_support.signals.orderflow import read_many
+from ashare_decision_support.signals.series import bar_day
 from ashare_decision_support.signals.stabilise import assess_stabilisation
 from ashare_decision_support.state.alerts import AlertState
+from ashare_decision_support.state.workflow import record_event
 from ashare_decision_support.symbols import bare_code, normalize_symbol
 
 # Minute granularity for the monitor. 1-minute bars give ~8 sessions of
@@ -70,7 +76,7 @@ class MonitorSession:
         self.engine = TriggerEngine(levels=levels)
         # **盘中永远不带裁决器。** 它是每标的一次 LLM 调用：20 只票的一轮会变成
         # 20 次网络往返、几十秒延迟、二十个失败机会，而告警要的是秒级时效。
-        # 见 `docs/ARCHITECTURE.md` §五。
+        # 见 `docs/ARCHITECTURE.md` 的“输出闸门”。
         self.advice_engine = AdviceEngine()
         # 五档快照相反——它是**整批一次**请求，一轮加不到一秒，却能带来两样
         # 规则层拿不到的东西：真实涨跌停价（封板了就买不进，再好的位置也没用），
@@ -92,7 +98,7 @@ class MonitorSession:
         self._previous_latest: datetime | None = None
         self._last_verdict: str | None = None
 
-    # ---- once per session -------------------------------------------------
+    # once per session
 
     def load_positions(self, positions: Any) -> list[str]:
         """读入持仓。**已持仓的票要盯的是卖点，不是买点。**
@@ -109,7 +115,9 @@ class MonitorSession:
             view = HoldingView.from_position(entry, today=self.session_date)
             self.holdings[view.symbol] = view
             if not view.cost_price:
-                notes.append(f"{view.symbol} 在持仓表里但没有成本价，只能报绝对价位，给不出浮盈判断")
+                notes.append(
+                    f"{view.symbol} 在持仓表里但没有成本价，只能报绝对价位，给不出浮盈判断"
+                )
             self._seed_peak(view)
         if self.holdings:
             notes.append(
@@ -186,7 +194,7 @@ class MonitorSession:
         }
         return len(self.risk_notes)
 
-    # ---- per poll ---------------------------------------------------------
+    # per poll
 
     def poll(
         self,
@@ -201,7 +209,9 @@ class MonitorSession:
         )
         if not symbols:
             health = assess_feed({}, 0, now, self._previous_latest, in_session)
-            return PassResult(health=health, notes=["监控列表为空"])
+            return self._record_pass(
+                PassResult(health=health, notes=["监控列表为空"]), symbols, now
+            )
 
         bars, fetch_notes = self.intraday_adapter.get_minute_bars(symbols, period=self.period)
         health = assess_feed(bars, len(symbols), now, self._previous_latest, in_session)
@@ -215,12 +225,16 @@ class MonitorSession:
             # Deliberately no alerts. The loop announces the suspension once;
             # publishing signals off data this old is the failure mode the
             # whole gate exists to prevent.
-            self.state.save()
-            return PassResult(health=health, notes=fetch_notes, verdict_changed=changed)
+            return self._record_pass(
+                PassResult(health=health, notes=fetch_notes, verdict_changed=changed),
+                symbols,
+                now,
+            )
 
         intraday = IntradayAnalyzer(today=now.date()).analyze_many(bars, self.prev_closes)
         books = self._fetch_books(symbols, fetch_notes)
         alerts: list[Alert] = []
+        observations: list[dict[str, Any]] = []
         for symbol in symbols:
             snapshot = intraday.get(symbol)
             if snapshot is None:
@@ -235,8 +249,22 @@ class MonitorSession:
             )
             armed = self._apply_pinned_levels(advice, snapshot, now)
             holding = self.holdings.get(symbol)
+            observations.append(
+                {
+                    "symbol": symbol,
+                    "price": snapshot.last_price,
+                    "source_at": getattr(snapshot, "last_timestamp", None),
+                    "entry_low": advice.entry_low,
+                    "entry_high": advice.entry_high,
+                    "stop": effective_stop(holding, advice.stop),
+                    "targets": effective_targets(holding, advice.targets),
+                    "armed": armed,
+                    "holding": holding is not None,
+                    "risk_note": self.risk_notes.get(bare_code(symbol)),
+                }
+            )
             if holding is not None:
-                advice.breakeven_lines = _breakeven_lines(
+                advice.breakeven_lines = breakeven_lines(
                     holding.cost_price,
                     snapshot.last_price,
                     self.snapshots.get(symbol),
@@ -285,13 +313,49 @@ class MonitorSession:
                     ),
                 )
             )
-        self.state.save()
-        return PassResult(
-            health=health,
-            alerts=alerts,
-            notes=fetch_notes,
-            verdict_changed=changed,
+        try:
+            self.state.save()
+        except (OSError, TypeError, ValueError) as exc:
+            fetch_notes.append(
+                f"个股告警状态落盘失败（{type(exc).__name__}），本轮告警保留，重启后可能重复提醒"
+            )
+        return self._record_pass(
+            PassResult(
+                health=health,
+                alerts=alerts,
+                notes=fetch_notes,
+                verdict_changed=changed,
+            ),
+            symbols,
+            now,
+            observations,
         )
+
+    def _record_pass(
+        self,
+        result: PassResult,
+        symbols: list[str],
+        now: datetime,
+        observations: list[dict[str, Any]] | None = None,
+    ) -> PassResult:
+        try:
+            record_event(
+                self.session_date,
+                "stock_poll",
+                {
+                    "watch_symbols": symbols,
+                    "health": {**asdict(result.health), "usable": result.health.usable},
+                    "observations": observations or [],
+                    "alerts": [asdict(alert) for alert in result.alerts],
+                    "notes": list(result.notes),
+                },
+                now,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            result.notes.append(
+                f"个股过程记录保存失败（{type(exc).__name__}），本轮告警保留，复盘证据缺失"
+            )
+        return result
 
     def _fetch_books(self, symbols: list[str], notes: list[str]) -> dict[str, Any]:
         """一轮一次的批量五档。**取不到就当没有，绝不拖垮这一轮。**
@@ -336,50 +400,27 @@ class MonitorSession:
             advice.targets = list(pinned.get("targets") or [])
             # Recompute the risk/reward against the pinned levels so the number
             # published in an alert matches the levels quoted beside it.
-            advice.rrr = risk_reward(advice)
+            refresh_level_risk(advice)
             return True
 
         if snapshot.bar_count < ARM_MIN_BARS:
             # Not enough session yet for the levels to describe anything.
             advice.stop = None
             advice.targets = []
-            advice.rrr = None
+            refresh_level_risk(advice)
             return False
 
         self.state.pin(advice.symbol, advice.stop, advice.targets, now)
         return True
 
 
-
-def _breakeven_lines(cost: float | None, price: float | None, daily: Any) -> list[str]:
-    """把成本价与日线压力交叉，仅供已持仓告警补充上下文。"""
-    if daily is None:
-        return []
-    levels = {
-        "MA5": getattr(daily, "ma5", None),
-        "MA10": getattr(daily, "ma10", None),
-        "MA20": getattr(daily, "ma20", None),
-        "MA60": getattr(daily, "ma60", None),
-        **{
-            str(getattr(level, "label", "压力位")): getattr(level, "price", None)
-            for level in (getattr(daily, "resistances", None) or [])
-        },
-    }
-    # 第一行重复了 HoldingView 的成本/浮盈信息，告警里只保留结构结论。
-    return measure_breakeven(cost, price, levels).describe()[1:]
-
-
 def _bar_date(row: dict) -> str:
     """日线一根的日期，取成 `YYYY-MM-DD`。
 
     键名在各适配器之间不统一（`timestamp` / `date` / `日期`），值也可能是
-    `datetime` 或字符串。取不出来时返回空串——它排在任何真实日期之前，于是
-    这根不会被算进「建仓以来」，宁可少算一根也不拿一根日期不明的去顶峰值。
+    `datetime` 或字符串——这件事由 `signals.series.bar_day` 统一回答，全仓只有
+    那一张键名表。这里只补一件它不管的事：取不出来时返回空串。空串排在任何真实
+    日期之前，于是这根不会被算进「建仓以来」，宁可少算一根也不拿一根日期不明的
+    去顶峰值；而 `bar_day` 交出的 `None` 没法直接和字符串比大小。
     """
-    for key in ("timestamp", "date", "日期", "time", "时间"):
-        value = row.get(key)
-        if value in (None, ""):
-            continue
-        text = value.isoformat() if hasattr(value, "isoformat") else str(value)
-        return text[:10]
-    return ""
+    return bar_day(row) or ""

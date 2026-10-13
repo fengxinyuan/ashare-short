@@ -95,7 +95,7 @@ MIN_RRR_DENOMINATOR_PCT = 0.015
 # Best and worst reachable component totals, excluding the base. Kept explicit
 # rather than derived so a weight change that breaks the mapping shows up as a
 # failing test instead of as silently squashed scores.
-#
+
 #   trend        +12 / -15
 #   wyckoff      +10 bias +10 structure +8 spring +7 LPS +3 SOS  /  -15 -10 -8
 #   dip          +10 / -8
@@ -278,16 +278,13 @@ class RuleBasedScoreProvider(ScoreProvider):
         if dip.turnover_cost_30_reclaimed:
             points += 4.5 if down_day else 3.5
             label = "当日下跌踩回" if down_day else "踩回"
-            reasons.append(
-                f"{label}30日成交成本代理 {dip.turnover_cost_30:.2f}（{points:+.1f}）"
-            )
+            reasons.append(f"{label}30日成交成本代理 {dip.turnover_cost_30:.2f}（{points:+.1f}）")
         elif distance_30 is not None:
             if distance_30 < -0.05:
                 penalty = -COST_CAP * _ramp(-distance_30, 0.05, 0.12)
                 points += penalty
                 warnings.append(
-                    f"收盘低于30日成交成本代理 {abs(distance_30):.1%}，"
-                    "成本线承接未确认"
+                    f"收盘低于30日成交成本代理 {abs(distance_30):.1%}，成本线承接未确认"
                 )
                 reasons.append(f"跌破30日成交成本代理 {distance_30:+.1%}（{penalty:+.1f}）")
             elif abs(distance_30) <= 0.03:
@@ -317,12 +314,7 @@ class RuleBasedScoreProvider(ScoreProvider):
         reasons: list[str],
         warnings: list[str],
     ) -> float:
-        """量能——**含义取决于当前处在回调段还是启动段，同一个量比意义相反。**
-
-        回调途中要的是缩量：放量下跌是出货，不是低吸机会。而没有回调时（`none`）
-        放量才是启动确认。此前这里只有一个静态阈值，`ratio >= 1.0` 一律 +8、
-        缩量 -5，对低吸恰好选反。
-        """
+        """按所处阶段解释量能：回调要求缩量，启动关注放量。"""
         ratio = snapshot.volume_ratio_20d
         if ratio is None:
             return 0.0
@@ -423,6 +415,8 @@ class RuleBasedScoreProvider(ScoreProvider):
         points = 8.0 * _ramp(rrr, 1.0, 2.5) - 8.0 * _ramp(-rrr, -0.8, -0.3)
         if rrr < 0.8:
             warnings.append(f"日线评分口径：盈亏比仅 {rrr:.2f}，风险收益不划算")
+        elif rrr < 1.5:
+            warnings.append(f"日线评分口径：盈亏比仅 {rrr:.2f}，未达到盘中执行门槛，仅供观察")
         if abs(points) >= 0.5:
             reasons.append(f"盈亏比 {rrr:.2f}（{points:+.1f}）")
         return points
@@ -448,7 +442,9 @@ class RuleBasedScoreProvider(ScoreProvider):
 
         hits = news.bullish_hits if points > 0 else news.bearish_hits
         label = "偏多" if points > 0 else "偏空"
-        detail = f"个股舆情 {news.doc_count} 条{label}（{points:+.1f}，关键词：{'、'.join(hits[:4])}）"
+        detail = (
+            f"个股舆情 {news.doc_count} 条{label}（{points:+.1f}，关键词：{'、'.join(hits[:4])}）"
+        )
         reasons.append(detail)
         if points <= -NEWS_CAP / 2:
             # Loud enough to survive into the pre-open card, where warnings are
@@ -491,15 +487,15 @@ class RuleBasedScoreProvider(ScoreProvider):
             total += volume_points
 
         # 业绩**刻意不计入分数**，只写进理由与风险。
-        #
-        # 这不是遗漏，是 `DECISIONS.md` §六b 那条教训的直接应用：上一轮把缩量做成
+
+        # 这不是遗漏，是 `docs/ARCHITECTURE.md` 中筛选与监控的约定的直接应用：上一轮把缩量做成
         # ±6 分的权重，结果 60 条建议里 52 条是放量回调——**只要它是权重，就能被
         # 别的项买回来**。业绩层的正面读数（预增/扭亏）在样本够之前和缩量当时的
         # 处境一模一样：看起来该加分，但没有任何回测支持这个幅度。
-        #
+
         # 否决那一侧照旧是硬的（`screens/earnings.py`，在打分之前就把标的移除），
         # 所以「不给权重」削弱的只有加分方向。两侧不对称是设计，不是不一致。
-        #
+
         # 它的可验证出口是台账：`Recommendation.earnings` 存下完整裁决，
         # `journal/stats.py:_veto_cost` 与 `by_group` 负责在样本够之后回答
         # 「带业绩催化的那批兑现率高多少」。**先落台账，等 edge，再谈权重。**
@@ -510,7 +506,10 @@ class RuleBasedScoreProvider(ScoreProvider):
             total += catalyst_points
 
         total = clamp(total, -CONTEXT_DELTA_CAP, CONTEXT_DELTA_CAP)
-        if item.snapshot.trend_state == TrendState.DOWNTREND and total > CONTEXT_POSITIVE_BROKEN_CAP:
+        if (
+            item.snapshot.trend_state == TrendState.DOWNTREND
+            and total > CONTEXT_POSITIVE_BROKEN_CAP
+        ):
             warnings.append("个股处于下跌趋势，板块/事件利好只作观察，正向上下文加分已限额")
             total = CONTEXT_POSITIVE_BROKEN_CAP
         return total, components
@@ -557,9 +556,7 @@ class RuleBasedScoreProvider(ScoreProvider):
             points += relative_points
             if abs(relative_points) >= 0.5:
                 label = "跑赢" if relative_points > 0 else "跑输"
-                reasons.append(
-                    f"个股5日相对板块{label} {excess:+.2%}（{relative_points:+.1f}）"
-                )
+                reasons.append(f"个股5日相对板块{label} {excess:+.2%}（{relative_points:+.1f}）")
 
         return clamp(points, -SECTOR_RELATION_CAP, SECTOR_RELATION_CAP)
 
@@ -582,7 +579,9 @@ class RuleBasedScoreProvider(ScoreProvider):
             if isinstance(raw, (int, float)):
                 detail = f"，净流入 {raw / 1e8:+.2f} 亿"
             if isinstance(amount, (int, float)) and amount > 0:
-                detail += f"，占当日成交额 {raw / amount:.1%}" if isinstance(raw, (int, float)) else ""
+                detail += (
+                    f"，占当日成交额 {raw / amount:.1%}" if isinstance(raw, (int, float)) else ""
+                )
             reasons.append(f"个股资金流相对强度 {basis:+.2f}{detail}（{points:+.1f}）")
         return points
 
@@ -666,12 +665,14 @@ class RuleBasedScoreProvider(ScoreProvider):
         stock_value = float(stock_catalyst.net_score)
         points = clamp((sector_value * 0.65) + (stock_value * 0.85), -CATALYST_CAP, CATALYST_CAP)
         if abs(points) >= 0.75:
-            hits = tuple(dict.fromkeys(
-                (*getattr(sector_catalyst, "hits", ()), *stock_catalyst.hits)
-            ))
-            risk_hits = tuple(dict.fromkeys(
-                (*getattr(sector_catalyst, "risk_hits", ()), *stock_catalyst.risk_hits)
-            ))
+            hits = tuple(
+                dict.fromkeys((*getattr(sector_catalyst, "hits", ()), *stock_catalyst.hits))
+            )
+            risk_hits = tuple(
+                dict.fromkeys(
+                    (*getattr(sector_catalyst, "risk_hits", ()), *stock_catalyst.risk_hits)
+                )
+            )
             if points > 0:
                 reasons.append(f"板块/个股事件催化：{'、'.join(hits[:5])}（{points:+.1f}）")
             else:
@@ -688,4 +689,3 @@ def _bars_return(bars: list[dict], window: int) -> float | None:
     if len(closes) <= window:
         return None
     return closes[-1] / closes[-window - 1] - 1.0
-

@@ -21,7 +21,7 @@ from ashare_decision_support.signals.chips import (
     estimate_chips,
 )
 
-# ---- 元数据 ---------------------------------------------------------------
+# 元数据
 
 INDUSTRIES = [
     {"symbol": "920130.BJ", "name": "立方控股", "industries": ["计算机", "IT服务", "IT服务Ⅲ"]},
@@ -60,7 +60,7 @@ def test_two_files_are_merged_on_symbol(tmp_path) -> None:
     assert len(master) == 3
     maotai = master.get("600519.SH")
     assert maotai.name == "贵州茅台"
-    assert maotai.industries == ("食品饮料", "白酒", "白酒Ⅲ")
+    assert maotai.industry == "白酒"
     assert maotai.concepts == ("白酒", "MSCI中国")
 
 
@@ -83,8 +83,9 @@ def test_cache_is_reused_without_refetching(tmp_path) -> None:
     def counting(url: str, timeout: float) -> str:
         calls["n"] += 1
         name = url.rsplit("/", 1)[-1]
-        return json.dumps({"industries.json": INDUSTRIES, "concepts.json": CONCEPTS}[name],
-                          ensure_ascii=False)
+        return json.dumps(
+            {"industries.json": INDUSTRIES, "concepts.json": CONCEPTS}[name], ensure_ascii=False
+        )
 
     source = SecurityMasterAdapter(
         base_url="https://example.invalid/ths/",
@@ -137,8 +138,11 @@ def test_broad_attributes_are_excluded_from_themes(tmp_path) -> None:
     payloads = {
         "industries.json": [],
         "concepts.json": [
-            {"symbol": f"{600000 + i}.SH", "name": f"N{i}",
-             "concepts": ["融资融券"] + (["第三代半导体"] if i < 2 else [])}
+            {
+                "symbol": f"{600000 + i}.SH",
+                "name": f"N{i}",
+                "concepts": ["融资融券"] + (["第三代半导体"] if i < 2 else []),
+            }
             for i in range(10)
         ],
     }
@@ -160,7 +164,7 @@ def test_a_non_list_payload_is_refused_not_guessed(tmp_path) -> None:
     assert master.get("000001.SZ") is not None
 
 
-# ---- 筹码 -----------------------------------------------------------------
+# 筹码
 
 
 def chip_bars(
@@ -223,8 +227,8 @@ def test_average_cost_lies_inside_the_traded_range() -> None:
 def test_high_turnover_forgets_old_chips_faster() -> None:
     """换手率就是这套算法的记忆长度——换手越高，平均成本越贴近近期价格。"""
     bars = chip_bars(drift=0.15)
-    slow = estimate_chips(bars, FLOAT_SHARES * 20)   # 低换手，记得久
-    fast = estimate_chips(bars, FLOAT_SHARES)        # 高换手，忘得快
+    slow = estimate_chips(bars, FLOAT_SHARES * 20)  # 低换手，记得久
+    fast = estimate_chips(bars, FLOAT_SHARES)  # 高换手，忘得快
     assert fast.chip_avg_cost_est > slow.chip_avg_cost_est
 
 
@@ -276,7 +280,7 @@ def test_grid_is_fine_enough_to_avoid_quantisation() -> None:
     assert GRID_SIZE >= 100
 
 
-# ---- 流通股本的取数与接线 --------------------------------------------------
+# 流通股本的取数与接线
 
 
 class MasterAdapter:
@@ -339,9 +343,10 @@ def test_security_metadata_merges_adapter_rows_with_reference_tags(tmp_path) -> 
     )
 
     assert rows["600519.SH"]["name"] == "茅台"
-    assert rows["600519.SH"]["industry_path"] == "食品饮料·白酒·白酒Ⅲ"
+    assert rows["600519.SH"]["industry"] == "白酒"
+    assert not {"industries", "industry_path", "industry_leaf"} & rows["600519.SH"].keys()
     assert rows["600519.SH"]["concepts"] == ["白酒", "MSCI中国"]
-    assert rows["000001.SZ"]["industry_path"] is None
+    assert rows["000001.SZ"]["industry"] is None
     assert rows["000001.SZ"]["concepts"] == ["银行", "深股通"]
 
 
@@ -378,7 +383,7 @@ def test_pipeline_actually_receives_float_shares() -> None:
     assert wired["volume_price"]["turnover_rate"] is not None
 
 
-# ---- 筹码：按下标切片的等价性 ----------------------------------------------
+# 筹码：按下标切片的等价性
 
 
 def _deposit_over_full_grid(chips, grid, step, row, turnover) -> None:
@@ -486,7 +491,9 @@ def test_a_flat_bar_still_deposits_and_widens_the_touched_range() -> None:
     grid = [floor + step * (index + 0.5) for index in range(GRID_SIZE)]
     chips = [0.0] * GRID_SIZE
 
-    low_index, high_index = _deposit(chips, grid, step, {"low": 25.0, "high": 25.0, "vwap": 25.0}, 0.05)
+    low_index, high_index = _deposit(
+        chips, grid, step, {"low": 25.0, "high": 25.0, "vwap": 25.0}, 0.05
+    )
     assert low_index == high_index
     assert chips[low_index] == pytest.approx(0.05)
     assert sum(chips) == pytest.approx(0.05)
@@ -502,7 +509,9 @@ def test_deposit_reports_an_empty_range_when_it_writes_nothing() -> None:
     chips = [0.0] * GRID_SIZE
 
     # 整根落在网格之外：没有一档的中心价落进 [low, high]。
-    low_index, high_index = _deposit(chips, grid, step, {"low": 100.0, "high": 100.2, "vwap": 100.1}, 0.05)
+    low_index, high_index = _deposit(
+        chips, grid, step, {"low": 100.0, "high": 100.2, "vwap": 100.1}, 0.05
+    )
     assert low_index > high_index
     assert sum(chips) == 0.0
 

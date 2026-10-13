@@ -1,31 +1,7 @@
-"""组合层读数：这几笔持仓合起来是一个什么敞口。
+"""持仓组合的权重、行业与主题集中度，以及计划完整度。
 
-单笔那一层已经齐了——`monitor/holdings.py` 判止损 / 目标 / 结构破坏 / 时间止损 /
-浮盈回吐，`strategy/positioning.py` 把「单笔该给多少仓位」收在一处。**没有的是把
-它们加起来的那一层**。
-
-超短线里这一层恰恰是最容易出事的：三只票分属三个代码，看起来是三笔分散的仓位，
-但它们可能挂在同一个概念上。那时它不是三笔，是一笔重仓——回调来的时候三个止损
-会在同一根 K 线上一起触发，而「我已经分散了」这个印象是在建仓那一刻形成的，
-不会自己更正。
-
-这一层只做三件事，全部是确定性读数：
-
-1. **权重**：每只占组合多少。有成本价和股数就按金额算，缺一个就退回按只数算，
-   并且**说清楚现在是哪一种口径**——两种口径下「占 33%」是完全不同的两句话。
-2. **归并**：按行业与题材把持仓合并，看合并之后最大的那一块有多大。题材用
-   `SecurityMaster.themes()` 过滤过的那份，否则最大的一块永远是「融资融券」
-   （覆盖 69% 的市场，那是可交易属性不是题材，见 `adapters/security_master.py`）。
-3. **计划完整度**：哪几笔没有止损、没有目标、没有成本价。缺止损的那一笔不是
-   「还没想好」，是**这笔仓位今天没有失效条件**——盘中监控对它只能报绝对价位。
-
-## 不做的两件事
-
-- **不报总仓位。** 「仓位上限 0.30」说的是占**账户总资金**的比例，而这套系统只
-  知道持仓表，不知道你的账户里还有多少钱，也永远不该知道（它不接管账户）。
-  拿持仓内部的权重去和周期上限比是个看起来对、实际错的数。
-- **不给建议。** 集中度高不等于该减仓——主升段里集中在一个题材上正是打法本身。
-  这一层只把「你现在实际押在什么上面」摆出来，动作由人决定。
+成本和股数完整时按金额计权，否则按持仓数量计权并说明口径。
+持仓内部权重不等于占账户总资金的仓位；集中度读数本身不生成交易建议。
 """
 
 from __future__ import annotations
@@ -96,7 +72,9 @@ class PortfolioRead:
             "持仓数": self.count,
             "权重口径": self.basis,
             "成本市值": self.cost_value,
-            "权重": [{"symbol": symbol, "权重": round(weight, 4)} for symbol, weight in self.weights],
+            "权重": [
+                {"symbol": symbol, "权重": round(weight, 4)} for symbol, weight in self.weights
+            ],
             "归并": [cluster.to_dict() for cluster in self.clusters],
             "计划缺口": list(self.plan_gaps),
             "说明": list(self.notes),
@@ -227,9 +205,7 @@ def _clusters_of(
         *_to_clusters(theme_groups, LEVEL_THEME, weight_of),
     ]
     clusters.sort(key=lambda item: (-item.weight, item.level, item.label))
-    notes = (
-        [f"{'、'.join(unknown)} 在元数据里查不到，未参与归并"] if unknown else []
-    )
+    notes = [f"{'、'.join(unknown)} 在元数据里查不到，未参与归并"] if unknown else []
     return clusters, notes
 
 

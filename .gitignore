@@ -1,33 +1,34 @@
-.pytest_cache/
+# Python 构建产物与虚拟环境
 __pycache__/
+*.py[cod]
 *.egg-info/
-*.pyc
+.eggs/
+build/
+dist/
 .venv/
-.mace_patch/
-# 测试与 lint 的缓存。`.ruff_cache/` 与 `.pytest_cache/` 自带 .gitignore，
-# `.coverage` 不带——不写在这里它每跑一次 pytest --cov 就冒到 git status 里。
+
+# 测试与静态检查产物
+.pytest_cache/
+.ruff_cache/
 .coverage
 .coverage.*
-.ruff_cache/
 htmlcov/
 
-# 密钥：只有 *.example 进版本库
+# 本地配置；保留可提交的示例文件
 .env
-.env.tickflow
-.env.feishu
+.env.*
+!.env*.example
 
-# 运行产物：每次跑都会重生成，进版本库只会制造噪声
+# 报告与运行状态
 briefs/
-briefs_*/
-tickflow_charts/
-audit_*.json
-tickflow_daily_report.json
-tickflow_smoke.json
-
-# 运行状态：自选股、持仓、台账、告警、舆情语料库。这是**你的数据**，
-# 不是代码——进版本库既泄露持仓又会在每次跑批后制造 diff。
+audit*.json
 .runtime_state/
+.runtime-state/
 
-# 参考资料原件。知识已经转写进 docs/KNOWLEDGE_VOLUME_PRICE.md，二进制原件留在
-# 本地即可——它 diff 不了、review 不了，进版本库只是每次 clone 多背 1MB。
+# 量价原始参考资料；文本知识库见 docs/KNOWLEDGE_VOLUME_PRICE.md
 *.pptx
+
+# IDE 与本地工具配置
+.claude/
+.vscode/
+.idea/

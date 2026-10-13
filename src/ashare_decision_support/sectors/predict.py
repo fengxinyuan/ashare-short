@@ -21,7 +21,7 @@ from ashare_decision_support.emotion_scale import (
     STREAK_MOMENTUM,
     STREAK_WEAK,
 )
-from ashare_decision_support.news.base import NewsDoc, SentimentAnalyzer
+from ashare_decision_support.news.base import NewsDoc, SentimentAnalyzer, is_market_wrap
 from ashare_decision_support.news.events import detect_events
 from ashare_decision_support.numeric import clamp, median_of
 from ashare_decision_support.sectors.base import SectorDefinition, SectorMetrics, SectorOutlook
@@ -56,7 +56,7 @@ MAX_SUGGESTED_FACTOR = 0.8
 # than strong. For an ultra-short book, a session where nearly everything rose
 # after a week of gains is a late entry, not a green light — mapping breadth
 # straight to position size is pro-cyclical exactly when it hurts most.
-#
+
 # Graduated, not a threshold. A step function here has the same defect this
 # project rejected in the original plan's `F_market_emotion` (a cliff at
 # N_down=50): readings either side of the line get sizes 3x apart, and a market
@@ -70,12 +70,12 @@ OVERHEAT_RET_5D_FULL = 0.08
 OVERHEAT_MAX_HAIRCUT = 0.30
 
 # 拿满舆情分所需的文档数。
-#
+
 # 为什么需要独立的一道闸：`SentimentScore.intensity` 是命中**密度**（按文档数
 # 归一），不是证据量。2 条措辞强烈的快讯，平均密度必然高于 22 条褒贬混杂的，
 # 于是样本越小反而越容易顶到上限——实测一天里基础化工靠 2 条拿满 +12，计算机
 # 22 条只拿到 +2.0，证据越多得分越低，方向正好反了。
-#
+
 # 密度回答「这批文档说得多强」，条数回答「有多少人在说」。两个问题都要过，所以
 # 用一条独立的样本量斜坡相乘，而不是去改密度的定义（那会连带影响个股舆情）。
 SENTIMENT_FULL_WEIGHT_DOCS = 8
@@ -102,6 +102,36 @@ def _ramp(value: float, onset: float, full: float) -> float:
     if full <= onset:
         return 1.0 if value >= full else 0.0
     return clamp((value - onset) / (full - onset), 0.0, 1.0)
+
+
+# 「板块普跌」的判据：当日中位下跌，且上涨家数不到三成。只看中位涨幅会把「中位
+# -0.1%、一半股票在涨」的分歧日也算成普跌；只看上涨家数会漏掉中位大跌但零星
+# 涨停撑住家数的日子。两者都要。
+FALLING_BREADTH = 0.3
+
+
+def _falling_session(metric: SectorMetrics) -> bool:
+    if metric.ret_1d is None or metric.ret_1d >= 0:
+        return False
+    if metric.breadth is None:
+        return True
+    return metric.breadth < FALLING_BREADTH
+
+
+def _trend_gate(metric: SectorMetrics) -> float:
+    """中期趋势还在不在，[0, 1]。两个读数各占一半，缺的那个不投票。
+
+    20 日中位涨幅 ≥ 0 算趋势完整、≤ -6% 算完全塌掉；站上 20 日线占比 ≥ 50% 算
+    完整、≤ 20% 算塌掉。
+    """
+    votes: list[float] = []
+    if metric.ret_20d is not None:
+        votes.append(_ramp(metric.ret_20d, -0.06, 0.0))
+    if metric.above_ma20 is not None:
+        votes.append(_ramp(metric.above_ma20, 0.2, 0.5))
+    if not votes:
+        return 1.0
+    return sum(votes) / len(votes)
 
 
 @dataclass(frozen=True)
@@ -229,7 +259,7 @@ class SectorPredictor:
         self.analyzer = analyzer
         self.min_coverage = min_coverage
 
-    # ---- sector ranking --------------------------------------------------
+    # sector ranking
 
     def predict(
         self,
@@ -274,7 +304,11 @@ class SectorPredictor:
             )
             if abs(sentiment_points) >= 1.0:
                 hits = sentiment.bullish_hits if sentiment_points > 0 else sentiment.bearish_hits
-                thin = "" if confidence >= 1.0 else f"，样本仅 {len(docs)} 条已按 {confidence:.2f} 折权"
+                thin = (
+                    ""
+                    if confidence >= 1.0
+                    else f"，样本仅 {len(docs)} 条已按 {confidence:.2f} 折权"
+                )
                 reasons.append(
                     f"舆情 {len(docs)} 条，{'偏多' if sentiment_points > 0 else '偏空'}"
                     f"（{sentiment_points:+.1f}，关键词：{'、'.join(hits[:4])}{thin}）"
@@ -293,7 +327,9 @@ class SectorPredictor:
             inflow = inflow_by_sector.get(definition.name)
             capital_points = 0.0
             if inflow is not None and inflow_scale > 0:
-                capital_points = clamp(inflow / inflow_scale * CAPITAL_CAP, -CAPITAL_CAP, CAPITAL_CAP)
+                capital_points = clamp(
+                    inflow / inflow_scale * CAPITAL_CAP, -CAPITAL_CAP, CAPITAL_CAP
+                )
                 if abs(capital_points) >= 1.0:
                     reasons.append(f"龙虎榜净额 {inflow / 1e8:+.2f} 亿（{capital_points:+.1f}）")
             score += capital_points
@@ -322,7 +358,7 @@ class SectorPredictor:
         # taking the top N never picks one up by accident.
         return sorted(outlooks, key=lambda item: (item.trusted, item.score), reverse=True)
 
-    # ---- market reading --------------------------------------------------
+    # market reading
 
     def market_outlook(
         self,
@@ -341,9 +377,7 @@ class SectorPredictor:
         """
         sentiment = self.market_sentiment(market_docs, metrics)
         trusted = [
-            metric
-            for metric in metrics.values()
-            if metric.coverage_ratio >= self.min_coverage
+            metric for metric in metrics.values() if metric.coverage_ratio >= self.min_coverage
         ]
         covered = sum(metric.covered for metric in trusted)
 
@@ -386,9 +420,13 @@ class SectorPredictor:
 
         score = BASE_SCORE
         if breadth is not None:
-            points = clamp((breadth - 0.5) * 2.0 * MARKET_BREADTH_CAP, -MARKET_BREADTH_CAP, MARKET_BREADTH_CAP)
+            points = clamp(
+                (breadth - 0.5) * 2.0 * MARKET_BREADTH_CAP, -MARKET_BREADTH_CAP, MARKET_BREADTH_CAP
+            )
             score += points
-            reasons.append(f"{len(trusted)} 个板块 {covered} 只成分股，加权上涨占比 {breadth:.0%}（{points:+.1f}）")
+            reasons.append(
+                f"{len(trusted)} 个板块 {covered} 只成分股，加权上涨占比 {breadth:.0%}（{points:+.1f}）"
+            )
         if ret_1d is not None:
             points = clamp(ret_1d * 400.0, -MARKET_RET_CAP, MARKET_RET_CAP)
             score += points
@@ -398,7 +436,9 @@ class SectorPredictor:
             score += points
             reasons.append(f"板块 5 日中位涨幅 {ret_5d:+.2%}（{points:+.1f}）")
         if above_ma20 is not None:
-            points = clamp((above_ma20 - 0.5) * 2.0 * MARKET_MA20_CAP, -MARKET_MA20_CAP, MARKET_MA20_CAP)
+            points = clamp(
+                (above_ma20 - 0.5) * 2.0 * MARKET_MA20_CAP, -MARKET_MA20_CAP, MARKET_MA20_CAP
+            )
             score += points
             reasons.append(f"站上 20 日均线占比 {above_ma20:.0%}（{points:+.1f}）")
         if sentiment.doc_count:
@@ -409,7 +449,9 @@ class SectorPredictor:
                 MARKET_SENTIMENT_CAP,
             )
             score += points
-            reasons.append(f"宏观舆情 {sentiment.doc_count} 条，情绪 {sentiment.polarity:+.2f}（{points:+.1f}）")
+            reasons.append(
+                f"宏观舆情 {sentiment.doc_count} 条，情绪 {sentiment.polarity:+.2f}（{points:+.1f}）"
+            )
 
         blowup_rate = getattr(limit_pool, "blowup_rate", None)
         max_streak = getattr(limit_pool, "max_streak", None)
@@ -527,8 +569,6 @@ class SectorPredictor:
             reasons=reasons,
         )
 
-    # ---- internals -------------------------------------------------------
-
     def _momentum_component(
         self,
         metric: SectorMetrics,
@@ -543,7 +583,7 @@ class SectorPredictor:
 
         total = 0.0
 
-        # ---- L1 中期趋势：这个板块值不值得看 --------------------------------
+        # L1 中期趋势：这个板块值不值得看
         # 用 20 日而不是 5 日。5 日涨幅高说明的恰恰是**已经涨过了**，把它当主要
         # 权重就是在按「谁涨得最多」排序——2026-08-02 实测，前五名板块的 5 日中位
         # 是 +10.16%/+10.48%/+9.48%/+8.03%/+4.80%，排序几乎就是已涨幅度倒序。
@@ -556,12 +596,12 @@ class SectorPredictor:
             total += points
             reasons.append(f"站上20日均线占比 {metric.above_ma20:.0%}（{points:+.1f}）")
 
-        # ---- L2 回调窗口：现在是不是进场时机 --------------------------------
+        # L2 回调窗口：现在是不是进场时机
         # 低吸要的板块画像是**中期强 + 短期弱**。回调用成分股中位的归一化深度，
         # 和个股层同口径（`signals/dipbuy.py`）。
         total += self._pullback_component(metric, reasons)
 
-        # ---- 短期读数降权为辅助 ----------------------------------------------
+        # 短期读数降权为辅助
         # 当日涨幅与上涨家数仍然有用（说明板块正在被关注），但权重砍到不再主导排序。
         if metric.ret_1d is not None:
             points = clamp(metric.ret_1d * 100.0, -4.0, 3.0)
@@ -575,17 +615,38 @@ class SectorPredictor:
             points = min(2.0, metric.strong_count * 0.5)
             total += points
             reasons.append(f"涨幅超 9.5% 个股 {metric.strong_count} 只（{points:+.1f}）")
-        if metric.volume_ratio is not None:
-            if metric.volume_ratio >= 3.0:
-                warnings.append(f"量比中位数 {metric.volume_ratio:.2f}，放量过猛需防高位接盘")
-            elif metric.volume_ratio >= 1.2:
-                total += 3.0
-                reasons.append(f"量比中位数 {metric.volume_ratio:.2f}，温和放量（+3.0）")
-            elif metric.volume_ratio < 0.7:
-                total -= 3.0
-                reasons.append(f"量比中位数 {metric.volume_ratio:.2f}，缩量（-3.0）")
+        total += self._volume_component(metric, reasons, warnings)
 
         return clamp(total, -MOMENTUM_CAP, MOMENTUM_CAP)
+
+    def _volume_component(
+        self, metric: SectorMetrics, reasons: list[str], warnings: list[str]
+    ) -> float:
+        """结合价格方向解释量比，避免将放量下跌计为正向量能。"""
+        ratio = metric.volume_ratio
+        if ratio is None:
+            return 0.0
+        falling = _falling_session(metric)
+        if ratio >= 3.0:
+            if falling:
+                reasons.append(f"量比中位数 {ratio:.2f} 且板块普跌，放量下跌（-4.0）")
+                return -4.0
+            warnings.append(f"量比中位数 {ratio:.2f}，放量过猛需防高位接盘")
+            return 0.0
+        if ratio >= 1.2:
+            if falling:
+                reasons.append(f"量比中位数 {ratio:.2f} 且板块普跌，放量下跌（-3.0）")
+                return -3.0
+            reasons.append(f"量比中位数 {ratio:.2f}，温和放量（+3.0）")
+            return 3.0
+        if ratio < 0.7:
+            if falling:
+                # 缩量下跌是回调里最健康的形态：没人急着走。不加分，但也不再倒扣。
+                reasons.append(f"量比中位数 {ratio:.2f}，缩量回调（+0.0）")
+                return 0.0
+            reasons.append(f"量比中位数 {ratio:.2f}，缩量（-3.0）")
+            return -3.0
+        return 0.0
 
     def _pullback_component(self, metric: SectorMetrics, reasons: list[str]) -> float:
         """板块回调窗口。**这是低吸口径下唯一回答「现在该不该进」的一项。**
@@ -605,7 +666,25 @@ class SectorPredictor:
             return 0.0
         if depth <= PULLBACK_DEEP:
             points = PULLBACK_CAP * _ramp(depth, PULLBACK_NONE, PULLBACK_IDEAL)
-            label = f"{metric.pullback:+.2%}" if metric.pullback is not None else f"{depth:.1f} 个日波幅"
+            label = (
+                f"{metric.pullback:+.2%}"
+                if metric.pullback is not None
+                else f"{depth:.1f} 个日波幅"
+            )
+            # L1 否决 L2：趋势坏了的回调是接刀，不是低吸窗口。个股层
+            # （`scoring/rule_based.py`）一直是这个口径，板块层此前没有同步——
+            # 2026-09-14 实测，东数西算 20 日中位 -5.03%、站上 20 日线只有 27%，
+            # 照样拿满 +10 的「回调到位」。趋势读数按斜坡折减：20 日涨幅 0 以上、
+            # 站上 20 日线一半以上算完整趋势，两者都塌到底就一分不给。
+            gate = _trend_gate(metric)
+            if gate < 1.0:
+                scaled = points * gate
+                state = "中期趋势偏弱" if gate >= 0.5 else "中期趋势未在"
+                reasons.append(
+                    f"板块回调 {label}（中位 {depth:.1f} 个日波幅）但{state}，"
+                    f"低吸窗口按 {gate:.2f} 折减（{scaled:+.1f}）"
+                )
+                return scaled
             reasons.append(f"板块回调到位 {label}（中位 {depth:.1f} 个日波幅，{points:+.1f}）")
             return points
 
@@ -634,12 +713,16 @@ class SectorPredictor:
 
         result: dict[str, list[NewsDoc]] = {definition.name: [] for definition in definitions}
         known = set(result)
-        terms_by_sector = {definition.name: sector_terms(definition.name) for definition in definitions}
+        terms_by_sector = {
+            definition.name: sector_terms(definition.name) for definition in definitions
+        }
         labels = attribution or {}
 
         for doc in docs:
             text = doc.text
-            if not text:
+            if not text or is_market_wrap(doc):
+                # 收评、早间新闻精选一篇点到十几个板块，模型归因和词表都会把它挂上；
+                # 挂上之后它带来的只有「退市 / 停牌」这类别人的风险词。见 `is_market_wrap`。
                 continue
             key = dedup_key(doc)
             if labels and key in labels:

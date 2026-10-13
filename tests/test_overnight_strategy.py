@@ -8,6 +8,8 @@ from ashare_decision_support.strategy.overnight import (
     _ordered_bars,
     diversified_shortlist,
     is_main_board,
+    latest_signal_date,
+    screen_all_profiles,
     screen_overnight,
 )
 
@@ -132,12 +134,59 @@ def test_scope_gate_runs_before_technical_analysis(monkeypatch) -> None:
         seen.extend(sorted(bars_by_symbol))
         return {}
 
-    monkeypatch.setattr("ashare_decision_support.strategy.overnight.DailyTechnicalAnalyzer.analyze_many", analyze_many)
+    monkeypatch.setattr(
+        "ashare_decision_support.strategy.overnight.DailyTechnicalAnalyzer.analyze_many",
+        analyze_many,
+    )
     screen_overnight(
         {"600519.SH": make_bars("600519.SH"), "300750.SZ": make_bars("300750.SZ")},
         config=StrategyScreenConfig(profile="balanced-pullback"),
     )
     assert seen == ["600519.SH"]
+
+
+def test_all_profiles_share_indicators_and_match_independent_screens(monkeypatch) -> None:
+    from copy import deepcopy
+
+    from ashare_decision_support.signals.daily_technical import DailyTechnicalAnalyzer
+
+    bars = {
+        "600519.SH": make_bars("600519.SH"),
+        "600000.SH": make_bars("600000.SH"),
+        "300750.SZ": make_bars("300750.SZ"),
+    }
+    names = {"600519.SH": "测试股", "600000.SH": "ST测试", "300750.SZ": "创业板"}
+    original = deepcopy(bars)
+    expected = {}
+    for name in PROFILES:
+        payload = screen_overnight(
+            bars,
+            names=names,
+            config=StrategyScreenConfig(profile=name, allow_st=False, limit=0),
+        ).to_dict()
+        payload["summary"]["matched_total"] = len(payload["candidates"])
+        payload["candidates"] = payload["candidates"][:1]
+        payload["summary"]["candidates"] = len(payload["candidates"])
+        payload["config"]["limit"] = 1
+        expected[name] = payload
+
+    calls = []
+    analyze = DailyTechnicalAnalyzer.analyze_many
+
+    def counted(self, rows):
+        calls.append(sorted(rows))
+        return analyze(self, rows)
+
+    monkeypatch.setattr(DailyTechnicalAnalyzer, "analyze_many", counted)
+    result = screen_all_profiles(bars, names=names, sectors={}, common={"allow_st": False}, limit=1)
+    assert result["profiles"] == expected
+    assert calls == [["600519.SH"]]
+    assert bars == original
+
+    # 同一代码的新一轮输入必须重新计算，不得命中上一轮的全局指标缓存。
+    bars["600519.SH"][-1]["close"] *= 0.9
+    screen_all_profiles(bars, names=names, sectors={}, common={"allow_st": False}, limit=1)
+    assert calls == [["600519.SH"], ["600519.SH"]]
 
 
 def test_rejection_reason_is_exposed_for_tuning() -> None:
@@ -152,16 +201,41 @@ def test_rejection_reason_is_exposed_for_tuning() -> None:
 def test_multi_profile_shortlist_is_diversified_without_cross_scale_rank() -> None:
     def candidate(symbol: str, profile: str, rank: float) -> StrategyCandidate:
         return StrategyCandidate(
-            symbol=symbol, name=None, sector=None, profile=profile, profile_label=profile,
-            setup_rank=rank, rank_components={}, signal_date=None, last_close=10,
-            signal_low=None, previous_low=None, amount_yi=5, atr_pct=0.02,
-            range_position_60d=0.5, pullback_pct=-0.05, close_vs_ma20_pct=0,
-            close_position=0.5, volume_contraction=0.8, volume_ratio_20d=1,
-            pullback_atr=None, down_days=None, is_st=False,
+            symbol=symbol,
+            name=None,
+            sector=None,
+            profile=profile,
+            profile_label=profile,
+            setup_rank=rank,
+            rank_components={},
+            signal_date=None,
+            last_close=10,
+            signal_low=None,
+            previous_low=None,
+            amount_yi=5,
+            atr_pct=0.02,
+            range_position_60d=0.5,
+            pullback_pct=-0.05,
+            close_vs_ma20_pct=0,
+            close_position=0.5,
+            volume_contraction=0.8,
+            volume_ratio_20d=1,
+            pullback_atr=None,
+            down_days=None,
+            is_st=False,
         )
+
     results = {
-        "a": StrategyScreenResult(StrategyScreenConfig(profile="balanced-pullback"), PROFILES["balanced-pullback"], [candidate("600001.SH", "a", 90)]),
-        "b": StrategyScreenResult(StrategyScreenConfig(profile="high-elasticity"), PROFILES["high-elasticity"], [candidate("600002.SH", "b", 10)]),
+        "a": StrategyScreenResult(
+            StrategyScreenConfig(profile="balanced-pullback"),
+            PROFILES["balanced-pullback"],
+            [candidate("600001.SH", "a", 90)],
+        ),
+        "b": StrategyScreenResult(
+            StrategyScreenConfig(profile="high-elasticity"),
+            PROFILES["high-elasticity"],
+            [candidate("600002.SH", "b", 10)],
+        ),
     }
     rows = diversified_shortlist(results, 2)
     assert [row["symbol"] for row in rows] == ["600001.SH", "600002.SH"]
@@ -343,3 +417,15 @@ def test_setup_rank_stays_inside_its_declared_scale() -> None:
                 )
                 assert 0.0 <= rank <= 100.0, (profile.name, range_position, amount_yi)
                 assert all(0.0 <= value <= 1.0 for value in components.values())
+
+
+def test_latest_signal_date_is_the_last_bar_across_the_universe() -> None:
+    """筛选结果按这个日期判时效：全场最后一根日线的交易日，一根都没有就 None。
+
+    此前落盘只有运行日 `as_of`，事实包找不到数据日期，整份被标成「时点未知」而降级。
+    """
+    bars = {"A.SH": make_bars("A.SH"), "B.SZ": [], "C.SH": make_bars("C.SH")[:10]}
+
+    assert latest_signal_date(bars) == "2026-03-31"
+    assert latest_signal_date({"B.SZ": []}) is None
+    assert latest_signal_date({}) is None

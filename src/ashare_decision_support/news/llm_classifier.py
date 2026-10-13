@@ -23,6 +23,7 @@ from typing import Any
 from ashare_decision_support.fanout import gather
 from ashare_decision_support.llmreply import anchor_text, parse_array
 from ashare_decision_support.news.base import NewsDoc, SentimentAnalyzer, SentimentScore
+from ashare_decision_support.news.cache import analysis_cache_key
 from ashare_decision_support.news.dedup import dedup_key
 
 DIRECTION_BULLISH = "bullish"
@@ -59,7 +60,7 @@ MIN_ANCHOR_CHARS = 4
 
 # 事件类型清单。**必须和 SYSTEM_PROMPT 里给模型的那份逐字一致**，因为下面要拿它
 # 做校验：清单外的值一律丢弃。
-#
+
 # 校验这一项的理由和校验板块名完全相同。2026-08-02 实测 314 条归因里有 17 条
 # （5.4%）带着清单外的自创类型——销量 10、事件 3、高管变动 / 组织调整 / 产品创新 /
 # 品牌建设各 1——而它们会原样印进简报的「关键词：技术突破、品牌建设、需求变化」。
@@ -195,17 +196,7 @@ class LlmNewsClassifier:
         if not docs or not sectors:
             return ClassifyResult(notes=[], ok=False)
         if not self.configured:
-            return ClassifyResult(
-                notes=["未配置 LLM key，舆情归因走关键词词典"], ok=False
-            )
-
-        cached = self._read_cache(trade_date)
-        if cached is not None:
-            return ClassifyResult(
-                labels=cached,
-                notes=[f"舆情归因命中当日缓存（{len(cached)} 条），未重复调用模型"],
-                ok=True,
-            )
+            return ClassifyResult(notes=["未配置 LLM key，舆情归因走关键词词典"], ok=False)
 
         # 去重后再分类：同一条消息被两个源转发时只该付一次钱。
         unique: dict[str, NewsDoc] = {}
@@ -215,12 +206,33 @@ class LlmNewsClassifier:
                 unique[key] = doc
 
         items = list(unique.items())
+        cache_key = analysis_cache_key(
+            "llm_news_labels_v2",
+            {
+                "system": SYSTEM_PROMPT,
+                "items": [(key, doc.title[:TITLE_LIMIT]) for key, doc in items],
+                "sectors": sectors,
+                "batch_size": self.batch_size,
+            },
+            self.client,
+        )
+        cached = self._read_cache(trade_date, cache_key)
+        allowed = set(sectors)
+        if (
+            cached is not None
+            and set(cached) == set(unique)
+            and all(set(label.sectors) <= allowed for label in cached.values())
+        ):
+            return ClassifyResult(
+                labels=cached,
+                notes=[f"舆情归因命中当日同输入缓存（{len(cached)} 条），未重复调用模型"],
+                ok=True,
+            )
         batches = [
             items[index : index + self.batch_size]
             for index in range(0, len(items), self.batch_size)
         ]
 
-        allowed = set(sectors)
         done, errors = gather(
             batches,
             lambda batch: self._classify_batch(batch, sectors, allowed),
@@ -239,8 +251,7 @@ class LlmNewsClassifier:
         if errors:
             kinds = "、".join(sorted({type(exc).__name__ for _, exc in errors}))
             notes.append(
-                f"舆情归因 {len(errors)}/{len(batches)} 批调用失败（{kinds}），"
-                "这部分退回关键词词典"
+                f"舆情归因 {len(errors)}/{len(batches)} 批调用失败（{kinds}），这部分退回关键词词典"
             )
         if voided:
             notes.append(
@@ -254,13 +265,10 @@ class LlmNewsClassifier:
                 f"大模型舆情归因：{len(labels)} 条去重快讯，{attributed} 条归到板块、"
                 f"{directional} 条有明确方向（模型只出标签，分值仍由规则层给）"
             )
-            self._write_cache(trade_date, labels)
+            if len(labels) == len(items):
+                self._write_cache(trade_date, cache_key, labels)
 
-        return ClassifyResult(
-            labels=labels, notes=notes, calls=len(batches), ok=bool(labels)
-        )
-
-    # ---- internals -------------------------------------------------------
+        return ClassifyResult(labels=labels, notes=notes, calls=len(batches), ok=bool(labels))
 
     def _classify_batch(
         self,
@@ -290,7 +298,7 @@ class LlmNewsClassifier:
             return {}
 
         # 对齐靠**回抄的标题前缀**，不靠模型自报的序号。
-        #
+
         # 实测：模型的 `i` 会整体偏一位，于是「法国森林火灾」拿到了「动画电影票房
         # 超预期」的归因，整批标签错行——而且在加上 `why` 之前完全看不出来，每条
         # 都"看着挺合理"。序号是模型说的，标题前缀是可以拿原文核对的，只信后者。
@@ -309,7 +317,8 @@ class LlmNewsClassifier:
             # 板块名必须原样命中清单。模型自创的板块直接丢——把它映射到"最像的"
             # 那个，等于让幻觉悄悄进入归因。
             picked = tuple(
-                name for name in _as_list(row.get("sectors"))
+                name
+                for name in _as_list(row.get("sectors"))
                 if isinstance(name, str) and name in allowed
             )[:MAX_SECTORS_PER_DOC]
             direction = row.get("direction")
@@ -334,37 +343,42 @@ class LlmNewsClassifier:
             return {}
         return mapping
 
-    def _read_cache(self, trade_date: Any) -> dict[str, DocLabel] | None:
+    def _read_cache(self, trade_date: Any, key: str) -> dict[str, DocLabel] | None:
         if self.cache is None or trade_date is None:
             return None
         try:
-            payload = self.cache.read(trade_date, "llm_news_labels")
+            payload = self.cache.read(trade_date, key)
         except Exception:
             return None
         if not isinstance(payload, list):
             return None
         labels: dict[str, DocLabel] = {}
         for row in payload:
-            if not isinstance(row, dict) or not row.get("key"):
-                continue
+            if not isinstance(row, dict) or not isinstance(row.get("key"), str):
+                return None
+            sectors = row.get("sectors")
+            if not isinstance(sectors, list) or not all(isinstance(name, str) for name in sectors):
+                return None
+            if row.get("direction") not in DIRECTIONS:
+                return None
             # 缓存也要过一遍清单：昨天写进去的自创事件类型不该因为走了缓存这条路
             # 就绕过校验。
             event = row.get("event")
             labels[row["key"]] = DocLabel(
-                sectors=tuple(row.get("sectors") or ()),
+                sectors=tuple(sectors),
                 direction=row.get("direction") or DIRECTION_NEUTRAL,
                 event=event if isinstance(event, str) and event in EVENT_TYPES else None,
                 why=row.get("why"),
             )
         return labels or None
 
-    def _write_cache(self, trade_date: Any, labels: dict[str, DocLabel]) -> None:
+    def _write_cache(self, trade_date: Any, key: str, labels: dict[str, DocLabel]) -> None:
         if self.cache is None or trade_date is None:
             return
         try:
             self.cache.write(
                 trade_date,
-                "llm_news_labels",
+                key,
                 [
                     {
                         "key": key,
@@ -449,8 +463,6 @@ class LabelBackedSentiment(SentimentAnalyzer):
             bearish_hits=tuple(dict.fromkeys(bearish))[:6],
         )
 
-
-# ---- parsing -------------------------------------------------------------
 
 def _match_anchor(anchor: Any, normalized: list[tuple[str, str]]) -> str | None:
     """用模型回抄的标题前缀找回它说的是哪一条。

@@ -28,21 +28,21 @@ OFFICIAL_GLOBAL_FEEDS: tuple[RssFeed, ...] = (
     RssFeed("美联储", "https://www.federalreserve.gov/feeds/press_all.xml", "美联储"),
     # 保留在册但**本机 403**（CDN 层拦的，换 UA 无效，`api.bls.gov` 同样 503）。
     # 不删是因为「取不到」和「不存在」是两回事——换个部署环境它就回来了，这条
-    # 分界线是 `DATA_SOURCES.md` §三 一直在守的。并发之后它只花 0.25s 就失败，
+    # 分界线是 `DATA_SOURCES.md` 的网络记录 一直在守的。并发之后它只花 0.25s 就失败，
     # 不占墙钟时间，代价只有 note 里的一行。
     RssFeed("美国劳工统计局", "https://www.bls.gov/feed/bls_latest.rss", "美国劳工统计局"),
     RssFeed("美国能源信息署", "https://www.eia.gov/rss/todayinenergy.xml", "美国能源信息署"),
     # BLS 一挂，**就业与通胀**整块就没了，而这恰好是「宽松预期 → 风格切换」那条
     # 推理链的输入端。这两路补的不是同一个数，但补的是同一个判断：
-    #
     # - 经济分析局：GDP、**个人收入与支出（PCE，美联储真正盯的通胀口径）**、贸易差额
     # - 人口普查局：零售、耐用品、批发库存、新屋销售
-    #
     # 拿 PCE 代替 CPI 在这条链路上不是退而求其次——议息决策看的本来就是 PCE。
     # 非农仍然没有第二个官方来源，这一块只能靠华尔街见闻那一路的中文快讯兜。
     RssFeed("美国经济分析局", "https://apps.bea.gov/rss/rss.xml", "美国经济分析局"),
     RssFeed(
-        "美国人口普查局", "https://www.census.gov/economic-indicators/indicator.xml", "美国人口普查局"
+        "美国人口普查局",
+        "https://www.census.gov/economic-indicators/indicator.xml",
+        "美国人口普查局",
     ),
 )
 
@@ -70,7 +70,9 @@ class RssNewsSource(FeedNewsSource):
         # adapter bounded. The source is independently guarded at feed level.
         root = element_tree.fromstring(payload)  # noqa: S314
         return [
-            NewsDoc(title=title, summary=summary, source=feed.source, published_at=published_at, url=url)
+            NewsDoc(
+                title=title, summary=summary, source=feed.source, published_at=published_at, url=url
+            )
             for title, summary, published_at, url in _rss_items(root)[: self.per_feed_limit]
         ]
 
@@ -83,7 +85,11 @@ def _rss_items(root: element_tree.Element) -> list[tuple[str, str, str, str]]:
         if not title:
             continue
         summary = _child_text(item, "description") or _child_text(item, "summary")
-        stamp = _child_text(item, "pubDate") or _child_text(item, "published") or _child_text(item, "updated")
+        stamp = (
+            _child_text(item, "pubDate")
+            or _child_text(item, "published")
+            or _child_text(item, "updated")
+        )
         link = _child_text(item, "link")
         if not link:
             for node in item.findall("{*}link"):

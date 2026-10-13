@@ -66,7 +66,7 @@ def test_a_naive_timestamp_is_already_beijing_and_is_left_alone() -> None:
     assert to_beijing_naive(naive) == naive
 
 
-# ---- 交易时段边界只有一份 --------------------------------------------------
+# 交易时段边界只有一份
 
 
 def test_downstream_modules_share_the_one_session_close() -> None:
@@ -86,21 +86,23 @@ def test_downstream_modules_share_the_one_session_close() -> None:
 
     assert freshness.AFTERNOON_CLOSE is clock.AFTERNOON_CLOSE
     assert context.SESSION_CLOSE is clock.AFTERNOON_CLOSE
+    # 集合竞价起算的那一刻同理：`ask/context.py` 与 `schedule/calendar.py` 共用一份。
+    assert context.SESSION_OPEN is clock.AUCTION_OPEN
 
 
 def test_no_module_outside_clock_writes_a_session_boundary_literal() -> None:
     """边界字面量只准出现在 `schedule/clock.py` 里。
 
     上面那条只覆盖今天已知的三个下游；这条挡的是**明天新写的那个模块**——
-    它才是四份定义当初的来源。`ask/context.py` 的 09:15（集合竞价起算）与 05:00
-    不在此列：那是本层特有的时段口径，不是交易时段边界。
+    它才是四份定义当初的来源。`ask/context.py` 的 05:00 不在此列：那是本层特有的
+    时段口径，不是交易时段边界。
     """
     import ast
     import pathlib
 
     from ashare_decision_support.schedule import clock
 
-    boundaries = {(9, 30), (11, 30), (13, 0), (15, 0)}
+    boundaries = {(9, 15), (9, 30), (11, 30), (13, 0), (15, 0)}
     package = pathlib.Path(clock.__file__).resolve().parent.parent
     offenders: list[str] = []
     for path in sorted(package.rglob("*.py")):
@@ -152,3 +154,51 @@ def test_the_session_length_is_not_stored_twice() -> None:
                     offenders.append(f"{path.relative_to(package)}:{node.lineno} {target.id}")
 
     assert offenders == [], "交易分钟数要从 schedule/clock.py 取：" + "、".join(offenders)
+
+
+def test_no_module_hands_out_a_host_clock_as_a_value() -> None:
+    """没有模块可以把 `datetime.now` / `date.today` **不带括号**地传出去。
+
+    上面几条查的都是「调用」；这条查的是**引用**，因为那正是 ruff 看不见的
+    那一种，而它恰好是注入时钟的默认参数最自然的写法：
+
+        now_fn: Callable[[], datetime] = datetime.now      # DTZ 沉默
+        moment = datetime.now()                            # DTZ005
+
+    `monitor/loop.py` 与 `schedule/daemon.py` 的 `now_fn` 默认值都曾是前者，
+    从 DTZ 整族通电起两道闸一次都没响过；测试也照不到，因为测试全都显式传
+    `now_fn=`，默认值那条路从没跑过。后果不是崩，是 UTC 容器里收盘后
+    `in_session()` 返回 `True`，告警照着收盘数据发出去。
+
+    所以这道闸只能由测试来把——ruff 结构上就看不到这个形状。
+    """
+    import ast
+    import pathlib
+
+    from ashare_decision_support.schedule import clock
+
+    banned = {
+        ("datetime", "now"),
+        ("datetime", "utcnow"),
+        ("date", "today"),
+        ("datetime", "fromtimestamp"),
+    }
+    package = pathlib.Path(clock.__file__).resolve().parent.parent
+    offenders: list[str] = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        called: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                called.add(id(node.func))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or id(node) in called:
+                continue
+            owner = getattr(node.value, "id", None)
+            if (owner, node.attr) in banned:
+                offenders.append(f"{path.relative_to(package)}:{node.lineno} {owner}.{node.attr}")
+
+    assert offenders == [], (
+        "宿主机时钟不能当值传出去，用 schedule/timezone.py 的 beijing_* 系列："
+        + "、".join(offenders)
+    )

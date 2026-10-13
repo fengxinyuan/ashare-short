@@ -1,14 +1,7 @@
-"""Measure how fresh the free intraday feed actually is.
+"""采样所选分钟线接口的时效与更新情况，供免费和付费数据源共同使用。
 
-Written to answer one question that cannot be answered outside trading hours:
-**does the Sina minute feed update during the session, and by how much does it
-lag?** The whole free-tier case for intraday advice rests on it — if the answer
-is "it lags badly" or "it does not move", the paid TickFlow tier is the only
-route to requirements 2 and 3, and there is no point building further on the
-free path.
-
-Run it during a session (09:30-15:00 on a trading day). Outside those hours it
-says so and refuses to guess.
+交易时段比较两次采样的时间戳；非交易时段只报告距最近数据的时间差，
+不据此判断盘中延迟。有限次采样不能证明全天的稳定性。
 """
 
 from __future__ import annotations
@@ -56,10 +49,20 @@ def check_intraday_freshness(
 
     first, notes = intraday_adapter.get_minute_bars(symbols, period=period)
     lag_by_symbol: dict[str, float | None] = {}
+    ahead: list[str] = []
     for symbol, bars in first.items():
         last = bars[-1]["timestamp"] if bars else None
-        lag_by_symbol[symbol] = (
-            round((moment - last).total_seconds() / 60.0, 1) if isinstance(last, datetime) else None
+        if isinstance(last, datetime):
+            raw_lag = (moment - last).total_seconds() / 60.0
+            lag_by_symbol[symbol] = round(max(0.0, raw_lag), 1)
+            if raw_lag < 0:
+                ahead.append(symbol)
+        else:
+            lag_by_symbol[symbol] = None
+    if ahead:
+        notes.append(
+            f"{len(ahead)} 只标的分钟线时间戳晚于采样时刻，延迟按 0 分钟显示；"
+            "可能使用分钟区间结束时间，请结合连续更新判断"
         )
 
     advanced: dict[str, bool | None] = {}
@@ -89,31 +92,33 @@ def check_intraday_freshness(
     }
 
 
-def _verdict(session_active: bool, median_lag: float | None, advanced: dict[str, bool | None]) -> str:
+def _verdict(
+    session_active: bool, median_lag: float | None, advanced: dict[str, bool | None]
+) -> str:
     if not session_active:
         return (
             "非交易时段，测不出盘中时效。请在交易日 09:30-11:30 或 13:00-15:00 重跑；"
             "此时返回的 lag 只反映距上一个收盘的自然时间，不代表数据延迟。"
         )
     if median_lag is None:
-        return "拿不到任何分钟数据，免费分钟线在本机不可用——需求 2/3 只能走付费档或 QMT。"
+        return "拿不到任何分钟数据，无法评估盘中时效；请检查所选接口的连接、权限和配额。"
 
     moved = [value for value in advanced.values() if value is not None]
     did_move = bool(moved) and any(moved)
 
     if median_lag <= 2 and did_move:
-        return f"中位延迟 {median_lag} 分钟且样本内出新数据——免费分钟线可支撑盘中判断，暂不需要付费。"
+        return f"中位延迟 {median_lag} 分钟且样本内出新数据，本次采样确认分钟线正在更新。"
     if median_lag <= UNUSABLE_LAG_MINUTES and did_move:
         return (
             f"中位延迟 {median_lag} 分钟，数据在动但偏慢。做 5 分钟以上级别的判断够用，"
-            "抢分时买点不够——按你的持仓周期决定是否付费。"
+            "短周期判断仍需核对最新数据。"
         )
     if not did_move:
         return (
-            "采样窗口内数据**没有前进**——免费分钟线盘中不更新，"
-            "需求 2/3 无法基于它实现，建议开通付费档或等 QMT。"
+            "采样窗口内数据**没有前进**，本轮未确认分钟线更新；"
+            "请检查源数据时点，并用 --source 对比可用的分钟线接口。"
         )
     return (
         f"中位延迟 {median_lag} 分钟，超过 {UNUSABLE_LAG_MINUTES} 分钟可用线——"
-        "盘中决策不可靠，建议开通付费档。"
+        "盘中决策不可靠，请检查源数据时点并对比其他可用接口。"
     )

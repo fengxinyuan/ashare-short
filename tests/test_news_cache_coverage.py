@@ -15,6 +15,8 @@ from ashare_decision_support.news.cache import NewsCache
 from ashare_decision_support.news.official_source import OfficialListing, OfficialNewsSource
 from ashare_decision_support.news.rss_source import RssFeed, RssNewsSource
 from ashare_decision_support.news.wallstreet_source import WallstreetNewsSource
+from tests.fakes import FakeResponse
+from tests.fakes import PageOpener as CountingHttp
 
 TRADE_DATE = date(2026, 8, 8)
 
@@ -25,36 +27,6 @@ RSS = """<?xml version="1.0"?><rss><channel>
 <item><title>Federal Reserve issues statement</title><description>Policy decision.</description>
 <link>https://fed.example/release</link><pubDate>Thu, 07 Aug 2026 18:00:00 GMT</pubDate></item>
 </channel></rss>"""
-
-
-class _Resp:
-    def __init__(self, body: bytes) -> None:
-        self.body = body
-
-    def read(self, size: int = -1) -> bytes:
-        return self.body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class CountingHttp:
-    """记下每个 URL 被打了几次；`dead` 里的直接抛。"""
-
-    def __init__(self, pages: dict[str, str], dead: set[str] | None = None) -> None:
-        self.pages = pages
-        self.dead = dead or set()
-        self.calls: list[str] = []
-
-    def __call__(self, request, timeout=None):
-        url = request.full_url
-        self.calls.append(url)
-        if url in self.dead:
-            raise OSError("down")
-        return _Resp(self.pages[url].encode("utf-8"))
 
 
 def test_official_listing_is_read_from_cache_on_the_second_run(tmp_path) -> None:
@@ -97,9 +69,9 @@ def test_a_dead_listing_does_not_stop_the_live_one_from_caching(tmp_path) -> Non
     cache = NewsCache(tmp_path)
 
     def run() -> tuple[list[NewsDoc], list[str]]:
-        return OfficialNewsSource(
-            opener=http, listings=(live, dead), cache=cache
-        ).fetch_market(TRADE_DATE)
+        return OfficialNewsSource(opener=http, listings=(live, dead), cache=cache).fetch_market(
+            TRADE_DATE
+        )
 
     first, first_notes = run()
     second, _ = run()
@@ -128,7 +100,7 @@ class PagingHttp:
         items = self.pages[index] if index < len(self.pages) else []
         nxt = str(index + 1) if index + 1 < len(self.pages) else None
         body = json.dumps({"data": {"items": items, "next_cursor": nxt}}, ensure_ascii=False)
-        return _Resp(body.encode("utf-8"))
+        return FakeResponse(body.encode("utf-8"))
 
 
 def _item(title: str) -> dict:

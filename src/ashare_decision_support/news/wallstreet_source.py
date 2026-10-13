@@ -1,27 +1,7 @@
-"""宏观与政策快讯：华尔街见闻电报。
+"""华尔街见闻宏观、政策与海外流动性快讯。
 
-**为什么要加这一路。** 2026-08-02 实测现有三路舆情（财联社电报 20 条、东财全球快讯
-180 条、新闻联播）在全市场 200 条里的关键词命中：
-
-| 关键词 | 命中 |
-|---|---|
-| 伊朗 / 中东 | 66 / 26 ✅ 地缘覆盖得很好 |
-| **PMI / 统计局 / 制造业** | **0 / 0 / 0** |
-| **美债 / 收益率 / 降准 / 关税** | **0 / 0 / 0 / 0** |
-
-也就是说：**宏观数据发布对这个系统是完全不可见的**。同一天 07-31 09:30 公布的
-「中国 7 月官方制造业 PMI 49.2（前值 50.3）、非制造业 49.0、综合 49.3」——三个全线
-跌破荣枯线——链路里一个字都没有。这不是权重问题，是这类消息压根没进来。
-
-对盘前研判来说这是个硬缺口：板块方向可以靠量价推，**风格切换不行**。PMI 破荣枯线
-直接对应「宽松预期升温 → 红利/消费占优、顺周期走弱」，而这条推理链的输入端是空的。
-
-**数据源。** 华尔街见闻 `api-one.wallstcn.com` 电报接口，本机可达（东财 `push2` 被
-代理拒的那套限制不适用于这个 host）。两个频道：`global-channel`（宏观/海外/大宗）
-与 `a-stock-channel`（A 股）。单页上限 100 条，用 `cursor` 往前翻。
-
-**只做宏观补充，不替换任何现有源。** 财联社/东财/联播覆盖盘面与政策文件，这一路
-补的是数据发布与海外流动性——两边重叠的部分由 `news/dedup.py` 按标题去重合并。
+并发采集 global-channel 和 a-stock-channel，按回溯时间窗翻页。
+单页最多 100 条；部分分页失败时保留已取得文档，并报告覆盖不完整。
 """
 
 from __future__ import annotations
@@ -38,7 +18,7 @@ from ashare_decision_support.news.base import NewsDoc, NewsSource
 from ashare_decision_support.news.cache import NewsCache
 from ashare_decision_support.news.feed_source import USER_AGENT
 from ashare_decision_support.news.health import probe_feeds
-from ashare_decision_support.schedule.timezone import BEIJING_TZ
+from ashare_decision_support.schedule.timezone import BEIJING_TZ, beijing_now
 
 BASE_URL = "https://api-one.wallstcn.com/apiv1/content/lives?channel={channel}&limit={limit}"
 CURSOR_SUFFIX = "&cursor={cursor}"
@@ -46,22 +26,12 @@ CURSOR_SUFFIX = "&cursor={cursor}"
 CHANNEL_GLOBAL = "global-channel"
 CHANNEL_A_SHARE = "a-stock-channel"
 
-PAGE_LIMIT = 100          # 服务端硬上限
+PAGE_LIMIT = 100  # 服务端硬上限
 
-# 回溯**时间窗**，不是页数。两个频道的流量差一个数量级（global 一天上千条、
-# a-stock 一天几百条），固定页数会让高流量频道只翻到几小时前——而 07-31 09:30
-# 发布的 PMI 恰好落在那个盲区里。按时间窗翻页，两个频道才覆盖同一段历史。
-#
-# 72 小时：周一盘前要回看到**上周五开盘**（周五 09:00 → 周一 08:30 是 71.5 小时）。
-# 取 60 小时差一点够不着周五早盘的数据发布——07-31 09:30 的 PMI 就正好落在窗外。
+# 按时间窗而非页数对齐频道覆盖；72 小时可覆盖周一盘前至上周五早盘。
 DEFAULT_LOOKBACK_HOURS = 72
-MAX_PAGES = 16           # 失控保护：单频道最多翻 1200 条
+MAX_PAGES = 16  # 失控保护：单频道最多翻 1600 条
 TIMEOUT_SECONDS = 15
-
-# 交易所时钟。**不在这里另立一份**：`schedule/timezone.py` 写着「时钟只有这一个
-# 来源」，而这一行原来是它的第二份私有副本（第三份在
-# `adapters/tickflow_adapter.py`）。固定 +08:00 与 `Asia/Shanghai` 在 1992 年以后
-# 的每一天都相等，只有 1986-1991 那几年的夏令时不同——快讯时间戳到不了那里。
 
 
 class WallstreetNewsSource(NewsSource):
@@ -86,38 +56,41 @@ class WallstreetNewsSource(NewsSource):
         self.cache = cache
         self.last_market_stats: dict[str, object] = {}
 
-    # ---- market-wide -----------------------------------------------------
+    # market-wide
 
     def fetch_market(self, trade_date: date, limit: int = 200) -> tuple[list[NewsDoc], list[str]]:
         docs: list[NewsDoc] = []
         notes: list[str] = []
-        # 截止时间锚在 `trade_date` 当天 24:00，而不是 `now`——这样同一个交易日
-        # 无论几点跑，取回的窗口都一样，盘前跑两次不会得到两份不同的输入。
-        cutoff = int(
-            (
-                datetime.combine(trade_date, datetime.min.time(), tzinfo=BEIJING_TZ)
-                + timedelta(days=1)
-                - timedelta(hours=self.lookback_hours)
-            ).timestamp()
+        # 当日按实际采集时刻回溯，周一 08:30 的 72 小时窗口才能覆盖周五早盘。
+        # 历史日期仍锚定该日结束；同日重跑由 TTL 缓存复用已采集的文档。
+        moment = beijing_now()
+        anchor = (
+            moment
+            if moment.date() == trade_date
+            else datetime.combine(trade_date, datetime.min.time(), tzinfo=BEIJING_TZ)
+            + timedelta(days=1)
         )
+        cutoff = int((anchor - timedelta(hours=self.lookback_hours)).timestamp())
 
-        # 两个频道各自要翻十几页，彼此没有依赖。并发之后这一段的墙钟时间由**翻页
-        # 更深的那个频道**决定，而不是两个频道之和。
         fetched, unreachable = gather(
             self.channels, lambda channel: self._channel_docs(trade_date, channel, cutoff)
         )
         # `_channel` 自己不抛异常，翻第一页就失败时返回 ok=False；两种失败都要
         # 进同一条 note，否则「频道挂了」会读起来像「今天这个频道没消息」。
-        partial = {channel for channel, (_, ok) in fetched if not ok}
+        partial = [channel for channel, (_, ok, complete) in fetched if ok and not complete]
+        empty = {channel for channel, (_, ok, _) in fetched if not ok}
         dead = {channel for channel, _exc in unreachable}
-        failed = [channel for channel in self.channels if channel in partial or channel in dead]
-        for _, (got, ok) in fetched:
+        failed = [channel for channel in self.channels if channel in empty or channel in dead]
+        for _, (got, ok, _) in fetched:
             if ok:
                 docs.extend(got)
 
         if failed:
+            notes.append(f"华尔街见闻 {'/'.join(failed)} 频道不可用，本次宏观快讯不完整")
+        if partial:
             notes.append(
-                f"华尔街见闻 {'/'.join(failed)} 频道不可用，本次宏观快讯不完整"
+                f"华尔街见闻 {'/'.join(partial)} 频道仅取到部分分页，"
+                "本次宏观快讯不完整，未写入完整缓存"
             )
         if not docs:
             notes.append("华尔街见闻快讯全部不可用，本次无宏观数据发布输入")
@@ -132,9 +105,7 @@ class WallstreetNewsSource(NewsSource):
         notes.append(
             f"华尔街见闻快讯 {len(result)} 条（宏观数据发布与海外流动性），回溯至 {oldest}"
         )
-        # 这一路的 `raw_by_source` 交给文档自报：两个频道混在一起去重之后，一条
-        # 快讯来自哪个频道已经无从分辨，而它自报的 `source` 才是下游按来源配额
-        # 分配时真正用的那个键。
+        # 频道合并去重后，按文档 source 字段分配来源配额。
         result, self.last_market_stats = retain_market_docs(result, limit)
         return result, notes
 
@@ -159,59 +130,54 @@ class WallstreetNewsSource(NewsSource):
             lambda channel: (self._page(channel, None) or {}).get("items") or [],
         )
 
-    # ---- internals -------------------------------------------------------
-
     def _channel_docs(
         self, trade_date: date, channel: str, cutoff: int | None
-    ) -> tuple[list[NewsDoc], bool]:
-        """带缓存的单频道取数。缓存命中直接算成功。
+    ) -> tuple[list[NewsDoc], bool, bool]:
+        """保留部分结果与完整性标识；只缓存已完成窗口的采集。
 
-        这一路是四路源里最贵的：一个频道最多翻 16 页、每页 100 条，两个频道就是
-        32 个往返。盘前重跑一次就再来一遍，而 `cutoff` 已经锚死在交易日 24:00，
-        同一天翻回来的本来就该是同一批——那就没有理由再打一次。
-
-        **只缓存翻完整的那次。** `_channel` 中途失败会返回已经拿到的半截加
-        `ok=True`（有多少算多少），把半截写进缓存等于让后面每一次重跑都只看到
-        半截，而且看不出来。半截值得用，不值得记住。
+        版本键隔离旧版误写的完整缓存，不同回溯长度也不能共用覆盖结论。
         """
-        key = f"wallstreet_{channel}"
+        key = f"wallstreet_v2_{self.lookback_hours}_{channel}"
         if self.cache is not None:
             cached = self.cache.read_docs(trade_date, key)
             if cached is not None:
-                return cached, True
+                return cached, True, True
         docs, ok, complete = self._channel(channel, cutoff)
         if ok and complete and self.cache is not None:
             self.cache.write_docs(trade_date, key, docs)
-        return docs, ok
+        return docs, ok, complete
 
     def _channel(self, channel: str, cutoff: int | None) -> tuple[list[NewsDoc], bool, bool]:
         """返回 (文档, 这一路算不算取到, 是否翻完整)。
 
-        第三个值只给缓存用。翻页中途挂掉时前两个值仍然是「有多少算多少」——那是
-        这一路一贯的降级约定，不因为多了个缓存就改。
+        完整性同时用于缓存与报告。到达页数上限或重复游标时仍返回已采集的部分。
         """
         docs: list[NewsDoc] = []
         cursor: str | None = None
+        cursors: set[str] = set()
+        cutoff_stamp = _stamp(cutoff) if cutoff is not None else ""
         for _ in range(max(self.max_pages, 1)):
             try:
                 payload = self._page(channel, cursor)
             except Exception:
                 return docs, bool(docs), False
-            items = payload.get("items")
-            if not isinstance(items, list) or not items:
-                break
-            docs.extend(doc for doc in (_to_doc(item) for item in items) if doc is not None)
+            items = payload["items"]
+            if not items:
+                return docs, True, True
+            page_docs = [doc for doc in (_to_doc(item) for item in items) if doc is not None]
+            docs.extend(page_docs)
 
-            oldest = min(
-                (int(i.get("display_time") or 0) for i in items if isinstance(i, dict)),
-                default=0,
-            )
-            if cutoff is not None and oldest and oldest <= cutoff:
-                break
-            cursor = payload.get("next_cursor")
-            if not cursor:
-                break
-        return docs, True, True
+            oldest = min((doc.published_at for doc in page_docs if doc.published_at), default="")
+            if cutoff_stamp and oldest and oldest <= cutoff_stamp:
+                return docs, True, True
+            next_cursor = payload.get("next_cursor")
+            if not next_cursor:
+                return docs, True, True
+            cursor = str(next_cursor)
+            if cursor in cursors:
+                return docs, bool(docs), False
+            cursors.add(cursor)
+        return docs, bool(docs), False
 
     def _page(self, channel: str, cursor: str | None) -> dict:
         url = BASE_URL.format(channel=channel, limit=PAGE_LIMIT)
@@ -221,7 +187,9 @@ class WallstreetNewsSource(NewsSource):
         with self._opener(request, timeout=self.timeout) as response:
             payload = json.loads(response.read().decode("utf-8", "ignore"))
         data = payload.get("data") if isinstance(payload, dict) else None
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise ValueError("华尔街见闻响应缺少有效的 data.items 列表")
+        return data
 
 
 def _to_doc(item: Any) -> NewsDoc | None:
@@ -240,12 +208,12 @@ def _to_doc(item: Any) -> NewsDoc | None:
         summary=text[:500] if text and text != title else "",
         source="华尔街见闻",
         published_at=_stamp(item.get("display_time")),
-        url=str(item.get("uri") or "") or None,
+        url=str(item.get("uri") or ""),
     )
 
 
 def _stamp(value: Any) -> str:
     try:
         return datetime.fromtimestamp(int(value), BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError, OSError):
+    except (TypeError, ValueError, OSError, OverflowError):
         return ""

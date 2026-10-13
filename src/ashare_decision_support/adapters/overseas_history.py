@@ -1,37 +1,8 @@
-"""海外指数日线**历史**：A 股板块假设的外部驱动源。
+"""海外指数日线历史，用于板块情景的历史基准率研究。
 
-**为什么要历史，而不是只要一个当日快照。** `adapters/global_market.py` 每天取一次
-美股/韩股收盘，那份读数进盘前简报的一段文字，然后就没了。于是「费半跌了 2%」在
-系统里是个孤立事实——它答不了下一个必然被问到的问题：**过去费半跌 2% 之后，A 股
-电子板块第二天到底怎么走。**
-
-那个问题只能查，不能推。查它要两段序列：A 股板块指数（`ths_sector_index.py` 已在
-落盘，并可按年回填到 2007）和海外指数——后者此前一根都没存过。
-
-## 两个源，两种格式
-
-- **美股**：新浪美股日线。2026-08-20 实测 `.INX` 5696 根回到 2004-01-02、
-  `.IXIC` 5693 根、`.SOX` 3165 根回到 2014-01-16。日期是**美东日期**。
-- **亚太**：新浪环球指数日线。实测 KOSPI / KOSDAQ / 日经 / 台湾加权各 1000 根，
-  回到 2022-07。日期是**当地日期**。亚太这一路**没有成交额**，个别品种连成交量
-  都是 0——所以这一层只承诺 OHLC，量能字段取到就存、取不到就是 `None`。
-
-两路都归一成 `YYYYMMDD`，与板块序列同一种日期写法。不归一的话，基准率层要在
-`"2026-08-19"` 和 `"20260819"` 之间做一次隐式转换，而那种转换写错了不会报错，
-只会让两边永远对不上、样本数恒为 0。
-
-## 对齐规则：海外 T 日 → A 股的**下一个**交易日
-
-这一条决定基准率是不是错的，所以写在取数层而不是使用层——`ALIGNMENT_NOTE` 会
-跟着读数一起进事实包。统一按「A 股这根日线**开盘之前**，这条海外读数已经出来了
-吗」判：
-
-- 美股 T 日收盘 = 北京 T+1 凌晨，A 股 T+1 开盘前已知；
-- 亚太 T 日收盘 = 北京 T 日 14:30（韩）/ 13:30（台），**晚于 A 股当日多数建仓
-  时点**，所以对次日决策同样只能算到 T+1。
-
-按「同日」对齐会拿到一个偷看未来的结果——韩股当天怎么走，在 A 股当天开盘时还
-不知道。这类错不会报错，只会让基准率好看得离谱。
+新浪美股日线采用美东日期，亚太日线采用当地日期，统一存为 YYYYMMDD。
+只保证可用的 OHLC，缺失成交量或成交额保留 None。
+海外 T 日读数对齐 A 股下一交易日，保证决策时已知；ALIGNMENT_NOTE 随结果输出。
 """
 
 from __future__ import annotations
@@ -44,9 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ashare_decision_support.adapters.http import BROWSER_USER_AGENT, SINA_REFERER, fetch_text
+from ashare_decision_support.adapters.http import (
+    BROWSER_USER_AGENT,
+    SINA_REFERER,
+    fetch_text,
+    jsonp_payload,
+)
 from ashare_decision_support.fanout import gather
-from ashare_decision_support.jsoncache import read_stamped, write_stamped
+from ashare_decision_support.jsoncache import merge_series, read_series
 from ashare_decision_support.numeric import finite
 from ashare_decision_support.state.paths import state_home
 
@@ -74,7 +50,6 @@ ALIGNMENT_NOTE = (
     "两者对 A 股当日开盘都属于已知，对当日收盘都不该当成同日信号"
 )
 
-_CALLBACK = re.compile(r"\((.*)\)\s*;?\s*$", re.DOTALL)
 _DATE = re.compile(r"^(\d{4})-?(\d{2})-?(\d{2})")
 
 
@@ -115,7 +90,7 @@ INSTRUMENTS: dict[str, OverseasInstrument] = {
 
 @dataclass
 class OverseasHistoryResult:
-    """一次取数的战果。产物是序列文件，这里只交代覆盖到了什么。"""
+    """缓存覆盖与本次保存结果。ok 表示有历史可读，更新是否成功另列。"""
 
     keys: tuple[str, ...] = ()
     bars_after: dict[str, int] = field(default_factory=dict)
@@ -123,6 +98,8 @@ class OverseasHistoryResult:
     latest: dict[str, str] = field(default_factory=dict)
     failures: int = 0
     notes: list[str] = field(default_factory=list)
+    updated_keys: tuple[str, ...] = ()
+    write_failures: int = 0
 
     @property
     def ok(self) -> bool:
@@ -136,6 +113,8 @@ class OverseasHistoryResult:
             "earliest": dict(self.earliest),
             "latest": dict(self.latest),
             "failures": self.failures,
+            "updated_keys": list(self.updated_keys),
+            "write_failures": self.write_failures,
             "alignment": ALIGNMENT_NOTE,
             "notes": list(self.notes),
         }
@@ -160,9 +139,7 @@ class OverseasHistoryAdapter:
 
     def history_dir(self) -> Path:
         return (
-            self._history_dir
-            if self._history_dir is not None
-            else state_home() / HISTORY_DIR_NAME
+            self._history_dir if self._history_dir is not None else state_home() / HISTORY_DIR_NAME
         )
 
     def refresh(self, keys: Iterable[str] | None = None) -> OverseasHistoryResult:
@@ -172,22 +149,24 @@ class OverseasHistoryAdapter:
         最近 1000 根，跑够四年之后覆盖会把最早那段抹掉，而那段正是长窗口基准率
         要用的部分。
         """
-        wanted = [key for key in (keys or INSTRUMENTS) if key in INSTRUMENTS]
-        unknown = [key for key in (keys or ()) if key not in INSTRUMENTS]
+        requested = list(dict.fromkeys(INSTRUMENTS if keys is None else keys))
+        wanted = [key for key in requested if key in INSTRUMENTS]
+        unknown = [key for key in requested if key not in INSTRUMENTS]
         if not wanted:
             return OverseasHistoryResult(
-                notes=[f"没有可取的海外品种（未知：{'、'.join(unknown)}）" if unknown else "没有可取的海外品种"]
+                notes=[
+                    f"没有可取的海外品种（未知：{'、'.join(unknown)}）"
+                    if unknown
+                    else "没有可取的海外品种"
+                ]
             )
 
         done, errors = gather(
             [INSTRUMENTS[key] for key in wanted], self._fetch_one, max_workers=self.max_workers
         )
-        root = self.history_dir()
-        for instrument, bars in done:
-            if bars:
-                _write_series(root, instrument, bars)
-
         result = OverseasHistoryResult(keys=tuple(wanted), failures=len(errors))
+        self._persist_history(done, result)
+        root = self.history_dir()
         for key in wanted:
             stored = load_series(key, root)
             if not stored:
@@ -202,7 +181,9 @@ class OverseasHistoryAdapter:
             for key in wanted
             if key in result.bars_after
         )
-        result.notes.append(f"海外指数历史：{covered}" if covered else "海外指数历史：一根都没取到")
+        result.notes.append(
+            f"海外指数历史缓存：{covered}" if covered else "海外指数历史：没有可用缓存"
+        )
         if unknown:
             result.notes.append(f"未知海外品种已跳过：{'、'.join(unknown)}")
         if errors:
@@ -211,6 +192,29 @@ class OverseasHistoryAdapter:
                 f"{len(errors)}/{len(wanted)} 个品种取数失败（{kinds}），已落盘的序列不受影响"
             )
         return result
+
+    def _persist_history(
+        self,
+        fetched: list[tuple[OverseasInstrument, list[dict]]],
+        result: OverseasHistoryResult,
+    ) -> None:
+        updated: list[str] = []
+        failed: list[str] = []
+        empty: list[str] = []
+        root = self.history_dir()
+        for instrument, bars in fetched:
+            if not bars:
+                empty.append(instrument.key)
+            elif _write_series(root, instrument, bars):
+                updated.append(instrument.key)
+            else:
+                failed.append(instrument.key)
+        result.updated_keys = tuple(updated)
+        result.write_failures = len(failed)
+        if failed:
+            result.notes.append(f"海外历史保存失败：{'、'.join(failed)}；原有历史保留，可重试")
+        if empty:
+            result.notes.append(f"海外品种未返回可用日线：{'、'.join(empty)}；原有历史保留")
 
     def _fetch_one(self, instrument: OverseasInstrument) -> list[dict]:
         if instrument.source == SOURCE_US:
@@ -232,19 +236,9 @@ class OverseasHistoryAdapter:
         return _parse_asia(text)
 
 
-# ---- parsing -------------------------------------------------------------
-
-
 def _parse_us(text: str) -> list[dict]:
     """``var _ashare_ds([{"d":"2026-08-19","o":...}]);`` -> 日线列表。"""
-    match = _CALLBACK.search(text.strip())
-    if not match:
-        return []
-    try:
-        rows = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return []
-    return _bars_from(rows)
+    return _bars_from(jsonp_payload(text))
 
 
 def _parse_asia(text: str) -> list[dict]:
@@ -255,7 +249,11 @@ def _parse_asia(text: str) -> list[dict]:
         return []
     if not isinstance(payload, dict) or payload.get("code") != 0:
         return []
-    rows = ((payload.get("result") or {}).get("data")) if isinstance(payload.get("result"), dict) else None
+    rows = (
+        ((payload.get("result") or {}).get("data"))
+        if isinstance(payload.get("result"), dict)
+        else None
+    )
     return _bars_from(rows)
 
 
@@ -299,7 +297,7 @@ def _normalize_date(value: Any) -> str | None:
     return "".join(match.groups()) if match else None
 
 
-# ---- 序列的读写 -----------------------------------------------------------
+# 序列的读写
 
 
 def _series_path(root: Path, key: str) -> Path:
@@ -307,31 +305,22 @@ def _series_path(root: Path, key: str) -> Path:
 
 
 def _write_series(root: Path, instrument: OverseasInstrument, bars: list[dict]) -> bool:
-    if not bars:
-        return False
-    merged = {str(bar["date"]): bar for bar in load_series(instrument.key, root)}
-    merged.update({str(bar["date"]): bar for bar in bars})
-    return write_stamped(
-        _series_path(root, instrument.key),
-        {
-            "key": instrument.key,
-            "name": instrument.name,
-            "symbol": instrument.symbol,
-            "source": instrument.source,
-            "bars": [merged[stamp] for stamp in sorted(merged)],
-        },
-        HISTORY_SCHEMA,
+    """串行合并同一品种的历史；锁或保存失败不覆盖旧序列。"""
+    header = {
+        "key": instrument.key,
+        "name": instrument.name,
+        "symbol": instrument.symbol,
+        "source": instrument.source,
+    }
+    return merge_series(
+        _series_path(root, instrument.key), HISTORY_SCHEMA, bars, lambda _stored: header
     )
 
 
 def load_series(key: str, root: str | Path | None = None) -> list[dict]:
     """读回一个海外品种的日线，按日期升序。没有就返回空列表。"""
     directory = Path(root) if root is not None else state_home() / HISTORY_DIR_NAME
-    payload = read_stamped(_series_path(directory, str(key)), HISTORY_SCHEMA)
-    bars = (payload or {}).get("bars")
-    if not isinstance(bars, list):
-        return []
-    return [bar for bar in bars if isinstance(bar, dict) and bar.get("date")]
+    return read_series(_series_path(directory, str(key)), HISTORY_SCHEMA)
 
 
 def load_all_series(root: str | Path | None = None) -> dict[str, list[dict]]:

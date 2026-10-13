@@ -16,29 +16,47 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Exchange categories that end the discussion.
-BLOCKING_CATEGORIES: frozenset[str] = frozenset({
-    "其它风险提示公告",
-    "其他风险提示公告",
-    "资金占用",
-})
+BLOCKING_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "其它风险提示公告",
+        "其他风险提示公告",
+        "资金占用",
+    }
+)
 
 # Title fragments that are fatal wherever they are filed.
 BLOCKING_TITLE_TERMS: tuple[str, ...] = (
-    "立案调查", "被立案", "退市风险警示", "终止上市", "暂停上市",
-    "财务造假", "涉嫌信息披露违法", "行政处罚决定书", "市场禁入",
+    "立案调查",
+    "被立案",
+    "退市风险警示",
+    "终止上市",
+    "暂停上市",
+    "财务造假",
+    "涉嫌信息披露违法",
+    "行政处罚决定书",
+    "市场禁入",
 )
 
 # Categories worth surfacing but not disqualifying on their own.
-WARNING_CATEGORIES: frozenset[str] = frozenset({
-    "股票交易异常波动",
-    "股份质押、冻结",
-    "回复问询函公告",
-    "诉讼仲裁",
-    "限售股份上市流通",
-})
+WARNING_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "股票交易异常波动",
+        "股份质押、冻结",
+        "回复问询函公告",
+        "诉讼仲裁",
+        "限售股份上市流通",
+    }
+)
 
 WARNING_TITLE_TERMS: tuple[str, ...] = (
-    "减持", "问询函", "关注函", "警示函", "业绩预亏", "商誉减值", "解禁", "停牌",
+    "减持",
+    "问询函",
+    "关注函",
+    "警示函",
+    "业绩预亏",
+    "商誉减值",
+    "解禁",
+    "停牌",
 )
 
 
@@ -86,4 +104,6 @@ class AnnouncementScreen:
             if hit:
                 risk.warnings.append(f"{hit}：{title}")
 
-        return {symbol: risk for symbol, risk in by_symbol.items() if risk.blocking or risk.warnings}
+        return {
+            symbol: risk for symbol, risk in by_symbol.items() if risk.blocking or risk.warnings
+        }

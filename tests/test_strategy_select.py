@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from ashare_decision_support.models.enums import EmotionCycle, Playbook
+from ashare_decision_support.scoring import ScoreInput, ScoreProvider, ScoreResult
 from ashare_decision_support.strategy.regime import classify_regime
 from ashare_decision_support.strategy.select import (
     MIN_SETUP_CANDIDATES,
@@ -63,6 +64,36 @@ def test_analysis_is_computed_once_and_reused_across_scoring_passes() -> None:
     assert len(fine.selected) + len(fine.rejected) == 1
 
 
+class ReverseOrderScoreProvider(ScoreProvider):
+    """Deliberately returns service order, not score order."""
+
+    def score(self, item: ScoreInput) -> ScoreResult:
+        return ScoreResult(symbol=item.symbol, score=0.0)
+
+    def score_many(self, items: list[ScoreInput]) -> list[ScoreResult]:
+        scores = {"AAA.SH": 60.0, "BBB.SZ": 90.0, "CCC.SH": 90.0}
+        return [
+            ScoreResult(symbol=item.symbol, score=scores[item.symbol]) for item in reversed(items)
+        ]
+
+
+def test_select_from_sorts_provider_results_at_the_final_gate() -> None:
+    """外部打分器可能按批量服务返回顺序吐结果；最终候选必须仍按分数排。"""
+    bars = {
+        "AAA.SH": make_bars("AAA.SH", start_price=20.0),
+        "BBB.SZ": make_bars("BBB.SZ", start_price=30.0),
+        "CCC.SH": make_bars("CCC.SH", start_price=40.0),
+    }
+    result = evaluate_universe(
+        bars,
+        provider=ReverseOrderScoreProvider(),
+        require_playbook=False,
+    )
+
+    rows = result.selected + result.rejected
+    assert [item.symbol for item in rows] == ["BBB.SZ", "CCC.SH", "AAA.SH"]
+
+
 def test_empty_and_barless_input_is_survivable() -> None:
     assert analyze_universe({}).scope == []
     assert analyze_universe({"X.SH": []}).scope == []
@@ -114,9 +145,21 @@ def test_row_shape_carries_everything_the_journal_reads() -> None:
     row = (result.selected + result.rejected)[0].to_row()
 
     for key in (
-        "symbol", "name", "sector", "score", "reasons", "warnings",
-        "last_close", "trend_state", "stop_reference", "target_reference",
-        "wyckoff_bias", "news", "dip", "playbook", "setup",
+        "symbol",
+        "name",
+        "sector",
+        "score",
+        "reasons",
+        "warnings",
+        "last_close",
+        "trend_state",
+        "stop_reference",
+        "target_reference",
+        "wyckoff_bias",
+        "news",
+        "dip",
+        "playbook",
+        "setup",
     ):
         assert key in row, key
 
@@ -152,7 +195,7 @@ def test_regime_narrows_the_allowed_playbooks() -> None:
     assert unconstrained.matches["UP.SH"].blocked_by_regime == []
 
 
-# ---- 筹码按需计算 -----------------------------------------------------------
+# 筹码按需计算
 
 
 def test_chips_are_computed_only_for_the_symbols_that_get_scored() -> None:

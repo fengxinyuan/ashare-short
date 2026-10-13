@@ -184,13 +184,24 @@ class TencentDetailAdapter:
 
         amounts = [item.amount for item in prints if item.amount > 0]
         threshold = _quantile(amounts, LARGE_PRINT_QUANTILE)
-        large_buy = sum(item.amount for item in prints if item.side == "B" and threshold is not None and item.amount >= threshold)
-        large_sell = sum(item.amount for item in prints if item.side == "S" and threshold is not None and item.amount >= threshold)
+        large_buy = sum(
+            item.amount
+            for item in prints
+            if item.side == "B" and threshold is not None and item.amount >= threshold
+        )
+        large_sell = sum(
+            item.amount
+            for item in prints
+            if item.side == "S" and threshold is not None and item.amount >= threshold
+        )
         large_net = large_buy - large_sell
 
         tail_prints = [
-            item for item in prints
-            if item.minute_of_day is not None and item.minute_of_day >= TAIL_START_MINUTE and item.side in {"B", "S"}
+            item
+            for item in prints
+            if item.minute_of_day is not None
+            and item.minute_of_day >= TAIL_START_MINUTE
+            and item.side in {"B", "S"}
         ]
         tail_net = sum(item.signed_amount for item in tail_prints) if tail_prints else None
         tail_ratio = tail_net / net_amount if tail_net is not None and net_amount > 0 else None
@@ -226,7 +237,7 @@ class TencentDetailAdapter:
         # ＝全天 23.9%、中际旭创 30.86 亿＝10.6%、华能国际 0.36 亿＝4.1%）。
         # 缺口对跳空与涨停的标的最大，而那恰好是超短最在意的那批，且竞价那一笔
         # 全部带 B/S 方向，漏掉它会直接扭曲主动买卖占比。
-        #
+
         # 竞价那一笔的方向本身不可信——集合竞价是集中撮合，没有主动方，腾讯给的
         # B/S 是它按盘口的推断。**实测过影响，很小**：8 只标的上，含竞价与剔竞价
         # 的主动买占比只差 -0.7 ~ +1.3pp（竞价占全天主动成交的 0.4%~2.9%）。
@@ -246,8 +257,12 @@ class TencentDetailAdapter:
 
     def _get(self, url: str) -> str:
         return fetch_text(
-            self._opener, url, timeout=self.timeout, referer=TENCENT_REFERER,
-            encoding="gbk", errors="replace",
+            self._opener,
+            url,
+            timeout=self.timeout,
+            referer=TENCENT_REFERER,
+            encoding="gbk",
+            errors="replace",
         )
 
 
@@ -319,12 +334,5 @@ def _minute_of_day(text: str) -> int | None:
 
 
 def default_trade_flow_adapter() -> TencentDetailAdapter:
-    """默认逐笔源。
-
-    存在的理由不是省一次构造，而是**让它可以被替换掉**。消费方直接
-    `TencentDetailAdapter()` 的话，测试里就没有一个可打补丁的名字，于是每个跑
-    `run_morning` 的测试都会静默去打一次 `stock.gtimg.cn`——那正是 `tests/conftest.py`
-    里 `no_implicit_snapshot_adapter` 与 `no_implicit_earnings_adapter` 两条治过的
-    同一类泄漏：不会失败，只会悄悄变成另一件事（这里是每只候选多花约 20 秒）。
-    """
+    """默认逐笔源；工厂供 tests/conftest.py 在消费方绑定点替换，隔离在线请求。"""
     return TencentDetailAdapter()

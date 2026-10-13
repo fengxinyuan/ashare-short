@@ -10,10 +10,11 @@ existing classifier / daily-read layers.
 from __future__ import annotations
 
 import html
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin
 
 from ashare_decision_support.news.base import NewsDoc
@@ -25,14 +26,14 @@ PER_LISTING_LIMIT = 30
 # 标题长度上限。这三个栏目里**真实**标题实测 12–63 字（最长的一条是证监会那种
 # 「就《…》答记者问」的长标题），而漏进来的站点导航与页脚是 117–1121 字。中间
 # 这段空当足够宽，所以这里不是在调参，是在两类东西之间划线。
-#
+
 # 为什么需要这条而不是只靠去脚本：`<script>` 清掉之后，剩下的还有「首页 | 简 |
 # 繁 | EN | 登录…」这类**纯文本**导航条和版权页脚。它们带日期、带链接，长得和
 # 一条公告没有任何结构差别，只有长度分得开。
 MAX_TITLE_CHARS = 90
 
 # 导航条的三个特征，按实测反例定，不是按想象定。触发任意一条就丢弃：
-#
+
 # - `更多>>`／`>>`：栏目跳转标记。反例「更多>> 国务院公报 政策解读 新华时评：…」
 #   ——它把三个栏目名和一条真标题粘成了一条，长度只有 35 字，长度上限拦不住。
 # - 内嵌 `http`：锚文本里出现整条 URL，只有站点导航会这样。
@@ -48,6 +49,7 @@ class OfficialListing:
     name: str
     url: str
     source: str
+    response_format: Literal["html", "csrc_json"] = "html"
 
 
 DEFAULT_LISTINGS: tuple[OfficialListing, ...] = (
@@ -57,10 +59,17 @@ DEFAULT_LISTINGS: tuple[OfficialListing, ...] = (
     # 只有 12 条且混着站点导航，`zhengce/` 才是今天真正在更新的那一版。
     OfficialListing("国务院政策", "https://www.gov.cn/zhengce/", "国务院"),
     OfficialListing(
-        "中国人民银行", "http://www.pbc.gov.cn/goutongjiaoliu/113456/113469/index.html", "中国人民银行"
+        "中国人民银行",
+        "http://www.pbc.gov.cn/goutongjiaoliu/113456/113469/index.html",
+        "中国人民银行",
     ),
     OfficialListing(
-        "中国证监会", "http://www.csrc.gov.cn/csrc/c100028/common_list.shtml", "中国证监会"
+        "中国证监会",
+        "https://www.csrc.gov.cn/searchList/a1a078ee0bc54721ab6b148884c784a8"
+        "?_isAgg=true&_isJson=true&_pageSize=30&_template=index"
+        "&_rangeTimeGte=&_channelName=&page=1",
+        "中国证监会",
+        response_format="csrc_json",
     ),
 )
 
@@ -68,7 +77,7 @@ DEFAULT_LISTINGS: tuple[OfficialListing, ...] = (
 # a nearby date, then normalize the markup instead of binding to page classes.
 _LINK_WITH_DATE = re.compile(
     r'<a\b[^>]*\bhref=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<title>.*?)</a>'
-    r'.{0,500}?(?P<date>20\d{2}[./-]\d{1,2}[./-]\d{1,2})',
+    r".{0,500}?(?P<date>20\d{2}[./-]\d{1,2}[./-]\d{1,2})",
     re.IGNORECASE | re.DOTALL,
 )
 # 脚本与样式要**连内容一起**去掉，不能只去标签。`_TAGS` 删的是 `<script>` 和
@@ -84,7 +93,8 @@ class OfficialNewsSource(FeedNewsSource):
     """Public policy and regulatory listings, each independently degradable."""
 
     name = "official_cn"
-    cache_prefix = "official"
+    # v2 隔离旧证监会静态栏目（停留在 2021 年）的缓存。
+    cache_prefix = "official_v2"
     unreachable_note = "官方信息源 {names} 不可用，本次跳过"
     empty_note = "官方政策与监管信息源未返回可用条目"
     per_feed_limit = PER_LISTING_LIMIT
@@ -102,10 +112,34 @@ class OfficialNewsSource(FeedNewsSource):
 
     def fetch_one(self, feed: OfficialListing) -> list[NewsDoc]:
         page = self.open_bytes(feed.url).decode("utf-8", "ignore")
+        items = (
+            _csrc_items(json.loads(page), feed.url)
+            if feed.response_format == "csrc_json"
+            else _listing_items(page, feed.url)
+        )
         return [
             NewsDoc(title=title, source=feed.source, published_at=published_at, url=url)
-            for title, published_at, url in _listing_items(page, feed.url)[: self.per_feed_limit]
+            for title, published_at, url in items[: self.per_feed_limit]
         ]
+
+
+def _csrc_items(payload: Any, base_url: str) -> list[tuple[str, str, str]]:
+    """证监会要闻页面的公开列表接口；结构异常按取数失败处理。"""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    rows = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("证监会要闻响应缺少 data.results 列表")
+    items: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = _plain(str(row.get("title") or ""))
+        link = str(row.get("url") or "").strip()
+        published = str(row.get("publishedTimeStr") or "").strip()
+        url = urljoin(base_url, html.unescape(link))
+        if title and link and published and url.startswith(("http://", "https://")):
+            items.setdefault((title, url), (title, published, url))
+    return list(items.values())
 
 
 def _listing_items(page: str, base_url: str) -> list[tuple[str, str, str]]:

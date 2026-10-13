@@ -1,45 +1,10 @@
-"""跷跷板：哪两个板块**实测**是反着走的。
+"""板块跷跷板：按共同交易日测量历史负相关，不预设任何板块关系。
 
-`docs/ROADMAP.md` §5.2 的第 2 条，是那份清单里最后一个没建的读数。它要回答的
-原话是「银行和半导体是不是跷跷板」——而这个问题此前**连数据都没有**：
-`rotation.py` 算的是横截面的高低切换（前期涨幅与近期涨幅的秩相关），那是一个
-**全场一个数**的读数，答不了任何一对具体板块之间的关系。
+两个半窗的相关系数均为负才进入候选；整窗阈值通过 Bonferroni 和 Fisher z
+按本轮检验对数收紧。输出包含样本、窗口、半窗系数及阈值，集中在同一板块的关系单独说明。
 
-## 这一层刻意不做的三件事
-
-**不预设任何一对关系。** 银行 vs 半导体是一个**待验证的假设，不是前提**。本模块
-把实测出来的显著负相关对列出来，包括列出「银行和半导体其实不显著」这个结论。
-同一条纪律写在 `rotation.py` 的模块注释里，那里针对的是高低切换。
-
-**不预测。** 输出全部是对已经发生的事的陈述句。「今天银行 +1.2%、半导体 -2.8%，
-两者近 60 日相关 -0.42，与历史关系一致」是陈述；「所以明天会反过来」不写。
-`explain_divergence` 这个名字就是边界本身——它解释今天的分歧，不外推明天。
-
-**不进打分、不进筛选。** 与五档、同花顺指数、量价形态、轮动读数完全一样的处置：
-先进简报，等 `review` 攒够样本能回答「按跷跷板对冲的那些日子兑现率高多少」，
-再谈要不要给它权重。
-
-## 两道闸门，都是为了不把噪声当成关系
-
-**1. 相关系数会漂，所以只报两个半窗同号的。** 60 日滚动窗口在 A 股上的稳定性
-本身存疑（ROADMAP 原文的措辞）。做法是把窗口对半劈开，两半各算一次——**只有
-两半都为负才报**。一段行情里偶然反向走了三周的两个板块过不了这道闸，而它正是
-「跷跷板」这个词最容易被误用的地方。
-
-**2. 阈值随检验对数自己收紧（Bonferroni）。** 90 个板块两两组合是 4005 对，
-即便全部是独立随机序列，按 |r| ≥ 0.35 也会筛出**约十个**——这是多重比较，不是
-发现。第一版这里只在 `notes` 里警告了一句，而写测试时它当场被抓了个正着：
-**231 对纯高斯噪声里筛出了一对 r=-0.357、两个半窗同为负的「跷跷板」**。
-一句警告挡不住任何东西，所以阈值改成算出来的（见 `critical_correlation`）——
-实测 3240 对时收到 -0.52，而 -0.35 那个地板只是下限。
-
-报出去的每一条都带上**窗口长度、两个半窗各自的系数**，`notes` 里写明检验了多少
-对、本轮阈值是多少、固定阈值下噪声该出几个。
-
-**这两道闸门管的都是「这一对是不是碰巧」，管不了「它明年还成不成立」。**
-后者需要样本外验证，那要等台账攒够，不是一个算子能给的。这一层的定位因此是
-「解释今天为什么这两个板块背着走」，不是「找出稳定的对冲组合」。
-"""
+explain_today 使用同一批序列解释当日背离，不预测未来，也不进入筛选或打分。
+统计门槛不能保证样本外稳定；未入榜表示证据不足。研究边界见 docs/ARCHITECTURE.md 的“能力边界”。"""
 
 from __future__ import annotations
 
@@ -53,7 +18,7 @@ from ashare_decision_support.sectors import panel
 from ashare_decision_support.sectors.panel import MIN_SECTORS
 
 # 相关系数的窗口（交易日）。60 日 ≈ 三个月，短到能反映当前这轮行情的结构，
-# 长到不被一两周的行情主导。与 ROADMAP §5.2 定的窗口一致。
+# 长到不被一两周的行情主导。
 WINDOW = 60
 
 # 报出去的**下限**。定得比常见的 -0.2 严，但它只是地板——真正生效的阈值由
@@ -69,8 +34,7 @@ FAMILY_ERROR_RATE = 0.05
 # 在这半段里停更过，那一半的系数不可比。
 MIN_HALF_POINTS = 20
 
-# 榜上最多列几对。不是性能考虑——4005 对算完只要几十毫秒；是**可读性**：
-# 一份印了 200 对相关系数的简报，读的人会从里面挑一个支持自己看法的。
+# 榜上最多列出的关系数。
 TOP_PAIRS = 12
 
 LABEL_CONSISTENT = "与历史关系一致"
@@ -229,9 +193,7 @@ def read_seesaw(
             f"仅 {len(result.rows)} 个板块有足够长的序列（需 {MIN_SECTORS} 个），"
             "相关系数在这个样本量上不可信，本次不给跷跷板结论"
         )
-        read.observations.append(
-            f"板块样本仅 {len(result.rows)} 个，不足以支撑相关性判断。"
-        )
+        read.observations.append(f"板块样本仅 {len(result.rows)} 个，不足以支撑相关性判断。")
         return read
 
     returns = {
@@ -240,13 +202,10 @@ def read_seesaw(
         if len(rets := _returns(bars, window)) >= MIN_HALF_POINTS * 2
     }
     if len(returns) < MIN_SECTORS:
-        read.notes.append(
-            f"只有 {len(returns)} 个板块能算出足够长的收益序列，本次不给跷跷板结论"
-        )
+        read.notes.append(f"只有 {len(returns)} 个板块能算出足够长的收益序列，本次不给跷跷板结论")
         return read
 
-    # 两趟：先把所有对的系数算出来，才知道一共检验了多少对，才定得出阈值。
-    # 反过来（边算边筛）会让阈值取决于遍历顺序。
+    # 检验对数包含提前淘汰的组合，避免阈值随筛选结果改变。
     measured: list[SeesawPair] = []
     tested = 0
     for left, right in combinations(sorted(returns), 2):
@@ -352,9 +311,6 @@ def explain_divergence(
     )
 
 
-# ---- internals -----------------------------------------------------------
-
-
 def _returns(bars: list[dict], window: int) -> dict[str, float]:
     """近 `window` 根日收益，**按交易日建索引**。
 
@@ -378,30 +334,24 @@ def _returns(bars: list[dict], window: int) -> dict[str, float]:
     return rets
 
 
-def _measure(
-    left: str, right: str, a: dict[str, float], b: dict[str, float]
-) -> SeesawPair | None:
-    """一对板块的整窗系数与两个半窗系数。任一段算不出就返回 None。
-
-    先取两边**共同的交易日**再排序，这样两条序列既逐日配对、又按时间有序——
-    劈半窗要求后者，配对要求前者。
-    """
+def _measure(left: str, right: str, a: dict[str, float], b: dict[str, float]) -> SeesawPair | None:
+    """按共同交易日对齐，仅两个半窗均为负时计算整窗相关。"""
     days = sorted(a.keys() & b.keys())
     size = len(days)
     if size < MIN_HALF_POINTS * 2:
         return None
     left_series = [a[day] for day in days]
     right_series = [b[day] for day in days]
+    half = size // 2
+    first = panel.pearson(left_series[:half], right_series[:half])
+    if first is None or first >= 0.0:
+        return None
+    second = panel.pearson(left_series[half:], right_series[half:])
+    if second is None or second >= 0.0:
+        return None
     whole = panel.pearson(left_series, right_series)
     if whole is None:
         return None
-    half = size // 2
-    first = panel.pearson(left_series[:half], right_series[:half])
-    second = panel.pearson(left_series[half:], right_series[half:])
-    if first is None or second is None:
-        return None
-    if first >= 0.0 or second >= 0.0:
-        return None  # 两个半窗不同号 ⇒ 这段负相关不稳定，见模块注释闸门 1
     return SeesawPair(
         left=left,
         right=right,

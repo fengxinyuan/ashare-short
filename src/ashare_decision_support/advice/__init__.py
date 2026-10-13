@@ -6,7 +6,7 @@ candidates.py   L2 规则生成带出处的候选集
 adjudicate.py   L3 模型在候选集里取舍，或者弃权
 ```
 
-见 `docs/ARCHITECTURE.md` §一。
+见 `docs/ARCHITECTURE.md` 的“事实、规则与模型”。
 """
 
 from ashare_decision_support.advice.adjudicate import (

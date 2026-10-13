@@ -1,15 +1,16 @@
-"""语料库测试。
-
-这一层的价值全在「跨越单次运行」上，所以每条测试都要模拟至少两次采集——
-只跑一次的话，它和临时缓存没有任何区别。
-"""
+"""语料库的跨次采集、批量查询、时间边界与失败恢复。"""
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import sqlite3
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
+
+import pytest
 
 from ashare_decision_support.news.base import NewsDoc
 from ashare_decision_support.news.store import DocAttribution, NewsStore
+from ashare_decision_support.schedule.timezone import BEIJING_TZ
 
 TODAY = date(2026, 8, 3)
 MORNING = datetime(2026, 8, 3, 8, 0, 0)
@@ -23,7 +24,23 @@ def store(tmp_path) -> NewsStore:
     return NewsStore(tmp_path / "corpus.sqlite3")
 
 
-# ---- first_seen：这个模块存在的理由 ---------------------------------------
+def _trace_reads(corpus, monkeypatch) -> list[str]:
+    events: list[str] = []
+    connect = corpus._connect
+
+    @contextmanager
+    def tracked():
+        events.append("CONNECT")
+        with connect() as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 500)
+            conn.set_trace_callback(events.append)
+            yield conn
+
+    monkeypatch.setattr(corpus, "_connect", tracked)
+    return events
+
+
+# first_seen：这个模块存在的理由
 
 
 def test_first_seen_survives_a_second_collection_pass(tmp_path) -> None:
@@ -116,7 +133,7 @@ def test_cross_source_spread_is_counted_separately_from_repeats(tmp_path) -> Non
     assert repeat.source_count == 1, "同一个源推四次不等于四个源都在说"
 
 
-# ---- 归因标签 -------------------------------------------------------------
+# 归因标签
 
 
 def test_labels_are_written_after_ingest_not_during(tmp_path) -> None:
@@ -157,6 +174,52 @@ def test_label_many_writes_attribution_in_one_batch(tmp_path) -> None:
     assert labelled[0].event_type == "涨价"
 
 
+def test_label_many_reports_zero_when_the_transaction_rolls_back(tmp_path) -> None:
+    corpus = store(tmp_path)
+    corpus.ingest([doc("甲"), doc("乙")], TODAY, now=MORNING)
+    with corpus._connect() as conn:
+        conn.execute(
+            "CREATE TRIGGER reject_label BEFORE UPDATE ON docs WHEN NEW.key = '乙' "
+            "BEGIN SELECT RAISE(ABORT, 'fixture failure'); END"
+        )
+
+    written = corpus.label_many(
+        {name: DocAttribution(sectors=("电子",), direction="bullish") for name in ("甲", "乙")}
+    )
+
+    assert written == 0
+    assert corpus.read_error is not None
+    assert corpus.recent(sector="电子", now=MORNING) == []
+    assert all(item.direction is None for item in corpus.recent(now=MORNING))
+
+
+@pytest.mark.parametrize("count", [501, 1003])
+def test_recent_batches_labels_and_source_counts(tmp_path, monkeypatch, count) -> None:
+    corpus = store(tmp_path)
+    docs = [doc(f"消息{index}") for index in range(count)]
+    corpus.ingest(docs, TODAY, now=MORNING)
+    corpus.ingest([doc(item.title, source="em") for item in docs[::2]], TODAY, now=MORNING)
+    corpus.label_many(
+        {
+            item.title: DocAttribution(sectors=("板块B", "板块A"), direction="bullish")
+            for item in docs[::3]
+        }
+    )
+    events = _trace_reads(corpus, monkeypatch)
+
+    stored = corpus.recent(now=MORNING, limit=count)
+
+    assert len(stored) == count
+    by_title = {item.title: item for item in stored}
+    for index, item in enumerate(docs):
+        saved = by_title[item.title]
+        assert saved.source_count == (2 if index % 2 == 0 else 1)
+        assert saved.sectors == (("板块A", "板块B") if index % 3 == 0 else ())
+        assert saved.direction == ("bullish" if index % 3 == 0 else None)
+    assert events.count("CONNECT") == 1
+    assert sum(sql.startswith("SELECT") for sql in events) <= 7
+
+
 def test_recent_filters_by_sector(tmp_path) -> None:
     corpus = store(tmp_path)
     pv, chip = doc("光伏组件涨价"), doc("存储芯片降价")
@@ -168,7 +231,7 @@ def test_recent_filters_by_sector(tmp_path) -> None:
     assert [d.title for d in corpus.recent(sector="电子", now=MORNING)] == ["存储芯片降价"]
 
 
-# ---- 热度曲线 -------------------------------------------------------------
+# 热度曲线
 
 
 def test_sector_heat_counts_new_stories_not_repeats(tmp_path) -> None:
@@ -202,7 +265,50 @@ def test_sector_heat_shows_a_rising_curve(tmp_path) -> None:
     assert [point.fresh_docs for point in curve] == [1, 2, 5]
 
 
-# ---- 失败契约 -------------------------------------------------------------
+def test_sector_heat_stays_within_the_historical_observation_window(tmp_path) -> None:
+    corpus = store(tmp_path)
+    for name, seen in (
+        ("窗口之前", MORNING - timedelta(hours=24, seconds=1)),
+        ("窗口起点", MORNING - timedelta(hours=24)),
+        ("观察时点", MORNING),
+        ("未来记录", MORNING + timedelta(seconds=1)),
+    ):
+        corpus.ingest([doc(name)], TODAY, now=seen)
+        corpus.label(name, sectors=["电子"])
+
+    curve = corpus.sector_heat("电子", now=MORNING, within_hours=24)
+
+    assert [(point.bucket_start, point.fresh_docs) for point in curve] == [
+        (MORNING - timedelta(hours=24), 1),
+        (MORNING, 1),
+    ]
+
+
+@pytest.mark.parametrize("zone", [None, UTC, BEIJING_TZ])
+def test_corpus_clocks_use_the_same_beijing_instant(tmp_path, zone) -> None:
+    corpus = store(tmp_path)
+    seen = MORNING if zone is None else MORNING.replace(tzinfo=BEIJING_TZ).astimezone(zone)
+    now = seen + timedelta(hours=2)
+    item = doc("跨时区新闻")
+    corpus.ingest([item], TODAY, now=seen)
+    corpus.label(item, sectors=["电子"])
+
+    stored = corpus.recent(now=now, within_hours=4)
+
+    assert len(stored) == 1
+    assert stored[0].first_seen_at == MORNING
+    assert stored[0].last_seen_at == MORNING
+    assert stored[0].age_hours(now) == 2.0
+    assert not stored[0].is_fresh(now)
+    curve = corpus.sector_heat("电子", now=now, within_hours=4)
+    assert len(curve) == 1
+    assert curve[0].bucket_start == MORNING
+    assert corpus.annotate_freshness([item], now=now + timedelta(days=1))[1] == [
+        "1 条已在语料库中超过 24 小时，属重复播报而非新增信息"
+    ]
+
+
+# 失败契约
 
 
 def test_an_unusable_store_never_breaks_the_chain(tmp_path) -> None:
@@ -247,6 +353,44 @@ def test_freshness_annotation_reports_without_touching_weights(tmp_path) -> None
     assert any("重复播报" in note for note in notes)
 
 
+@pytest.mark.parametrize("count", [1, 501, 1003])
+def test_freshness_batches_reads_and_preserves_repeated_input_counts(
+    tmp_path, monkeypatch, count
+) -> None:
+    corpus = store(tmp_path)
+    old = [doc(f"旧闻{index}", weight=0.5) for index in range(count)]
+    corpus.ingest(old, TODAY, now=MORNING - timedelta(days=2))
+    boundary = doc("恰好24小时")
+    corpus.ingest([boundary], TODAY, now=MORNING - timedelta(hours=24))
+    new = doc("尚未入库")
+    docs = [*old, old[0], boundary, new, new, doc("")]
+    events = _trace_reads(corpus, monkeypatch)
+
+    returned, notes = corpus.annotate_freshness(docs, now=MORNING)
+
+    assert returned is docs
+    assert notes == [
+        "3 条为语料库中首次出现",
+        f"{count + 1} 条已在语料库中超过 24 小时，属重复播报而非新增信息",
+    ]
+    assert events.count("CONNECT") == 1
+    assert sum(sql.startswith("SELECT") for sql in events) <= 3
+
+
+def test_failed_freshness_lookup_does_not_claim_existing_stories_are_new(tmp_path) -> None:
+    corpus = store(tmp_path)
+    docs = [doc("已有旧闻")]
+    corpus.ingest(docs, TODAY, now=MORNING - timedelta(days=2))
+    corpus.path.write_bytes(b"not a database")
+
+    returned, notes = corpus.annotate_freshness(docs, now=MORNING)
+
+    assert returned is docs
+    assert corpus.read_error is not None
+    assert any("读取失败" in note for note in notes)
+    assert not any("条为语料库中首次出现" in note for note in notes)
+
+
 def test_a_schema_bump_rebuilds_rather_than_mixing_old_rows(tmp_path) -> None:
     """老库按旧口径写的行会静默参与新口径的统计——和板块分类缓存同一条教训。"""
     import ashare_decision_support.news.store as store_module
@@ -264,7 +408,7 @@ def test_a_schema_bump_rebuilds_rather_than_mixing_old_rows(tmp_path) -> None:
         store_module.SCHEMA_VERSION = original
 
 
-# ---- 接线：NewsAgent 采完就入库 --------------------------------------------
+# 接线：NewsAgent 采完就入库
 
 
 class StubSource:
@@ -313,7 +457,7 @@ def test_the_news_agent_runs_unchanged_without_a_store() -> None:
     assert not any("入库" in note for note in notes)
 
 
-# ---- 接进盘前 facts ---------------------------------------------------------
+# 接进盘前 facts
 
 
 def test_the_sector_memory_carries_the_cross_day_dimension_into_facts(tmp_path) -> None:
@@ -338,7 +482,7 @@ def test_the_sector_memory_carries_the_cross_day_dimension_into_facts(tmp_path) 
 
     class Outlook:
         name = "电力设备"
-        level = "SW1"
+        level = "THS_INDUSTRY"
 
     memory = _sector_news_memory(corpus, [Outlook()], now=MORNING + timedelta(hours=1))
 
@@ -363,7 +507,7 @@ def test_the_sector_memory_is_optional_evidence_not_a_hard_dependency(tmp_path) 
 
     class Outlook:
         name = "电力设备"
-        level = "SW1"
+        level = "THS_INDUSTRY"
 
     assert _sector_news_memory(None, [Outlook()]) == []
 
@@ -382,7 +526,7 @@ def test_a_broken_corpus_says_so_instead_of_looking_like_a_quiet_day(tmp_path) -
 
     class Outlook:
         name = "电力设备"
-        level = "SW1"
+        level = "THS_INDUSTRY"
 
     notes: list[str] = []
     memory = _sector_news_memory(corpus, [Outlook()], now=MORNING, notes=notes)

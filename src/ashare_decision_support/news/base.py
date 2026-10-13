@@ -40,6 +40,32 @@ class NewsDoc:
         return f"{self.title} {self.summary}".strip()
 
 
+# 全市场综述稿的标题特征。收评一篇会点到十几个板块、顺带一句「*ST 某某锁定退市」，
+# 按词表归因它会同时挂到元件、银行、证券头上，并给每个板块都记一条「退市」风险词。
+# 它们不是任何一个板块自己的消息；归因时整篇跳过，大盘层照常读。
+MARKET_WRAP_TERMS: tuple[str, ...] = (
+    "收评",
+    "午评",
+    "早评",
+    "新闻精选",
+    "早间要闻",
+    "财经早餐",
+    "早报",
+    "晚报",
+    "涨停复盘",
+    "盘前必读",
+    "盘后必读",
+    "今日看点",
+    "市场全景",
+)
+
+
+def is_market_wrap(doc: NewsDoc) -> bool:
+    """标题像全市场综述（收评、早间新闻精选等）就为真。只看标题：正文提到「收评」不算。"""
+    title = doc.title or ""
+    return any(term in title for term in MARKET_WRAP_TERMS)
+
+
 @dataclass(frozen=True)
 class SentimentScore:
     """Lexicon verdict for one piece of text.
@@ -109,7 +135,9 @@ class NewsSource(ABC):
         """Return (documents, notes) for market-wide feeds."""
 
     @abstractmethod
-    def fetch_for_symbols(self, symbols: list[str], limit: int = 10) -> tuple[dict[str, list[NewsDoc]], list[str]]:
+    def fetch_for_symbols(
+        self, symbols: list[str], limit: int = 10
+    ) -> tuple[dict[str, list[NewsDoc]], list[str]]:
         """Return ({symbol: documents}, notes) for per-stock feeds."""
 
 
@@ -123,15 +151,7 @@ class SentimentAnalyzer(ABC):
         """Score a single string."""
 
     def score_docs(self, docs: list[NewsDoc]) -> SentimentScore:
-        """Aggregate a document set, weighting each doc by its own intensity.
-
-        Intensity weighting stops a pile of neutral filler headlines from
-        diluting one strongly-worded item down to nothing. `NewsDoc.weight`
-        multiplies on top of it, so a stale or duplicated document contributes
-        proportionally less without needing a separate code path — documents
-        that never went through `news/dedup.py` carry weight 1.0 and behave
-        exactly as before.
-        """
+        """按命中强度与文档时效权重聚合，忽略中性及零权重文档。"""
         pairs = [(self.score_text(doc.text), max(0.0, doc.weight)) for doc in docs]
         active = [(score, weight) for score, weight in pairs if not score.is_neutral and weight > 0]
         if not active:
@@ -142,7 +162,8 @@ class SentimentAnalyzer(ABC):
             return SentimentScore(polarity=0.0, intensity=0.0)
 
         polarity = (
-            sum(score.polarity * score.intensity * weight for score, weight in active) / weight_total
+            sum(score.polarity * score.intensity * weight for score, weight in active)
+            / weight_total
         )
         bullish = tuple(dict.fromkeys(hit for score, _ in active for hit in score.bullish_hits))
         bearish = tuple(dict.fromkeys(hit for score, _ in active for hit in score.bearish_hits))

@@ -136,7 +136,7 @@ def build_plan(
     return plan
 
 
-# ---- 各步 -----------------------------------------------------------------
+# 各步
 
 
 def _unsupported_steps(plan: ResearchPlan, spec: QuestionSpec) -> None:
@@ -177,6 +177,23 @@ def _market_step(plan: ResearchPlan, blocks: dict[str, Any]) -> None:
                 question="",
                 supported=False,
                 gap="盘前主链路尚无落盘结果，本次没有大盘方向与板块排序可引用",
+            )
+        )
+        return
+
+    health = blocks.get("数据健康") or {}
+    morning_status = next(
+        (item.get("判定") for item in health.get("块", []) if item.get("名称") == "盘前主链路"),
+        None,
+    )
+    if morning_status != "当日" or morning.get("execution_ready") is not True:
+        plan.steps.append(
+            Step(
+                key=STEP_MARKET,
+                title="大盘与板块环境",
+                question="",
+                supported=False,
+                gap="盘前主链路不是当日可执行结果，不能据此判断当前大盘；请运行 `ashare-ds morning` 刷新",
             )
         )
         return
@@ -235,8 +252,7 @@ def _symbol_question(decision: Decision, spec: QuestionSpec) -> str:
     )
     if INTENT_GAP in intents:
         return (
-            base
-            + "问题问的是低开/跳空：额外说明开盘价与买入带、止损位的相对位置，"
+            base + "问题问的是低开/跳空：额外说明开盘价与买入带、止损位的相对位置，"
             "以及现在的量比和盘口是否支持「跌到位了」——支持不了就直说支持不了。"
         )
     if INTENT_EXIT in intents or decision.side == "sell":
@@ -245,7 +261,9 @@ def _symbol_question(decision: Decision, spec: QuestionSpec) -> str:
             "以及浮动盈亏处在什么位置。"
         )
     if INTENT_ENTRY in intents:
-        return base + "问题问的是买点：额外说明这个买入带的出处，以及它凭什么比另一个候选价更值得等。"
+        return (
+            base + "问题问的是买点：额外说明这个买入带的出处，以及它凭什么比另一个候选价更值得等。"
+        )
     return base
 
 
@@ -282,7 +300,8 @@ def _risk_step(plan: ResearchPlan, decisions: list[Decision]) -> None:
 
 def _journal_step(plan: ResearchPlan, blocks: dict[str, Any]) -> None:
     stats = blocks.get("台账统计")
-    if not isinstance(stats, dict) or not stats.get("samples"):
+    daily = blocks.get("每日归因复盘")
+    if not isinstance(daily, dict) and (not isinstance(stats, dict) or not stats.get("samples")):
         plan.steps.append(
             Step(
                 key=STEP_JOURNAL,
@@ -296,13 +315,19 @@ def _journal_step(plan: ResearchPlan, blocks: dict[str, Any]) -> None:
     plan.steps.append(
         Step(
             key=STEP_JOURNAL,
-            title="台账兑现情况",
+            title="每日复盘与台账兑现" if isinstance(daily, dict) else "台账兑现情况",
             question=(
                 "只陈述这份统计说了什么：样本量、先到目标与先到止损的比例、"
                 "入选与对照组的差值。样本不足的分组必须标明样本不足。"
                 "不得由此推出任何关于今天的结论——样本量不够时它只是记录。"
+                "有每日复盘时，说明原计划、过程证据、缺口和次日复查项；"
+                "生成的告警不能当作实际成交，时间相关不能当作新闻因果。"
             ),
-            facts={"台账统计": stats},
+            facts={
+                key: value
+                for key, value in (("台账统计", stats), ("每日归因复盘", daily))
+                if isinstance(value, dict)
+            },
         )
     )
 
@@ -338,7 +363,7 @@ def _synthesis_step(plan: ResearchPlan, ordered: list[Decision]) -> None:
     )
 
 
-# ---- 取块 -----------------------------------------------------------------
+# 取块
 
 
 def _symbol_payload(blocks: dict[str, Any], symbol: str) -> dict | None:

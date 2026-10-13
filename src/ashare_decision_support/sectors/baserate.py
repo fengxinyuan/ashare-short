@@ -1,36 +1,8 @@
-"""条件基准率：**「过去出现同样条件时，这个板块后来怎么走」**。
+"""板块在相同历史条件下的反应日与前向收益基准率。
 
-这一层补的是整套系统里最要命的一个空档。板块层能算出「今天电子排第一」，舆情层
-能识别出「费半跌了 2%」，宏观层能连出「韩股存储 → A 股半导体」这条链——但**没有
-任何一处回答过这些链条在 A 股历史上到底兑不兑现**。于是所有映射都只是措辞：说得
-通，查不了。
-
-而 A 股恰恰是那种「说得通」和「真会涨」相关性很弱的市场。有政策、有业绩、外盘
-大涨，第二天照样能低开走绿。所以这一层的产物**不是预测，是基准率**——一个可以
-查证的历史事实：同样条件下，过去 N 次里涨了几次、超额中位数是多少。
-
-## 三条口径（都影响结论，改之前先读）
-
-1. **超额，不是绝对收益。** 前向收益一律减掉**当日全部板块的横截面中位数**。
-   不减的话，一轮普涨里随便挑哪个板块的「胜率」都是 80%，而那衡量的是大盘，
-   不是这条映射。基准率只用于研究上下文，不进入板块评分或交易信号。
-
-2. **反应日与前向分开报。** `reaction` 是条件出现后 A 股**第一个能反应的交易日
-   自身**的涨跌；`horizons` 是从那一天收盘再往后 1/3/5 日。两者答的是不同问题，
-   而它们经常反号——那正是「一日游」的定量长相，也正是电风扇行情里最该看见的
-   东西。合成一个数会把这两件事抵消掉。
-
-3. **样本数与独立事件数并列。** 前向窗口互相重叠，相邻交易日又属于同一轮行情，
-   所以样本数**不是**独立事件数。两个都报，`trusted` 要求两个都过线。胜率不能
-   当概率读，`BaseRate.notes` 里每次都会写这句话。
-
-## 这一层不做的事
-
-- **不给建议、不给权重、不产出订单。** 它只回答「历史上是这样」。
-- **不做参数搜索。** 窗口取 1/3/5 是因为主链路的持有期就是超短 1–3 日，换一组
-  数字再挑最好看的那组，得到的是过拟合，不是发现。
-- **样本不足时不外推。** `trusted=False` 的基准率照样报出来（藏起来只会让人
-  误读那个数字），但驱动层不许拿它加权——见 `sectors/drivers.py`。
+超额收益减去同期板块横截面中位数；reaction 与收盘后 1/3/5 日分别统计。
+样本数和独立事件数都达到门槛才标记 trusted，重叠窗口不能当作独立事件。
+结果仅用于研究上下文，不进入评分或交易信号，历史胜率不等于未来概率。
 """
 
 from __future__ import annotations
@@ -38,10 +10,10 @@ from __future__ import annotations
 import bisect
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from statistics import median
 from typing import Any
 
 from ashare_decision_support.numeric import finite, median_of
+from ashare_decision_support.sectors.panel import rounded
 
 # 前向窗口。1/3/5 对应主链路的超短持有期；再长的窗口不是这套系统的口径，
 # 见模块 docstring 第三条「不做参数搜索」。
@@ -300,14 +272,12 @@ def base_rate(
     )
 
 
-# ---- internals ------------------------------------------------------------
-
-
 def _reaction_stat(panel: SectorPanel, sector: str, sessions: Sequence[str]) -> HorizonStat | None:
     """反应日**自身**的涨跌：前一根收盘 → 这一根收盘。
 
-    走 `forward(..., -1)` 的镜像而不是另写一遍：`forward` 已经处理了序列边界与
-    板块各自的起始日，重写一遍等于把同一个越界判断再实现一次。
+    与 `_horizon_stat` 同一套横截面去中位的口径，只是收益由 `_self_return` 算：
+    它按**该板块自己的**序列位置取前一根，与 `SectorPanel.forward` 处理起始日与
+    缺口的方式一致——不能拿全场交易日表去索引，理由见 `forward` 的说明。
     """
     absolutes: list[float] = []
     excesses: list[float] = []
@@ -315,12 +285,11 @@ def _reaction_stat(panel: SectorPanel, sector: str, sessions: Sequence[str]) -> 
         value = _self_return(panel, sector, stamp)
         if value is None:
             continue
-        peers = [
+        centre = median_of(
             other
             for name in panel.closes
             if (other := _self_return(panel, name, stamp)) is not None
-        ]
-        centre = median(peers) if peers else None
+        )
         absolutes.append(value)
         if centre is not None:
             excesses.append(value - centre)
@@ -329,8 +298,8 @@ def _reaction_stat(panel: SectorPanel, sector: str, sessions: Sequence[str]) -> 
     return HorizonStat(
         horizon=0,
         samples=len(absolutes),
-        median_excess=_rounded(median_of(excesses)),
-        median_absolute=_rounded(median_of(absolutes)),
+        median_excess=rounded(median_of(excesses)),
+        median_absolute=rounded(median_of(absolutes)),
         win_rate=_rate(excesses),
     )
 
@@ -355,27 +324,24 @@ def _horizon_stat(
             continue
         # 横截面中位只在**这一天**算，且只算当天有前向读数的那些板块。拿全样本
         # 的平均去减，会把不同市场阶段的收益混在一起当基准。
-        peers = [
+        centre = median_of(
             other
             for name in panel.closes
             if (other := panel.forward(name, stamp, horizon)) is not None
-        ]
-        centre = median(peers) if peers else None
+        )
         absolutes.append(value)
         if centre is not None:
             excesses.append(value - centre)
     return HorizonStat(
         horizon=horizon,
         samples=len(absolutes),
-        median_excess=_rounded(median_of(excesses)),
-        median_absolute=_rounded(median_of(absolutes)),
+        median_excess=rounded(median_of(excesses)),
+        median_absolute=rounded(median_of(absolutes)),
         win_rate=_rate(excesses),
     )
 
 
-def _independent_events(
-    sessions: Sequence[str], trading_days: Sequence[str], spacing: int
-) -> int:
+def _independent_events(sessions: Sequence[str], trading_days: Sequence[str], spacing: int) -> int:
     """粗略独立事件数：相邻两次至少隔 `spacing` 个交易日才算两轮。
 
     只是一个粗计数，不是统计意义上的独立性检验——它挡的是「一轮行情连续成立
@@ -402,7 +368,3 @@ def _rate(values: Sequence[float]) -> float | None:
     if not values:
         return None
     return round(sum(1 for value in values if value > 0) / len(values), 4)
-
-
-def _rounded(value: float | None) -> float | None:
-    return None if value is None else round(value, 6)

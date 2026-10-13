@@ -178,7 +178,7 @@ def run_ask(
     return _result(ctx, answer=reply, notes=[])
 
 
-# ---- 深挖 ----------------------------------------------------------------
+# 深挖
 
 
 def _run_deep(
@@ -227,7 +227,12 @@ def _run_deep(
         as_of=ctx.as_of,
         notes=ctx.notes,
         source=source,
-        position_factor=_position_factor(ctx.blocks),
+        position_factor=_position_factor(ctx),
+        screen=ctx.blocks.get("参数化策略扫描"),
+        screen_health=next(
+            (item.status for item in ctx.health.blocks if item.name == "参数化策略扫描"),
+            None,
+        ),
     )
     emit(report)
 
@@ -257,9 +262,7 @@ def _execute(
         note = "未配置 LLM key，本次没有论证段；结论与价位由规则算出，不受影响"
         return {step.key: {"text": "", "note": note} for step in steps}
 
-    done, errors = gather(
-        steps, lambda step: _run_step(step, llm, phase), max_workers=max_workers
-    )
+    done, errors = gather(steps, lambda step: _run_step(step, llm, phase), max_workers=max_workers)
     findings = {step.key: finding for step, finding in done}
     # 一步调用失败只损失这一步的论证段：它照样在字典里，只是带着说明没有正文。
     for step, exc in errors:
@@ -300,11 +303,15 @@ def _guard(ctx: AskContext) -> OutputGuard:
     return OutputGuard.from_facts(morning, phase=ctx.phase)
 
 
-def _position_factor(blocks: dict[str, Any]) -> float | None:
-    """盘前算出来的仓位系数。取不到就不报——**没有默认值**，编一个 0.5 出来
-    比不说更糟：它看起来和真的算出来的那个数一模一样。"""
-    morning = blocks.get("盘前主链路")
-    if not isinstance(morning, dict):
+def _position_factor(ctx: AskContext) -> float | None:
+    """只有当日、可执行的盘前结果才可称为今日仓位系数。"""
+    morning = ctx.blocks.get("盘前主链路")
+    status = next((item.status for item in ctx.health.blocks if item.name == "盘前主链路"), None)
+    if (
+        not isinstance(morning, dict)
+        or status != "当日"
+        or morning.get("execution_ready") is not True
+    ):
         return None
     value = morning.get("position_factor")
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
@@ -322,7 +329,7 @@ def _deep_notes(plan: ResearchPlan, findings: dict[str, dict]) -> list[str]:
     return list(dict.fromkeys(notes))
 
 
-# ---- 共用 ----------------------------------------------------------------
+# 共用
 
 
 def _messages(ctx: AskContext, question: str) -> list[dict]:

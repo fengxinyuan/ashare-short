@@ -2,36 +2,62 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import datetime, time
 from pathlib import Path
-from statistics import median
 from typing import Any
 
-from ashare_decision_support.research.sector_forecast import build_sector_forecast
+from ashare_decision_support.numeric import median_of
+from ashare_decision_support.research.sector_forecast import (
+    CONFIRM_AFTER,
+    CONFIRM_BREADTH,
+    INVALIDATE_BREADTH,
+    MIN_INDEPENDENT_INDUSTRIES,
+    build_sector_forecast,
+)
 from ashare_decision_support.schedule.clock import (
     AFTERNOON_CLOSE,
     AFTERNOON_OPEN,
     MORNING_CLOSE,
 )
+from ashare_decision_support.schedule.timezone import to_beijing_naive
+from ashare_decision_support.sectors.base import LEVEL_INDUSTRY
 from ashare_decision_support.sectors.intraday import (
-    LEVEL_INDUSTRY,
     SectorRead,
     SectorSnapshot,
     load_history,
     store_path,
 )
+from ashare_decision_support.sectors.panel import rounded
+from ashare_decision_support.signals.series import parse_bar_date
 
 SCHEMA = "ashare-sector-confirmation-v2"
 MIN_AMOUNT_SHARE_RISE = 0.0001
 
 
 def build_sector_confirmation(
-    output_dir: str | Path = "briefs", *, store_root: Path | None = None
+    output_dir: str | Path = "briefs",
+    *,
+    store_root: Path | None = None,
+    forecast: dict[str, Any] | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    snapshots: list[SectorSnapshot] | None = None,
 ) -> dict[str, Any]:
-    forecast = build_sector_forecast(output_dir)
-    target = str(forecast.get("target_session") or "")
-    history = load_history(store_path(target, root=store_root)) if target else []
-    history = [item for item in history if item.as_of.date().isoformat() == target]
+    forecast = build_sector_forecast(output_dir) if forecast is None else forecast
+    day = parse_bar_date(forecast.get("target_session"))
+    target = str(day) if day is not None else ""
+    history = (
+        snapshots
+        if snapshots is not None
+        else (load_history(store_path(target, root=store_root)) if target else [])
+    )
+    history = [
+        item
+        for item in history
+        if item.as_of.date().isoformat() == target
+        and (since is None or item.as_of >= to_beijing_naive(since))
+        and (until is None or item.as_of <= to_beijing_naive(until))
+    ]
     observed = history[-1] if history else None
     usable = [item for item in history if _confirmation_window(item.as_of.time())]
     if observed is not None and not _confirmation_window(observed.as_of.time()):
@@ -80,10 +106,8 @@ def _evaluate(
         excess_series[0] > excess_series[1] > excess_series[2]  # type: ignore[operator]
     )
     industries = sum(row.level == LEVEL_INDUSTRY and row.excess_pct > 0 for row in current)
-    broad = breadth is not None and breadth >= 0.60
-    outperforming = (
-        excess is not None and excess > 0 and stability_observed and not declining_twice
-    )
+    broad = breadth is not None and breadth >= CONFIRM_BREADTH
+    outperforming = excess is not None and excess > 0 and stability_observed and not declining_twice
     # 一轮截面没有变化方向。未知不能冒充“成交关注没有下降”，否则第一轮只要
     # 广度与超额为正就会直接确认，绕过协议要求的成交额验证。
     attention = (
@@ -91,9 +115,12 @@ def _evaluate(
         and prev_amount is not None
         and amount - prev_amount >= MIN_AMOUNT_SHARE_RISE
     )
-    invalid = (breadth is not None and breadth < 0.45) or (
-        excess is not None and excess < 0 and amount is not None
-        and prev_amount is not None and amount > prev_amount
+    invalid = (breadth is not None and breadth < INVALIDATE_BREADTH) or (
+        excess is not None
+        and excess < 0
+        and amount is not None
+        and prev_amount is not None
+        and amount > prev_amount
     )
     if not ready:
         status = "等待数据"
@@ -101,8 +128,11 @@ def _evaluate(
         status = "无法匹配"
     elif invalid:
         status = "已否决"
-    elif broad and outperforming and attention and (
-        industries >= 2 or bool(forecast.get("independent_signal"))
+    elif (
+        broad
+        and outperforming
+        and attention
+        and (industries >= MIN_INDEPENDENT_INDUSTRIES or bool(forecast.get("independent_signal")))
     ):
         status = "已确认"
     elif broad or outperforming:
@@ -121,7 +151,8 @@ def _evaluate(
         "amount_share": amount,
         "amount_share_change": (
             round(amount - prev_amount, 6)
-            if amount is not None and prev_amount is not None else None
+            if amount is not None and prev_amount is not None
+            else None
         ),
         "independent_industries": industries,
         "checks": {
@@ -145,8 +176,7 @@ def _independent(rows: list[SectorRead]) -> list[SectorRead]:
 
 
 def _centre(rows: list[SectorRead], field: str) -> float | None:
-    values = [float(getattr(row, field)) for row in rows]
-    return round(median(values), 6) if values else None
+    return rounded(median_of(getattr(row, field) for row in rows))
 
 
 def _data_status(latest: SectorSnapshot | None, ready: bool) -> str:
@@ -157,12 +187,12 @@ def _data_status(latest: SectorSnapshot | None, ready: bool) -> str:
     if MORNING_CLOSE < latest.as_of.time() < AFTERNOON_OPEN:
         return "午间休市，行情冻结；等待13:00后新截面"
     if not ready:
-        return "09:35前噪声较大，等待确认窗口"
+        return (
+            f"不在{CONFIRM_AFTER:%H:%M}–{MORNING_CLOSE:%H:%M}"
+            f"或{AFTERNOON_OPEN:%H:%M}–{AFTERNOON_CLOSE:%H:%M}确认窗口，等待有效截面"
+        )
     return "可确认"
 
 
 def _confirmation_window(moment: time) -> bool:
-    return (
-        time(9, 35) <= moment <= MORNING_CLOSE
-        or AFTERNOON_OPEN <= moment <= AFTERNOON_CLOSE
-    )
+    return CONFIRM_AFTER <= moment <= MORNING_CLOSE or AFTERNOON_OPEN <= moment <= AFTERNOON_CLOSE

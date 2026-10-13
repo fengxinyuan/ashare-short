@@ -72,9 +72,7 @@ def is_advice_like(block: Any) -> bool:
     return any(
         isinstance(item, dict)
         and (
-            item.get("entry_low") is not None
-            or item.get("shortline")
-            or item.get("trade_context")
+            item.get("entry_low") is not None or item.get("shortline") or item.get("trade_context")
         )
         for item in symbols
     )

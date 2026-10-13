@@ -1,20 +1,8 @@
-"""付费档分钟线：列式解析、量纲、浮点卫生、向前翻页。
-
-三件事这个文件必须钉住，每一件都实测过一次错法：
-
-1. **响应是列式的**（`{'timestamp': [...], 'close': [...]}`），和日线的行式不同。
-   当成行处理会得到一条巨大的假记录，而且不会报错。
-2. **`volume` 是「手」**，新浪那路是「股」。`signals/intraday.py` 的 `_vwap` 用
-   `amount / volume`，不换算的话茅台 VWAP 会算成 135083 而不是 1351。
-3. **单次 5000 根是硬顶**，`count` 调大无效，只能把 `end_time` 往前推。
-
-外加一条浮点卫生：复权后的 OHLC 四个字段各自带尾巴，实测 15000 根里 1399 根
-（9.33%）满足 `high < low`。
-"""
+"""付费档分钟线：列式解析、成交量换算、价格精度、批量上限与免费回退。"""
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 
 import pytest
 
@@ -22,27 +10,23 @@ from ashare_decision_support.adapters.tickflow_intraday import (
     MAX_BARS_PER_REQUEST,
     TickFlowIntradayAdapter,
     build_intraday_adapter,
-    fetch_minute_history,
     to_bars,
 )
-from ashare_decision_support.schedule.timezone import BEIJING_TZ
 
 # 600519.SH 2026-07-31 尾盘三根，取自实测响应。
 COMPACT = {
-    "timestamp": [1785480960000, 1785481020000, 1785481200000],   # 14:56 / 14:57 / 15:00 CST
+    "timestamp": [1785480960000, 1785481020000, 1785481200000],  # 14:56 / 14:57 / 15:00 CST
     "open": [1350.5, 1351.0, 1350.599999999998],
-    "high": [1351.9, 1352.96, 1350.599999999988],     # 注意 high < low
+    "high": [1351.9, 1352.96, 1350.599999999988],  # 注意 high < low
     "low": [1349.88, 1350.24, 1350.6000000000106],
     "close": [1351.54, 1352.4, 1350.5999999999965],
-    "volume": [370, 346, 677],                          # 手
+    "volume": [370, 346, 677],  # 手
     "amount": [49980887.1, 46766968.3, 91322169.0],
 }
 
 
 class FakeKlines:
-    def __init__(self, pages=None, boom: bool = False) -> None:
-        # pages: 依次返回的响应；不给就每次都返回 COMPACT。
-        self.pages = pages
+    def __init__(self, boom: bool = False) -> None:
         self.boom = boom
         self.calls: list[dict] = []
 
@@ -50,11 +34,7 @@ class FakeKlines:
         self.calls.append(kwargs)
         if self.boom:
             raise RuntimeError("klines down")
-        if self.pages is None:
-            return dict.fromkeys(kwargs["symbols"], COMPACT)
-        index = len(self.calls) - 1
-        page = self.pages[index] if index < len(self.pages) else {}
-        return dict.fromkeys(kwargs["symbols"], page)
+        return dict.fromkeys(kwargs["symbols"], COMPACT)
 
 
 class FakeClient:
@@ -62,7 +42,7 @@ class FakeClient:
         self.klines = klines or FakeKlines()
 
 
-# ---- 列式解析 -------------------------------------------------------------
+# 列式解析
 
 
 def test_columnar_payload_becomes_one_bar_per_timestamp() -> None:
@@ -79,7 +59,7 @@ def test_timestamps_are_exchange_local_time() -> None:
     bars = to_bars(COMPACT, "600519.SH")
 
     assert bars[-1]["timestamp"].hour == 15
-    assert bars[-1]["timestamp"].tzinfo is None      # 与新浪那路同为 naive
+    assert bars[-1]["timestamp"].tzinfo is None  # 与新浪那路同为 naive
 
 
 def test_a_row_shaped_payload_yields_nothing_rather_than_garbage() -> None:
@@ -96,7 +76,7 @@ def test_ragged_columns_do_not_invent_values() -> None:
     assert bars[1]["high"] is None
 
 
-# ---- 量纲 -----------------------------------------------------------------
+# 量纲
 
 
 def test_volume_is_converted_from_lots_to_shares() -> None:
@@ -113,7 +93,7 @@ def test_vwap_only_comes_out_right_because_volume_was_converted() -> None:
     assert bar["amount"] / bar["volume"] == pytest.approx(1351.1, abs=0.5)
 
 
-# ---- 浮点卫生 -------------------------------------------------------------
+# 浮点卫生
 
 
 def test_prices_are_rounded_so_high_is_never_below_low() -> None:
@@ -128,7 +108,7 @@ def test_prices_are_rounded_so_high_is_never_below_low() -> None:
     assert third["close"] == 1350.6
 
 
-# ---- 批量取数 -------------------------------------------------------------
+# 批量取数
 
 
 def test_minute_bars_are_fetched_for_all_symbols_in_one_request() -> None:
@@ -154,21 +134,6 @@ def test_minute_bars_are_unadjusted_because_they_are_quoted_as_order_prices() ->
     """
     client = FakeClient()
     TickFlowIntradayAdapter(client).get_minute_bars(["600519.SH"], period="1")
-
-    assert client.klines.calls[0]["adjust"] == "none"
-
-
-def test_history_can_opt_into_adjusted_prices_for_return_studies() -> None:
-    """跨除权比收益率要用复权序列，训练与推理必须同口径。"""
-    client = FakeClient(FakeKlines(pages=[_page(1785000000000, 3), {}]))
-    fetch_minute_history(client, "600519.SH", period="1", adjust="forward")
-
-    assert client.klines.calls[0]["adjust"] == "forward"
-
-
-def test_history_defaults_to_unadjusted_like_the_live_path() -> None:
-    client = FakeClient(FakeKlines(pages=[_page(1785000000000, 3), {}]))
-    fetch_minute_history(client, "600519.SH", period="1")
 
     assert client.klines.calls[0]["adjust"] == "none"
 
@@ -200,98 +165,7 @@ def test_no_symbols_is_not_a_request() -> None:
     assert client.klines.calls == []
 
 
-# ---- 向前翻页 -------------------------------------------------------------
-
-
-def _page(start_ms: int, count: int) -> dict:
-    stamps = [start_ms + i * 60_000 for i in range(count)]
-    return {
-        "timestamp": stamps,
-        "open": [10.0] * count,
-        "high": [10.1] * count,
-        "low": [9.9] * count,
-        "close": [10.0] * count,
-        "volume": [100] * count,
-        "amount": [100000.0] * count,
-    }
-
-
-def test_history_pages_backwards_by_moving_end_time() -> None:
-    """单次 5000 根封顶且 `count`/`start_time` 都放宽不了，只能把 end_time 前推。"""
-    newer = _page(1785000000000, 3)
-    older = _page(1784000000000, 3)
-    client = FakeClient(FakeKlines(pages=[newer, older, {}]))
-
-    bars, _ = fetch_minute_history(client, "600519.SH", period="1")
-
-    assert len(bars) == 6
-    assert bars[0]["timestamp"] < bars[-1]["timestamp"]        # 升序
-    # 第二页的 end_time 落在第一页最早一根之前。
-    assert client.klines.calls[1]["end_time"] == 1785000000000 - 60_000
-
-
-def test_history_stops_when_a_page_adds_nothing_new() -> None:
-    """到数据底之后服务端会一直返回同一批，不停就会一直空转到页数上限。"""
-    same = _page(1785000000000, 3)
-    client = FakeClient(FakeKlines(pages=[same, same, same, same]))
-
-    bars, _ = fetch_minute_history(client, "600519.SH", period="1")
-
-    assert len(bars) == 3
-    assert len(client.klines.calls) == 2       # 第二页发现没有新数据就停
-
-
-def test_history_stops_once_the_requested_start_is_covered() -> None:
-    page = _page(1785000000000, 3)
-    client = FakeClient(FakeKlines(pages=[page, page]))
-
-    fetch_minute_history(
-        client, "600519.SH", period="1", start=date(2000, 1, 1), end=date(2026, 7, 31)
-    )
-
-    assert len(client.klines.calls) >= 1
-
-
-def test_history_trims_to_the_requested_window() -> None:
-    """翻页是按整页回来的，落在窗口外的部分不该混进结果。"""
-    # 时间戳按北京折算——接口给的毫秒本来就是交易所时钟，用宿主机时区造这个值
-    # 会让这条用例只在 Asia/Shanghai 的机器上成立。
-    page = _page(int(datetime(2026, 7, 30, 9, 30, tzinfo=BEIJING_TZ).timestamp() * 1000), 3)
-    client = FakeClient(FakeKlines(pages=[page, {}]))
-
-    bars, _ = fetch_minute_history(
-        client, "600519.SH", period="1", start=date(2026, 7, 31), end=date(2026, 7, 31)
-    )
-
-    assert bars == []
-
-
-def test_a_page_cap_is_announced_instead_of_looking_complete() -> None:
-    """截断了不说，读起来就像「数据就这么多」。"""
-    pages = [_page(1785000000000 - i * 1_000_000, 3) for i in range(6)]
-    client = FakeClient(FakeKlines(pages=pages))
-
-    _, notes = fetch_minute_history(client, "600519.SH", period="1", max_pages=3)
-
-    assert any("翻满" in note and "未触底" in note for note in notes)
-
-
-def test_a_mid_page_failure_keeps_what_was_already_fetched() -> None:
-    class HalfDead(FakeKlines):
-        def batch(self, **kwargs):
-            self.calls.append(kwargs)
-            if len(self.calls) > 1:
-                raise RuntimeError("boom")
-            return {kwargs["symbols"][0]: _page(1785000000000, 3)}
-
-    client = FakeClient(HalfDead())
-    bars, notes = fetch_minute_history(client, "600519.SH", period="1")
-
-    assert len(bars) == 3
-    assert any("取数失败" in note for note in notes)
-
-
-# ---- 选路 -----------------------------------------------------------------
+# 选路
 
 
 class PaidAdapter:
@@ -310,14 +184,26 @@ def test_a_paid_adapter_routes_to_the_batch_endpoint() -> None:
     assert isinstance(build_intraday_adapter(PaidAdapter()), TickFlowIntradayAdapter)
 
 
-def test_a_free_adapter_does_not_route_to_the_paid_endpoint() -> None:
+@pytest.mark.parametrize("adapter", [FreeAdapter(), None])
+def test_a_free_adapter_does_not_route_to_the_paid_endpoint(adapter, monkeypatch) -> None:
     """档位是服务端说了算的，猜不得——`supports_intraday` 为假就必须退回免费路径。"""
-    assert not isinstance(build_intraday_adapter(FreeAdapter()), TickFlowIntradayAdapter)
+    fallback = object()
+    monkeypatch.setattr(
+        "ashare_decision_support.adapters.sina_intraday.SinaIntradayAdapter", lambda: fallback
+    )
+    assert build_intraday_adapter(adapter) is fallback
 
 
-def test_no_adapter_at_all_still_returns_something_or_none_but_never_raises() -> None:
+def test_no_intraday_backend_degrades_to_none(monkeypatch) -> None:
     """分钟线缺了链路仍要能跑（退化成只出日线结构判断），所以这里不许抛。"""
-    build_intraday_adapter(None)
+
+    def missing():
+        raise RuntimeError("optional intraday dependency is not installed")
+
+    monkeypatch.setattr(
+        "ashare_decision_support.adapters.sina_intraday.SinaIntradayAdapter", missing
+    )
+    assert build_intraday_adapter(None) is None
 
 
 def test_minute_bars_drop_non_finite_readings() -> None:

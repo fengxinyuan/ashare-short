@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
+from ashare_decision_support.numeric import as_int, positive
 from ashare_decision_support.state.paths import state_path
-from ashare_decision_support.state.store import read_json, write_json
+from ashare_decision_support.state.store import read_json_object, record_map, write_json
 from ashare_decision_support.symbols import normalize_symbol
 
 
@@ -32,38 +33,45 @@ class AlertState:
     @classmethod
     def load(cls, session: date, path: Path | None = None) -> AlertState:
         resolved = Path(path) if path is not None else state_path("alerts", f"{session}.json")
-        payload = read_json(resolved, default={}) or {}
+        payload = read_json_object(resolved)
+        if payload.get("session") not in (None, str(session)):
+            payload = {}
+        peaks = payload.get("peaks")
         return cls(
             session=session,
             path=resolved,
-            fired=payload.get("fired") or {},
-            observed=payload.get("observed") or {},
-            pinned=payload.get("pinned") or {},
-            # 老的 alerts/*.json 没有这个键。缺省空字典即「今天还没记过峰值」，
-            # 读旧文件不会炸。
-            peaks=payload.get("peaks") or {},
+            fired=_read_fired(payload.get("fired"), session),
+            observed={
+                normalize_symbol(key): row
+                for key, row in record_map(payload.get("observed")).items()
+            },
+            pinned=_read_pinned(payload.get("pinned")),
+            peaks={
+                normalize_symbol(key): price
+                for key, value in (peaks.items() if isinstance(peaks, dict) else ())
+                if (price := positive(value)) is not None
+            },
         )
 
-    # ---- what has already fired -----------------------------------------
+    # what has already fired
 
     def last_fired(self, symbol: str, trigger: str) -> datetime | None:
         record = self.fired.get(_key(symbol, trigger))
         if not record:
             return None
-        try:
-            return datetime.fromisoformat(record["at"])
-        except (KeyError, TypeError, ValueError):
-            return None
+        return _alert_time(record.get("at"))
 
     def fire_count(self, symbol: str, trigger: str) -> int:
-        return int(self.fired.get(_key(symbol, trigger), {}).get("count", 0))
+        return max(0, as_int(self.fired.get(_key(symbol, trigger), {}).get("count")))
 
     def mark_fired(self, symbol: str, trigger: str, now: datetime) -> None:
         key = _key(symbol, trigger)
-        record = self.fired.get(key) or {"count": 0}
-        self.fired[key] = {"at": now.isoformat(timespec="seconds"), "count": int(record["count"]) + 1}
+        self.fired[key] = {
+            "at": now.isoformat(timespec="seconds"),
+            "count": self.fire_count(symbol, trigger) + 1,
+        }
 
-    # ---- last observed state, for transition detection -------------------
+    # last observed state, for transition detection
 
     def state_of(self, symbol: str) -> dict:
         return dict(self.observed.get(normalize_symbol(symbol)) or {})
@@ -71,7 +79,7 @@ class AlertState:
     def set_state(self, symbol: str, state: dict) -> None:
         self.observed[normalize_symbol(symbol)] = dict(state)
 
-    # ---- pinned levels ---------------------------------------------------
+    # pinned levels
 
     def pinned_of(self, symbol: str) -> dict | None:
         """Levels frozen when the symbol was armed, or None if not yet armed.
@@ -89,12 +97,11 @@ class AlertState:
             "at": at.isoformat(timespec="seconds"),
         }
 
-    # ---- 持仓期最高价 -----------------------------------------------------
+    # 持仓期最高价
 
     def peak_of(self, symbol: str) -> float | None:
         """这笔持仓到目前为止摸到过的最高价，移动止损的分母。"""
-        value = self.peaks.get(normalize_symbol(symbol))
-        return float(value) if isinstance(value, (int, float)) and value > 0 else None
+        return positive(self.peaks.get(normalize_symbol(symbol)))
 
     def observe_peak(self, symbol: str, price: float | None) -> float | None:
         """记下新高并返回当前峰值。只涨不跌——峰值回落就不是峰值了。
@@ -105,9 +112,10 @@ class AlertState:
         """
         code = normalize_symbol(symbol)
         current = self.peak_of(code)
-        if price is not None and price > 0 and (current is None or price > current):
-            self.peaks[code] = float(price)
-            return float(price)
+        price = positive(price)
+        if price is not None and (current is None or price > current):
+            self.peaks[code] = price
+            return price
         return current
 
     def save(self) -> None:
@@ -134,3 +142,43 @@ class AlertState:
 
 def _key(symbol: str, trigger: str) -> str:
     return f"{normalize_symbol(symbol)}|{trigger}"
+
+
+def _alert_time(value: object) -> datetime | None:
+    # 延迟导入，避免 schedule -> daemon -> state 的初始化环。
+    from ashare_decision_support.schedule.timezone import to_beijing_naive
+
+    try:
+        return to_beijing_naive(datetime.fromisoformat(str(value)))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _read_fired(value: object, session: date) -> dict[str, dict]:
+    fired: dict[str, dict] = {}
+    for key, row in record_map(value).items():
+        symbol, separator, trigger = key.partition("|")
+        at = _alert_time(row.get("at"))
+        if not symbol or not separator or not trigger or at is None or at.date() != session:
+            continue
+        fired[_key(symbol, trigger)] = {
+            "at": at.isoformat(timespec="seconds"),
+            # 有有效发生时间就至少发生过一次，坏计数不能使 once_per_session 重发。
+            "count": max(1, as_int(row.get("count"))),
+        }
+    return fired
+
+
+def _read_pinned(value: object) -> dict[str, dict]:
+    pinned: dict[str, dict] = {}
+    for key, row in record_map(value).items():
+        stop = positive(row.get("stop"))
+        raw_targets = row.get("targets")
+        targets = [
+            price
+            for item in (raw_targets if isinstance(raw_targets, list) else [])
+            if (price := positive(item)) is not None
+        ]
+        if stop is not None or targets:
+            pinned[normalize_symbol(key)] = {**row, "stop": stop, "targets": targets}
+    return pinned

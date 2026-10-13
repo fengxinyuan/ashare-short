@@ -1,12 +1,6 @@
-"""共享的仓位决策策略。
+"""盘前与盘后共用的仓位决策。
 
-同一条规则此前分别写在 `jobs/morning.py` 与 `jobs/post_close.py`：
-
-- 系统建议值与情绪周期上限取 `min`
-- 手工值仍然优先
-- 手工值高于周期上限必须显式报警，不能静默放行
-
-收成一处之后，两条链路不会再各自漂移。
+系统建议受情绪周期上限约束；手工值优先，超过周期上限时显式提示。
 """
 
 from __future__ import annotations
@@ -44,7 +38,9 @@ def resolve_position_sizing(
     effective = manual_factor if manual_factor is not None else capped
     if manual_factor is not None:
         reference = (
-            f"系统建议 {capped:.2f}" if suggested_factor is not None else f"周期上限 {cycle_cap:.2f}"
+            f"系统建议 {capped:.2f}"
+            if suggested_factor is not None
+            else f"周期上限 {cycle_cap:.2f}"
         )
         notes.append(f"仓位系数使用手工值 {manual_factor:.2f}（{reference}）")
         if manual_factor > cycle_cap:

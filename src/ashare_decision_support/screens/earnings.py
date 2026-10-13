@@ -1,31 +1,8 @@
-"""业绩风险否决与业绩催化标注。**刻意不对称。**
+"""净利润口径的业绩风险筛选与正面信息标注。
 
-否决与标注不是同一个决定的两面，所以这一层对它们的处置强度不同：
-
-| | 处置 | 理由 |
-|---|---|---|
-| 亏损 / 大幅预减 | **移除标的** | 中报窗口里最典型的「业绩杀」。这是公司自己签字披露的事实，不是推断 |
-| 预增 / 扭亏 | **只标注，不加分** | 未经回测的读数不给权重（`DECISIONS.md` §六b） |
-
-不对称的理由：**否决的错误是漏掉一只本可以做的票，加分的错误是买进一只不该买的票。**
-前者可以被下一个交易日补回来，后者不能。而且加分那一侧有前科——上一轮把缩量做成
-±6 分的权重，结果 60 条建议里 52 条是放量回调，**只要它是权重，就能被别的项买回来**。
-标注不会被买回来。
-
-**三条护栏**，每条都对应一种「这一层可能造成的静默错误」：
-
-1. **只有净利润口径能否决。** 营业收入口径的「略减」不是业绩杀——一家公司可以
-   营收微降而净利润翻倍。判据见 `EarningsForecast.is_net_profit_basis`。
-2. **取不到数据一律放行。** 和 `LiquidityScreen` 同一条纪律：拿不到业绩去否决
-   标的，等于让数据缺失冒充风险判断。放行并把「未经该层过滤」写进 note。
-3. **续亏与首亏分开报。** 「早就在亏」和「刚开始亏」对市场是两件事。默认两者
-   都否决（中报窗口里市场对亏损一视同仁地杀），但 `block_persistent_loss=False`
-   可以只否决恶化的那批——**这个开关存在是因为它的正确取值尚未被台账验证**。
-
-**已知代价，写在这里而不是藏起来：** 这道闸门会挡掉一部分**亏损但正当红的题材股**，
-而它们在超短线上完全可能是当期最强的品种。这是一个真实的取舍，不是免费的改进。
-台账（`journal/`）记录了每一条被否决的理由，60 个交易日后可以回答「被业绩否决的
-那批，如果买了会怎样」——在那之前，这个取舍是按保守方向拍的板，不是被验证过的。
+亏损和大幅预减可否决标的，正面信息不能抵消风险门槛。
+缺失数据放行并说明未经筛选；续亏与首亏分别报告，续亏是否拦截由配置决定。
+否决样本进入台账，供后续核对规则效果。
 """
 
 from __future__ import annotations
@@ -99,9 +76,7 @@ class EarningsStats:
 
     def note(self) -> str | None:
         if not self.active:
-            return (
-                "业绩数据不可用，**本次没有业绩风险否决**，候选未经该层过滤"
-            )
+            return "业绩数据不可用，**本次没有业绩风险否决**，候选未经该层过滤"
         if not self.evaluated:
             return None
         return (
@@ -146,7 +121,9 @@ class EarningsScreen:
                 result[verdict.symbol] = verdict
         return result
 
-    def filter(self, symbols: list[str]) -> tuple[list[str], dict[str, EarningsVerdict], EarningsStats]:
+    def filter(
+        self, symbols: list[str]
+    ) -> tuple[list[str], dict[str, EarningsVerdict], EarningsStats]:
         """返回 (放行的标的, 全部裁决, 统计)。
 
         取不到数据时**原样放行**并把这件事标进 `EarningsStats.active`，
@@ -171,31 +148,23 @@ class EarningsScreen:
         kept = [symbol for symbol in symbols if normalize_symbol(symbol) not in blocked]
         return kept, verdicts, stats
 
-    # ---- internals -------------------------------------------------------
-
     def _judge(self, symbol: str, item: EarningsForecast) -> EarningsVerdict:
         verdict = EarningsVerdict(symbol=symbol, forecast=item)
 
         # 护栏 1：非净利润口径不参与否决，只提示。营收「略减」不是业绩杀。
         if not item.is_net_profit_basis:
             if item.direction != DIRECTION_POSITIVE:
-                verdict.warnings.append(
-                    f"{item.headline}——该读数不是净利润口径，不作否决依据"
-                )
+                verdict.warnings.append(f"{item.headline}——该读数不是净利润口径，不作否决依据")
             return verdict
 
         if item.is_deteriorating_loss:
-            verdict.blocking.append(
-                f"{item.headline}——中报窗口内由盈转亏/亏损扩大，业绩杀风险"
-            )
+            verdict.blocking.append(f"{item.headline}——中报窗口内由盈转亏/亏损扩大，业绩杀风险")
             return verdict
 
         # 「减亏」：方向为正但净利润仍为负。既不该否决（在改善），也不该当成
         # 业绩催化（还在亏钱）。这是唯一一类必须落在两者之间的。
         if item.is_improving_loss:
-            verdict.warnings.append(
-                f"{item.headline}——仍处亏损，只是同比减亏，不构成业绩支撑"
-            )
+            verdict.warnings.append(f"{item.headline}——仍处亏损，只是同比减亏，不构成业绩支撑")
             return verdict
 
         if item.is_loss:
@@ -212,9 +181,7 @@ class EarningsScreen:
             and item.change_pct is not None
             and item.change_pct <= self.severe_decline_pct
         ):
-            verdict.blocking.append(
-                f"{item.headline}——净利润同比下滑过半"
-            )
+            verdict.blocking.append(f"{item.headline}——净利润同比下滑过半")
             return verdict
 
         if item.kind in WARNING_TYPES:

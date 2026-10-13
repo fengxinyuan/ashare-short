@@ -4,19 +4,16 @@ import os
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from ashare_decision_support.adapters.base import MarketDataAdapter
 from ashare_decision_support.adapters.ratelimit import wrap_client
+from ashare_decision_support.adapters.validate import LOTS_TO_SHARES
 from ashare_decision_support.numeric import finite, first_finite
-from ashare_decision_support.schedule.timezone import (
-    BEIJING_TZ,
-    beijing_from_epoch,
-    beijing_naive_now,
-)
+from ashare_decision_support.schedule.timezone import BEIJING_TZ, beijing_naive_now
+from ashare_decision_support.signals.series import parse_bar_datetime
 
 # Exchange timezone. Epoch-millisecond windows must be anchored to it explicitly,
 # otherwise a host running in UTC shifts the request window by 8 hours and
 # silently drops the first or last trading day of the range.
-#
+
 # This used to be a local `timezone(timedelta(hours=8))`, duplicated verbatim in
 # `news/wallstreet_source.py`. `schedule/timezone.py` says the clock has exactly
 # one source, and two private copies are how that stops being true. Behaviour is
@@ -29,7 +26,7 @@ class TickFlowAdapterError(RuntimeError):
     """Raised when the TickFlow adapter cannot complete a requested action."""
 
 
-VOLUME_UNIT_MULTIPLIERS: dict[str, float] = {"share": 1.0, "lot": 100.0, "lot10": 10.0}
+VOLUME_UNIT_MULTIPLIERS: dict[str, float] = {"share": 1.0, "lot": LOTS_TO_SHARES, "lot10": 10.0}
 
 # Symbols per batch kline request. The SDK parallelises inside a batch, so the
 # ceiling here is request size rather than throughput.
@@ -41,7 +38,7 @@ BATCH_CHUNK_SIZE = 100
 BATCH_MAX_CHUNK = 100
 
 
-class TickFlowAdapter(MarketDataAdapter):
+class TickFlowAdapter:
     """Analysis-only adapter backed by the TickFlow Python SDK."""
 
     def __init__(
@@ -89,9 +86,7 @@ class TickFlowAdapter(MarketDataAdapter):
             free_factory = getattr(tickflow_factory, "free", None)
             client = free_factory() if callable(free_factory) else tickflow_factory()
 
-        # 免费档 60 次/分钟的闸门包在 client 上，不是包在本类的方法上：
-        # `sectors/taxonomy.py` 拿的是 `adapter.client` 直接调 `universes.*`，
-        # 包方法覆盖不到那条路径。见 `adapters/ratelimit.py`。
+        # 限流包在共享 client 上，统一覆盖日线、盘中和标的元数据请求。
         self.client = wrap_client(client, api_key=self.api_key, limit=rate_limit)
 
         if auto_connect:
@@ -105,7 +100,9 @@ class TickFlowAdapter(MarketDataAdapter):
             result[raw_symbol] = rows.get(normalized_symbol, {"symbol": normalized_symbol})
         return result
 
-    def get_historical_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[dict]]:
+    def get_historical_bars(
+        self, symbols: list[str], start: date, end: date
+    ) -> dict[str, list[dict]]:
         result: dict[str, list[dict]] = {}
         for raw_symbol, normalized_symbol in self._normalized_symbol_map(symbols).items():
             payload = self._daily_payload(normalized_symbol, start, end)
@@ -146,7 +143,13 @@ class TickFlowAdapter(MarketDataAdapter):
             return self.get_historical_bars(symbols, start, end)
 
         start_time = int(datetime.combine(start, time.min, tzinfo=BEIJING_TZ).timestamp() * 1000)
-        end_time = int(datetime.combine(end + timedelta(days=1), time.min, tzinfo=BEIJING_TZ).timestamp() * 1000) - 1
+        end_time = (
+            int(
+                datetime.combine(end + timedelta(days=1), time.min, tzinfo=BEIJING_TZ).timestamp()
+                * 1000
+            )
+            - 1
+        )
         count = min(max((end - start).days * 2 + 16, 64), 10000)
         step = max(1, min(int(chunk_size), BATCH_MAX_CHUNK))
 
@@ -156,8 +159,25 @@ class TickFlowAdapter(MarketDataAdapter):
             chunk = unique[index : index + step]
             payload = self._try_call(
                 batch_fn,
-                ((chunk,), {"period": "1d", "start_time": start_time, "end_time": end_time, "count": count, "adjust": self.adjust}),
-                ((chunk,), {"period": "1d", "start_time": start_time, "end_time": end_time, "count": count}),
+                (
+                    (chunk,),
+                    {
+                        "period": "1d",
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "count": count,
+                        "adjust": self.adjust,
+                    },
+                ),
+                (
+                    (chunk,),
+                    {
+                        "period": "1d",
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "count": count,
+                    },
+                ),
                 ((chunk,), {"period": "1d", "count": count}),
                 ((), {"symbols": chunk, "period": "1d", "count": count}),
             )
@@ -209,18 +229,53 @@ class TickFlowAdapter(MarketDataAdapter):
         if not callable(get_fn):
             return None
         start_time = int(datetime.combine(start, time.min, tzinfo=BEIJING_TZ).timestamp() * 1000)
-        end_time = int(datetime.combine(end + timedelta(days=1), time.min, tzinfo=BEIJING_TZ).timestamp() * 1000) - 1
+        end_time = (
+            int(
+                datetime.combine(end + timedelta(days=1), time.min, tzinfo=BEIJING_TZ).timestamp()
+                * 1000
+            )
+            - 1
+        )
         count = min(max((end - start).days * 2 + 16, 64), 10000)
         # `adjust` is passed explicitly: the SDK default is forward adjustment,
         # which rescales history and makes limit-up/limit-down and tick-size
         # checks meaningless. See docs/DATA_SOURCES.md.
         return self._try_call(
             get_fn,
-            ((symbol,), {"period": "1d", "start_time": start_time, "end_time": end_time, "count": count, "adjust": self.adjust}),
-            ((symbol,), {"period": "1d", "start_time": start_time, "end_time": end_time, "count": count}),
-            ((symbol,), {"period": "1d", "start_date": start.isoformat(), "end_date": end.isoformat(), "count": count}),
+            (
+                (symbol,),
+                {
+                    "period": "1d",
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "count": count,
+                    "adjust": self.adjust,
+                },
+            ),
+            (
+                (symbol,),
+                {"period": "1d", "start_time": start_time, "end_time": end_time, "count": count},
+            ),
+            (
+                (symbol,),
+                {
+                    "period": "1d",
+                    "start_date": start.isoformat(),
+                    "end_date": end.isoformat(),
+                    "count": count,
+                },
+            ),
             ((symbol,), {"period": "1d", "count": count}),
-            ((), {"symbol": symbol, "period": "1d", "start_time": start_time, "end_time": end_time, "count": count}),
+            (
+                (),
+                {
+                    "symbol": symbol,
+                    "period": "1d",
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "count": count,
+                },
+            ),
         )
 
     def _instruments_rows(self, symbols: list[str]) -> dict[str, dict]:
@@ -259,7 +314,27 @@ class TickFlowAdapter(MarketDataAdapter):
             return f"{text}.SH"
         if text.startswith(("000", "001", "002", "003", "300", "301")):
             return f"{text}.SZ"
-        if text.startswith(("430", "440", "830", "831", "832", "833", "834", "835", "836", "837", "838", "839", "870", "871", "872", "873", "920")):
+        if text.startswith(
+            (
+                "430",
+                "440",
+                "830",
+                "831",
+                "832",
+                "833",
+                "834",
+                "835",
+                "836",
+                "837",
+                "838",
+                "839",
+                "870",
+                "871",
+                "872",
+                "873",
+                "920",
+            )
+        ):
             return f"{text}.BJ"
         return f"{text}.SH"
 
@@ -294,26 +369,19 @@ class TickFlowAdapter(MarketDataAdapter):
             return self._compact_kline_rows(payload["data"], symbol)
 
         if not isinstance(payload, dict):
-            rows = self._rows(payload)
-            compact_rows: list[dict] = []
-            for row in rows:
-                timestamp = self._source_datetime(row)
-                compact_rows.append(
-                    {
-                        "symbol": symbol or str(row.get("symbol") or row.get("code") or ""),
-                        "timestamp": timestamp,
-                        "open": first_finite(row, "open", "Open", "开盘"),
-                        "high": first_finite(row, "high", "High", "最高"),
-                        "low": first_finite(row, "low", "Low", "最低"),
-                        "close": first_finite(row, "close", "Close", "收盘"),
-                        "volume": first_finite(row, "volume", "Volume", "成交量"),
-                        "amount": first_finite(row, "amount", "Amount", "成交额"),
-                        "prev_close": first_finite(row, "prev_close", "prevClose", "pre_close", "preClose"),
-                    }
-                )
-            return [row for row in compact_rows if row.get("close") is not None]
+            return self._row_kline_rows(self._rows(payload), symbol)
 
-        array_fields = ("timestamp", "time", "open", "high", "low", "close", "volume", "amount", "prev_close")
+        array_fields = (
+            "timestamp",
+            "time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "prev_close",
+        )
         if any(isinstance(payload.get(field), list) for field in array_fields):
             timestamps = payload.get("timestamp", []) or payload.get("time", []) or []
             opens = payload.get("open", []) or []
@@ -333,7 +401,6 @@ class TickFlowAdapter(MarketDataAdapter):
                         # 这一支此前是**逐格照抄**，唯独它不过 `finite`——同一个函数
                         # 的另外两支都过。而列式这一支正是 TickFlow 返回数组时走的那
                         # 条，也就是主行情源的日线主路径。
-                        #
                         # 漏的那一项是 NaN：下面只按 `close is not None` 过滤，NaN 不
                         # 是 None，照样进 K 线序列。之后它不会报错——`dipbuy` 的
                         # `float(high)` 收得下 NaN，真实波幅变成 NaN，ATR 跟着变成
@@ -350,26 +417,36 @@ class TickFlowAdapter(MarketDataAdapter):
                 )
             return [row for row in compact if row.get("close") is not None]
 
-        rows = self._rows(payload)
+        return self._row_kline_rows(self._rows(payload), symbol)
+
+    def _row_kline_rows(self, rows: list[dict], symbol: str) -> list[dict]:
+        """归一化行式载荷；列式载荷由 _compact_kline_rows 处理。"""
         compact_rows: list[dict] = []
         for row in rows:
-            timestamp = self._source_datetime(row)
             compact_rows.append(
                 {
                     "symbol": symbol or str(row.get("symbol") or row.get("code") or ""),
-                    "timestamp": timestamp,
+                    "timestamp": self._source_datetime(row),
                     "open": first_finite(row, "open", "Open", "开盘"),
                     "high": first_finite(row, "high", "High", "最高"),
                     "low": first_finite(row, "low", "Low", "最低"),
                     "close": first_finite(row, "close", "Close", "收盘"),
                     "volume": first_finite(row, "volume", "Volume", "成交量"),
                     "amount": first_finite(row, "amount", "Amount", "成交额"),
-                    "prev_close": first_finite(row, "prev_close", "prevClose", "pre_close", "preClose"),
+                    "prev_close": first_finite(
+                        row, "prev_close", "prevClose", "pre_close", "preClose"
+                    ),
                 }
             )
         return [row for row in compact_rows if row.get("close") is not None]
 
     def _source_datetime(self, payload: dict[str, Any]) -> datetime:
+        """这份快照/K 线是什么时候取的。
+
+        键名顺序**故意**把 `time` 排在 `date` 前面，和 `signals/series.py` 的交易日
+        键名表不同：同时给出 `date` 与更精确的 `time` 时，取前者会让快照看上去陈旧
+        几小时。`tests/test_bar_day_single_source.py` 为此显式豁免了这一处。
+        """
         for key in ("timestamp", "time", "datetime", "date", "日期", "时间"):
             value = payload.get(key)
             if value not in (None, ""):
@@ -377,23 +454,12 @@ class TickFlowAdapter(MarketDataAdapter):
         return beijing_naive_now()
 
     def _parse_datetime(self, value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, (int, float)):
-            ts = float(value)
-            if ts > 1e12:
-                ts /= 1000.0
-            return beijing_from_epoch(ts)
-        text = str(value)
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
-            try:
-                return datetime.strptime(text, fmt)
-            except ValueError:
-                continue
-        try:
-            return datetime.fromisoformat(text)
-        except ValueError:
-            return beijing_naive_now()
+        """解析走 `signals.series.parse_bar_datetime`；认不出来兜底成现在。
+
+        兜底成现在是这一层的口径（一根没有时间的 K 线仍要能排序），解析本身不再
+        自带一份——原来这里的那份把八位整数当成 epoch 秒，`20250801` 会落到 1970 年。
+        """
+        return parse_bar_datetime(value) or beijing_naive_now()
 
     def _try_call(self, func: Any, *attempts: tuple[tuple, dict]) -> Any:
         """Call ``func`` trying successive signatures.

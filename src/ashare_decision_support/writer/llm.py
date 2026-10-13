@@ -70,6 +70,9 @@ SYSTEM_PROMPT = """你是一名 A 股短线分析助手的文字改写器。
 4. 不得写「概率」「胜率」「预期收益率」这类数字，也不要把结果包装成预测。
 5. 不得直接写成投资建议；你可以保留系统的观察、情景、风险与纪律要求。
 6. 输出要像分析，不像报表：先给判断，再讲证据，再讲风险/分歧点/下一步观察条件。
+7. 每个数字只能和它在输入里所属的板块或标的一起出现：不得把一个板块的涨跌幅、
+   业绩或资金读数安到另一个板块头上，也不得把「5 日涨幅」写成「当日跌幅」或
+   「业绩」。记不清一个数属于谁、是什么口径，就不写那个数。
 
 输出格式：Markdown，不要代码块包裹，不要堆装饰。"""
 
@@ -166,9 +169,7 @@ class LlmBriefWriter(BriefWriter):
 
     def write(self, request: WriteRequest) -> WriteResult:
         if not self.api_key:
-            return self._fallback(
-                request, f"未配置 {self.provider.api_key_env}，改用模板输出"
-            )
+            return self._fallback(request, f"未配置 {self.provider.api_key_env}，改用模板输出")
 
         facts_text = json.dumps(request.facts, ensure_ascii=False, indent=2, default=str)
         try:
@@ -184,9 +185,7 @@ class LlmBriefWriter(BriefWriter):
         # 简报更危险：它读起来和规则层算出来的那份一模一样。
         review = review_output(generated, facts_text, OutputGuard.from_facts(request.facts))
         if not review.ok:
-            return self._fallback(
-                request, f"LLM 输出{review.reason()}，已丢弃并改用模板输出"
-            )
+            return self._fallback(request, f"LLM 输出{review.reason()}，已丢弃并改用模板输出")
 
         # Compliance text is appended, never generated. The model summarised the
         # discipline block away every time it was merely asked to keep it.
@@ -195,16 +194,22 @@ class LlmBriefWriter(BriefWriter):
             markdown = f"{markdown}\n\n{request.mandatory_suffix.strip()}"
         return WriteResult(markdown=markdown, writer=self.name)
 
-    # ---- internals -------------------------------------------------------
-
     def _user_prompt(self, request: WriteRequest, facts_text: str) -> str:
         audience = request.audience_note or "读者是本系统的唯一使用者，本人做 A 股超短线。"
+        verbatim = ""
+        if request.verbatim_sections:
+            names = "、".join(section.lstrip("#").strip() for section in request.verbatim_sections)
+            verbatim = (
+                f"「{names}」这几节的表格会由系统在稿后按原样附上，不必复述表格；"
+                "正文里可以点名先看哪几只，但价位以附表为准。\n"
+            )
         return (
             f"{audience}\n\n"
             f"以下是系统已经算好的结构化结论（JSON）。请把它改写成一份可读的《{request.title}》。\n"
             f"要求：先给一句判断，再展开证据、风险、分歧点和下一步观察条件；\n"
             f"能合并的信息就合并，尽量不要逐字段复述 JSON。\n"
-            f"保留原有的分节结构与全部风险提示，语言简洁，但要像在做分析，不要像在记账。\n\n"
+            f"保留原有的分节结构与全部风险提示，语言简洁，但要像在做分析，不要像在记账。\n"
+            f"{verbatim}\n"
             f"```json\n{facts_text}\n```"
         )
 

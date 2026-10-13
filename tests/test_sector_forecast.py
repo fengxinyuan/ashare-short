@@ -4,7 +4,9 @@ from datetime import date
 from ashare_decision_support.research.sector_forecast import build_sector_forecast
 
 
-def test_forecast_collapses_overlapping_themes_and_exposes_falsification(tmp_path, monkeypatch) -> None:
+def test_forecast_collapses_overlapping_themes_and_exposes_falsification(
+    tmp_path, monkeypatch
+) -> None:
     payload = {
         "trade_date": "2026-08-28",
         "market": {"direction": "偏强", "score": 72.0, "breadth": 0.62},
@@ -55,6 +57,8 @@ def test_forecast_collapses_overlapping_themes_and_exposes_falsification(tmp_pat
     result = build_sector_forecast(tmp_path)
 
     assert result["schema"] == "ashare-sector-forecast-v1"
+    # 2026-08-28 是周五，开市：目标交易日就是计划日本身。
+    assert result["target_session"] == "2026-08-28"
     assert result["information_date"] == "2026-08-27"
     assert result["market"]["state"] == "偏强但快速轮动"
     assert result["forecasts"][0]["name"] == "科技成长"
@@ -64,3 +68,23 @@ def test_forecast_collapses_overlapping_themes_and_exposes_falsification(tmp_pat
     assert result["execution_protocol"]["confirm"]
     assert result["execution_protocol"]["invalidate"]
     assert any("不是概率" in note for note in result["notes"])
+
+
+def test_a_weekend_plan_targets_the_next_session_not_the_run_date() -> None:
+    """周日跑的 `morning`：计划日是周日，行情截止上周五，预测对的是周一。
+
+    2026-09-13 实测把目标日写成了周日，`sector-confirmation` 于是去找一个不存在的
+    周日截面。日期解析不出来就 None，不猜。
+    """
+    payload = {
+        "trade_date": "2026-09-13",
+        "market": {"direction": "偏空", "score": 30.0},
+        "sectors": [{"name": "元件", "level": "THS_INDUSTRY", "score": 75.0}],
+        "rotation_price": {"trade_date": "20260911"},
+    }
+
+    result = build_sector_forecast(facts=payload)
+
+    assert result["target_session"] == "2026-09-14"
+    assert result["information_date"] == "2026-09-11"
+    assert build_sector_forecast(facts={**payload, "trade_date": None})["target_session"] is None

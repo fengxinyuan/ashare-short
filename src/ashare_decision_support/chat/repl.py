@@ -42,10 +42,14 @@ def run_chat(
     write(BANNER)
     if symbols:
         session.add_symbols(symbols)
-        write(f"\n正在装配 {len(symbols)} 只标的的上下文 ...")
-        session.set_facts("advice", compute_symbols(session.symbols))
-        write("已装配上下文，可以直接问趋势、买卖点、监控结果或如果跌破怎么办。")
-        write(render_facts_summary(session))
+        write(f"\n正在装配 {len(session.symbols)} 只标的的上下文 ...")
+        try:
+            session.set_facts("advice", compute_symbols(list(session.symbols)))
+        except Exception as exc:
+            write(f"初始取数失败（{type(exc).__name__}）：{str(exc)[:200]}；可用 /refresh 重试。")
+        else:
+            write("已装配上下文，可以直接问趋势、买卖点、监控结果或如果跌破怎么办。")
+            write(render_facts_summary(session))
     else:
         write("\n上下文为空，先用 /add <代码> 加入标的，或 /positions 载入持仓。")
 

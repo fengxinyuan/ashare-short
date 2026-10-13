@@ -23,7 +23,7 @@ def advice_with(client=None):
     )
 
 
-# ---- 台账 ----------------------------------------------------------------
+# 台账
 
 
 def test_the_journal_keeps_both_conclusions_not_just_the_final_one() -> None:
@@ -33,9 +33,7 @@ def test_the_journal_keeps_both_conclusions_not_just_the_final_one() -> None:
     只有现在开始记才会有。
     """
     base = advice_with()
-    alternative = next(
-        item for item in base.candidates.entries if item.price != base.entry_low
-    )
+    alternative = next(item for item in base.candidates.entries if item.price != base.entry_low)
     reply = json.dumps(
         {
             "action": "select",
@@ -99,13 +97,16 @@ def test_the_journal_keeps_deterministic_score_components() -> None:
     assert record.score_components == {"technical": 58.2, "capital_flow": 1.5}
 
 
-# ---- 统计 ----------------------------------------------------------------
+# 统计
 
 
 def outcome(overrode: bool, close_pct: float, abstained: bool = False) -> dict:
     return {
         "kind": "outcome",
         "symbol": "600519.SH",
+        "trade_date": "2026-08-17",
+        "source": "advise",
+        "sessions": 5,
         "mfe_pct": close_pct + 0.01,
         "mae_pct": -0.01,
         "close_pct": close_pct,
@@ -188,7 +189,7 @@ def test_old_records_without_an_adjudication_are_a_bucket_of_their_own() -> None
     assert buckets == {"未记录"}
 
 
-# ---- 主链路 --------------------------------------------------------------
+# 主链路
 
 
 def test_advise_puts_candidates_and_the_book_into_the_facts() -> None:
@@ -215,6 +216,10 @@ def test_advise_puts_candidates_and_the_book_into_the_facts() -> None:
     assert entry["candidates"] is not None
     assert entry["candidates"]["entries"]
     assert entry["adjudication"]["used_fallback"] is True
+    assert entry["rrr_basis"] == "entry_high_to_nearest_target"
+    assert entry["transaction_costs_included"] is False
+    assert any("已关闭个股舆情" in note for note in summary["data_notes"])
+    assert not any("个股舆情源不可用" in note for note in summary["data_notes"])
 
     # 引擎报的价必须出现在 facts 文本里，闸门才认得它。
     facts_text = json.dumps(summary["facts"], ensure_ascii=False, default=str)
@@ -260,8 +265,8 @@ def test_the_order_book_agent_reaches_the_advice_when_a_stub_is_injected() -> No
     assert "五档买盘墙" in bases
 
 
-# ---- 主链路：落台账 --------------------------------------------------------
-#
+# 主链路：落台账
+
 # 上面两节钉的是「记录格式对不对」和「统计算得对不对」，两半都绿——而**中间那根
 # 线一直是断的**：`advise` 从头到尾没引用过 `journal`，于是 `adjudication` 在生产
 # 里永远是空，`adjudication_edge` 永远返回 `available: False`。两半各自有测试、
@@ -286,6 +291,14 @@ def _run_advise(journal=None, symbols=("600519.SH",)):
         trade_date=SESSION,
         journal=journal,
     )
+
+
+def test_advice_summary_does_not_equate_levels_with_a_buy_signal() -> None:
+    summary = _run_advise()
+    assert summary["analyzed"] == 1
+    assert summary["with_levels"] == summary["advised"]
+    assert summary["risk_qualified_plans"] <= summary["with_levels"]
+    assert "不是即刻买点" in summary["count_note"]
 
 
 class _ForwardBars:
@@ -423,8 +436,8 @@ def test_hand_asked_symbols_stay_out_of_the_selection_comparison() -> None:
     assert summarize(screened + hand_asked)["samples"] == 7
 
 
-# ---- 业绩层在 advise 上的语义：提示，不移除 --------------------------------
-#
+# 业绩层在 advise 上的语义：提示，不移除
+
 # `morning` 是系统主动选票，业绩亏损直接否决；`advise` 是你点名问一只票，答案
 # 必须是「它怎么样」而不是把它藏起来。同一份裁决在两条链路上处置强度不同，
 # 这不是不一致，是「谁在提问」不同。

@@ -20,12 +20,8 @@ from ashare_decision_support.strategy.portfolio import (
 
 class _Info:
     def __init__(self, industry: str | None, concepts: tuple[str, ...]) -> None:
-        self.industries = (industry,) if industry else ()
+        self.industry = industry
         self.concepts = concepts
-
-    @property
-    def industry(self) -> str | None:
-        return self.industries[0] if self.industries else None
 
 
 class _Master:

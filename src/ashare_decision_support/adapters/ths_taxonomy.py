@@ -1,41 +1,14 @@
-"""同花顺静态分类文件：全 A 的名称、申万三级行业、概念标签。
+"""同花顺行业与概念的静态画像，保留股票和板块的对应关系。
 
-**为什么换掉 TickFlow 的 universe 分类。** 那条路能跑通是因为免费档的
-`universes.list()` 恰好带申万一级，但它有四个硬伤，全部由这份静态文件消掉：
+数据来自第三方托管的 industries.json / concepts.json，并非同花顺官方成分接口。
+行业数组的第二项与当前同花顺行业指数名称对应；只将这一项导入 industry，
+不保留大类、细分层级或提供层级切换。名称匹配不代表已核验官方成分完全一致。
 
-| | TickFlow `universes` | 这份文件 |
-|---|---|---|
-| 覆盖 | 4430 / 5528，**北交所一只都没有** | **5550 只**（SH 2280 / SZ 2837 / **BJ 337**） |
-| 层级 | 只有一级 31 个 | **一/二/三级 31 / 90 / 257** |
-| 概念 | 无 | **390 个** |
-| 冷启动 | 335 个分片 × 60 次/分钟闸门 = **约 6 分钟** | 两次 HTTP，**< 1 秒** |
-| 配额 | 吃掉 60/分钟里的 45 次 | 不占 |
+两份文件按股票代码取并集。缺少行业的股票仍保留概念，行业缺失不向其他层级
+回填。概念数量随上游变化，排序时过滤无效标签及规模过小的概念。
 
-行业一级名与申万完全一致（机械设备 602、电子 513、医药生物 500 … 银行 42、
-煤炭 34、综合 18），二三级带 `IT服务Ⅲ`、`游戏Ⅲ` 这类罗马数字后缀，是申万三级
-分类的写法。以上数字都是 2026-08-09 实测。
-
-**两个文件的覆盖不一样，所以按并集合并。** `industries.json` 5446 只、
-`concepts.json` 5550 只，且前者是后者的真子集——有 104 只（华银电力、华大智造、
-众生药业这些老票，不是新股）只在概念文件里。此前这里以行业文件为主循环，
-那 104 只**整只消失**：既不进行业板块，也不进概念板块，简报里查不到它的画像。
-行业缺失时 `industries=()`，它照样能进概念板块——**缺一个维度不该让整只票蒸发**。
-
-**这份文件每天 00:00 UTC（北京 08:00）刷新一次**（2026-08-09 实测两个文件的
-`last-modified` 都是当天 00:00:0x）。此前按「更新频率未知」按周缓存，于是概念
-成分表可以整整落后一周——而概念成分是天天变的（新题材上榜、蹭概念的票被塞进来），
-盘中板块监控读的正是这张表。所以 `MAX_AGE_DAYS = 0`：只认当天抓的。
-两次 HTTP 约 2MB，一天一次，代价可以忽略。
-
-过期的分类**外观完全正常**——新股不在里面、摘帽的还标着 ST，链路照跑不误。
-这正是 2026-08-01 那次「缺 469 只成分股却一个行业不缺」的事故形态。所以：
-
-1. 落盘带 `fetched_on`，超过 `MAX_AGE_DAYS` 天自动重取；
-2. 重取失败**继续用旧的**（分类过期比没有分类好），但把**实际年龄**写进 notes；
-3. 从来没取到过则 `ok=False`，由调用方决定回退还是中止——**不返回空分类**，
-   空分类会让下游读成「今天没有板块」。
-
-量纲与命名：`symbol` 一律过 `normalize_symbol`，与台账、持仓表同一口径。
+缓存默认每天刷新一次，读取旧版本时投影为单个行业。刷新失败可继续用旧缓存
+并记录年龄；无可用缓存则标记不可用，由板块调用方明确报错。
 """
 
 from __future__ import annotations
@@ -54,13 +27,7 @@ from ashare_decision_support.schedule.timezone import beijing_today
 from ashare_decision_support.state.paths import state_home
 from ashare_decision_support.symbols import normalize_symbol
 
-# 这份静态分类的地址与两个文件名。**同一台主机上的同两个文件还被
-# `adapters/security_master.py` 读一遍**（它取的是同两份 JSON 里的名称与标签，
-# 做的是标的画像，不是板块分类），所以那边从这里 import，不再写第二份。
-#
-# 这是「改一处而漏了另一处不会报错」的那一类：上游换个文件名或换台机器，只改一边
-# 的话另一边照样能跑——它只会继续对着旧地址取，直到某天两个模块对同一只票的行业
-# 给出不同答案，而中间没有任何一步会失败。
+# 分类与 SecurityMaster 共用相同端点，保证板块和标的画像来自同一份快照。
 BASE_URL = "https://files.688798.xyz/ths/"
 INDUSTRY_FILE = "industries.json"
 CONCEPT_FILE = "concepts.json"
@@ -69,70 +36,76 @@ TIMEOUT_SECONDS = 30
 
 CACHE_DIR_NAME = "taxonomy"
 CACHE_NAME = "ths_profiles.json"
-# 只有走完整性检查的结果才配带这个戳，读取时无戳即重建。沿用
-# `sectors/taxonomy.py:TAXONOMY_SCHEMA` 的做法。
-CACHE_SCHEMA = "ths-profiles-v1"
+# 新版本只保存一个行业；旧版本的数组仅在读取时转换。
+CACHE_SCHEMA = "ths-profiles-v2"
+LEGACY_CACHE_SCHEMA = "ths-profiles-v1"
 
-# 超过这个天数自动重取。取 0 是因为**上游每天 00:00 UTC 刷新一次**（实测），
-# 也就是「只认当天抓的」。此前取 7 天，理由是「新股上市、ST 摘帽、行业调整都是
-# 周级别的事件」——那对行业分类成立，对概念分类不成立：概念成分表天天变，而盘中
-# 板块监控就读它。重取失败仍然回落到旧缓存并报出年龄，所以激进一点没有下行风险。
+# 只将当天快照视为新鲜；刷新失败可回退旧缓存并说明年龄。
 MAX_AGE_DAYS = 0
-
-# 行业层级名。对外沿用 SW1/SW2/SW3，因为 `--level` 参数、缓存文件名和台账字段
-# 已经在用这套写法；一级名与申万逐字一致，二三级的申万对应关系**未逐条核对**。
-LEVELS: dict[str, int] = {"SW1": 0, "SW2": 1, "SW3": 2}
 
 # 概念里**不是主题**的那些标签。它们混进板块排序是纯噪声——一只票属于「融资融券」
 # 说明的是它的交易资格，不是它今天为什么涨。
-#
+
 # 分两类，都按**精确名**匹配而不是子串：`一体化压铸`、`光伏建筑一体化` 是真主题，
 # 子串匹配 `一体化` 会把它们一起误杀。
-_MECHANISM_TAGS = frozenset({
-    # 交易机制与资格
-    "融资融券", "深股通", "沪股通", "同花顺果指数",
-    # 上市阶段与状态
-    "ST板块", "摘帽", "新股与次新股", "注册制次新股", "科创次新股",
-})
-_SLOGAN_TAGS = frozenset({
-    # 区域与政策口号。它们的成分股是按注册地或政策文件圈的，不按业务共振，
-    # 所以「这个板块今天强」在它们身上没有可解释的含义。
-    "国企改革", "央企国企改革", "上海国企改革", "深圳国企改革",
-    "一带一路", "西部大开发", "乡村振兴", "新疆振兴",
-    "粤港澳大湾区", "京津冀一体化", "长三角一体化", "新型城镇化", "新型工业化",
-    "海峡两岸", "自由贸易港", "专精特新",
-    "上海自贸区", "天津自贸区", "广东自贸区", "福建自贸区", "海南自贸区",
-    "黑龙江自贸区", "中韩自贸区",
-})
+_MECHANISM_TAGS = frozenset(
+    {
+        # 交易机制与资格
+        "融资融券",
+        "深股通",
+        "沪股通",
+        "同花顺果指数",
+        # 上市阶段与状态
+        "ST板块",
+        "摘帽",
+        "新股与次新股",
+        "注册制次新股",
+        "科创次新股",
+    }
+)
+_SLOGAN_TAGS = frozenset(
+    {
+        # 区域与政策口号。它们的成分股是按注册地或政策文件圈的，不按业务共振，
+        # 所以「这个板块今天强」在它们身上没有可解释的含义。
+        "国企改革",
+        "央企国企改革",
+        "上海国企改革",
+        "深圳国企改革",
+        "一带一路",
+        "西部大开发",
+        "乡村振兴",
+        "新疆振兴",
+        "粤港澳大湾区",
+        "京津冀一体化",
+        "长三角一体化",
+        "新型城镇化",
+        "新型工业化",
+        "海峡两岸",
+        "自由贸易港",
+        "专精特新",
+        "上海自贸区",
+        "天津自贸区",
+        "广东自贸区",
+        "福建自贸区",
+        "海南自贸区",
+        "黑龙江自贸区",
+        "中韩自贸区",
+    }
+)
 CONCEPT_BLOCKLIST = _MECHANISM_TAGS | _SLOGAN_TAGS
 
 # 带年份的财报事件标签（`2026中报预增`、`2026一季报预增`）。它们每年换名，
 # 写进黑名单会年年失效，所以按模式挡。
 _DATED_EVENT = re.compile(r"^20\d{2}(年)?(一季报|中报|三季报|年报|季报)")
 
-# 上游漏出来的空值。2026-08-09 实测 `concepts.json` 里有 4 只票带着一个字面量
-# 叫 `nan` 的「概念」——那是源头某一步把 NaN 直接字符串化了。它此前靠规模下限
-# 被顺带挡住，但那是巧合而不是判断：下限一放宽它就会变成一个板块名。
+# 排除上游将空值字符串化后产生的伪概念。
 _NULL_TAGS = frozenset({"nan", "NaN", "None", "null", "-", "--"})
 
 # 概念规模下限。少于这么多成分股，中位数由个别票决定，排名翻上翻下全是噪声。
 # 只是**不进板块排序**，标签仍然留在 `SymbolProfile.concepts` 上照常印进简报。
 CONCEPT_MIN_SIZE = 15
 
-# **没有上限。** 此前是 400，理由写的是「太大的概念不是轮动单位——『人工智能』
-# 1069 只，它涨说明的是大盘涨」。那个担心是真的，但用成分股只数当判据是它的
-# 粗糙代理，而且代价极高：2026-08-09 实测被 400 挡掉的 32 个概念，恰好是超短的
-# 全部主战场——
-#
-#   机器人概念1215、人工智能1083、新能源汽车1061、华为概念1003、芯片概念911、
-#   储能894、DeepSeek概念769、数据中心(AIDC)650、AI应用527、商业航天503、
-#   低空经济498、无人机463、人形机器人461、AI智能体453、东数西算409 …
-#
-# 也就是说「监控机器人板块有没有异动」这件事，在旧闸门下**结构上不可能实现**。
-#
-# 精确的判据是**超额涨幅**（板块中位涨幅 − 全市场中位涨幅，见
-# `sectors/intraday.py`）：占市场 20% 的「人工智能」跟着大盘涨时超额≈0，自己
-# 排不上去；只有真的整体异动才拉得开。同一个担心，量出来而不是猜出来。
+# 概念不设规模上限；盘中按超额涨幅排名，避免用成分数量代替实际强弱。
 
 
 @dataclass(frozen=True)
@@ -141,29 +114,14 @@ class SymbolProfile:
 
     symbol: str
     name: str
-    industries: tuple[str, ...] = ()   # (一级, 二级, 三级)，可能短于 3
+    industry: str | None = None
     concepts: tuple[str, ...] = ()
 
-    def industry(self, level: str = "SW1") -> str | None:
-        index = LEVELS.get(level)
-        if index is None or index >= len(self.industries):
-            return None
-        return self.industries[index] or None
-
-    @property
-    def industry_path(self) -> str:
-        """`计算机·软件开发·横向通用软件`，给简报直接印。"""
-        return "·".join(item for item in self.industries if item)
-
     def describe(self, max_concepts: int = 3) -> str:
-        """`奥拓电子｜计算机·软件开发·横向通用软件｜AI应用、算力租赁`。
-
-        候选表里此前只有一个裸代码 `300588.SZ`——读的人认不出这是什么公司、
-        属于哪条线，于是整份排序看起来像是凭空来的。
-        """
+        """将证券名称、行业与概念标签组合成一行。"""
         parts = [self.name or self.symbol]
-        if self.industry_path:
-            parts.append(self.industry_path)
+        if self.industry:
+            parts.append(self.industry)
         tradable = [item for item in self.concepts if is_tradable_concept(item)]
         if tradable:
             parts.append("、".join(tradable[:max_concepts]))
@@ -195,13 +153,11 @@ class ThsTaxonomySnapshot:
     def names(self) -> dict[str, str]:
         return {symbol: profile.name for symbol, profile in self.profiles.items() if profile.name}
 
-    def industry_groups(self, level: str = "SW1") -> dict[str, list[str]]:
-        """行业名 → 成分股。层级不存在时返回空 dict。"""
-        if level not in LEVELS:
-            return {}
+    def industry_groups(self) -> dict[str, list[str]]:
+        """同花顺行业名 → 成分股；未知归属保持缺失。"""
         groups: dict[str, list[str]] = {}
         for symbol, profile in self.profiles.items():
-            name = profile.industry(level)
+            name = profile.industry
             if name:
                 groups.setdefault(name, []).append(symbol)
         return groups
@@ -218,7 +174,9 @@ class ThsTaxonomySnapshot:
     def coverage_note(self) -> str:
         markets: dict[str, int] = {}
         for symbol in self.profiles:
-            markets[symbol.partition(".")[2] or "?"] = markets.get(symbol.partition(".")[2] or "?", 0) + 1
+            markets[symbol.partition(".")[2] or "?"] = (
+                markets.get(symbol.partition(".")[2] or "?", 0) + 1
+            )
         breakdown = " / ".join(f"{market} {count}" for market, count in sorted(markets.items()))
         source = "缓存" if self.from_cache else "远端"
         return (
@@ -255,12 +213,10 @@ class ThsTaxonomySource:
         self._opener = opener or urllib.request.urlopen
         self.timeout = timeout
         self.max_age_days = max_age_days
-        # 行业与概念 taxonomy 共用同一个 source。磁盘缓存解决跨任务重复下载；
-        # 这一层解决同一任务内连续 `load()` 两次仍重复读盘/出网的问题，并保证
-        # 两个维度看到的是同一份快照。
+        # 行业与概念共用任务内快照，避免重复读取，并保证两个维度一致。
         self._loaded: ThsTaxonomySnapshot | None = None
 
-    # ---- public ----------------------------------------------------------
+    # public
 
     def load(self, force_refresh: bool = False) -> ThsTaxonomySnapshot:
         """缓存够新就用缓存，否则重取；重取失败继续用旧的并报出年龄。"""
@@ -298,7 +254,7 @@ class ThsTaxonomySource:
         )
         return self._loaded
 
-    # ---- io --------------------------------------------------------------
+    # io
 
     def _fetch(self) -> tuple[ThsTaxonomySnapshot | None, list[str]]:
         """行业文件是必需的，概念文件缺了只降级。
@@ -329,7 +285,7 @@ class ThsTaxonomySource:
                 # 两份文件都带名字，取先有的那个——它们实测一致，不一致时行业
                 # 文件优先，因为板块链路的其余部分都以它为准。
                 name=industry_name or concept_name,
-                industries=industry_tags,
+                industry=industry_from_path(industry_tags),
                 concepts=concept_tags,
             )
 
@@ -360,7 +316,9 @@ class ThsTaxonomySource:
     def _get_json(self, filename: str, errors: list[str]) -> Any:
         try:
             payload = fetch_text(
-                self._opener, f"{self.base_url}{filename}", timeout=self.timeout,
+                self._opener,
+                f"{self.base_url}{filename}",
+                timeout=self.timeout,
                 user_agent=BROWSER_USER_AGENT,
             )
             return json.loads(payload)
@@ -368,14 +326,16 @@ class ThsTaxonomySource:
             errors.append(f"{filename}: {type(exc).__name__}")
             return None
 
-    # ---- cache -----------------------------------------------------------
+    # cache
 
     def _cache_path(self) -> Path:
         root = self._cache_dir if self._cache_dir is not None else state_home() / CACHE_DIR_NAME
         return root / CACHE_NAME
 
     def _read_cache(self) -> ThsTaxonomySnapshot | None:
-        payload = read_stamped(self._cache_path(), CACHE_SCHEMA)
+        payload = read_stamped(self._cache_path(), CACHE_SCHEMA) or read_stamped(
+            self._cache_path(), LEGACY_CACHE_SCHEMA
+        )
         if payload is None:
             return None
         rows = payload.get("profiles")
@@ -392,7 +352,11 @@ class ThsTaxonomySource:
             profiles[symbol] = SymbolProfile(
                 symbol=symbol,
                 name=str(row.get("name") or ""),
-                industries=tuple(str(item) for item in row.get("industries") or []),
+                industry=(
+                    industry_from_path(row.get("industries"))
+                    if payload.get("schema") == LEGACY_CACHE_SCHEMA
+                    else normalize_industry(row.get("industry"))
+                ),
                 concepts=tuple(str(item) for item in row.get("concepts") or []),
             )
         if not profiles:
@@ -414,7 +378,7 @@ class ThsTaxonomySource:
                     {
                         "symbol": profile.symbol,
                         "name": profile.name,
-                        "industries": list(profile.industries),
+                        "industry": profile.industry,
                         "concepts": list(profile.concepts),
                     }
                     for profile in snapshot.profiles.values()
@@ -437,11 +401,32 @@ def _index_rows(rows: Any, tag_key: str) -> dict[str, tuple[str, tuple[str, ...]
         symbol = normalize_symbol(str(row.get("symbol") or ""))
         if not symbol:
             continue
-        tags = tuple(
-            str(item).strip() for item in (row.get(tag_key) or []) if str(item).strip()
+        values = row.get(tag_key)
+        tags = (
+            tuple(item.strip() if isinstance(item, str) else "" for item in values)
+            if isinstance(values, list)
+            else ()
         )
+        if tag_key == "concepts":
+            tags = tuple(item for item in tags if item)
         out[symbol] = (str(row.get("name") or "").strip(), tags)
     return out
+
+
+def industry_from_path(values: Any) -> str | None:
+    """导入旧画像及上游数组中的同花顺行业；不把大类或细分名补成行业。
+
+    静态文件的第二项与同花顺行业指数名称对应。保留空项的位置，避免缺字段时
+    将第三级细分误当成行业。其余层级只在导入边界出现，不进入新的分类画像。
+    """
+    if not isinstance(values, (list, tuple)) or len(values) < 2:
+        return None
+    return normalize_industry(values[1])
+
+
+def normalize_industry(value: Any) -> str | None:
+    name = value.strip() if isinstance(value, str) else ""
+    return name if name and name not in _NULL_TAGS else None
 
 
 def _is_fresh(snapshot: ThsTaxonomySnapshot, max_age_days: int) -> bool:

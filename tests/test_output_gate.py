@@ -11,10 +11,10 @@ import json
 
 from ashare_decision_support.agents.debate import DebatePanel
 from ashare_decision_support.chat.session import ChatResponder, ChatSession
-from ashare_decision_support.factcheck import OutputGuard, prose_violations
+from ashare_decision_support.factcheck import OutputGuard, prose_violations, review_output
 from ashare_decision_support.writer import LlmBriefWriter, WriteRequest
 
-# ---- 第二条：措辞 ----------------------------------------------------------
+# 第二条：措辞
 
 
 def test_probability_words_are_blocked() -> None:
@@ -34,9 +34,32 @@ def test_the_systems_own_disclaimer_passes() -> None:
     assert prose_violations("系统不产出概率、胜率、预期收益率：没有拟合模型能支撑它们。") == []
     assert prose_violations("情景之间只有触发条件，没有概率。") == []
     assert prose_violations("setup_rank 只用于同一策略内排序，不是胜率、概率或预期收益率。") == []
+    assert prose_violations("评分不代表上涨概率，也不等于胜率。") == []
 
 
-# ---- 第三条：立场 ----------------------------------------------------------
+def test_model_cannot_move_a_price_to_another_named_stock() -> None:
+    facts = json.dumps(
+        {
+            "贵州茅台": {"last_price": 1400.0},
+            "平安银行": {"last_price": 11.8},
+        },
+        ensure_ascii=False,
+    )
+
+    assert not review_output("贵州茅台现价 11.8 元", facts).ok
+    assert review_output("贵州茅台现价 1400 元", facts).ok
+
+
+def test_model_cannot_add_unverified_wait_or_large_order_trigger() -> None:
+    facts = json.dumps({"sell_condition": "跌破止损位立即减仓", "count": 3}, ensure_ascii=False)
+
+    assert not review_output("跌破止损位后等待 3 分钟再卖出", facts).ok
+    assert not review_output("出现连续 3 笔万手买单才进场", facts).ok
+    grounded = json.dumps({"sell_condition": "跌破后等待3分钟再卖出"}, ensure_ascii=False)
+    assert review_output("跌破后等待 3 分钟再卖出", grounded).ok
+
+
+# 第三条：立场
 
 
 def test_freezing_cycle_blocks_any_entry_wording() -> None:
@@ -82,7 +105,9 @@ def test_guard_without_readings_judges_nothing() -> None:
 def test_guard_reads_all_three_fact_shapes() -> None:
     """三条链路各写各的事实，尺子必须都认得。"""
     assert OutputGuard.from_facts({"regime_position_cap": 0.5}).position_cap == 0.5
-    assert OutputGuard.from_facts({"regime": {"position_cap": 0.4, "cycle": "高潮"}}).cycle == "高潮"
+    assert (
+        OutputGuard.from_facts({"regime": {"position_cap": 0.4, "cycle": "高潮"}}).cycle == "高潮"
+    )
     assert OutputGuard.from_facts({"position_factor": 0.68}).position_cap == 0.68
 
 
@@ -101,7 +126,7 @@ def test_guard_reads_the_chinese_keys_the_deep_path_uses() -> None:
     ]
 
 
-# ---- 四个调用点：越界的整段丢弃 --------------------------------------------
+# 四个调用点：越界的整段丢弃
 
 
 class _FixedClient:

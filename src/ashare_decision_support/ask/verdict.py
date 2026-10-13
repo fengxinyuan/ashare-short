@@ -1,29 +1,8 @@
-"""规则算出来的**决策卡**：一只票一张，只有四种内容。
+"""规则决策卡：结论标签、触发条件、失效条件和阻断项。
 
-你说输出「没有重点、比较混乱、没有实质性的建议组织」。根源不在措辞，在结构：
-一份把所有块平铺出来的上下文，读的人（和模型）没办法知道哪一条改变行动、哪一条
-只是背景。加长度不会解决它，只会让它更长。
-
-所以先在**规则层**把每只票压成一张卡：
-
-| 卡上的东西 | 是什么 | 谁产生 |
-|---|---|---|
-| 结论标签 | 可执行 / 需确认 / 不成立 | 规则 |
-| 触发条件 | 还差什么才算成立 | 规则 |
-| 失效条件 | 什么发生就说明这次错了 | 规则 |
-| 阻断项 | 此刻做不成、或者不该做的硬理由 | 规则 |
-
-**三个标签的判据全部写死在这里，不经过模型。** 模型只解释这张卡；解释被数字闸门
-丢掉的时候，卡还在。这就是「有重点」和「可丢弃」能同时成立的原因——原来那条路
-是一次调用产出整个答案，一个编造的数字下去，三只票十五个小节一起消失。
-
-排序同理，`rank` 是确定性函数。让模型排序等于让它在没有拟合模型的前提下给相对
-强弱，那正是这套系统一直拒绝提供的东西（`docs/SOLUTION.md` §七）。模型能做的是
-解释已经排好的顺序，以及指出第一名和最后一名的差别落在哪个读数上。
-
-**卡本身要进 facts 再交给模型**（`plan.py` 就是这么装的）。理由和
-`jobs/advise.py:_facts` 把候选集放进去是同一条：数字闸门比对的就是那份 facts，
-卡上的止损距离若不在里面，模型引用它反而会被判成编造。
+标签与排序由确定性规则产生，模型只解释已有结果。卡片经 plan.py 放进 facts，
+其中的价位与距离进入数字校验；模型论证越界时仍保留规则卡。
+能力边界见 docs/ARCHITECTURE.md。
 """
 
 from __future__ import annotations
@@ -31,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ashare_decision_support.numeric import finite
+from ashare_decision_support.advice.engine import MIN_RRR, meets_min_rrr, risk_reward
+from ashare_decision_support.numeric import finite, positive
 
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
@@ -45,10 +25,6 @@ LABEL_BLOCKED = "不成立"
 #   卖出侧  可执行＝止损或目标条件**已经触发**；需确认＝还没到；不成立＝此刻卖不出
 LABEL_ORDER = {LABEL_ACTIONABLE: 0, LABEL_CONFIRM: 1, LABEL_BLOCKED: 2}
 
-# 盈亏比门槛。和 `advice/engine.py` 里那条「不满足超短线最低要求」的警告同一个数，
-# 写成常量是为了让两处一起改——它是人工设定、未经回测的，见 `docs/SOLUTION.md` §七。
-MIN_RRR = 1.5
-
 
 @dataclass
 class Decision:
@@ -57,6 +33,7 @@ class Decision:
 
     symbol: str
     name: str | None = None
+    playbook: str | None = None
     side: str = SIDE_BUY
     label: str = LABEL_BLOCKED
     score: float | None = None
@@ -98,13 +75,12 @@ class Decision:
         return {
             "symbol": self.symbol,
             "名称": self.name,
+            "打法": self.playbook,
             "方向": "卖出侧" if self.side == SIDE_SELL else "买入侧",
             "结论": self.label,
             "评分": self.score,
             "现价": self.last_price,
-            "买入带": [self.entry_low, self.entry_high]
-            if self.entry_low is not None
-            else None,
+            "买入带": [self.entry_low, self.entry_high] if self.entry_low is not None else None,
             "止损": self.stop,
             "止损距离": self.stop_distance_pct,
             "目标": self.targets,
@@ -124,15 +100,23 @@ def assess(payload: dict[str, Any], holding: dict[str, Any] | None = None) -> De
     没持仓时该盯买点、已持仓时该盯卖点，两套判断的输入和紧急程度本来就不同。
     """
     payload = payload or {}
+    raw_targets = payload.get("targets") or []
+    targets = (
+        [positive(value) for value in raw_targets]
+        if isinstance(raw_targets, (list, tuple))
+        else [None]
+    )
+    invalid_targets = any(value is None for value in targets)
     decision = Decision(
         symbol=str(payload.get("symbol") or ""),
         name=payload.get("name"),
+        playbook=payload.get("playbook"),
         score=finite(payload.get("score")),
         last_price=finite(payload.get("last_price")),
         entry_low=finite(payload.get("entry_low")),
         entry_high=finite(payload.get("entry_high")),
         stop=finite(payload.get("stop")),
-        targets=[value for value in (finite(t) for t in payload.get("targets") or []) if value],
+        targets=[value for value in targets if value is not None],
         rrr=finite(payload.get("rrr")),
     )
     intraday = payload.get("intraday") or {}
@@ -149,7 +133,11 @@ def assess(payload: dict[str, Any], holding: dict[str, Any] | None = None) -> De
     if holding and finite(holding.get("cost_price")):
         _sell_side(decision, holding, book)
     else:
-        _buy_side(decision, book)
+        if invalid_targets:
+            decision.blockers.append("目标价包含无效值，无法核对最近的兑现位置")
+        # 缓存中的比值可能来自旧价位或只按下沿计算，必须核对当前这组价位。
+        decision.rrr = None if invalid_targets else risk_reward(decision)
+        _buy_side(decision, book, intraday)
     return decision
 
 
@@ -246,17 +234,18 @@ def summarise(decisions: list[Decision]) -> str:
     return f"共 {len(decisions)} 只：{body}"
 
 
-# ---- 买入侧 ---------------------------------------------------------------
+# 买入侧
 
 
-def _buy_side(decision: Decision, book: dict[str, Any]) -> None:
+def _buy_side(decision: Decision, book: dict[str, Any], intraday: dict[str, Any]) -> None:
     last, low, high = decision.last_price, decision.entry_low, decision.entry_high
+    breakout = decision.playbook == "突破"
 
     if decision.stop is not None:
         decision.invalidations.append(
             f"跌破止损 {decision.stop}：买入依据消失，按纪律离场，不临场改止损"
         )
-    if low is not None and last is not None and last < low:
+    if not breakout and low is not None and last is not None and last < low:
         # 低开/急跌落到买入带下方。这**不是**更便宜的买点：回踩带被跌穿，
         # 说明当初画这条带的依据已经不在了。`advice/candidates.py` 里对同一
         # 情形的措辞是「这不是低吸位而是失守位」，两处必须说同一件事。
@@ -268,26 +257,30 @@ def _buy_side(decision: Decision, book: dict[str, Any]) -> None:
         decision.label = LABEL_BLOCKED
         return
 
+    if last is None:
+        decision.blockers.append("拿不到现价，无法确认是否进入买入带")
+        decision.label = LABEL_BLOCKED
+        return
+
     if low is None or high is None or decision.stop is None:
         decision.blockers.append("没有可用的买入位或止损位，给不出可执行的动作")
         decision.label = LABEL_BLOCKED
         return
+    if low <= 0 or high < low or decision.stop >= low:
+        decision.blockers.append("买入带或止损位结构无效，无法形成正向风险空间")
+        decision.label = LABEL_BLOCKED
+        return
 
-    ready = True
-    if last is not None and last > high:
-        decision.triggers.append(f"回落进买入带 {low}–{high}（现价 {last} 在上沿之上）")
+    ready = _entry_price_ready(decision, last, low, high, breakout)
+    if breakout and (finite(intraday.get("volume_ratio")) or 0.0) < 1.0:
+        decision.triggers.append("突破还需分钟量能达到前 5 日同期均量，当前未确认")
         ready = False
-    elif last is not None and last < low:
-        decision.triggers.append(f"重新站回 {low} 之上并出现止跌形态，才谈得上接")
-        ready = False
-    else:
-        decision.triggers.append(f"现价已在买入带 {low}–{high} 内")
-
-    if decision.rrr is None:
+    ratio = risk_reward(decision, rounded=False)
+    if ratio is None:
         decision.triggers.append("上方无参照位，盈亏比算不出来——没有兑现点的仓位不成立")
         ready = False
-    elif decision.rrr < MIN_RRR:
-        decision.triggers.append(f"盈亏比 {decision.rrr} 低于 {MIN_RRR}，不满足最低要求")
+    elif not meets_min_rrr(ratio):
+        decision.triggers.append(f"按买入区间上沿盈亏比 {ratio:.4f} 低于 {MIN_RRR}，不满足最低要求")
         ready = False
 
     if not _tradable_now(book):
@@ -299,7 +292,28 @@ def _buy_side(decision: Decision, book: dict[str, Any]) -> None:
     decision.label = LABEL_ACTIONABLE if ready else LABEL_CONFIRM
 
 
-# ---- 卖出侧 ---------------------------------------------------------------
+def _entry_price_ready(
+    decision: Decision, last: float, low: float, high: float, breakout: bool
+) -> bool:
+    if breakout and last < low:
+        decision.triggers.append(f"放量站上突破触发价 {low} 后重新核对目标与止损")
+        return False
+    if breakout and last > high:
+        decision.triggers.append(f"现价 {last} 已越过突破触发价 {high}，需核对追价后的盈亏比")
+        return False
+    if last > high:
+        decision.triggers.append(f"回落进买入带 {low}–{high}（现价 {last} 在上沿之上）")
+        return False
+    if last < low:
+        decision.triggers.append(f"重新站回 {low} 之上并出现止跌形态，才谈得上接")
+        return False
+    decision.triggers.append(
+        f"现价已到突破触发价 {low}" if breakout else f"现价已在买入带 {low}–{high} 内"
+    )
+    return True
+
+
+# 卖出侧
 
 
 def _sell_side(decision: Decision, holding: dict[str, Any], book: dict[str, Any]) -> None:
@@ -367,11 +381,14 @@ def _sell_side(decision: Decision, holding: dict[str, Any], book: dict[str, Any]
     decision.label = LABEL_ACTIONABLE if triggered else LABEL_CONFIRM
 
 
-# ---- 读数与阻断 -----------------------------------------------------------
+# 读数与阻断
 
 
 def _blockers(payload: dict, adjudication: dict) -> list[str]:
     blockers: list[str] = []
+    setup = payload.get("setup")
+    if isinstance(setup, dict) and not setup.get("matched"):
+        blockers.append("今日没有通过任何入场打法，价位只能作为观察参考")
     for warning in payload.get("warnings") or []:
         text = str(warning)
         # 风险筛除与模型弃权在 `advise` 里就是靠这两个前缀标出来的，这里沿用，

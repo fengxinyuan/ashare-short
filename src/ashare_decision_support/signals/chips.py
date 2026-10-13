@@ -1,42 +1,8 @@
-"""筹码分布估算：换手衰减法。
+"""以日线 OHLCV 和流通股本估算换手衰减筹码分布。
 
-`docs/DATA_SOURCES.md` §十一记录的结论是：生产链路里**没有真实筹码数据源**：
-TickFlow 无 chip/cost/winner 接口，东财 CYQ（`akshare.stock_cyq_em`）在本机
-`RemoteDisconnected`（2026-08-04 复测仍然如此，与 `push2` 被出口代理拒绝同因），
-同花顺没有个股筹码接口。
-
-但那份文档漏掉了一条路：**这个分布可以自己算，输入只要日线 OHLCV + 流通股本，
-两样今天都有。** 算法是通达信 CYQ 的公开做法：
-
-```text
-逐日：t = 当日换手率 = 成交量 / 流通股本
-      chips *= (1 - t)                      老筹码按换手率衰减
-      chips[当日价格区间] += total * t       今日成交成为新筹码，按分布假设铺开
-```
-
-派生 `avg_cost`（加权平均成本）、`winner_ratio`（获利盘比例）、`concentration_90`
-（90% 筹码的价格区间宽度）。
-
-## 它和真实筹码差在哪
-
-差在**分布假设**，不在算法本体。真实 CYQ 用更精细的日内分布（甚至逐笔），这里用
-三角分布（低点→均价→高点线性升降）。所以：
-
-- 命名一律 `chip_*_est`，简报里写「**估算**筹码分布（换手衰减法）」；
-- **永远不和 `signals/dipbuy.py` 的 `turnover_cost_15/30` 混用一个字段名。**
-  三个数三个名字：`chip_avg_cost_est`（这里）/ `chip_avg_cost`（真实源，尚无）/
-  `turnover_cost_30`（成交成本代理）。混用一个名字，事后没有任何办法查出某个数
-  当时是从哪来的。
-
-## 为什么这条路值得先做
-
-它零外部依赖、不受本机网络策略影响、可以逐日回算（因此可回测、可进台账），而且
-「分布之和恒等于 1」是一条能写成测试的守恒律——真实筹码源给不了这个保证。
-
-## 阈值
-
-价格网格取 `GRID_SIZE` 档。太少会让 `avg_cost` 量化到几个离散值上，太多在 240 根
-日线上纯属浪费。`concentration_90` 用的是 5%–95% 分位区间宽度除以现价。
+每日按换手率衰减旧筹码，再将新增成交按低点、均价、高点的三角分布铺开。
+输出平均成本、获利盘比例和集中度；集中度为 5%–95% 价格区间宽度 / 现价。
+字段使用 chip_*_est，与真实筹码和 turnover_cost 成交成本代理分别标识。
 """
 
 from __future__ import annotations
@@ -97,9 +63,7 @@ class ChipDistributionEstimate:
         return lines
 
 
-def estimate_chips(
-    bars: list[dict], float_shares: float | None = None
-) -> ChipDistributionEstimate:
+def estimate_chips(bars: list[dict], float_shares: float | None = None) -> ChipDistributionEstimate:
     """从前复权日线 + 流通股本估算筹码分布。
 
     `float_shares` 缺失时**整体弃权**：没有流通股本就没有换手率，没有换手率就没有
@@ -156,17 +120,13 @@ def estimate_chips(
     weights = [value / total for value in chips]
     last_close = rows[-1]["close"]
     average = sum(price * weight for price, weight in zip(grid, weights, strict=True))
-    winner = sum(
-        weight for price, weight in zip(grid, weights, strict=True) if price <= last_close
-    )
+    winner = sum(weight for price, weight in zip(grid, weights, strict=True) if price <= last_close)
 
     return ChipDistributionEstimate(
         chip_avg_cost_est=round(average, 4),
         chip_winner_ratio_est=round(winner, 4),
         chip_concentration_90_est=_concentration(grid, weights, last_close),
-        dist_to_chip_avg_est=(
-            round(last_close / average - 1.0, 6) if average > 0 else None
-        ),
+        dist_to_chip_avg_est=(round(last_close / average - 1.0, 6) if average > 0 else None),
         bars_used=len(rows),
     )
 
@@ -174,21 +134,9 @@ def estimate_chips(
 def _deposit(
     chips: list[float], grid: list[float], step: float, row: dict, turnover: float
 ) -> tuple[int, int]:
-    """把当日成交按**三角分布**铺在 low..high 之间，峰值在均价。
+    """按三角分布将当日成交铺在 low..high，峰值在均价。
 
-    返回**实际写到的下标区间** `(low_index, high_index)`，一档都没写到时返回一个
-    空区间（`low > high`）。调用方靠它维护「哪一段可能非零」，从而不必每根都去
-    衰减那些精确为 0.0 的档。
-
-    三角而不是均匀：一天的成交并不平均分布在最高最低之间，靠近均价的价位成交
-    最密集。这是这套估算与真实 CYQ 唯一的实质差别，写在这里而不是文档里，是因为
-    换掉它就是换掉整份分布的形状。
-
-    **只扫 low..high 覆盖的那几档，不扫整条网格。** 网格铺的是 240 根日线的全幅
-    （实测常见 2–4 倍价差），而单根 K 线的振幅通常在 2% 上下——200 档里真正落进
-    区间的往往不到 10 档，其余 190 多档此前每根都要走一遍「比较 → append(0.0)」，
-    再被 `sum` 和 `enumerate` 各扫一遍。实测这一处占整个 `analyze_universe` 的
-    近一半时间，改成按下标切片后同一批输入**逐位完全相同**（差值 0.0），快 3.4 倍。
+    只扫描该价格区间覆盖的档位，返回实际写入的下标区间；low_index > high_index 表示空区间。
     """
     low, high, peak = row["low"], row["high"], row["vwap"]
     if high <= low:
@@ -228,9 +176,7 @@ def _deposit(
     return indices[0], indices[-1]
 
 
-def _concentration(
-    grid: list[float], weights: list[float], last_close: float
-) -> float | None:
+def _concentration(grid: list[float], weights: list[float], last_close: float) -> float | None:
     """90% 筹码所在价格区间的宽度，除以现价。越小越集中。"""
     if last_close <= 0:
         return None
@@ -268,14 +214,12 @@ def _usable(bars: list[dict]) -> list[dict]:
             continue
         if low <= 0 or high <= 0 or close <= 0:
             continue
-        # 浮点卫生：复权后 high < low 的倒挂实测占 9.33%（`docs/DATA_SOURCES.md` §五）。
+        # 浮点卫生：复权后 high < low 的倒挂实测占 9.33%（`docs/DATA_SOURCES.md` 的“字段口径”）。
         if high < low:
             low, high = high, low
         vwap = amount / volume if amount and volume else close
         # VWAP 落在当根区间外说明量纲或成交额有问题，退回收盘价而不是信它。
         if not (low <= vwap <= high):
             vwap = close
-        rows.append(
-            {"low": low, "high": high, "close": close, "vwap": vwap, "volume": volume}
-        )
+        rows.append({"low": low, "high": high, "close": close, "vwap": vwap, "volume": volume})
     return rows

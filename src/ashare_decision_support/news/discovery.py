@@ -69,9 +69,7 @@ def rank_news_targets(
         ret_5d = metric.ret_5d or 0.0
         breadth = metric.breadth or 0.0
         volume_ratio = metric.volume_ratio or 0.0
-        money_ratio = (
-            inflow.get(definition.name, 0.0) / inflow_scale if inflow_scale else 0.0
-        )
+        money_ratio = inflow.get(definition.name, 0.0) / inflow_scale if inflow_scale else 0.0
 
         score = 0.0
         reasons: list[str] = []
@@ -124,9 +122,7 @@ def sector_doc_counts(
 ) -> dict[str, int]:
     """Count current documents matching each sector's recall vocabulary."""
     counts = {definition.name: 0 for definition in definitions}
-    terms_by_sector = {
-        definition.name: sector_terms(definition.name) for definition in definitions
-    }
+    terms_by_sector = {definition.name: sector_terms(definition.name) for definition in definitions}
     for doc in docs:
         text = doc.text
         if not text:
@@ -143,16 +139,13 @@ def sector_coverage_snapshot(
     docs: list[NewsDoc],
 ) -> dict[str, dict[str, Any]]:
     """Diagnose whether price strength and news coverage agree."""
-    terms_by_sector = {
-        definition.name: sector_terms(definition.name) for definition in definitions
-    }
+    terms_by_sector = {definition.name: sector_terms(definition.name) for definition in definitions}
     snapshot: dict[str, dict[str, Any]] = {}
     for definition in definitions:
         matched = [
             doc
             for doc in docs
-            if doc.text
-            and any(term in doc.text for term in terms_by_sector[definition.name])
+            if doc.text and any(term in doc.text for term in terms_by_sector[definition.name])
         ]
         metric = metrics.get(definition.name)
         ret_5d = metric.ret_5d if metric is not None else None

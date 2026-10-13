@@ -1,49 +1,9 @@
-"""盘中板块截面：把全市场实时行情按行业与概念归并，回答「此刻资金在哪」。
+"""按行业与概念聚合全市场实时行情，生成盘中板块截面。
 
-**为什么要单写一层。** 项目里已有的三处板块读数都回答不了「现在」：
-
-| 现有层 | 口径 | 盘中能不能更新 |
-|---|---|---|
-| `sectors/momentum.py` | 成分股**日线** | 不能，日线要收盘才定 |
-| `sectors/rotation.py` | 同花顺板块指数 `last.js` | 不能，`ths_sector_index.py` 开头写明「日频，收盘后定格」 |
-| `sectors/history.py` | 系统自己的每日排名 | 不能，一天一条 |
-
-盘前简报给的是**昨收口径**的板块排序。盘中要回答「早盘资金实际去了哪里、盘前
-的排序有没有被证伪」，需要的是当下的横截面，而 `adapters/market_scan.py` 一次
-就能把全市场 5500+ 只的实时涨跌与成交额扫回来——**取数早就有了，只是从来没有
-人按板块归并过**（该 adapter 此前只在 `jobs/morning.py` 盘前用了一次）。
-
-## 三个和盘后那几层不同的口径
-
-**1. 排的是超额，不是涨幅。** 板块中位涨幅 − 全市场中位涨幅。绝对涨幅答不了
-「跑赢没有」：普涨日里 +1.5% 是落后，阴跌日里 −0.5% 是强势。这也是概念规模上限
-被取消之后唯一还需要的那道闸——占市场 20% 的「人工智能」跟着大盘涨时超额≈0，
-自己排不上去；只有真的整体异动才拉得开。同 `rotation.py` 的 `excess_5d`，
-不是第二套口径。
-
-**2. 行业与概念并排跑，各自排名。** 超短真正轮动的单位是概念：「机器人」在申万
-里压在「机械设备」下面，而它完全可以在机械设备整体平淡的一天里涨停潮。两者
-**分开排名**——把一个 1215 只的概念和一个 88 只的行业放进同一张榜，名次本身
-就没有含义了。
-
-**3. 涨跌幅取中位数不取均值。** 一个 20cm 涨停的小票能把均值拉出两个点。
-
-## 边界
-
-- 成交额是**双边**的，一笔成交同时是买和卖。本层只说注意力在哪，不说「净流入」。
-- `amount_share` 是各板块**各自**占全场的比重，概念之间成分重叠，所以它们**不构成
-  一个和为 1 的划分**。它回答「这条线吸走了多少注意力」，不回答「资金怎么分配的」。
-- 上涨占比按**有报价的成分股**算，停牌（无涨跌幅）不计入分母。
-- **不打分、不进任何评分链路。** 与 `rotation.py` 同一条纪律：先进观察，
-  等 `review` 能回答「盘中排名跃升的板块选出来的票兑现率高多少」再谈权重。
-- 早盘前十几分钟的排名噪声极大（成交额基数小），`MIN_TOTAL_AMOUNT_YI` 是为此设的
-  闸门——不达标时照样落盘，但 `tradable=False`，告警层据此整轮不发。
-
-## 落盘成 JSONL 而不是覆盖
-
-「持续监控」的价值在**序列**不在**截面**：某板块 09:45 排第 12、10:30 升到第 3，
-这个变化才是要看的东西，只存最新一条就把它扔了。`monitor/sector_triggers.py`
-读的正是这条序列。
+以板块涨幅中位数减全场中位数计算超额，行业和概念分别排名。
+上涨占比只统计有报价成分股；概念重叠，amount_share 之和不保证为 1。
+成交额为双边交易量，不解释为净流入。未达总成交额门槛时标记 tradable=False。
+截面追加到 JSONL，供板块跃迁告警读取。
 """
 
 from __future__ import annotations
@@ -56,13 +16,21 @@ from statistics import median
 from typing import Any
 
 from ashare_decision_support.numeric import finite
-from ashare_decision_support.schedule.timezone import beijing_naive_now, beijing_today
-from ashare_decision_support.sectors.base import SectorDefinition
-from ashare_decision_support.sectors.taxonomy import SectorTaxonomyError
+from ashare_decision_support.schedule.timezone import (
+    beijing_naive_now,
+    beijing_today,
+    to_beijing_naive,
+)
+from ashare_decision_support.sectors.base import (
+    LEVEL_CONCEPT,
+    LEVEL_INDUSTRY,
+    SectorDefinition,
+    SectorTaxonomyError,
+)
 from ashare_decision_support.state.paths import state_path
+from ashare_decision_support.state.store import append_jsonl, file_lock, read_jsonl
 
-LEVEL_INDUSTRY = "SW1"
-LEVEL_CONCEPT = "CONCEPT"
+LEVEL_LABEL = {LEVEL_INDUSTRY: "行业", LEVEL_CONCEPT: "概念"}
 
 # 一个板块至少要有这么多只**有报价**的成分股才给读数。少于这个数，中位数由个别
 # 票决定，排名翻上翻下全是噪声。分类层已经按成分股总数过了一道闸（行业 5、
@@ -97,7 +65,7 @@ class SectorRead:
     # (名称, 涨跌幅)，按涨跌幅降序。
     leaders: tuple[tuple[str, float], ...] = ()
     # 这个板块里你自己盯着的票（持仓，或本轮显式传进来的那几只），(代码, 名称)。
-    #
+
     # **在归并时算，不在告警时算。** 告警层拿到的是 `SectorRead`，里面没有成分股
     # 名单；要在那里做交集就得把 1215 只的成分表一路带过去，落盘也会跟着涨一个
     # 量级。这里只留命中的那几只，绝大多数板块是空的。
@@ -201,9 +169,7 @@ class SectorSnapshot:
     def levels(self) -> list[str]:
         """本轮有读数的层级。**行业在前、概念在后**，不按字母序。
 
-        字母序会把 `CONCEPT` 排在 `SW1` 前面，于是每份简报都从 346 个概念开始读。
-        行业是粗粒度的定位（今天是医药还是有色），概念是细粒度的题材，先粗后细
-        才是人读盘的顺序。
+        先展示行业定位，再展示可跨行业的题材，避免数量更多的概念占据简报开头。
         """
         present = {item.level for item in self.reads}
         ordered = [level for level in (LEVEL_INDUSTRY, LEVEL_CONCEPT) if level in present]
@@ -224,18 +190,25 @@ class SectorSnapshot:
     def from_dict(cls, payload: dict[str, Any]) -> SectorSnapshot | None:
         raw = str(payload.get("as_of") or "")
         try:
-            moment = datetime.fromisoformat(raw)
+            moment = to_beijing_naive(datetime.fromisoformat(raw))
         except ValueError:
             return None
-        reads = [
-            item
-            for item in (SectorRead.from_dict(row) for row in payload.get("reads") or [])
-            if item is not None
-        ]
+        raw_reads = payload.get("reads")
+        reads = (
+            [
+                item
+                for item in (
+                    SectorRead.from_dict(row) for row in raw_reads if isinstance(row, dict)
+                )
+                if item is not None
+            ]
+            if isinstance(raw_reads, list)
+            else []
+        )
         return cls(
             as_of=moment,
             reads=reads,
-            notes=list(payload.get("notes") or []),
+            notes=list(payload["notes"]) if isinstance(payload.get("notes"), list) else [],
             breadth_advance=finite(payload.get("breadth_advance")),
             market_median_pct=finite(payload.get("market_median_pct")),
             market_amount_yi=finite(payload.get("market_amount_yi")) or 0.0,
@@ -243,7 +216,7 @@ class SectorSnapshot:
         )
 
 
-# ---- 归并 -----------------------------------------------------------------
+# 归并
 
 
 def measure(
@@ -313,9 +286,7 @@ def measure(
                 covered=len(pcts),
                 total=definition.size,
                 limit_up=limit_up,
-                leaders=tuple(
-                    (name, round(pct, 2)) for name, pct in scored[:LEADER_COUNT]
-                ),
+                leaders=tuple((name, round(pct, 2)) for name, pct in scored[:LEADER_COUNT]),
                 watch_hits=tuple(sorted(hits)),
             )
         )
@@ -358,7 +329,7 @@ def take_snapshot(
 ) -> SectorSnapshot:
     """扫一次全市场，按每个分类各归并一遍。
 
-    `taxonomies` 形如 `{"SW1": ThsIndustryTaxonomy(...), "CONCEPT": ThsConceptTaxonomy(...)}`。
+    `taxonomies` 的键为 `LEVEL_INDUSTRY` 与 `LEVEL_CONCEPT`。
     分类对象自带缓存，所以多轮之间只有第一次会读文件。
 
     **一个分类挂了不影响另一个。** 概念文件不可用时行业排名照出，反之亦然——
@@ -437,21 +408,14 @@ def _default_adapter() -> Any:
 
 
 def default_taxonomies(source: Any | None = None) -> dict[str, Any]:
-    """行业 + 概念两套，共用同一个分类源（也就是共用同一份缓存与同一次 HTTP）。"""
-    from ashare_decision_support.adapters.ths_taxonomy import ThsTaxonomySource
-    from ashare_decision_support.sectors.ths_taxonomy import (
-        ThsConceptTaxonomy,
-        ThsIndustryTaxonomy,
-    )
+    """盘中与盘前共用同一行业、概念分类工厂。"""
+    from ashare_decision_support.sectors.ths_taxonomy import static_taxonomies
 
-    shared = source or ThsTaxonomySource()
-    return {
-        LEVEL_INDUSTRY: ThsIndustryTaxonomy(shared, level=LEVEL_INDUSTRY),
-        LEVEL_CONCEPT: ThsConceptTaxonomy(shared),
-    }
+    industry, concept = static_taxonomies(source)
+    return {LEVEL_INDUSTRY: industry, LEVEL_CONCEPT: concept}
 
 
-# ---- 序列落盘 --------------------------------------------------------------
+# 序列落盘
 
 
 def store_path(trade_date: str, root: Path | None = None) -> Path:
@@ -465,13 +429,17 @@ def store_path(trade_date: str, root: Path | None = None) -> Path:
 
 # 板块序列保留多少天。实测一天 30 轮 × 377 个板块 ≈ 3.1MB，是状态目录里最大的
 # 一类文件（其余日更文件都在几十 KB），一年不清就是 750MB。
-#
+
 # 取 30 天，因为这份数据存在的理由是让 `review` 有朝一日能回答「盘中排名跃升的
 # 板块选出来的票兑现率高多少」——那需要一个月量级的样本，不需要一年。
 HISTORY_KEEP_DAYS = 30
 
 
-def prune_history(keep_days: int = HISTORY_KEEP_DAYS, root: Path | None = None) -> list[str]:
+def prune_history(
+    keep_days: int = HISTORY_KEEP_DAYS,
+    root: Path | None = None,
+    protected_dates: set[str] | None = None,
+) -> list[str]:
     """删掉过期的板块序列文件，返回删掉的文件名。
 
     **按文件名里的日期删，不按 mtime。** mtime 会被备份、rsync、容器镜像重建
@@ -482,41 +450,32 @@ def prune_history(keep_days: int = HISTORY_KEEP_DAYS, root: Path | None = None) 
     if not base.is_dir():
         return []
     cutoff = beijing_today() - timedelta(days=max(0, keep_days))
+    protected = {str(item).replace("-", "") for item in protected_dates or set()}
     removed: list[str] = []
     for path in base.glob("intraday_sector_*.jsonl"):
         stamp = path.stem.rsplit("_", 1)[-1]
+        if stamp in protected:
+            continue
         try:
             when = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
         except (ValueError, IndexError):
-            continue          # 名字对不上格式的不碰——宁可留着也不误删
+            continue  # 名字对不上格式的不碰——宁可留着也不误删
         if when < cutoff:
             try:
                 path.unlink()
             except OSError:
-                continue      # 删不掉只是没省下空间，不是错误
+                continue  # 删不掉只是没省下空间，不是错误
             removed.append(path.name)
     return removed
 
 
 def append(snapshot: SectorSnapshot, path: Path) -> None:
-    """追加一行。**先确认上一行是完整收尾的。**
-
-    进程被杀在写入中途会留下一条没有换行符的残行。直接 append 会把新记录**粘在
-    残行后面**，于是坏的那一行吃掉一条好记录——而 `load_history` 跳过坏行的设计
-    本来是为了「只损失一条」。补一个换行符，让损失停在崩溃的那一条上。
-    """
-    if path.exists() and path.stat().st_size:
-        with path.open("rb") as handle:
-            handle.seek(-1, 2)
-            needs_newline = handle.read(1) != b"\n"
-        if needs_newline:
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write("\n")
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(snapshot.to_dict(), ensure_ascii=False) + "\n")
+    """在锁内追加，公共写入器隔离残行并在失败时回滚本次追加。"""
+    with file_lock(path):
+        append_jsonl(path, snapshot.to_dict())
 
 
-def load_history(path: Path) -> list[SectorSnapshot]:
+def load_history(path: Path, notes: list[str] | None = None) -> list[SectorSnapshot]:
     """读回当日全部快照，按时间升序。
 
     半行（进程被杀在写入中途）跳过而不是抛错——一次崩溃不该让当天剩下的
@@ -525,13 +484,13 @@ def load_history(path: Path) -> list[SectorSnapshot]:
     **告警层不用这个，用 `load_first`。** 那边只要基线一条，而整天下来这里是
     二三十条 × 377 个板块读数。
     """
-    if not path.exists():
-        return []
     out: list[SectorSnapshot] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        snapshot = _parse_line(line)
+    for row in read_jsonl(path, notes):
+        snapshot = SectorSnapshot.from_dict(row)
         if snapshot is not None:
             out.append(snapshot)
+        elif notes is not None:
+            notes.append(f"{path.name} 有无法解析的板块截面，已跳过")
     out.sort(key=lambda item: item.as_of)
     return out
 
@@ -549,7 +508,7 @@ def load_first(path: Path) -> SectorSnapshot | None:
     """
     if not path.exists():
         return None
-    with path.open(encoding="utf-8") as handle:
+    with path.open("rb") as handle:
         for line in handle:
             snapshot = _parse_line(line)
             if snapshot is not None:
@@ -557,67 +516,12 @@ def load_first(path: Path) -> SectorSnapshot | None:
     return None
 
 
-def _parse_line(line: str) -> SectorSnapshot | None:
+def _parse_line(line: str | bytes) -> SectorSnapshot | None:
     text = line.strip()
     if not text:
         return None
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
+    except ValueError:
         return None
     return SectorSnapshot.from_dict(payload) if isinstance(payload, dict) else None
-
-
-# ---- 渲染 -----------------------------------------------------------------
-
-LEVEL_LABEL = {LEVEL_INDUSTRY: "行业", LEVEL_CONCEPT: "概念"}
-
-
-def render(snapshot: SectorSnapshot, history: list[SectorSnapshot], top: int = 8) -> str:
-    """当前排名 + 相对当日首轮与上一轮的排名变化。给 `--once` 与人工查看用。"""
-    lines: list[str] = []
-    breadth = (
-        f"{snapshot.breadth_advance:.0%}" if snapshot.breadth_advance is not None else "—"
-    )
-    lines.append(f"## 盘中板块强弱　{snapshot.as_of:%Y-%m-%d %H:%M:%S}")
-    header = f"全场上涨占比 {breadth}"
-    if snapshot.market_median_pct is not None:
-        header += f"　中位涨幅 {snapshot.market_median_pct:+.2f}%"
-    header += f"　成交额 {snapshot.market_amount_yi:.0f} 亿"
-    lines.append(header)
-    lines.append("")
-
-    for level in snapshot.levels():
-        rows = snapshot.ranked(level)
-        if not rows:
-            continue
-        first = history[0].rank_map(level) if history else {}
-        prev = history[-1].rank_map(level) if history else {}
-        lines.append(f"### {LEVEL_LABEL.get(level, level)}（{len(rows)} 个有读数）")
-        lines.append("| # | 板块 | 超额 | 中位 | 上涨占比 | 涨停 | 成交额(亿) | 较上轮 | 较开盘 | 领涨 |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|")
-        for index, item in enumerate(rows[:top], start=1):
-            lines.append(
-                f"| {index} | {item.name} | {item.excess_pct:+.2f}% | {item.median_pct:+.2f}% | "
-                f"{item.advance_ratio:.0%} | {item.limit_up} | {item.amount_yi:.0f} | "
-                f"{_delta(prev.get(item.name), index)} | {_delta(first.get(item.name), index)} | "
-                f"{item.leaders_text()} |"
-            )
-        lines.append("")
-        lines.append(
-            "**垫底**　" + "、".join(f"{r.name} {r.excess_pct:+.2f}%" for r in rows[-3:])
-        )
-        lines.append("")
-
-    for note in snapshot.notes:
-        lines.append(f"- {note}")
-    return "\n".join(lines).strip()
-
-
-def _delta(old: int | None, now: int) -> str:
-    if old is None:
-        return "新"
-    diff = old - now
-    if diff == 0:
-        return "—"
-    return f"{'↑' if diff > 0 else '↓'}{abs(diff)}"

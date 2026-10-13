@@ -71,15 +71,7 @@ class Stabilisation:
         return f"尚未出现止跌信号（{self.reason}）" if self.reason else "尚未出现止跌信号"
 
     def _age(self) -> str:
-        """距当日最低点过了几根分时。
-
-        止跌信号的**成色随时间变**：低点后第 2 根就确认，和第 15 根才确认，是两种
-        强度——前者很可能只是下跌途中的一次反抽。而三种形态里，此前只有最弱的
-        「缩量止跌」把这个数写进了自己的 reason，**放量反包与二次探底不破一个字都
-        没有**，恰恰是这两个会被拿去当买点。
-
-        所以收在这里统一给：`bars_since_low` 本来就三种形态都算了，只是没说出口。
-        """
+        """描述距日内低点的分时根数，供各止跌形态共用。"""
         if self.bars_since_low is None:
             return ""
         return f"（距当日最低 {self.bars_since_low} 根分时）"
@@ -103,15 +95,21 @@ def assess_stabilisation(bars: list[dict]) -> Stabilisation:
     reversal = _reversal(rows)
     if reversal is not None:
         return Stabilisation(
-            confirmed=True, pattern=PATTERN_REVERSAL, reason=reversal,
-            volume_contraction=contraction, bars_since_low=since_low,
+            confirmed=True,
+            pattern=PATTERN_REVERSAL,
+            reason=reversal,
+            volume_contraction=contraction,
+            bars_since_low=since_low,
         )
 
     retest = _retest(rows)
     if retest is not None:
         return Stabilisation(
-            confirmed=True, pattern=PATTERN_RETEST, reason=retest,
-            volume_contraction=contraction, bars_since_low=since_low,
+            confirmed=True,
+            pattern=PATTERN_RETEST,
+            reason=retest,
+            volume_contraction=contraction,
+            bars_since_low=since_low,
         )
 
     # 缩量止跌放最后判：它是三者里最弱的信号，能被更明确的形态取代时就不该用它。
@@ -132,8 +130,10 @@ def assess_stabilisation(bars: list[dict]) -> Stabilisation:
     else:
         reason = f"近端均量为基线的 {contraction:.0%}，抛压未见衰竭"
     return Stabilisation(
-        confirmed=False, reason=reason,
-        volume_contraction=contraction, bars_since_low=since_low,
+        confirmed=False,
+        reason=reason,
+        volume_contraction=contraction,
+        bars_since_low=since_low,
     )
 
 
@@ -158,7 +158,7 @@ def _retest(rows: list[dict]) -> str | None:
     if len(rows) < RECENT_BARS * 2:
         return None
     recent = rows[-RECENT_BARS:]
-    earlier = rows[: -RECENT_BARS]
+    earlier = rows[:-RECENT_BARS]
 
     prior_low = min(row["low"] for row in earlier)
     recent_low = min(row["low"] for row in recent)

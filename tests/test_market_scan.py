@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 
@@ -17,17 +18,27 @@ from ashare_decision_support.adapters.market_scan import (
     _parse_row,
 )
 from ashare_decision_support.screens import LiquidityScreen
+from tests.fakes import FakeResponse
 
-# ---- http double ---------------------------------------------------------
+# http double
 
 
 def _row(code, name, trade=10.0, changepercent=1.0, amount=5e8, nmc=500000.0, **kw):
     """nmc/mktcap 的单位是**万元**，和新浪一致。500000 万元 = 50 亿。"""
     base = {
-        "symbol": f"sh{code}", "code": code, "name": name, "trade": str(trade),
-        "changepercent": changepercent, "settlement": str(trade - 0.1),
-        "volume": 1000000, "amount": amount, "per": 25.0, "pb": 3.0,
-        "mktcap": nmc * 2, "nmc": nmc, "turnoverratio": 2.5,
+        "symbol": f"sh{code}",
+        "code": code,
+        "name": name,
+        "trade": str(trade),
+        "changepercent": changepercent,
+        "settlement": str(trade - 0.1),
+        "volume": 1000000,
+        "amount": amount,
+        "per": 25.0,
+        "pb": 3.0,
+        "mktcap": nmc * 2,
+        "nmc": nmc,
+        "turnoverratio": 2.5,
     }
     base.update(kw)
     return base
@@ -42,24 +53,7 @@ class StubHttp:
         page = int(request.full_url.split("page=")[1].split("&")[0])
         self.asked.append(page)
         body = json.dumps(self.pages.get(page, []), ensure_ascii=False).encode("gbk")
-        return _Resp(body)
-
-
-class _Resp:
-    def __init__(self, body: bytes) -> None:
-        self.body = body
-
-    def read(self):
-        return self.body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-# ---- parsing -------------------------------------------------------------
+        return FakeResponse(body)
 
 
 def test_market_cap_is_converted_from_wan_yuan() -> None:
@@ -92,7 +86,7 @@ def test_st_is_detected_from_the_name() -> None:
     assert not _parse_row(_row("000003", "平安银行")).is_st
 
 
-# ---- scan ----------------------------------------------------------------
+# scan
 
 
 def test_scan_collects_pages_until_they_run_dry() -> None:
@@ -104,18 +98,37 @@ def test_scan_collects_pages_until_they_run_dry() -> None:
 
 
 def test_breadth_counts_the_whole_market_not_a_sample() -> None:
-    http = StubHttp({1: [
-        _row("600000", "涨", changepercent=2.0),
-        _row("600001", "涨2", changepercent=0.5),
-        _row("600002", "跌", changepercent=-1.0),
-        _row("600003", "平", changepercent=0.0),
-    ]})
+    http = StubHttp(
+        {
+            1: [
+                _row("600000", "涨", changepercent=2.0),
+                _row("600001", "涨2", changepercent=0.5),
+                _row("600002", "跌", changepercent=-1.0),
+                _row("600003", "平", changepercent=0.0),
+            ]
+        }
+    )
     scan = MarketScanAdapter(opener=http).fetch(max_pages=1)
 
     assert scan.advancers == 2
     assert scan.decliners == 1
     # 平盘不进分母：上涨面问的是「动了的票里多少是涨的」。
     assert scan.breadth == pytest.approx(2 / 3, abs=1e-4)
+
+
+def test_a_scan_with_no_change_data_describes_itself_instead_of_crashing() -> None:
+    """隔夜行情源把涨跌幅清零之后，全场没有一只算涨或跌，上涨面是 None。
+
+    2026-09-14 01:10 实测：`describe()` 把 None 往 `.0%` 里格式化，整轮盘前跑崩在
+    全市场扫描这一步。缺读数要说出来，不能让它替整份晨报做决定。
+    """
+    http = StubHttp(
+        {1: [_row("600000", "A", changepercent=0.0), _row("600001", "B", changepercent=0.0)]}
+    )
+    scan = MarketScanAdapter(opener=http).fetch(max_pages=1)
+
+    assert scan.breadth is None
+    assert any("上涨面无读数" in line for line in scan.describe())
 
 
 def test_one_dead_page_costs_only_its_own_rows() -> None:
@@ -128,8 +141,17 @@ def test_one_dead_page_costs_only_its_own_rows() -> None:
     http = HalfDead({1: [_row("600000", "A")], 2: [_row("600001", "B")]})
     scan = MarketScanAdapter(opener=http).fetch(max_pages=2)
 
-    assert scan.ok and len(scan) == 1
+    assert scan.ok and not scan.complete and len(scan) == 1
     assert any("1/2 页取数失败" in note for note in scan.notes)
+
+
+def test_empty_middle_page_is_partial_even_without_http_error() -> None:
+    scan = MarketScanAdapter(
+        opener=StubHttp({1: [_row("600000", "A")], 3: [_row("600002", "C")]})
+    ).fetch(max_pages=4)
+
+    assert scan.ok and not scan.complete
+    assert any("截面不完整" in note for note in scan.notes)
 
 
 def test_everything_down_reports_not_ok() -> None:
@@ -139,7 +161,29 @@ def test_everything_down_reports_not_ok() -> None:
 
     scan = MarketScanAdapter(opener=Dead({})).fetch(max_pages=2)
 
-    assert not scan.ok and len(scan) == 0
+    assert not scan.ok and not scan.complete and len(scan) == 0
+
+
+def test_full_scan_cache_reuses_lunch_snapshot_but_expires_at_afternoon_open(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("ASHARE_DS_HOME", str(tmp_path))
+    clock = [datetime(2026, 9, 14, 12, 50)]
+    monkeypatch.setattr(
+        "ashare_decision_support.adapters.market_scan.beijing_naive_now", lambda: clock[0]
+    )
+    scan = MarketScan(
+        rows={f"{code:06d}": MarketRow(f"{code:06d}", "测试", 10.0) for code in range(5000)}
+    )
+    MarketScanAdapter._save_recent_cache(scan)
+
+    clock[0] = datetime(2026, 9, 14, 12, 53)
+    cached = MarketScanAdapter._read_recent_cache()
+    assert cached is not None and len(cached) == 5000
+    assert cached.as_of == datetime(2026, 9, 14, 12, 50)
+
+    clock[0] = datetime(2026, 9, 14, 13, 0)
+    assert MarketScanAdapter._read_recent_cache() is None
 
 
 def test_symbols_resolve_with_or_without_an_exchange_suffix() -> None:
@@ -149,7 +193,7 @@ def test_symbols_resolve_with_or_without_an_exchange_suffix() -> None:
     assert scan.get("600519") is scan.get("600519.SH")
 
 
-# ---- liquidity screen ----------------------------------------------------
+# liquidity screen
 
 
 def _scan_of(*rows: MarketRow) -> MarketScan:
@@ -157,7 +201,7 @@ def _scan_of(*rows: MarketRow) -> MarketScan:
 
 
 BIG = _parse_row(_row("600519", "贵州茅台", nmc=168_840_000.0, amount=73.7e8))
-TINY_CAP = _parse_row(_row("301000", "小盘票", nmc=80000.0, amount=5e8))       # 8 亿流通
+TINY_CAP = _parse_row(_row("301000", "小盘票", nmc=80000.0, amount=5e8))  # 8 亿流通
 THIN = _parse_row(_row("600001", "地量票", nmc=500000.0, amount=1900_0000.0))  # 0.19 亿成交
 
 
@@ -207,6 +251,37 @@ def test_a_clean_pass_produces_no_note() -> None:
 
 def test_a_row_missing_both_measures_is_treated_as_tradable() -> None:
     blind = _parse_row(_row("600002", "无数据", amount="", nmc=""))
-    kept, rejected, _ = LiquidityScreen(_scan_of(blind)).filter(["600002.SH"])
+    kept, rejected, stats = LiquidityScreen(_scan_of(blind)).filter(["600002.SH"])
 
     assert kept == ["600002.SH"] and rejected == []
+    assert stats.missing_fields == 1
+    assert "只按已知字段过滤" in stats.note()
+
+
+def test_intraday_amount_is_optional_but_float_cap_remains_required() -> None:
+    no_amount = _parse_row(_row("600002", "盘中", amount=""))
+    scan = _scan_of(no_amount)
+    scan.session_in_progress = True
+
+    _, _, stats = LiquidityScreen(scan).filter(["600002.SH"])
+
+    assert stats.missing_fields == 0
+
+
+def test_an_intraday_scan_turns_off_the_amount_gate_but_keeps_the_cap_gate() -> None:
+    """09:33 取到的成交额是半截交易日的，拿它比 0.8 亿会把大半个市场判成不可交易。
+
+    2026-09-14 实测剔了 958 只。盘中只留流通市值这一半（它不随时间走），并且把
+    「成交额门槛没开」写进 note——否则读起来像全都测过且都合格。
+    """
+    scan = _scan_of(BIG, TINY_CAP, THIN)
+    scan.session_in_progress = True
+    scan.as_of = datetime(2026, 9, 14, 9, 33)
+
+    kept, rejected, stats = LiquidityScreen(scan).filter(["600519.SH", "301000.SZ", "600001.SH"])
+
+    assert kept == ["600519.SH", "600001.SH"]  # 地量票放行，小盘票仍被市值门槛拦下
+    assert [item.symbol for item in rejected] == ["301000.SZ"]
+    assert stats.amount_gate_off is True
+    assert "只按流通市值筛" in stats.note()
+    assert any("取自盘中（截至 09:33）" in line for line in scan.describe())

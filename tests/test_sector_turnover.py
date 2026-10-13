@@ -20,9 +20,7 @@ from ashare_decision_support.sectors.turnover import (
 NEED = 20
 
 
-def bars(
-    amounts: list[float], closes: list[float], start_day: int = 1
-) -> list[dict]:
+def bars(amounts: list[float], closes: list[float], start_day: int = 1) -> list[dict]:
     return [
         {
             "date": f"202606{start_day + index:02d}",
@@ -59,7 +57,7 @@ def baseline(n: int = MIN_SECTORS) -> dict[str, tuple[list[float], list[float]]]
     return {f"陪衬{i:02d}": (flat(1e8), flat(100.0)) for i in range(n)}
 
 
-# ---- 读反的那一格 ---------------------------------------------------------
+# 读反的那一格
 
 
 def test_rising_share_on_falling_price_is_not_called_inflow() -> None:
@@ -96,7 +94,7 @@ def test_shrinking_share_with_falling_price_reads_as_neglected() -> None:
     assert picked["没人看"].quadrant == QUADRANT_NEGLECT
 
 
-# ---- 占比抹掉的那个量 -----------------------------------------------------
+# 占比抹掉的那个量
 
 
 def test_total_turnover_is_reported_separately_from_share() -> None:
@@ -119,7 +117,7 @@ def test_total_turnover_is_reported_separately_from_share() -> None:
     assert not any("指向相反" in line for line in read.observations)
 
 
-# ---- 拐点：块均值与窗口内走向反号 -----------------------------------------
+# 拐点：块均值与窗口内走向反号
 
 
 def _uniform(daily_yi: list[float]) -> dict[str, tuple[list[float], list[float]]]:
@@ -144,10 +142,27 @@ def test_v_shaped_week_reports_the_turn_the_block_means_hide() -> None:
             _uniform(
                 [
                     # 前 15 日：一路退潮。
-                    28347, 27195, 25874, 24189, 26716, 27181, 29742, 26686,
-                    22095, 19445, 20887, 20391, 23117, 23584, 25599,
+                    28347,
+                    27195,
+                    25874,
+                    24189,
+                    26716,
+                    27181,
+                    29742,
+                    26686,
+                    22095,
+                    19445,
+                    20887,
+                    20391,
+                    23117,
+                    23584,
+                    25599,
                     # 近 5 日：触底回升。
-                    20111, 22284, 26799, 25475, 26834,
+                    20111,
+                    22284,
+                    26799,
+                    25475,
+                    26834,
                 ]
             )
         )
@@ -212,7 +227,7 @@ def test_absolute_amount_surfaces_what_share_hides() -> None:
     assert any("占比榜看不见这一类" in line for line in read.observations)
 
 
-# ---- 样本与对齐 -----------------------------------------------------------
+# 样本与对齐
 
 
 def test_small_sample_refuses_to_conclude() -> None:
@@ -232,7 +247,10 @@ def test_a_stale_sector_is_dropped_before_shares_are_computed() -> None:
     profiles = baseline(MIN_SECTORS + 1)
     series = series_from(profiles)
     code, (name, rows) = next(iter(series.items()))
-    series[code] = (name, [dict(row, date=f"202605{index + 1:02d}") for index, row in enumerate(rows)])
+    series[code] = (
+        name,
+        [dict(row, date=f"202605{index + 1:02d}") for index, row in enumerate(rows)],
+    )
 
     read = read_turnover(series)
 

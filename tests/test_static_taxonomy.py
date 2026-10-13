@@ -1,25 +1,29 @@
-"""静态板块分类的两条硬约定，以及那个「文件过期了没有」的探针。
-
-板块分类是整条盘前链路的**第一步**：它错了，后面的动量、排序、选股全都建立在
-一个错的成分股集合上，而且不会有任何一步报错。这个文件测的就是这一层最容易
-静默出错的三件事。
-
-`sectors/ths_taxonomy.py` 此前覆盖率 64%，未覆盖的正好是 `reconcile` 整个函数
-和概念规模闸门——前者是**唯一**能让「这份第三方文件是不是已经陈旧」变成可观测
-量的东西（见该函数 docstring），后者决定 321 个概念里哪些进排名。
-"""
+"""静态板块分类：可用性、稳定分组、缓存与概念规模门槛。"""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from ashare_decision_support.adapters.ths_taxonomy import SymbolProfile, ThsTaxonomySnapshot
-from ashare_decision_support.sectors import SectorTaxonomyError
+from ashare_decision_support.adapters.security_master import SecurityMasterAdapter
+from ashare_decision_support.adapters.ths_taxonomy import (
+    CACHE_SCHEMA,
+    LEGACY_CACHE_SCHEMA,
+    SymbolProfile,
+    ThsTaxonomySnapshot,
+    ThsTaxonomySource,
+)
+from ashare_decision_support.jsoncache import write_stamped
+from ashare_decision_support.schedule.timezone import beijing_today
+from ashare_decision_support.sectors import LEVEL_CONCEPT, LEVEL_INDUSTRY, SectorTaxonomyError
+from ashare_decision_support.sectors.intraday import default_taxonomies
 from ashare_decision_support.sectors.ths_taxonomy import (
     ThsConceptTaxonomy,
     ThsIndustryTaxonomy,
-    reconcile,
+    static_taxonomies,
 )
+from tests.fakes import json_response
 
 
 class _Source:
@@ -36,7 +40,10 @@ class _Source:
 
 def _profile(symbol: str, industry: str, concepts: tuple[str, ...] = ()) -> SymbolProfile:
     return SymbolProfile(
-        symbol=symbol, name=f"票{symbol[:3]}", industries=(industry, "二级", "三级"), concepts=concepts
+        symbol=symbol,
+        name=f"票{symbol[:3]}",
+        industry=industry,
+        concepts=concepts,
     )
 
 
@@ -51,7 +58,7 @@ def test_unavailable_classification_raises_instead_of_reporting_no_sectors() -> 
 
     返回空列表在下游读起来是后者：`morning` 会照常往下跑，得出一份「没有板块
     值得做」的结论，而真相是这一步根本没拿到数据。两者该导向完全不同的动作，
-    所以这里抛错——同 `taxonomy.py` 对 TickFlow 那一路的处置。
+    所以这里抛错并保留数据源失败的原因。
     """
     taxonomy = ThsIndustryTaxonomy(_Source(_snapshot([], ok=False, notes=["文件下载失败"])))
 
@@ -68,6 +75,7 @@ def test_industry_groups_are_ordered_and_deduplicated() -> None:
     sectors = taxonomy.list_sectors()
 
     assert [s.name for s in sectors] == ["电子"]
+    assert sectors[0].level == LEVEL_INDUSTRY
     symbols = sectors[0].symbols
     assert list(symbols) == sorted(set(symbols))
 
@@ -94,9 +102,7 @@ def test_the_snapshot_is_loaded_once_and_cached() -> None:
 
 def test_concept_size_gate_reports_how_many_it_dropped() -> None:
     """被规模闸门挡掉的数量要能查——否则「概念只剩这些」看不出是闸门还是数据。"""
-    profiles = [
-        _profile(f"0000{i:02d}.SZ", "电子", concepts=("AI算力",)) for i in range(8)
-    ]
+    profiles = [_profile(f"0000{i:02d}.SZ", "电子", concepts=("AI算力",)) for i in range(8)]
     profiles += [_profile("000090.SZ", "电子", concepts=("小众概念",))]
     taxonomy = ThsConceptTaxonomy(_Source(_snapshot(profiles)), min_size=5)
 
@@ -112,78 +118,99 @@ def test_concept_upper_bound_is_optional_and_off_by_default() -> None:
     默认不设上限是有意的：一个 800 只的概念（比如「融资融券」那类）已经在
     adapter 层的黑名单里挡掉了，剩下的大概念仍然是真题材。
     """
-    profiles = [
-        _profile(f"0000{i:02d}.SZ", "电子", concepts=("大概念",)) for i in range(12)
-    ]
+    profiles = [_profile(f"0000{i:02d}.SZ", "电子", concepts=("大概念",)) for i in range(12)]
     source = _Source(_snapshot(profiles))
 
     assert [s.name for s in ThsConceptTaxonomy(source, min_size=5).list_sectors()] == ["大概念"]
-    assert ThsConceptTaxonomy(_Source(_snapshot(profiles)), min_size=5, max_size=10).list_sectors() == []
+    assert (
+        ThsConceptTaxonomy(_Source(_snapshot(profiles)), min_size=5, max_size=10).list_sectors()
+        == []
+    )
 
 
-# ---- reconcile：文件过期是「外观完全正常」的那种失效 -----------------------
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (["电子", " 半导体 ", "集成电路"], "半导体"),
+        (["", "半导体", "集成电路"], "半导体"),
+        (["电子"], None),
+        (["电子", "", "集成电路"], None),
+        (["电子", None, "集成电路"], None),
+        (["电子", "nan", "集成电路"], None),
+        (["电子", {"name": "半导体"}, "集成电路"], None),
+        ("电子·半导体·集成电路", None),
+    ],
+)
+def test_taxonomy_and_metadata_project_the_same_industry_without_shifting_empty_slots(
+    tmp_path, path, expected
+):
+    files = {
+        "industries.json": [{"symbol": "600000", "name": "测试", "industries": path}],
+        "concepts.json": [{"symbol": "600000", "concepts": ["先进封装"]}],
+    }
+    source = ThsTaxonomySource(
+        opener=lambda request, timeout: json_response(files[request.full_url.rsplit("/", 1)[-1]]),
+        cache_dir=tmp_path,
+    )
+    snapshot = source.load(force_refresh=True)
+    master = SecurityMasterAdapter(
+        opener=lambda url, timeout: json.dumps(files[url.rsplit("/", 1)[-1]]),
+        cache_path=tmp_path / "master.json",
+    ).load()
+
+    assert snapshot.profiles["600000.SH"].industry == master.get("600000").industry == expected
+    assert snapshot.profiles["600000.SH"].concepts == master.get("600000").concepts == ("先进封装",)
+    sectors = ThsIndustryTaxonomy(source, min_constituents=1).list_sectors()
+    assert [item.name for item in sectors] == ([expected] if expected else [])
+    for filename, key in (("ths_profiles.json", "profiles"), ("master.json", "entries")):
+        row = json.loads((tmp_path / filename).read_text(encoding="utf-8"))[key][0]
+        assert row["industry"] == expected
+        assert "industries" not in row
 
 
-class _Static:
-    def __init__(self, sectors) -> None:
-        self._sectors = sectors
+def test_legacy_caches_remain_readable_as_one_industry_and_preserve_concept_only_stocks(tmp_path):
+    rows = [
+        {"symbol": "600000", "name": "测试", "industries": ["电子", "半导体", "集成电路"]},
+        {"symbol": "600001", "name": "无行业", "concepts": ["先进封装"]},
+    ]
+    assert write_stamped(
+        tmp_path / "ths_profiles.json",
+        {"profiles": rows, "fetched_on": str(beijing_today())},
+        LEGACY_CACHE_SCHEMA,
+    )
+    assert write_stamped(tmp_path / "master.json", {"entries": rows}, 1)
+    calls = []
 
-    def list_sectors(self):
-        return self._sectors
+    def no_fetch(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("旧缓存转换不需要网络")
 
+    source = ThsTaxonomySource(cache_dir=tmp_path, opener=no_fetch)
+    snapshot = source.load()
+    master = SecurityMasterAdapter(cache_path=tmp_path / "master.json", opener=no_fetch).cached()
 
-class _Broken:
-    def __init__(self, exc: Exception) -> None:
-        self.exc = exc
-
-    def list_sectors(self):
-        raise self.exc
-
-
-def _definition(name: str, symbols: tuple[str, ...]):
-    from ashare_decision_support.sectors.base import SectorDefinition
-
-    return SectorDefinition(name=name, level="SW1", symbols=symbols)
-
-
-def test_reconcile_flags_symbols_only_the_other_source_knows_about() -> None:
-    """对照源有、静态文件没有的标的，就是「文件过期了」的直接证据。
-
-    新股上市之后要等第三方更新文件才会出现，而在那之前静态分类**外观完全正常**：
-    板块数对、成分股有、链路照跑。只有拿另一路独立来源比一次才看得见。
-    """
-    static = _Static([_definition("电子", ("000001.SZ", "000002.SZ"))])
-    other = _Static([_definition("电子", ("000001.SZ", "000002.SZ", "301999.SZ"))])
-
-    notes = reconcile(static, other)
-
-    assert any("301999.SZ" in note and "可能已过期" in note for note in notes)
-
-
-def test_reconcile_only_reports_and_never_repairs() -> None:
-    """两套分类口径本来就不同，自动「修正」只会把两个不确定的东西混成一个。"""
-    static_sectors = [_definition("电子", ("000001.SZ",))]
-    static = _Static(static_sectors)
-    other = _Static([_definition("电子", ("000001.SZ",)), _definition("北交所行业", ("830001.BJ",))])
-
-    notes = reconcile(static, other)
-
-    # 报出来了……
-    assert any("北交所行业" in note for note in notes)
-    # ……但静态分类一个字都没被改。
-    assert static.list_sectors() == static_sectors
+    assert snapshot.from_cache and snapshot.ok and master.ok
+    assert snapshot.profiles["600000.SH"].industry == master.get("600000").industry == "半导体"
+    assert snapshot.profiles["600001.SH"].industry is master.get("600001").industry is None
+    assert snapshot.profiles["600001.SH"].concepts == master.get("600001").concepts == ("先进封装",)
+    assert calls == []
+    assert source._write_cache(snapshot)
+    assert (
+        json.loads((tmp_path / "ths_profiles.json").read_text(encoding="utf-8"))["schema"]
+        == CACHE_SCHEMA
+    )
+    assert (
+        ThsTaxonomySource(cache_dir=tmp_path, opener=no_fetch).load().profiles == snapshot.profiles
+    )
 
 
-def test_reconcile_degrades_to_a_note_when_either_side_is_unavailable() -> None:
-    """对账本身是旁证，它取不到不能中断盘前链路。"""
-    good = _Static([_definition("电子", ("000001.SZ",))])
+def test_morning_and_intraday_use_identical_industry_and_concept_constituents():
+    profiles = [_profile(f"6000{i:02d}.SH", "半导体", ("先进封装",)) for i in range(20)]
+    source = _Source(_snapshot(profiles))
+    industry, concept = static_taxonomies(source)
+    intraday = default_taxonomies(source)
 
-    static_down = reconcile(_Broken(SectorTaxonomyError("静态文件没了")), good)
-    other_down = reconcile(good, _Broken(ConnectionError("对照源超时")))
-
-    assert any("静态分类不可用" in note for note in static_down)
-    assert any("对照源不可用" in note and "ConnectionError" in note for note in other_down)
-
-
-def test_reconcile_says_nothing_when_there_is_nothing_to_compare() -> None:
-    assert reconcile(_Static([]), _Static([_definition("电子", ("000001.SZ",))])) == []
+    assert set(intraday) == {LEVEL_INDUSTRY, LEVEL_CONCEPT}
+    assert industry.list_sectors() == intraday[LEVEL_INDUSTRY].list_sectors()
+    assert concept.list_sectors() == intraday[LEVEL_CONCEPT].list_sectors()
+    assert all(item.source is source for item in (industry, concept, *intraday.values()))

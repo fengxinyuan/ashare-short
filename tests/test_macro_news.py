@@ -14,7 +14,9 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from ashare_decision_support.news import CompositeNewsSource, WallstreetNewsSource
+from ashare_decision_support.news.balance import balance_by_source
 from ashare_decision_support.news.base import NewsDoc, NewsSource
+from tests.fakes import FakeResponse
 
 CN_TZ = timezone(timedelta(hours=8))
 
@@ -44,28 +46,14 @@ class StubHttp:
         items = pages[index] if index < len(pages) else []
         nxt = str(index + 1) if index + 1 < len(pages) else None
         body = json.dumps({"data": {"items": items, "next_cursor": nxt}}, ensure_ascii=False)
-        return _Resp(body.encode("utf-8"))
-
-
-class _Resp:
-    def __init__(self, body: bytes) -> None:
-        self.body = body
-
-    def read(self):
-        return self.body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+        return FakeResponse(body.encode("utf-8"))
 
 
 PMI = _item("2026-07-31 09:30", content="中国7月官方制造业PMI 49.2，前值 50.3。")
 RECENT = _item("2026-08-02 08:00", title="早间要闻")
 
 
-# ---- document mapping ----------------------------------------------------
+# document mapping
 
 
 def test_a_titleless_flash_uses_its_body_as_the_title() -> None:
@@ -95,7 +83,7 @@ def test_an_item_with_neither_title_nor_body_is_dropped() -> None:
     assert docs == []
 
 
-# ---- time-window paging --------------------------------------------------
+# time-window paging
 
 
 def test_paging_is_driven_by_a_time_window_not_a_page_count() -> None:
@@ -117,12 +105,15 @@ def test_paging_is_driven_by_a_time_window_not_a_page_count() -> None:
 
 def test_paging_stops_once_the_window_is_covered() -> None:
     """翻够了就停，不把整个历史拖回来。"""
-    pages = [[_item("2026-08-02 08:00", title="新")], [_item("2026-07-01 08:00", title="旧")],
-             [_item("2026-06-01 08:00", title="更旧")]]
+    pages = [
+        [_item("2026-08-02 08:00", title="新")],
+        [_item("2026-07-01 08:00", title="旧")],
+        [_item("2026-06-01 08:00", title="更旧")],
+    ]
     http = StubHttp({"global-channel": pages, "a-stock-channel": [[]]})
     docs, _ = WallstreetNewsSource(opener=http, lookback_hours=72).fetch_market(date(2026, 8, 2))
 
-    assert {d.title for d in docs} == {"新", "旧"}      # 第三页没去翻
+    assert {d.title for d in docs} == {"新", "旧"}  # 第三页没去翻
     assert len([c for c in http.calls if c[0] == "global-channel"]) == 2
 
 
@@ -147,7 +138,7 @@ def test_a_page_cap_stops_a_runaway_feed() -> None:
     assert len([c for c in http.calls if c[0] == "global-channel"]) == 4
 
 
-# ---- degradation ---------------------------------------------------------
+# degradation
 
 
 def test_one_dead_channel_still_yields_the_other() -> None:
@@ -182,7 +173,7 @@ def test_the_same_flash_in_both_channels_is_counted_once() -> None:
     assert len(docs) == 1
 
 
-# ---- composite -----------------------------------------------------------
+# composite
 
 
 class FakeSource(NewsSource):
@@ -262,10 +253,102 @@ def test_composite_market_limit_is_shared_fairly_across_sources() -> None:
         market=[NewsDoc(title=f"纸浆消息{i}", source="行业源") for i in range(2)],
     )
 
-    docs, _ = CompositeNewsSource(busy, industry).fetch_market(
-        date(2026, 8, 2), limit=10
-    )
+    docs, _ = CompositeNewsSource(busy, industry).fetch_market(date(2026, 8, 2), limit=10)
 
     assert len(docs) == 10
     assert len([doc for doc in docs if doc.source == "行业源"]) == 2
     assert len([doc for doc in docs if doc.source == "忙源"]) == 8
+
+
+def test_composite_diagnostics_include_expired_and_unretained_docs(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ashare_decision_support.news.composite.beijing_naive_now",
+        lambda: datetime(2026, 9, 14, 10),
+    )
+    raw = [
+        NewsDoc(title="过期政策", source=" policy ", published_at="2026-09-11 09:59:59"),
+        NewsDoc(title="政策更新", source="policy", published_at="2026-09-14T01:00:00Z"),
+        NewsDoc(title="", source="policy", published_at="2026-09-14T01:30:00Z"),
+        NewsDoc(title="政策旧稿", source="policy", published_at="2026-09-12 10:00:00"),
+        NewsDoc(title="无时间", source=""),
+        NewsDoc(title="时间异常", source="unknown", published_at="bad-time"),
+        NewsDoc(title="截止时刻", source="boundary", published_at="2026-09-11 10:00:00"),
+        NewsDoc(title="有效临界稿", source="recent", published_at="2026-09-11 10:00:01"),
+        NewsDoc(title="旧栏目", source="old-only", published_at="2026-09-01"),
+    ]
+    source = CompositeNewsSource(FakeSource("mixed", market=raw))
+
+    docs, notes = source.fetch_market(date(2026, 9, 14), limit=2)
+
+    assert docs == [raw[1], raw[7]]
+    assert source.last_market_stats == {
+        "raw_doc_count": 9,
+        "retained_doc_count": 2,
+        "raw_by_source": {"boundary": 1, "old-only": 1, "policy": 4, "recent": 1, "unknown": 2},
+        "retained_by_source": {"policy": 1, "recent": 1},
+        "effective_doc_count": 6,
+        "effective_by_source": {"policy": 3, "recent": 1, "unknown": 2},
+        "expired_before_budget": 3,
+        "latest_by_source": {
+            " policy ": "2026-09-11T09:59:59",
+            "boundary": "2026-09-11T10:00:00",
+            "old-only": "2026-09-01T00:00:00",
+            "policy": "2026-09-14T09:30:00",
+            "recent": "2026-09-11T10:00:01",
+        },
+    }
+    assert notes == [
+        "mixed ok",
+        "超过 72 小时的快讯在分配来源预算前剔除 3 条",
+        "市场快讯原始 9 条，按来源均衡保留 2 条",
+    ]
+
+
+def test_composite_historical_recency_uses_the_requested_day_end(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ashare_decision_support.news.composite.beijing_naive_now",
+        lambda: datetime(2026, 9, 14, 10),
+    )
+    raw = [
+        NewsDoc(title="已过期", source="archive", published_at="2026-09-10 23:59:59"),
+        NewsDoc(title="历史有效稿", source="archive", published_at="2026-09-11 00:00:00"),
+    ]
+    source = CompositeNewsSource(FakeSource("archive", market=raw))
+
+    docs, _ = source.fetch_market(date(2026, 9, 13))
+
+    assert docs == [raw[1]]
+    assert source.last_market_stats["expired_before_budget"] == 1
+
+
+@pytest.mark.parametrize(
+    ("limit", "indices", "counts"),
+    [
+        (-1, [], {}),
+        (0, [], {}),
+        (1, [1], {"a": 1}),
+        (2, [1, 0], {"a": 1, "b": 1}),
+        (3, [1, 0, 4], {"a": 1, "b": 1, "unknown": 1}),
+        (4, [1, 2, 0, 4], {"a": 2, "b": 1, "unknown": 1}),
+        (5, [1, 2, 0, 4, 5], {"a": 2, "b": 1, "unknown": 2}),
+        (6, [1, 2, 0, 6, 4, 5], {"a": 3, "b": 1, "unknown": 2}),
+        (20, [1, 2, 0, 6, 4, 5], {"a": 3, "b": 1, "unknown": 2}),
+    ],
+)
+def test_market_balance_preserves_ties_and_redistributes_quota(limit, indices, counts) -> None:
+    docs = [
+        NewsDoc(title="b-first", source="b", published_at="2026-09-14T01:30:00Z"),
+        NewsDoc(title="a-first", source=" a ", published_at="2026/09/14 09:30"),
+        NewsDoc(title="a-second", source="a", published_at="20260914093000"),
+        NewsDoc(title="", source="c", published_at="2026-09-15"),
+        NewsDoc(title="missing", source=" "),
+        NewsDoc(title="bad-date", source="unknown", published_at="invalid"),
+        NewsDoc(title="oldest-valid", source="a", published_at="0001-01-01"),
+    ]
+    original = list(docs)
+
+    selected, by_source = balance_by_source(docs, limit)
+
+    assert selected == [original[index] for index in indices]
+    assert by_source == counts
+    assert docs == original

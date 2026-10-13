@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from ashare_decision_support.news.rss_source import RssFeed, RssNewsSource
+from tests.fakes import PageOpener as Http
 
 RSS = """<?xml version="1.0"?><rss><channel>
 <item><title>Federal Reserve issues statement</title><description>Policy decision.</description>
@@ -14,32 +15,6 @@ ATOM = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
 <entry><title>EIA weekly petroleum report</title><summary>Crude inventories.</summary>
 <link href="https://eia.example/report"/><updated>2026-08-07T15:30:00Z</updated></entry>
 </feed>"""
-
-
-class Response:
-    def __init__(self, body: str) -> None:
-        self.body = body.encode("utf-8")
-
-    def read(self, size: int = -1) -> bytes:
-        return self.body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class Http:
-    def __init__(self, pages: dict[str, str], dead: set[str] | None = None) -> None:
-        self.pages = pages
-        self.dead = dead or set()
-
-    def __call__(self, request, timeout=None):
-        url = request.full_url
-        if url in self.dead:
-            raise OSError("down")
-        return Response(self.pages[url])
 
 
 def test_rss_and_atom_are_normalized_to_news_docs() -> None:
@@ -77,9 +52,9 @@ def test_default_feeds_cover_inflation_after_bls_is_unreachable() -> None:
     from ashare_decision_support.news.rss_source import OFFICIAL_GLOBAL_FEEDS
 
     sources = {feed.source for feed in OFFICIAL_GLOBAL_FEEDS}
-    assert "美国经济分析局" in sources     # GDP / PCE / 贸易差额
-    assert "美国人口普查局" in sources     # 零售 / 耐用品 / 库存
-    assert "美联储" in sources             # 议息与声明
+    assert "美国经济分析局" in sources  # GDP / PCE / 贸易差额
+    assert "美国人口普查局" in sources  # 零售 / 耐用品 / 库存
+    assert "美联储" in sources  # 议息与声明
     # 取不到不等于不存在：换个部署环境 BLS 就回来了，不能因为本机 403 就删掉。
     assert "美国劳工统计局" in sources
 
@@ -88,9 +63,7 @@ def test_one_dead_feed_costs_only_its_own_documents() -> None:
     """BLS 那一路今天就是这个状态：它挂掉不能带走另外四路。"""
     live = RssFeed("美国经济分析局", "https://bea.example/rss", "美国经济分析局")
     dead = RssFeed("美国劳工统计局", "https://bls.example/rss", "美国劳工统计局")
-    source = RssNewsSource(
-        opener=Http({live.url: RSS}, dead={dead.url}), feeds=(live, dead)
-    )
+    source = RssNewsSource(opener=Http({live.url: RSS}, dead={dead.url}), feeds=(live, dead))
 
     docs, notes = source.fetch_market(date(2026, 8, 8))
 
