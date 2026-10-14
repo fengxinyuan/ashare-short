@@ -30,9 +30,37 @@ SEAT_BRANCH = "营业部"
 
 NORTHBOUND_MARKERS = ("沪股通专用", "深股通专用")
 
+# 席位交易行为特征画像标签
+PROFILE_INSTITUTION = "机构专用"
+PROFILE_NORTHBOUND = "北向资金"
+PROFILE_QUANT = "量化主力"
+PROFILE_RETAIL = "散户大本营"
+PROFILE_HOT_MONEY = "一线游资"
+PROFILE_BRANCH = "普通营业部"
+
+RETAIL_MARKERS = ("拉萨团结路", "拉萨东环路", "拉萨金珠西路", "拉萨察古大道")
+QUANT_MARKERS = (
+    "华泰证券股份有限公司总部",
+    "中信证券股份有限公司总部",
+    "中国国际金融股份有限公司上海分公司",
+    "中国国际金融股份有限公司北京建国门外大街",
+    "国泰君安证券股份有限公司总部",
+    "中国银河证券股份有限公司北京金融街",
+)
+TOP_HOT_MONEY_MARKERS = (
+    "中信证券股份有限公司西安朱雀大街",
+    "国泰君安证券股份有限公司上海江苏路",
+    "中信证券股份有限公司上海溧阳路",
+    "国泰君安证券股份有限公司南京太平南路",
+    "中国银河证券股份有限公司北京中关村大街",
+    "国信证券股份有限公司深圳泰然九路",
+    "华鑫证券有限责任公司上海分公司",
+    "光大证券股份有限公司宁波解放南路",
+    "招商证券股份有限公司深圳蛇口工业七路",
+    "光大证券股份有限公司深圳金田路",
+)
+
 # 知名游资席位。**这是一份先验名单，不是从台账标定出来的**，也没有回测支持。
-# 它的作用只有一个：把「某个营业部」变成「一个可追踪的对象」，让 `journal/` 有
-# 东西可以累积。名单不全、会过时，所以命中与否都不改变任何数值读数，只加一个标注。
 KNOWN_HOT_MONEY: tuple[str, ...] = (
     "国信证券股份有限公司深圳泰然九路证券营业部",
     "华鑫证券有限责任公司上海分公司",
@@ -49,6 +77,24 @@ KNOWN_HOT_MONEY: tuple[str, ...] = (
 CONCENTRATION_THRESHOLD = 0.05
 
 
+def profile_seat(name: str) -> str:
+    """席位行为特征画像识别：量化对倒、散户接盘、一线游资或机构锁仓。"""
+    text = (name or "").strip()
+    if not text:
+        return PROFILE_BRANCH
+    if SEAT_INSTITUTION in text:
+        return PROFILE_INSTITUTION
+    if any(m in text for m in NORTHBOUND_MARKERS):
+        return PROFILE_NORTHBOUND
+    if any(m in text for m in RETAIL_MARKERS):
+        return PROFILE_RETAIL
+    if any(m in text for m in QUANT_MARKERS) or "证券股份有限公司总部" in text:
+        return PROFILE_QUANT
+    if any(m in text for m in TOP_HOT_MONEY_MARKERS) or text in KNOWN_HOT_MONEY:
+        return PROFILE_HOT_MONEY
+    return PROFILE_BRANCH
+
+
 @dataclass(frozen=True)
 class Seat:
     name: str
@@ -59,6 +105,7 @@ class Seat:
     buy_share: float | None = None
     sell_share: float | None = None
     known_hot_money: bool = False
+    profile: str = PROFILE_BRANCH
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +117,7 @@ class Seat:
             "buy_share": self.buy_share,
             "sell_share": self.sell_share,
             "known_hot_money": self.known_hot_money,
+            "profile": self.profile,
         }
 
 
@@ -110,13 +158,25 @@ class SeatRead:
             lines.append(f"{category}净额 {net / 1e4:+.0f} 万")
         if self.top_buyer and self.top_buyer.net:
             tag = "（知名游资席位）" if self.top_buyer.known_hot_money else ""
+            prof = self.top_buyer.profile
+            prof_tag = f"【{prof}】" if prof != PROFILE_BRANCH else ""
             lines.append(
-                f"买方居首 {self.top_buyer.name}{tag} 净 {self.top_buyer.net / 1e4:+.0f} 万"
+                f"买方居首 {self.top_buyer.name}{tag}{prof_tag} 净 {self.top_buyer.net / 1e4:+.0f} 万"
             )
+            if prof == PROFILE_RETAIL:
+                lines.append("⚠️ 买方居首出现拉萨散户天团，筹码承接偏散，谨防次日竞价踩踏与多杀多")
+            elif prof == PROFILE_QUANT:
+                lines.append("⚠️ 买方出现高频量化主力席位，注意防范次日冲高兑现与反水砸盘")
+            elif prof == PROFILE_INSTITUTION:
+                lines.append("✅ 机构专用席位居首大额买入，中线锁仓意愿较强")
+            elif prof == PROFILE_HOT_MONEY:
+                lines.append("🔥 一线顶级游资入驻，具备较强短线号召溢价")
         if self.top_seller and self.top_seller.net:
             tag = "（知名游资席位）" if self.top_seller.known_hot_money else ""
+            prof = self.top_seller.profile
+            prof_tag = f"【{prof}】" if prof != PROFILE_BRANCH else ""
             lines.append(
-                f"卖方居首 {self.top_seller.name}{tag} 净 {self.top_seller.net / 1e4:+.0f} 万"
+                f"卖方居首 {self.top_seller.name}{tag}{prof_tag} 净 {self.top_seller.net / 1e4:+.0f} 万"
             )
         if self.concentration is not None and self.concentration >= CONCENTRATION_THRESHOLD:
             lines.append(f"单一席位占当日成交 {self.concentration:.1%}，盘面由少数席位主导")
@@ -134,7 +194,7 @@ def classify_seat(name: str) -> tuple[str, bool]:
         return SEAT_INSTITUTION, False
     if any(marker in text for marker in NORTHBOUND_MARKERS):
         return SEAT_NORTHBOUND, False
-    return SEAT_BRANCH, text in KNOWN_HOT_MONEY
+    return SEAT_BRANCH, text in KNOWN_HOT_MONEY or any(m in text for m in TOP_HOT_MONEY_MARKERS)
 
 
 class LhbSeatAdapter:
@@ -235,6 +295,7 @@ class LhbSeatAdapter:
 
 def _build_seat(seat_name: str, row: dict[str, Any]) -> Seat:
     category, hot = classify_seat(seat_name)
+    prof = profile_seat(seat_name)
     buy = finite(row.get("买入金额"))
     sell = finite(row.get("卖出金额"))
     net = finite(row.get("净额"))
@@ -249,4 +310,5 @@ def _build_seat(seat_name: str, row: dict[str, Any]) -> Seat:
         buy_share=finite(row.get("买入金额-占总成交比例")),
         sell_share=finite(row.get("卖出金额-占总成交比例")),
         known_hot_money=hot,
+        profile=prof,
     )

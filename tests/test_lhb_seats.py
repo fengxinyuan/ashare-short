@@ -7,11 +7,18 @@
 from __future__ import annotations
 
 from ashare_decision_support.adapters.lhb_seats import (
+    PROFILE_BRANCH,
+    PROFILE_HOT_MONEY,
+    PROFILE_INSTITUTION,
+    PROFILE_NORTHBOUND,
+    PROFILE_QUANT,
+    PROFILE_RETAIL,
     SEAT_BRANCH,
     SEAT_INSTITUTION,
     SEAT_NORTHBOUND,
     LhbSeatAdapter,
     classify_seat,
+    profile_seat,
 )
 
 HOT_SEAT = "国信证券股份有限公司深圳泰然九路证券营业部"
@@ -103,6 +110,15 @@ def test_blank_seat_name_falls_back_without_guessing() -> None:
     assert classify_seat(None) == (SEAT_BRANCH, False)
 
 
+def test_seat_profile_recognition() -> None:
+    assert profile_seat("机构专用") == PROFILE_INSTITUTION
+    assert profile_seat("深股通专用") == PROFILE_NORTHBOUND
+    assert profile_seat("东方财富证券股份有限公司拉萨团结路第二证券营业部") == PROFILE_RETAIL
+    assert profile_seat("华泰证券股份有限公司总部") == PROFILE_QUANT
+    assert profile_seat("中信证券股份有限公司西安朱雀大街证券营业部") == PROFILE_HOT_MONEY
+    assert profile_seat("某某普通营业部") == PROFILE_BRANCH
+
+
 # 取数与聚合
 
 
@@ -132,6 +148,7 @@ def test_top_buyer_is_flagged_when_it_is_a_known_hot_money_seat() -> None:
     assert read.top_buyer is not None
     assert read.top_buyer.name == HOT_SEAT
     assert read.top_buyer.known_hot_money is True
+    assert read.top_buyer.profile == PROFILE_HOT_MONEY
     body = " ".join(read.describe())
     assert "知名游资席位" in body
 

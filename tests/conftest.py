@@ -88,6 +88,9 @@ def no_implicit_data_sources(monkeypatch):
         "ashare_decision_support.jobs.sources.default_earnings_adapter",
         "ashare_decision_support.jobs.sources.default_broad_index_adapter",
         "ashare_decision_support.jobs.sources.default_trade_flow_adapter",
+        "ashare_decision_support.jobs.post_close.default_broad_index_adapter",
+        "ashare_decision_support.jobs.post_close.default_global_market_adapter",
+        "ashare_decision_support.jobs.post_close.default_macro_news_source",
     ):
         monkeypatch.setattr(target, lambda: None)
     monkeypatch.setattr(

@@ -175,5 +175,12 @@ def test_shipped_instrument_table_is_well_formed() -> None:
         assert kind in kinds, f"{key} 的解析口径 {kind!r} 不认识"
         assert group in groups, f"{key} 的分组 {group!r} 不认识"
         # 口径必须和代码前缀对得上——填错不报错，只会静默读到别的字段。
-        expected = {"gb_": "equity", "hf_": "future", "fx_": "fx", "b_": "index"}
-        assert kind == expected[symbol[: symbol.index("_") + 1]], f"{key} 口径与代码前缀不符"
+        expected = {
+            "gb_": "equity",
+            "hf_": "future",
+            "fx_": "fx",
+            "b_": "index",
+            "DINIW": "fx",
+        }
+        prefix = symbol if "_" not in symbol else symbol[: symbol.index("_") + 1]
+        assert kind == expected[prefix], f"{key} 口径与代码前缀不符"

@@ -157,7 +157,15 @@ def _determine_stage_and_advice(
     max_streak: int,
     fault_line: bool,
 ) -> tuple[str, str, str]:
-    if limit_down_cnt >= 5 or (blowup_rate is not None and blowup_rate >= 0.45):
+    if limit_down_cnt >= 8 or (
+        blowup_rate is not None and blowup_rate >= 0.40 and limit_down_cnt >= 5
+    ):
+        return (
+            "退潮期",
+            "防守为先，坚决空仓；跌停数量高企，中高位个股面临批量核按钮，严禁抄底与中位接力",
+            f"极端亏钱效应发酵（跌停 {limit_down_cnt} 只，炸板率 {blowup_rate or 0:.1%}），进入恐慌防守",
+        )
+    if limit_down_cnt >= 4 or (blowup_rate is not None and blowup_rate >= 0.45):
         return (
             "退潮期",
             "防守为先，严控仓位；坚决规避中位接力与高位分歧股，防范极端核按钮",

@@ -47,8 +47,21 @@ def test_healthy_regime_around_one_trillion() -> None:
 
 
 def test_expansion_regime_clamps_to_max() -> None:
-    # 2.5 万亿巨量放量高潮
+    # 2.5 万亿巨量放量
     res = calculate_liquidity_factor(25000.0)
     assert res.regime == "放量高潮"
     assert res.scaling_factor == 1.40  # 触发上限 clamp
-    assert res.position_cap_mult == 1.0
+
+
+def test_volume_price_coordination() -> None:
+    # 放量杀跌：1.4 万亿但指数 -1.2%
+    res_dump = calculate_liquidity_factor(14000.0, index_ret=-1.2)
+    assert res_dump.regime == "放量杀跌"
+    assert res_dump.defense_bias == 1.30
+    assert res_dump.position_cap_mult == 0.70
+
+    # 放量进攻：1.4 万亿且指数 +1.5%
+    res_surge = calculate_liquidity_factor(14000.0, index_ret=1.5)
+    assert res_surge.regime == "放量进攻"
+    assert res_surge.defense_bias == 0.85
+    assert res_surge.position_cap_mult == 1.0

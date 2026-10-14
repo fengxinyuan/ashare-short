@@ -28,8 +28,13 @@ from ashare_decision_support.schedule.timezone import beijing_naive_now
 BASE_URL = (
     "https://push2ex.eastmoney.com/getTopic{pool}Pool"
     "?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt"
-    "&Pageindex=0&pagesize={size}&sort=fbt%3Aasc&date={date}"
+    "&Pageindex=0&pagesize={size}&sort={sort}&date={date}"
 )
+POOL_SORT = {
+    "ZT": "fbt%3Aasc",
+    "ZB": "fbt%3Aasc",
+    "DT": "zdp%3Aasc",
+}
 REFERER = "https://quote.eastmoney.com/"
 
 POOL_LIMIT_UP = "ZT"
@@ -186,7 +191,9 @@ class LimitPoolSnapshot:
         early = self.early_seal_ratio
         if early is not None:
             verdict = "主动性买盘为主" if early >= EARLY_SEAL_STRONG else "多数是盘中或尾盘才封上"
-            lines.append(f"早盘封板占比 {early:.0%}（首封早于 {EARLY_SEAL_BEFORE}，{verdict}）")
+            lines.append(
+                f"早盘封板占比 {early:.0%}（首封早于 {EARLY_SEAL_BEFORE}，全天涨停中早盘封板为主，{verdict}）"
+            )
         # 封单与换手写在同一行：它们是「这些板牢不牢」的两面，拆成两行会让读的人
         # 分别去判断，而单看任何一个都得不出结论——封单薄但换手也低是惜售，
         # 封单薄且换手高才是随时会开板。
@@ -323,7 +330,9 @@ class LimitPoolAdapter:
         )
 
     def _fetch_pool(self, pool: str, stamp: str) -> tuple[list[LimitStock], date | None]:
-        url = BASE_URL.format(pool=pool, size=self.page_size, date=stamp)
+        url = BASE_URL.format(
+            pool=pool, size=self.page_size, sort=POOL_SORT.get(pool, "fbt%3Aasc"), date=stamp
+        )
         payload = json.loads(
             fetch_text(
                 self._opener,
@@ -365,7 +374,7 @@ def _parse_stock(row: dict) -> LimitStock:
         amount=finite(row.get("amount")),
         turnover=finite(row.get("hs")),
         seal_fund=finite(row.get("fund")),
-        first_seal=_clock(row.get("fbt")),
+        first_seal=_clock(row.get("fbt") or row.get("lbt")),
         blowups=as_int(row.get("zbc")),
         streak=as_int(row.get("lbc")),
         window_days=as_int(stats.get("days")) or None,

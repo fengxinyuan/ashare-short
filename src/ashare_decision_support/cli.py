@@ -492,6 +492,7 @@ def _parser_post_close(subparsers) -> None:
         "--position-factor", type=float, help="手工仓位系数 (0-1)，省略用情绪周期上限"
     )
     post_close.add_argument("--no-limit-pool", action="store_true", help="跳过涨停池情绪读数")
+    post_close.add_argument("--no-earnings", action="store_true", help="跳过业绩预告与财报排雷")
     post_close.add_argument("--no-debate", action="store_true", help="关闭多空辩论层")
     _add_tickflow_args(post_close)
 
@@ -1124,6 +1125,7 @@ def _cmd_post_close(args) -> None:
         strategy_version=args.strategy_version,
         position_factor=args.position_factor,
         use_limit_pool=not args.no_limit_pool,
+        use_earnings=not args.no_earnings,
         top_n=args.top,
         debate=_debate(args),
         security_master_adapter=SecurityMasterAdapter(),

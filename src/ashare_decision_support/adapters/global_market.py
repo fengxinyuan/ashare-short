@@ -98,8 +98,16 @@ SINA_INSTRUMENTS: dict[str, tuple[str, str, str, str]] = {
     "corn": ("hf_C", "CBOT玉米", "future", GROUP_COMMODITY),
     "wheat": ("hf_W", "CBOT小麦", "future", GROUP_COMMODITY),
     "cotton": ("hf_CT", "ICE棉花", "future", GROUP_COMMODITY),
-    # 汇率
-    "usdcny": ("fx_susdcny", "美元/人民币", "fx", GROUP_FX),
+    # 富时中国 A50 与美股股指期货：次日早盘集合竞价与海外科技开盘风险偏好的直接先行指标
+    "a50": ("hf_CHA50CFD", "富时中国A50", "future", GROUP_INDEX),
+    "nq_future": ("hf_NQ", "纳指期货", "future", GROUP_INDEX),
+    "es_future": ("hf_ES", "标普500期指", "future", GROUP_INDEX),
+    "hsi": ("b_HSI", "恒生指数", "index", GROUP_INDEX),
+    "hscei": ("b_HSCEI", "恒生国企指数", "index", GROUP_INDEX),
+    # 汇率与流动性
+    "usdcny": ("fx_susdcny", "美元/在岸人民币", "fx", GROUP_FX),
+    "usdcnh": ("fx_susdcnh", "美元/离岸人民币", "fx", GROUP_FX),
+    "dxy": ("DINIW", "美元指数", "fx", GROUP_FX),
 }
 YAHOO_INSTRUMENTS = {"vix": ("^VIX", "VIX"), "us10y": ("^TNX", "美国10年期国债收益率")}
 
@@ -288,18 +296,26 @@ def _sina_reading(
             finite(_at(values, 26)),
         )
     elif kind == "future":
-        last, previous, as_of = finite(values[0]), finite(values[7]), f"{values[12]} {values[6]}"
+        last, previous = finite(values[0]), finite(_at(values, 7))
+        as_of = f"{_at(values, 12) or ''} {_at(values, 6) or ''}".strip()
         change_pct = _change_pct(last, previous)
     elif kind == "fx":
-        last, previous, as_of = finite(values[1]), finite(values[2]), f"{values[17]} {values[0]}"
+        last = finite(values[1])
+        # 若是 DINIW（美元指数），日期在 values[10]；常规 fx（如 fx_susdcnh）日期在 values[17]
+        date_str = _at(values, 10) if symbol.startswith("DINIW") else _at(values, 17)
+        as_of = f"{date_str or ''} {values[0]}".strip()
+        prev_cand = finite(_at(values, 3))
+        previous = prev_cand if prev_cand is not None else finite(_at(values, 2))
         change_pct = _change_pct(last, previous)
-    else:
-        last, change_pct, as_of, previous = (
-            finite(values[1]),
-            finite(values[3]),
-            f"{values[6]} {values[5]}",
-            finite(_at(values, 9)),
-        )
+    else:  # index (涵盖 b_KOSPI / b_NKY 13字段，与 b_HSI / b_HSCEI 6字段短格式)
+        last, change_pct = finite(values[1]), finite(values[3])
+        if len(values) <= 8:  # 恒指短格式
+            as_of = str(_at(values, 5) or _at(values, 4) or "")
+            diff = finite(_at(values, 2))
+            previous = round(last - diff, 4) if last is not None and diff is not None else None
+        else:
+            as_of = f"{_at(values, 6) or ''} {_at(values, 5) or ''}".strip()
+            previous = finite(_at(values, 9))
     if last is None:
         raise ValueError("missing price")
     return GlobalMarketReading(
@@ -346,3 +362,7 @@ def _yahoo_reading(key: str, name: str, symbol: str, payload: Any) -> GlobalMark
         datetime.fromtimestamp(stamp, UTC).isoformat() if isinstance(stamp, (int, float)) else None
     )
     return GlobalMarketReading(key, name, symbol, "yahoo", last, previous, change_pct, as_of)
+
+
+def default_global_market_adapter() -> GlobalMarketAdapter:
+    return GlobalMarketAdapter()

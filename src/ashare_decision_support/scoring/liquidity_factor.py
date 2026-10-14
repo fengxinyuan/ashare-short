@@ -39,8 +39,17 @@ class LiquidityRegimeReport:
         return round(base_val * self.scaling_factor, 2)
 
 
-def calculate_liquidity_factor(turnover_yi: float | None) -> LiquidityRegimeReport:
-    """计算市场流动性自适应因子与环境分档。"""
+def calculate_liquidity_factor(
+    turnover_yi: float | None,
+    index_ret: float | None = None,
+) -> LiquidityRegimeReport:
+    """计算市场流动性自适应因子与环境分档。
+
+    结合全市场成交额与宽基指数涨跌幅（量价配合度）：
+    - 放量下跌（>1.3万亿且跌幅明显）：判定为【放量分歧杀跌】，防守偏好上升防接盘；
+    - 放量上涨（>1.3万亿且涨幅明显）：判定为【放量上攻突破】，做多进攻弹性增强；
+    - 地量缩量：区分【地量企稳】与【缩量阴跌】。
+    """
     if turnover_yi is None or turnover_yi <= 0:
         return LiquidityRegimeReport(
             turnover_yi=0.0,
@@ -55,14 +64,26 @@ def calculate_liquidity_factor(turnover_yi: float | None) -> LiquidityRegimeRepo
     raw_factor = math.sqrt(turnover_yi / BASELINE_TURNOVER_YI)
     clamped_factor = round(max(MIN_FACTOR, min(MAX_FACTOR, raw_factor)), 4)
 
+    ret_pct: float | None = None
+    if index_ret is not None:
+        ret_pct = index_ret * 100.0 if abs(index_ret) <= 0.2 else index_ret
+
     notes: list[str] = []
     if turnover_yi < TURNOVER_FREEZE:
-        regime = "冰点地量"
-        defense_bias = 1.4
-        position_cap = 0.6
-        notes.append(
-            f"全市场成交额 {turnover_yi:.0f} 亿处于地量冰点期，个股门槛按 {clamped_factor:.2f}x 适度下调，防守系数提高至 1.4"
-        )
+        if ret_pct is not None and ret_pct < -0.3:
+            regime = "缩量阴跌"
+            defense_bias = 1.45
+            position_cap = 0.55
+            notes.append(
+                f"全市场成交额 {turnover_yi:.0f} 亿地量阴跌（{ret_pct:+.2f}%），市场承接力弱，防守系数提高至 1.45"
+            )
+        else:
+            regime = "冰点地量"
+            defense_bias = 1.4
+            position_cap = 0.6
+            notes.append(
+                f"全市场成交额 {turnover_yi:.0f} 亿处于地量冰点期，个股门槛按 {clamped_factor:.2f}x 适度下调，防守系数提高至 1.4"
+            )
     elif turnover_yi < TURNOVER_CONTRACTION:
         regime = "缩量分化"
         defense_bias = 1.15
@@ -75,12 +96,26 @@ def calculate_liquidity_factor(turnover_yi: float | None) -> LiquidityRegimeRepo
         defense_bias = 1.0
         position_cap = 1.0
         notes.append(f"全市场成交额 {turnover_yi:.0f} 亿处于健康万亿中轴区间")
-    else:
-        regime = "放量高潮"
+    elif ret_pct is not None and ret_pct <= -0.5:
+        regime = "放量杀跌"
+        defense_bias = 1.30  # 放量大跌防守加码，绝不盲目当多头高潮
+        position_cap = 0.70
+        notes.append(
+            f"全市场成交额 {turnover_yi:.0f} 亿巨量，但宽基指数下挫（{ret_pct:+.2f}%），呈放量分歧派发特征，防守偏好提高至 1.30"
+        )
+    elif ret_pct is not None and ret_pct >= 0.5:
+        regime = "放量进攻"
         defense_bias = 0.85
         position_cap = 1.0
         notes.append(
-            f"全市场成交额 {turnover_yi:.0f} 亿放量充沛，题材流动性外溢，个股门槛按 {clamped_factor:.2f}x 适当提高防接盘"
+            f"全市场成交额 {turnover_yi:.0f} 亿放量上攻（{ret_pct:+.2f}%），做多情绪高涨，题材溢价充沛"
+        )
+    else:
+        regime = "放量高潮"
+        defense_bias = 0.95
+        position_cap = 0.90
+        notes.append(
+            f"全市场成交额 {turnover_yi:.0f} 亿放量高位分歧，个股门槛按 {clamped_factor:.2f}x 适当提高防接盘"
         )
 
     return LiquidityRegimeReport(

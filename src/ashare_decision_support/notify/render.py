@@ -278,7 +278,30 @@ def _score_attribution(item: Any) -> str | None:
     return "；".join(parts) or None
 
 
+def _clean_notes(notes: list[str]) -> list[str]:
+    """清洗与降噪：过滤内部调试台账日志、无信息增量的状态以及重复项。"""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    skip_keywords = (
+        "已落台账",
+        "已跳过",
+        "提取完成，共",
+    )
+    for n in notes:
+        text = str(n).strip()
+        if not text:
+            continue
+        if any(kw in text for kw in skip_keywords):
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    return cleaned
+
+
 def _render_notes_section(notes: list[str], heading: str = "数据边界") -> list[str]:
+    notes = _clean_notes(notes)
     if not notes:
         return []
 
@@ -357,11 +380,14 @@ def _candidate_table(rows: list[dict]) -> list[str]:
     ]
     for row in rows:
         name = f" {row['name']}" if row.get("name") else ""
+        target_str = _fmt(row.get("target_reference"))
+        if any("盈亏比" in str(w) for w in (row.get("warnings") or [])):
+            target_str += " ⚠️盈亏比偏低"
         lines.append(
             f"| {row['symbol']}{name} | {row.get('playbook') or '—'} | "
             f"{row.get('score', 0.0):.1f} | {_fmt(row.get('last_close'))} | "
             f"{row.get('trend_state') or '—'} | {_fmt(row.get('stop_reference'))} | "
-            f"{_fmt(row.get('target_reference'))} |"
+            f"{target_str} |"
         )
     return lines
 
@@ -425,6 +451,13 @@ def _lhb_seat_summary(reading: Any) -> str | None:
         for name, value in categories.items()
         if isinstance(value, (int, float))
     ]
+    top_buyer = reading.get("top_buyer")
+    if isinstance(top_buyer, dict) and top_buyer.get("net"):
+        name = str(top_buyer.get("name") or "")
+        prof = str(top_buyer.get("profile") or "")
+        short_name = name[:8] + ".." if len(name) > 8 else name
+        prof_tag = f"({prof})" if prof and prof != "普通营业部" else ""
+        parts.append(f"买一:{short_name}{prof_tag}")
     concentration = reading.get("concentration")
     if isinstance(concentration, (int, float)):
         parts.append(f"最大席位占成交 {concentration:.1%}")
@@ -516,6 +549,183 @@ def _post_close_sector_confirmation_section(payload: dict) -> list[str]:
     return lines
 
 
+def _render_ladder_cycle_section(ladder: dict | None) -> list[str]:
+    if not ladder:
+        return []
+    lines = ["## 连板天梯与情绪周期量化"]
+    max_streak = ladder.get("max_streak", 0)
+    stage = ladder.get("cycle_stage", "未知")
+    score = ladder.get("emotion_score", 0.0)
+    lines.append(
+        f"- **最高连板高度**：{max_streak} 连板　**短线情绪周期**：【{stage}】（情绪温度打分：{score:.1f}/100）"
+    )
+
+    if ladder.get("has_fault_line"):
+        lines.append("- ⚠️ **警惕中位梯队断层**：中位连板接力断档，资金抱团极端化，接力盈亏比极低")
+    else:
+        lines.append("- ✅ **梯队排列完整**：各梯队有序承接")
+
+    tiers = ladder.get("tiers") or []
+    if tiers:
+        lines.append("")
+        lines.append("**梯队分布明细**：")
+        for t in reversed(tiers):
+            names = "、".join(t.get("names", []))
+            streak = t.get("streak")
+            count = t.get("count")
+            lines.append(f"  - **{streak} 板**（{count} 只）：{names}")
+
+    progressions = ladder.get("progressions") or []
+    if progressions:
+        lines.append("")
+        lines.append("**逐阶晋级率**：")
+        for p in progressions:
+            f_s = p.get("from_streak")
+            t_s = p.get("to_streak")
+            y_c = p.get("yesterday_count")
+            t_c = p.get("today_count")
+            rate = p.get("rate", 0.0)
+            lines.append(
+                f"  - {f_s}板 进 {t_s}板：昨日 {y_c} 只 -> 今日 {t_c} 只（晋级率 {rate:.1%}）"
+            )
+
+    top_sectors = ladder.get("top_sectors_by_funds") or []
+    if top_sectors:
+        funds_str = "、".join(f"{x['sector']}（{x['fund_yi']}亿）" for x in top_sectors)
+        lines.append(f"- **涨停资金主攻板块（成交+封单）**：{funds_str}")
+
+    advice = ladder.get("action_advice")
+    if advice:
+        lines.append("")
+        lines.append(f"- **量化操盘战术建议**：{advice}")
+    lines.append("")
+    return lines
+
+
+def _render_top_limit_stocks(stocks: list[dict] | None) -> list[str]:
+    if not stocks:
+        return []
+    lines = ["## 今日涨停池核心标的（次日重点锚点）"]
+    lines.append("| 代码 | 名称 | 连板数 | 封单金额 | 首次封板时间 | 所属行业 |")
+    lines.append("| :--- | :--- | :---: | :---: | :---: | :--- |")
+    for s in stocks:
+        sym = s.get("symbol")
+        nm = s.get("name")
+        stk = s.get("streak")
+        sf = s.get("seal_fund", 0.0)
+        fs = s.get("first_seal") or "-"
+        sec = s.get("sector") or "-"
+        lines.append(f"| {sym} | {nm} | {stk}板 | {sf:.2f}亿 | {fs} | {sec} |")
+    lines.append("")
+    return lines
+
+
+def _render_liquidity_section(
+    liquidity: dict | None, broad_indices: dict | None = None
+) -> list[str]:
+    if not liquidity and not broad_indices:
+        return []
+    lines = ["## 市场流动性与大盘指数表现"]
+    if broad_indices:
+        turnover = broad_indices.get("turnover_yi")
+        amt_str = f"{turnover:.1f} 亿元" if turnover else "缺少统计"
+        summary = broad_indices.get("summary") or ""
+        lines.append(f"- **沪深两市全天总成交额**：**{amt_str}**")
+        lines.append(f"- **宽基指数收盘涨跌幅**：{summary}")
+
+    if liquidity:
+        regime = liquidity.get("regime", "常态")
+        scale = liquidity.get("scaling_factor", 1.0)
+        cap = liquidity.get("position_cap_mult", 1.0)
+        bias = liquidity.get("defense_bias", 1.0)
+        lines.append(
+            f"- **流动性自适应分档**：【{regime}】（筛选门槛乘数 {scale:.2f}x，仓位上限乘数 {cap:.2f}，防守偏好系数 {bias:.2f}）"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_global_market_section(global_market: dict | None) -> list[str]:
+    if not global_market:
+        return []
+    lines = ["## 外盘跨市场联动与次日推演"]
+
+    rows: list[tuple[str, str, str, str]] = []
+    items = [
+        ("a50", "富时中国A50期指", "先导：大盘权重与竞价"),
+        ("nq_future", "纳斯达克期指", "海外科技成长风向"),
+        ("es_future", "标普500期指", "全球权益风险偏好"),
+        ("hsi", "恒生指数", "港股中资资产共振"),
+        ("nikkei", "日经225", "亚太周边日内情绪"),
+        ("kospi", "韩国KOSPI", "半导体存储产业链"),
+        ("usdcnh", "美元/离岸人民币", "外资流动性与汇率"),
+        ("dxy", "美元指数", "美元流动性强弱"),
+        ("wti", "WTI国际原油", "能化成本与地缘通胀"),
+        ("gold", "COMEX黄金", "避险与抗通胀情绪"),
+    ]
+
+    for key, label, role in items:
+        info = global_market.get(key)
+        if not info or info.get("last") is None:
+            continue
+        last_val = info["last"]
+        pct_val = info.get("change_pct")
+        pct_str = f"{pct_val:+.2f}%" if pct_val is not None else "—"
+        price_str = f"{last_val:,.2f}" if last_val >= 100 else f"{last_val:.4f}"
+        rows.append((label, price_str, pct_str, role))
+
+    if rows:
+        lines.append("| 品种 | 最新价 | 涨跌幅 | 跨资产传导定位 |")
+        lines.append("|---|---|---|---|")
+        for label, price_str, pct_str, role in rows:
+            lines.append(f"| {label} | {price_str} | {pct_str} | {role} |")
+        lines.append("")
+
+    insights = global_market.get("insights") or []
+    if insights:
+        lines.append("### 次日开盘溢价与题材传导推演")
+        for item in insights:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    return lines
+
+
+def _render_macro_news_section(macro_news: dict | None) -> list[str]:
+    if not macro_news:
+        return []
+    lines = ["## 宏观大环境与外围重大消息"]
+    headlines = macro_news.get("headlines") or []
+    if headlines:
+        lines.append("### 核心要闻与宏观事件")
+        category_map = {
+            "rates_fed": "美联储/利率",
+            "inflation_cpi": "通胀/经济数据",
+            "china_liquidity": "中国央行/宏观流动性",
+            "tariffs_geopolitics": "地缘/关税外贸",
+        }
+        for item in headlines:
+            if isinstance(item, dict):
+                cat = item.get("category", "")
+                title = item.get("title", "")
+                pub = item.get("published_at", "")
+                time_str = pub[-8:-3] if len(pub) >= 16 else ""
+                cat_tag = category_map.get(cat, "宏观要闻")
+                time_suffix = f"（{time_str}）" if time_str else ""
+                lines.append(f"- **【{cat_tag}】** {title}{time_suffix}")
+            else:
+                lines.append(f"- {item}")
+        lines.append("")
+
+    transmissions = macro_news.get("transmissions") or []
+    if transmissions:
+        lines.append("### 宏观与政策传导链推演")
+        for item in transmissions:
+            lines.append(f"- {item}")
+        lines.append("")
+    return lines
+
+
 def render_post_close_brief(payload: dict) -> str:
     """盘后简报。输入是 `jobs/post_close.py` 落盘的那份 payload，不是模型对象——
     简报与执行卡读同一份字典，两边就不可能对不上。"""
@@ -532,6 +742,13 @@ def render_post_close_brief(payload: dict) -> str:
     lines.append(_post_close_conclusion(actionable, watch_only))
     lines.append("")
 
+    lines.extend(_render_ladder_cycle_section(payload.get("ladder_cycle")))
+    lines.extend(_render_top_limit_stocks(payload.get("top_limit_stocks")))
+    lines.extend(
+        _render_liquidity_section(payload.get("liquidity_regime"), payload.get("broad_indices"))
+    )
+    lines.extend(_render_global_market_section(payload.get("global_market")))
+    lines.extend(_render_macro_news_section(payload.get("macro_news")))
     lines.extend(_post_close_sector_confirmation_section(payload))
 
     lines.append("## 明天可以做的")
